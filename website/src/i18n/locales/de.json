@@ -10553,15 +10553,12 @@
       "workspace_2": "Workspace",
       "workspace_name_is_required": "Workspace-Name ist erforderlich",
       "yes_delete_it": "Ja, löschen",
-      "session_color": "Sitzungsfarbe",
-      "session_color_hint": "Von diesem Agenten gestartete Sitzungen verwenden diese Farbe, sofern die Sitzung keine eigene Farbe hat. Eine Änderung färbt diese Sitzungen neu ein. Leer lassen für keine Agentenfarbe.",
-      "session_color_hex": "Hex-Wert der Sitzungsfarbe",
-      "session_color_clear": "Entfernen",
       "discard_unsaved_changes": "Nicht gespeicherte Änderungen verwerfen?",
       "discard_unsaved_body": "Diese Crew hat Änderungen, die nie gespeichert wurden. Wenn Sie jetzt schließen, gehen sie verloren.",
       "discard_confirm": "Änderungen verwerfen",
       "discard_also_crew_edits": "Die übrigen nicht gespeicherten Änderungen dieser Crew gehen damit ebenfalls verloren.",
-      "editor_options_load_failed": "Die Workspace-, Vorlagen- und Erinnerungsspeicher-Optionen des Crew-Editors konnten nicht geladen werden."
+      "editor_options_load_failed": "Die Workspace-, Vorlagen- und Erinnerungsspeicher-Optionen des Crew-Editors konnten nicht geladen werden.",
+      "template_edit_later_note": "Wähle den passendsten Startpunkt — die Vorlage dieses Agenten kannst du nach dem Erstellen jederzeit wechseln."
     },
     "knowledge": {
       "detailView": {
