@@ -34,7 +34,7 @@ from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility fac
 # FROZEN pre-split alias snapshot (test_loader_reexports_historical_snapshot_by_identity),
 # so new resolution helpers are reached through the module, not re-exported.
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import __version__, model_registry, platform_compat, windows_acl
+from kiro_crew import __version__, model_registry, pinned_fs, platform_compat, windows_acl
 from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
@@ -1553,6 +1553,316 @@ def default_project_dir(workspace: str | None = None) -> str:
     except Exception:
         pass
     return ""
+
+
+#: Container the per-session directories live in when no root is configured.
+#: A FIXED name, never derived from a session key, and dot-prefixed so it cannot
+#: collide with a project file: the session name becomes the directory name, so
+#: creating those directly in the workspace root lets a session called
+#: ``package.json`` put a DIRECTORY on that path and every later write of the
+#: real file fails with ``IsADirectoryError``. One level of indirection removes
+#: the whole class -- inside the container the only neighbours a session name can
+#: collide with are other session names, which exclusive creation already
+#: refuses.
+_SESSION_DIR_CONTAINER = ".sessions"
+
+
+def _pinned_dir_create(
+    parent: str, name: str, *, exclusive: bool, linked_ancestor: str | None
+) -> None:
+    """Create ``name`` directly under ``parent``, or raise.
+
+    The ONE create routine for both directories this module makes -- the
+    container and a session's own directory -- so their protection is identical
+    by construction rather than by two call sites remembering the same rules. A
+    second, softer create is how a fixed container reintroduced the very class
+    the hardened session create had closed: ``mkdir(exist_ok=True)`` follows a
+    symlink planted at the name, and everything below then resolves through it.
+
+    *parent* must be resolved by the CALLER, once, before this runs, and
+    *linked_ancestor* must be the ancestor shape observed at that same moment
+    (``None`` where the platform can walk components instead). Both are the
+    caller's because both have to predate the window this closes.
+
+    ``exclusive`` refuses a name that already exists. Without it an existing
+    directory is accepted, but only after an ``O_NOFOLLOW`` open proves it is a
+    real directory and not a link -- accepting the name is not the same as
+    accepting whatever currently answers to it.
+
+    Raises :class:`pinned_fs.PinnedPathRefusal` for a swapped or linked
+    component, ``FileExistsError`` for a refused existing name, and ``OSError``
+    for an ordinary failure. Callers turn all three into "no per-session
+    directory".
+    """
+    if pinned_fs.supports_pinned_walk() and os.mkdir in os.supports_dir_fd:
+        # POSIX: one `openat` per component of the already-resolved parent, each
+        # with `O_NOFOLLOW`, so a component swapped since the caller resolved it
+        # is refused, and the child is created against the descriptor that walk
+        # produced rather than against a path.
+        parent_fd = pinned_fs.pin_parent(parent, what="per-session project root")
+        try:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                if exclusive:
+                    raise
+                # Prove what is there. `O_NOFOLLOW` refuses a link or a
+                # non-directory at the name, which is the whole reason an
+                # `exist_ok` create is not good enough here.
+                os.close(os.open(name, pinned_fs.dir_flags(), dir_fd=parent_fd))
+        finally:
+            os.close(parent_fd)
+        return
+    # Windows: no `O_DIRECTORY` and no `dir_fd`, and naming those flags raises
+    # `AttributeError`. Holding the parent open without `FILE_SHARE_DELETE`
+    # forbids renaming or deleting it and everything above it, and refuses a
+    # reparse point at its own name; re-reading the ancestor shape while that pin
+    # is HELD is what catches a swap that landed before it. Order is the
+    # property: the same check before the pin leaves the window open.
+    parent_pin = platform_compat.pin_directory(parent)
+    try:
+        if platform_compat.first_linked_ancestor(parent) != linked_ancestor:
+            raise pinned_fs.PinnedPathRefusal("an ancestor changed shape mid-call")
+        child = os.path.join(parent, name)
+        if platform_compat.is_link_or_junction(child):
+            raise pinned_fs.PinnedPathRefusal("a link sits at the directory's own name")
+        try:
+            os.mkdir(child, 0o700)
+        except FileExistsError:
+            if exclusive:
+                raise
+    finally:
+        os.close(parent_pin)
+
+
+def _default_session_root(workspace: str | None) -> str:
+    """The container under the workspace default, created if absent.
+
+    Returns ``""`` when the workspace directory is unusable or the container
+    cannot be made, which the caller reads as "no per-session directory" -- the
+    same degrade the rest of this path takes.
+
+    Created here rather than required to pre-exist, unlike a CONFIGURED root: a
+    configured root that does not exist is a typo, and creating it would scatter
+    directories wherever the typo pointed, but this path is a fixed name under a
+    directory that already validated, so there is nothing to guess at. Created
+    through the same pinned routine the session directories use, and owner-only,
+    because a container that can be redirected redirects everything under it.
+    """
+    from kiro_crew.security import is_sensitive_path  # circular import
+
+    ws = default_project_dir(workspace)
+    if not ws:
+        return ""
+    try:
+        can_pin = pinned_fs.supports_pinned_walk() and os.mkdir in os.supports_dir_fd
+        linked = None if can_pin else platform_compat.first_linked_ancestor(ws)
+        _pinned_dir_create(ws, _SESSION_DIR_CONTAINER, exclusive=False, linked_ancestor=linked)
+        container = os.path.realpath(os.path.join(ws, _SESSION_DIR_CONTAINER))
+        if not os.path.isdir(container) or is_sensitive_path(container):
+            return ""
+        if os.path.dirname(container) != ws:
+            return ""
+        return container
+    except Exception:
+        logger.debug("per-session container unavailable under %r", ws, exc_info=True)
+        return ""
+
+
+def session_project_dir(session_key: str, root: str = "", workspace: str | None = None) -> str:
+    """Resolve a per-session project directory for ``session_key``.
+
+    Returns the realpath of a directory under ``root`` -- creating only that one
+    directory -- or ``""`` when no such directory can be offered. A caller must
+    read ``""`` as "no per-session directory", NOT as an error: every failure
+    mode here (a root that is missing, not a directory, or sensitive; a
+    derived name that would escape the root; an ``OSError`` from the ``mkdir``)
+    has to leave the session openable on the shared default. That is the posture
+    the configured-default branch in ``chat_handlers`` already takes for an
+    ineligible path -- degrade rather than wedge a new slot.
+
+    ``root`` empty falls back to a fixed container inside the workspace the
+    session already resolves to, rather than to the workspace directory itself:
+    the session name becomes the directory name, so creating them at that top
+    level lets a session called ``package.json`` squat a DIRECTORY on that path.
+    A CONFIGURED root must ALREADY EXIST, matching how
+    ``dashboard.default_project`` is treated: a typo then disables the feature
+    instead of scattering directories across the filesystem. The container is the
+    one directory this function will create for itself, because its name is fixed
+    rather than guessed at.
+
+    Two properties are load-bearing rather than incidental:
+
+    * The containment assertion is not decorative. :func:`_safe_dir_name` is a
+      *sanitizer*, not a validator -- it maps separators to ``_`` but does not
+      reject ``..`` -- so the joined path is checked against the resolved root
+      instead of the derived name being trusted. This is the immediate-child
+      form of the containment check ``api_workspaces_create`` applies with
+      ``is_relative_to``, tightened because a session directory is always
+      exactly one level down; it also rejects an existing ``name`` that is a
+      symlink pointing out of the root. ``mkdir`` is called without ``parents``
+      so nothing above the root's own children can be created regardless.
+    * The derivation is DETERMINISTIC in ``session_key``, but NOTHING depends on
+      that for restore. ``slot.project`` is persisted on the transcript's
+      metadata line (``chat_persistence`` writes it, ``history`` owns the field)
+      and is rehydrated from there, so a restored session is served from
+      metadata and never reaches this function. Determinism is therefore only a
+      naming choice and is explicitly NOT relied on to re-find a directory.
+    * Consequently the directory is created EXCLUSIVELY, and an existing one is
+      never adopted. Since a restored session comes back from metadata, a
+      candidate that already exists belongs to some EARLIER session whose key
+      was reused -- handing it over would give a fresh session that session's
+      files. Refusing, and letting the caller fall back to the shared default,
+      is the entire point.
+
+    Blocking file IO (``mkdir``): call via ``asyncio.to_thread`` from async
+    paths, as the sibling project-resolution in ``chat_handlers`` does.
+    """
+    from kiro_crew.security import is_sensitive_path  # circular import
+
+    if not isinstance(session_key, str) or not session_key:
+        # Explicit, rather than letting a bad key reach `_safe_dir_name` and
+        # raise into the broad `except` below. That masking is not theoretical:
+        # it turned a caller passing the request body's `name` -- which is None
+        # on the dashboard's own new-chat path -- into a silent no-op where the
+        # opt-in appeared to do nothing at all.
+        #
+        # Measured: removing this guard reddens nothing, because the broad
+        # `except` returns the same `""`. It is kept anyway, to make a caller
+        # error explicit AT THE BOUNDARY instead of incidental to a catch-all,
+        # and so it still holds if that `except` is ever narrowed.
+        return ""
+
+    try:
+        base = (
+            os.path.realpath(os.path.expanduser(root)) if root else _default_session_root(workspace)
+        )
+        if not base or not os.path.isdir(base) or is_sensitive_path(base):
+            # `isdir` is redundant with the `mkdir` below, which fails anyway on a
+            # missing or non-directory root because it is called without
+            # `parents` -- deleting it reddens nothing. It stays for two reasons:
+            # it states the documented "root must already exist" contract at the
+            # point the contract applies, and it does not depend on which OSError
+            # subclass a given platform raises for that mkdir.
+            return ""
+        name = _safe_dir_name(session_key)
+        if not name or name in (".", ".."):
+            return ""
+        base_resolved = Path(base).resolve()
+        candidate = base_resolved / name
+        # Whether this platform can create relative to a directory descriptor.
+        # POSIX has `openat` behind it; Windows has neither `O_DIRECTORY` nor
+        # `dir_fd`, and naming those flags there raises `AttributeError`. Probed
+        # rather than branched on the platform name, and probed HERE because the
+        # branch that cannot pin needs a sample taken before the window opens.
+        can_pin = pinned_fs.supports_pinned_walk() and os.mkdir in os.supports_dir_fd
+        # The shape of the ancestor chain as validation sees it, for the branch
+        # that has no per-component walk to refuse a change with. A junction the
+        # user's own layout already contains -- a redirected profile, a mapped
+        # drive -- is legitimate and must keep working, so what matters is not
+        # whether a linked ancestor EXISTS but whether the answer changes while
+        # this function runs. Sampled root-first by the helper, so the probe
+        # itself never traverses a link.
+        linked_ancestor = None if can_pin else platform_compat.first_linked_ancestor(base_resolved)
+        # The two containment assertions are a deliberate PAIR, and BOTH are now
+        # measurably unobservable - deleting either or both reddens nothing. That
+        # is a property of the other guards rather than of the tests, and it was
+        # measured, not assumed: `_safe_dir_name` cannot emit a path separator
+        # (it maps `/`, `\` and `:` to `_`), so the join is an immediate child by
+        # construction, and `mkdir` does NOT follow a symlink at the final
+        # component - dangling or not it raises `FileExistsError`, which the
+        # exclusive create already refuses.
+        #
+        # They stay as depth against a change to either of those two facts: a
+        # sanitizer that starts passing separators through, or a move away from
+        # exclusive creation, would make them load-bearing again with no other
+        # signal. The first refuses before any side effect; the second re-checks
+        # after the mkdir. `_set_project` guards its own path the same way,
+        # checking both the pre-resolution and the post-realpath form.
+        if candidate.resolve().parent != base_resolved:
+            return ""
+        if is_sensitive_path(str(candidate)):
+            # BEFORE the mkdir, not only after it. The post-`mkdir` check below
+            # rejects a sensitive result but cannot undo the side effect, and
+            # nothing here deletes - so creating first would leave a DIRECTORY
+            # squatting on a path that is supposed to hold a file. For a
+            # governance leaf such as `<data_home>/security_policy.json` that is
+            # unbounded: policy loading expects a file, and a directory in its
+            # place blocks it. The key is caller-steerable (a supplied name
+            # becomes the slot key), so the name reaching this line is not
+            # necessarily a minted one, and `is_sensitive_path` matches a path
+            # that does not exist yet - which is exactly the case that matters.
+            return ""
+        # Create the child through a PINNED PARENT, never by re-resolving the
+        # root's path. A path-based `mkdir` resolves every component afresh, so a
+        # root -- or any directory above it -- that an attacker replaces between
+        # the validation and the create redirects the create to wherever the
+        # replacement points, under a name the caller steers (the session key
+        # becomes the directory name). The refusals below reject the RESULT, but
+        # nothing here deletes, so the escaped directory would already exist.
+        #
+        # Both branches use the mechanism the repo already has rather than a
+        # bespoke open, and neither is a weaker substitute for the other -- the
+        # platforms close the window by different means:
+        #
+        # * POSIX: `pin_parent` does one `openat` per component of the ALREADY
+        #   RESOLVED root, each with `O_NOFOLLOW`, and the final component is the
+        #   root itself -- so a root swapped for a link and an ANCESTOR swapped
+        #   for a link are both refused, and `name` is then created relative to
+        #   the descriptor that walk produced. A single `O_NOFOLLOW` open of the
+        #   root does NOT cover this: it guards the last component only, and a
+        #   swapped ancestor is followed silently. Checking the result afterwards
+        #   cannot see it either, since re-resolving the path traverses the
+        #   swapped ancestor and so agrees with itself. `base_resolved` is passed
+        #   as-is and never re-resolved here, which is `pin_parent`'s stated
+        #   contract: resolving inside the walk re-follows whatever an ancestor
+        #   points at by then and makes the walk useless.
+        # * Windows: it has neither `O_DIRECTORY` nor `dir_fd`, and naming those
+        #   flags there raises `AttributeError`, so it takes the pin-and-verify
+        #   branch. `pin_directory` opens the root without `FILE_SHARE_DELETE`,
+        #   and a directory held by such a handle -- along with every directory
+        #   above it -- can be neither renamed nor deleted while the handle
+        #   lives; that open also refuses to follow a reparse point at the root's
+        #   own name. Those two together leave one gap, an ancestor swapped
+        #   BEFORE the pin, which the ancestor-shape re-read closes.
+        #
+        # `name` is a single component by construction (`_safe_dir_name` maps
+        # `/`, `\` and `:` to `_`), which is what makes it safe to create
+        # relative to a pinned directory at all. `0o700` on both branches: POSIX
+        # masks it with the umask, and on Windows the DACL governs access instead
+        # of the mode bits.
+        try:
+            _pinned_dir_create(
+                str(base_resolved), name, exclusive=True, linked_ancestor=linked_ancestor
+            )
+        except (FileExistsError, pinned_fs.PinnedPathRefusal):
+            # NEVER adopt an existing directory, and never write through a
+            # component that changed under us. A restored session is served its
+            # project from the transcript metadata line and does not reach this
+            # function, so a path that already exists here belongs to an EARLIER
+            # session whose key was reused -- a closed session plus a same-second
+            # restart can reproduce a minted key. Adopting it would leak that
+            # session's files into a fresh one, so refuse and let the caller fall
+            # back to the shared default. Exclusive creation is also what makes
+            # this safe without a delete path: nothing is ever cleared or reused.
+            #
+            # Both refusals collapse to the same answer deliberately: the caller's
+            # contract is "no per-session directory", and it has nothing different
+            # to do for a reused key than for a swapped ancestor.
+            return ""
+        resolved = os.path.realpath(str(candidate))
+        if not os.path.isdir(resolved) or is_sensitive_path(resolved):
+            return ""
+        if Path(resolved).parent != base_resolved:
+            return ""
+        return resolved
+    except Exception:
+        # Same breadth as `default_project_dir` above, for the same reason: this
+        # runs on the slot-creation path, so an unexpected failure has to become
+        # "no per-session directory" rather than an exception that stops a
+        # session from opening.
+        logger.debug("per-session project dir unavailable for %r", session_key, exc_info=True)
+        return ""
 
 
 def env_path() -> Path:
@@ -3379,6 +3689,10 @@ class KiroCrewConfig:
                     key_present="tailscale" in dashboard_data,
                 ),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
+                new_project_per_session=_safe_bool(
+                    dashboard_data.get("new_project_per_session"), False
+                ),
+                session_project_root=dashboard_data.get("session_project_root", ""),
                 qr_session_until_restart=_safe_bool(
                     dashboard_data.get("qr_session_until_restart"), True
                 ),
