@@ -45,6 +45,7 @@ from kiro_crew.knowledge.folder_watcher import (
     walk_filters,
 )
 from kiro_crew.knowledge.ingestion import (
+    ImportChunkBudgetError,
     IngestionPipeline,
     _redact,
     rebuild_embeddings,
@@ -1053,7 +1054,8 @@ async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) ->
     Shared by add_source (initial ingest) and sync_source (manual re-sync) so both
     entry points route local files through the same FileReader path and apply the
     same read-time sensitive-path re-validation (defense-in-depth against TOCTOU).
-    Updates sync_status to 'synced' on success or 'error' on failure.
+    Updates sync_status to 'synced' on success, 'pending' when the import budget
+    defers the ingest, or 'error' on failure.
     """
     try:
         if is_sensitive_path(str(Path(path).resolve())):
@@ -1065,6 +1067,24 @@ async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) ->
         await pipeline.ingest_file(path, source_id=source_id)
         store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
         store.db.commit()
+    except ImportChunkBudgetError as exc:
+        # A budget deferral is transient, so it must not land in 'error': sync_all
+        # skips an errored source, which would quiesce this local_file permanently
+        # over a window that clears in a minute. 'pending' keeps it in the sweep,
+        # and the file on disk is still there to re-read -- the same test that
+        # keeps 'pending' off an upload, whose only copy is the unlinked temp file.
+        # SyncScheduler.sync_source treats this exception the same way.
+        #
+        # Offloaded, unlike the baselined sibling writes in this function: a
+        # statement holds the write lock for up to busy_timeout, so new code here
+        # takes the off-loop shape rather than adding to that debt.
+        def _mark_pending() -> None:
+            store.db.execute(
+                "UPDATE sources SET sync_status = 'pending' WHERE id = ?", (source_id,))
+            store.db.commit()
+
+        logger.warning("Ingestion deferred by import budget for %s: %s", path, exc)
+        await asyncio.to_thread(_mark_pending)
     except Exception:
         logger.exception("Background ingestion failed for %s", path)
         store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
@@ -1157,6 +1177,21 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
         )
         store.db.commit()
         logger.info("Agent sync complete: source=%s url=%s", source_id, url)
+    except ImportChunkBudgetError as exc:
+        # Transient, so not 'error': sync_all skips an errored source, which would
+        # quiesce this agent-url source permanently over a window that clears in a
+        # minute. The URL is re-fetchable, so a retry has content to act on. Written
+        # off the loop, unlike the baselined sibling writes in this function.
+        def _mark_pending() -> None:
+            store.db.execute(
+                "UPDATE sources SET sync_status = 'pending' WHERE id = ?", (source_id,)
+            )
+            store.db.commit()
+
+        logger.warning(
+            "Agent sync deferred by import budget: source=%s url=%s: %s", source_id, url, exc
+        )
+        await asyncio.to_thread(_mark_pending)
     except Exception:
         logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
         store.db.execute(
@@ -1399,6 +1434,13 @@ async def ingest_text(request: web.Request) -> web.Response:
         store.db.commit()
         _sel_log("source.ingest_text", source_id=source_id, name=name)
         return web.json_response({"ok": True, "job_id": job_id})
+    except ImportChunkBudgetError as exc:
+        # The cross-file import budget deferred this ingest. Surface the reasoned
+        # refusal (429, not a generic 500) so the caller learns it is a transient
+        # budget deferral it can retry, not a server fault. Nothing was written.
+        return web.json_response(
+            {"error": str(exc), "code": "import_budget_exceeded", "deferred": True},
+            status=429)
     except Exception:
         logger.exception("Agent ingest_text failed for source %s", source_id)
         return web.json_response({"error": "internal server error"}, status=500)
@@ -1578,6 +1620,13 @@ async def ingest_file(request: web.Request) -> web.Response:
             try:
                 await pipeline.ingest_file(tmp_path, original_name=filename, namespace=namespace, source_id=src_id)
             except Exception:
+                # Covers ImportChunkBudgetError too: an upload's only copy is the
+                # staged temp file, unlinked in the finally below, and an upload://
+                # source has no re-fetchable URI -- so a budget deferral cannot be
+                # retried and 'error' is the honest terminal state, the same one a
+                # genuine failure gets. No dedicated deferral branch here (unlike
+                # the re-syncable local_file / agent-url paths), which keeps this
+                # handler a single on-loop write already covered by the baseline.
                 logger.exception("Background ingestion failed for %s", filename)
                 store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (src_id,))
                 store.db.commit()

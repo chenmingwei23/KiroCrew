@@ -200,6 +200,7 @@ class KnowledgeWatcher:
                                 source_id=row["id"],
                                 namespace=props.get("namespace", "default"),
                                 embed_priority=PRIORITY_BULK,
+                                count_toward_import_budget=False,
                             )
                         except FileTooLargeError:
                             # Warning already logged by the pipeline (names the file
