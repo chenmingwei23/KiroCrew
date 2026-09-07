@@ -127,9 +127,17 @@ full page.
 Not a rail destination. The user-facing memory browser is a drill-in under
 Settings → Overview; the graph visualizer is a Developer internals view.
 
+Every card on the memory browser reads the store the picker names, passed as
+`?store=`. Naming a store takes the owner gate, so a signed-in non-owner keeps
+the page it had — an absent `?store=` serves the caller's own binding.
+
 | Feature | What it is | Reach it | Page | Handler | Endpoints |
 |---|---|---|---|---|---|
 | Memory browser | Preferences, projects, history, lessons, vector store | `/settings/overview?view=memory` | `pages/overview/MemoryTab.tsx` | `handlers/memory.py`, `handlers/cron.py` | `GET,PUT /api/memory/preferences`, `GET /api/memory/semantic`, `GET,POST /api/lessons` |
+| Store picker | Choose which declared memory store the page reads, and declare a new one | Memory browser → store card | `pages/overview/MemoryStoreCard.tsx` | `handlers/memory_admin.py` | `GET,POST /api/memory/stores` |
+| Carve | Group a store's memories by facet and drill into one bucket | Memory browser → carve card | `pages/overview/MemoryCarveCard.tsx` | `handlers/memory.py` | `GET /api/memory/carve` |
+| Retired episodes | List episodes retirement took out of recall, and put one back | Memory browser → retired card | `pages/overview/MemoryRetiredCard.tsx` | `handlers/memory_admin.py` | `GET /api/memory/retired`, `POST /api/memory/retired/restore` |
+| Backups | Snapshot a store on demand and restore it from a snapshot | Memory browser → backups card | `pages/overview/MemoryBackupsCard.tsx` | `handlers/memory_admin.py` | `GET /api/memory/backups`, `POST /api/memory/backup`, `POST /api/memory/restore` |
 | Episodic search | Search past episodic memories | Memory browser → search | `pages/overview/MemoryTab.tsx` | `handlers/memory.py` | `GET /api/memory/episodic/search`, `GET /api/memory/episodic`, `DELETE /api/memory/episodic/{id}` |
 | Embeddings | Enable the vector store and pick its model | Memory browser → vector card | `pages/overview/VectorMemoryCard.tsx` | `handlers/memory.py` | `GET /api/memory/embedding-status`, `POST /api/memory/enable-embeddings`, `POST /api/memory/embedding-model` |
 | Memory graph | Entity/relation visualizer over the memory store | `/developer?tab=memory` | `pages/overview/MemoryGraphTab.tsx` | `handlers/memory.py` | `GET /api/memory/graph`, `GET /api/memory/observability` |

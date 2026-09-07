@@ -10460,12 +10460,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Eine eindeutige Kennung für diesen Workspace. Agenten verweisen über den Namen auf Workspaces.",
-      "additional_stores_coming_with_memory_v2": "Derzeit ist nur der Standardspeicher verfügbar – Unterstützung für weitere Speicher folgt bald.",
       "agent_template_is_required": "Agent-Template ist erforderlich",
       "agents": "Agenten",
       "also_used_by_these_crews": "Wird auch von {{crews}} verwendet. Agenten mit gemeinsamem Speicher können die Dateien und die Erinnerung der anderen lesen.",
-      "bindings_preview_info": "Vorschau. Eine eigene Erinnerung pro Agent wird noch gebaut. Ein Agent hat seinen eigenen Ordner, aber semantisches Gedächtnis, der Rückgriff auf frühere Gespräche und globale Lektionen erreichen jeden Agenten, deshalb trennt eine Änderung hier nicht, woran sich ein Agent erinnert.",
-      "bindings_preview_notice": "Vorschau. Jeder Agent liest und schreibt schon seinen eigenen Ordner, aber was er sich merkt, ist noch nicht getrennt: semantisches Gedächtnis, der Rückgriff auf frühere Gespräche und globale Lektionen erreichen jeden Agenten. Eine eigene Erinnerung pro Agent folgt bald.",
+      "bindings_preview_info": "Ein Agent, der an seinen eigenen Erinnerungsspeicher gebunden ist, erinnert sich jetzt getrennt, von wo aus er auch angesprochen wird: im Chat, über einen Messaging-Kanal und in einem geplanten Auftrag. Auf der Seite „Erinnerung“ kann die angemeldete Person, der das Dashboard gehört, die Speicherauswahl auf jeden deklarierten Speicher richten.",
+      "bindings_preview_notice": "Ein Agent, der an seinen eigenen Erinnerungsspeicher gebunden ist, behält für sich, woran er sich erinnert. Agenten, die im Standardspeicher bleiben, teilen weiterhin eine Erinnerung.",
       "cancel": "Abbrechen",
       "chat_with_this_crew": "Mit diesem Agenten chatten",
       "copy_from_optional": "Kopieren von (optional)",
@@ -10545,7 +10544,7 @@
       "view_cards_tooltip": "Großzügige Karten mit den Ressourcen jedes Agenten",
       "view_list": "Liste",
       "view_list_tooltip": "Kompakte Tabelle, eine Zeile pro Agent",
-      "which_store_its_lessons_and_history_are_written": "An welchen Speicher dieser Agent gebunden ist. Die Bindung wird gespeichert, gibt dem Agenten aber noch keine eigene Erinnerung.",
+      "which_store_its_lessons_and_history_are_written": "An welchen Erinnerungsspeicher dieser Agent gebunden ist. Ein Agent mit eigenem Speicher behält seine eigenen Einstellungen, Projekte, Tageshistorie, gespeicherten Fakten, erinnerten Gespräche und Lektionen. Agenten, die im Standardspeicher bleiben, teilen eine Erinnerung.",
       "workspace": "Workspace",
       "workspace_2": "Workspace",
       "workspace_name_is_required": "Workspace-Name ist erforderlich",
@@ -10558,7 +10557,8 @@
       "discard_unsaved_body": "Diese Crew hat Änderungen, die nie gespeichert wurden. Wenn Sie jetzt schließen, gehen sie verloren.",
       "discard_confirm": "Änderungen verwerfen",
       "discard_also_crew_edits": "Die übrigen nicht gespeicherten Änderungen dieser Crew gehen damit ebenfalls verloren.",
-      "editor_options_load_failed": "Die Workspace-, Vorlagen- und Erinnerungsspeicher-Optionen des Crew-Editors konnten nicht geladen werden."
+      "editor_options_load_failed": "Die Workspace-, Vorlagen- und Erinnerungsspeicher-Optionen des Crew-Editors konnten nicht geladen werden.",
+      "only_the_default_store_is_declared": "In Ihrer Konfigurationsdatei ist nur der Standardspeicher deklariert. Deklarieren Sie mit „Neuer Speicher“ auf der Seite „Erinnerung“ einen weiteren, damit ein Agent eine eigene Erinnerung erhält."
     },
     "knowledge": {
       "detailView": {
@@ -10793,7 +10793,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "Abschnittslimit pro Quelle",
+        "chunk_limit_desc": "Maximale Abschnitte, die eine einzelne Quelle pro Scanlauf aufnehmen darf. Jeder Abschnitt kostet einen LLM-Extraktionsaufruf. 0 = ohne Limit.",
+        "max_sources_label": "Max. Quellen",
+        "max_sources_desc": "Maximale Zahl automatisch gefundener Wissensquellen. Von Hand hinzugefügte Quellen sind nicht begrenzt. 0 = ohne Limit.",
+        "auto_project_label": "Projektdokumente automatisch registrieren",
+        "auto_project_desc": "Dokumente aus jedem Projekt, in dem du arbeitest, automatisch als Wissensquelle registrieren."
       }
     },
     "localStorageDebug": {
@@ -11279,7 +11285,8 @@
         "session_other": "{{count}} Sitzungen",
         "summarize_now": "Jetzt zusammenfassen",
         "tool": "Werkzeug",
-        "when": "Wann"
+        "when": "Wann",
+        "the_cards_below_do_not_follow_the_store_picker_m": "Die Karten unten folgen der Speicherauswahl nicht. Erinnerungseinstellungen und Embedding-Modell gelten für die ganze Installation, Lektionen führen den globalen Speicher mit dem des aktiven Workspace zusammen, und der Browser für Vektor-Erinnerung liest den Speicher, an den diese Sitzung gebunden ist."
       },
       "portabilityTab": {
         "archive_contents": "Archivinhalt:",
@@ -11605,6 +11612,81 @@
         "vector_memory": "Vektor-Erinnerung",
         "vector_memory_is_initializing_the_embedding_mode": "Die Vektor-Erinnerung wird initialisiert. Das Embedding-Modell (~610 MB) wird automatisch im Hintergrund heruntergeladen, und die Legacy-Erinnerung migriert von selbst — kein Eingreifen erforderlich.",
         "verifying_model_integrity": "Modellintegrität wird geprüft…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "Ein neuer Speicher startet leer und hält seine Erinnerung in einer eigenen Datenbankdatei, deshalb erreicht nichts, was eine Agent darin merkt, einen anderen Speicher. Von hier aus lässt sich ein Speicher nicht wieder abmelden: das würde alles Gemerkte verwaisen lassen, dafür braucht es einen bewussten Schritt außerhalb dieser Seite.",
+        "a_store_with_that_name_is_already_declared_pick": "Ein Speicher mit diesem Namen ist bereits deklariert. Wähle ihn aus der Liste, statt ihn erneut zu deklarieren.",
+        "backups": "Sicherungen: <v/>",
+        "cancel": "Abbrechen",
+        "crew_silo": "Agent-Speicher",
+        "declare_store": "Speicher deklarieren",
+        "episodes": "Episoden: <v/>",
+        "facts_and_directives": "Fakten und Direktiven: <v/>",
+        "lessons": "Lektionen: <v/>",
+        "memory_store": "Erinnerungsspeicher",
+        "new_memory_store": "Neuer Erinnerungsspeicher",
+        "new_store": "Neuer Speicher",
+        "newest_backup": "Neueste Sicherung: <v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "Nur der angemeldete Dashboard-Besitzer kann einen Erinnerungsspeicher beim Namen ansprechen. Alles auf dieser Seite liest weiterhin den Speicher, an den diese Sitzung gebunden ist.",
+        "schema_lineage": "Schema-Linie: <v/>",
+        "shared_default_store": "Gemeinsamer Standardspeicher",
+        "store_name": "Name des Speichers",
+        "that_name_cannot_be_used_for_a_store_directory_u": "Dieser Name lässt sich nicht als Speicherverzeichnis verwenden. Nutze Kleinbuchstaben, Ziffern und Bindestriche.",
+        "the_picker_drives_this_card_the_preferences_proj": "Die Auswahl steuert diese Karte, die Dokumente für Präferenzen, Projekte und täglichen Verlauf sowie die Karten für Aufteilung, ausgemusterte Einträge und Sicherungen unten.",
+        "this_install_does_not_declare_a_memory_store_by": "Diese Installation deklariert keinen Erinnerungsspeicher mit diesem Namen mehr. Wähle einen anderen Speicher aus der Liste oben.",
+        "this_store_has_no_database_file_that_can_be_read": "Dieser Speicher hat noch keine lesbare Datenbankdatei. Sie wird angelegt, sobald zum ersten Mal etwas darin gemerkt wird, bis dahin gibt es nichts aufzulisten. Eine bereits vorhandene Sicherung lässt sich unten trotzdem wiederherstellen.",
+        "this_store_is_declared_but_its_database_could_no": "Dieser Speicher ist deklariert, aber seine Datenbank konnte nicht geöffnet werden. Es wird nichts angezeigt, statt unter diesem Namen die Erinnerung eines anderen Speichers auszugeben.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Dieser Speicher nutzt das gemeinsame Schema, daher gelten die Aufteilungsfacetten für ihn nicht.",
+        "unknown": "unbekannt"
+      },
+      "memoryRetiredCard": {
+        "actions": "Aktionen",
+        "an_episode_lands_here_when_a_later_fact_supersed": "Eine Episode landet hier, wenn ein späterer Fakt sie ersetzt.",
+        "episodes_a_later_fact_superseded_their_text_is_k": "Episoden, die ein späterer Fakt ersetzt hat. Ihr Text bleibt erhalten, deshalb lässt sich eine Ausmusterung, die etwas Gewünschtes entfernt hat, hier zurücknehmen.",
+        "memory": "Erinnerung",
+        "not_recorded": "nicht erfasst",
+        "nothing_has_been_retired": "Nichts wurde ausgemustert",
+        "restore": "Wiederherstellen",
+        "retired": "Ausgemustert",
+        "retired_memories": "Ausgemusterte Erinnerungen",
+        "superseded_by": "Ersetzt durch",
+        "times_retired": "Ausmusterungen",
+        "unknown": "unbekannt"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "Eine wiederhergestellte Datenbank wird erst beim nächsten Start des Gateways gelesen. Bis dahin verwendet dieser Erinnerungsspeicher weiterhin die Datei, die ersetzt wurde.",
+        "actions": "Aktionen",
+        "already_recent": "Schon aktuell: {{value}}",
+        "back_up_now": "Jetzt sichern",
+        "backups": "Sicherungen",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "Sicherungen werden nach einem Zeitplan erstellt, und „Jetzt sichern“ erstellt sofort eine.",
+        "cancel": "Abbrechen",
+        "confirm_restore": "Wiederherstellen bestätigen",
+        "copies_taken": "Erstellte Kopien: {{value}}",
+        "failed": "Fehlgeschlagen: {{value}}",
+        "no_backups_yet": "Noch keine Sicherungen",
+        "older_copies_removed": "Entfernte alte Kopien: {{value}}",
+        "restore": "Wiederherstellen",
+        "restored_the_database_it_replaced_was_kept_besid": "Wiederhergestellt. Die ersetzte Datenbank wurde neben der eigenen Datei des Speichers aufbewahrt statt überschrieben, unter diesem Namen: <name/>",
+        "size": "Größe",
+        "taken": "Erstellt",
+        "this_replaces_the_store_s_live_database_the_file": "Das ersetzt die aktive Datenbank des Speichers. Die verdrängte Datei bleibt daneben unter einem Ersetzt-Namen liegen, also wird nichts gelöscht."
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "Eine Zählung erscheint, sobald etwas mit dieser Achse erfasst gemerkt wird.",
+        "carve": "Aufteilung",
+        "clear_filter": "Filter zurücksetzen",
+        "count_by": "Zählen nach",
+        "crew": "Agent",
+        "how_this_store_s_memory_divides_up_across_the_ax": "Wie sich die Erinnerung dieses Speichers auf die Achsen verteilt, die jeder Schreibvorgang stempelt. Wähle einen Wert, um die Erinnerungen dieses Ausschnitts aufzulisten.",
+        "kind": "Art",
+        "memory": "Erinnerung",
+        "no_live_memories_in_this_slice": "Keine aktiven Erinnerungen in diesem Ausschnitt",
+        "not_recorded": "nicht erfasst",
+        "nothing_is_stamped_on_this_axis_yet": "Auf dieser Achse ist noch nichts gestempelt",
+        "surface": "Oberfläche",
+        "the_count_includes_only_live_rows_so_a_slice_can": "Die Zählung enthält nur aktive Zeilen, deshalb kann ein Ausschnitt zwischen zwei Lesevorgängen leer werden.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Dieser Speicher nutzt das gemeinsame Schema, daher gelten die Aufteilungsfacetten nicht. Seine Zeilen tragen keine Marken für Agent, Oberfläche oder Bereich, nach denen sie sich teilen ließen, und das ist etwas anderes als ein leerer Speicher."
       }
     },
     "overviewPage": {
@@ -14103,8 +14185,8 @@
       "inherited": "Geerbt",
       "member_count_one": "{{count}} Mitglied",
       "member_count_other": "{{count}} Mitglieder",
-      "memory_dedicated_note": "Einstellungen und Projektnotizen kommen aus dem Speicher {{store}} statt aus dem gemeinsamen Standardspeicher. Gesprächsgedächtnis und Lektionen sind noch nicht getrennt: Was du diesem Mitglied sagst, wissen weiterhin alle.",
-      "memory_shared_note": "Mitglieder teilen sich derzeit ein Gedächtnis. Was du einem Mitglied sagst, wissen alle.",
+      "memory_dedicated_note": "Einstellungen, Projektnotizen, gespeicherte Fakten, erinnerte Gespräche und Lektionen kommen aus dem Speicher {{store}} und nicht aus dem gemeinsamen Standardspeicher, deshalb bleibt bei diesem Mitglied, was Sie ihm sagen.",
+      "memory_shared_note": "Mitglieder im Standard-Erinnerungsspeicher teilen sich eine Erinnerung: Was du einem sagst, wissen alle. Ein Mitglied mit eigenem Speicher erinnert sich getrennt, von wo aus du es auch ansprichst.",
       "memory_store": "Speicher",
       "model": "Modell",
       "opening_thread": "Unterhaltung wird geöffnet…",

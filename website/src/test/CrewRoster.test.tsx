@@ -248,8 +248,14 @@ describe('crew roster — cards', () => {
 })
 
 describe('crew roster — isolation preview notice', () => {
-  const NOTICE = /Isolated memory per agent is on the way/
-  const TIP = /Isolated memory per agent is still being built/
+  /* Anchored on the one clause of each string that carries the disclosure, not
+     on the whole sentence: the copy is reworded whenever the isolation surface
+     grows, and a whole-sentence match would then fail for a wording change
+     while a match on incidental words would keep passing after the disclosure
+     itself was dropped. The assertions below are about STRUCTURE — one
+     page-level notice, two per-binding tips. */
+  const NOTICE = /Agents left on the default store still share one memory/
+  const TIP = /remembers separately wherever it is addressed/
 
   /* The view choice persists to localStorage, so a test here that switches to
      List would otherwise hand every later block a table instead of the cards

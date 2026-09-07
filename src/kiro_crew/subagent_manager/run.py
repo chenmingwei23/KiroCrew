@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         fire_tool_hooks,
         logger,
         name_grant,
+        prepare_store_vectors,
         provider_fallback_active,
         run_in_embed_pool,
         sel,
@@ -865,12 +866,22 @@ class RunEventCoordinator(ManagerComponent):
         # workspace directory, not a checkout, so it can only ever mean "this
         # run named no project", which is exactly the fail-closed case. Keeping
         # one meaning for that makes the rule the same on every surface.
+        # The child's own memory silo. Without it every subagent -- and so every
+        # crew-mode topic, since crew_chat dispatches only through spawn -- reads
+        # the operator's global store however the parent crew is bound, which
+        # makes a crew's isolation end at the moment it delegates.
+        #
+        # Prepared before the offloaded build because the vector tier's init is
+        # blocking file IO; best-effort, so a store that cannot be stood up costs
+        # this run its vectors and not its turn.
+        await prepare_store_vectors(self._manager._ctx_builder, info.memory_store)
         full_message, _ = await run_in_embed_pool(
             self._manager._ctx_builder.build_message,
             message,
             is_new,
             session_key,
             project=info.cwd or None,
+            memory_store=info.memory_store or None,
             provider_type=self._manager._provider_label_of(client),
             model_window=_sub_window,
             context_groups=_groups,

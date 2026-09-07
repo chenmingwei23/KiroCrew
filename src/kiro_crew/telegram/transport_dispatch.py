@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 from kiro_crew.acp.client import AcpError
 from kiro_crew.agent_discovery import list_agents
 from kiro_crew.config.loader import ACTIVATION_MENTION, ACTIVATION_OFF
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
@@ -901,6 +902,14 @@ class TelegramDispatcher:
             # Publish this turn's session identity so managed MCP tools resolve
             # X-Session-Key; one shared writer lives in messaging.identity.
             await publish_turn_identity(self.sessions, session_key)
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``agent``: that value is a kiro agent name, a namespace
+            # disjoint from ``cfg.agents``, so a store derived from it resolves to
+            # ``default`` for exactly the crew that configured otherwise. Awaited
+            # before the offloaded build because it stands up the silo's vector
+            # tier (blocking file IO), and best-effort, so a silo that cannot be
+            # prepared costs this turn its vectors only.
+            _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -909,6 +918,7 @@ class TelegramDispatcher:
                 session_key,
                 channel_id=channel_id,
                 agent=agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 runtime_source="telegram",
                 # Temporary mode reads NO memory, which is the half the transcript

@@ -84,7 +84,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import DATA_WARNING, SUBAGENT_COMPLETION_META_KEY, strip_control_comments
-from kiro_crew.context import ContextBuilder
+from kiro_crew.context import ContextBuilder, session_store_for_turn
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import (
     _SUBPROC_CLEANUP_ALLOWANCE_SECS,
@@ -5636,8 +5636,20 @@ class GatewayOrchestrator:
                 )
             _acquired = True
             _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+            # An auto-nudge cycle continues the NUDGED session's own conversation,
+            # so it reads that session's silo — resolved from its recorded binding,
+            # the same key its consolidations are filed under. Without it a
+            # crew-bound conversation gets nudged with the operator's own memory in
+            # the prompt, and the reply it produces is then filed into the crew's
+            # store as if the crew had said it.
+            _memory_store = await session_store_for_turn(self.ctx_builder, key)
             full_msg, _ = await run_in_embed_pool(
-                self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
+                self.ctx_builder.build_message,
+                tagged,
+                is_new,
+                key,
+                memory_store=_memory_store,
+                provider_type=_provider,
             )
             _completion_hook = self._monitor_completion_hook(loop)
             if wake_message is not None and _completion_hook is None:
@@ -8007,11 +8019,21 @@ class GatewayOrchestrator:
                         _footer_client = client
                         _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
                         if self.ctx_builder:
+                            # The completion is injected into the PARENT's
+                            # conversation, so it reads the parent session's silo,
+                            # resolved from that session's recorded binding. The
+                            # child's own store is not the answer here: this turn
+                            # continues the parent, and the reply it produces is
+                            # consolidated into the parent's store.
+                            _memory_store = await session_store_for_turn(
+                                self.ctx_builder, parent_key
+                            )
                             msg, _ = await run_in_embed_pool(
                                 self.ctx_builder.build_message,
                                 announce,
                                 is_new,
                                 parent_key,
+                                memory_store=_memory_store,
                                 provider_type=_provider,
                             )
                         else:
@@ -8225,11 +8247,16 @@ class GatewayOrchestrator:
                     acquired = True
                     _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
                     if self.ctx_builder:
+                        # Same rule as the interactive injection above: the turn
+                        # continues the PARENT conversation, so it reads the parent
+                        # session's silo from that session's recorded binding.
+                        _memory_store = await session_store_for_turn(self.ctx_builder, parent_key)
                         msg, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
                             announce,
                             is_new,
                             parent_key,
+                            memory_store=_memory_store,
                             provider_type=_provider,
                         )
                     else:

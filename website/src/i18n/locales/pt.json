@@ -10611,12 +10611,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Um identificador único para este workspace. Agentes referenciam workspaces pelo nome.",
-      "additional_stores_coming_with_memory_v2": "Por enquanto, apenas o armazenamento padrão está disponível; o suporte a mais armazenamentos de memória chega em breve.",
       "agent_template_is_required": "O modelo de agente é obrigatório",
       "agents": "Agentes",
       "also_used_by_these_crews": "Também usado por {{crews}}. Agentes que compartilham um armazenamento podem ler os arquivos e a memória uns dos outros.",
-      "bindings_preview_info": "Prévia. A memória isolada por agente ainda está sendo construída. Um agente tem a própria pasta, mas a memória semântica, a recuperação de conversas anteriores e as lições globais chegam a todos os agentes, então trocar isto não separa o que um agente lembra.",
-      "bindings_preview_notice": "Prévia. Cada agente já lê e grava a própria pasta, mas o que ele lembra ainda não está separado: a memória semântica, a recuperação de conversas anteriores e as lições globais chegam a todos os agentes. A memória isolada por agente está a caminho.",
+      "bindings_preview_info": "Um agente ligado ao seu próprio armazenamento de memória passa a lembrar-se separadamente onde quer que seja chamado: no chat, a partir de um canal de mensagens e num trabalho agendado. Na página Memória, a pessoa proprietária do painel com sessão iniciada pode apontar o seletor de armazenamentos para qualquer armazenamento declarado.",
+      "bindings_preview_notice": "Um agente ligado ao seu próprio armazenamento de memória guarda para si o que se lembra. Os agentes que ficam no armazenamento predefinido continuam a partilhar uma só memória.",
       "cancel": "Cancelar",
       "chat_with_this_crew": "Conversar com este agente",
       "copy_from_optional": "Copiar de (opcional)",
@@ -10696,7 +10695,7 @@
       "view_cards_tooltip": "Cartões amplos mostrando o que cada agente usa",
       "view_list": "Lista",
       "view_list_tooltip": "Tabela compacta, uma linha por agente",
-      "which_store_its_lessons_and_history_are_written": "A qual armazenamento de memória este agente está vinculado. O vínculo é registrado, mas ainda não dá ao agente uma memória própria.",
+      "which_store_its_lessons_and_history_are_written": "A que armazenamento de memória este agente está ligado. Um agente com o seu próprio armazenamento mantém as suas preferências, projetos, histórico diário, factos guardados, conversas recordadas e lições. Os agentes que ficam no armazenamento predefinido partilham uma só memória.",
       "workspace": "espaço de trabalho",
       "workspace_2": "Espaço de trabalho",
       "workspace_name_is_required": "O nome do workspace é obrigatório",
@@ -10709,7 +10708,8 @@
       "discard_unsaved_body": "Este grupo tem edições que nunca foram salvas. Fechar agora vai descartá-las.",
       "discard_confirm": "Descartar alterações",
       "discard_also_crew_edits": "As outras edições não salvas deste grupo serão descartadas junto com ele.",
-      "editor_options_load_failed": "Não foi possível carregar as opções de espaço de trabalho, modelo e armazenamento de memória do editor de crew."
+      "editor_options_load_failed": "Não foi possível carregar as opções de espaço de trabalho, modelo e armazenamento de memória do editor de crew.",
+      "only_the_default_store_is_declared": "No seu ficheiro de configuração só está declarado o armazenamento predefinido. Declare outro com Novo armazenamento na página Memória para dar a um agente uma memória própria."
     },
     "knowledge": {
       "detailView": {
@@ -10950,7 +10950,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "Limite de trechos por fonte",
+        "chunk_limit_desc": "Máximo de trechos que uma única fonte pode ingerir por ciclo de varredura. Cada trecho custa uma chamada de extração ao LLM. 0 = sem limite.",
+        "max_sources_label": "Máximo de fontes",
+        "max_sources_desc": "Número máximo de fontes de conhecimento descobertas automaticamente. Fontes adicionadas à mão não têm limite. 0 = sem limite.",
+        "auto_project_label": "Registrar documentos do projeto automaticamente",
+        "auto_project_desc": "Registra automaticamente como fonte de conhecimento os documentos de cada projeto em que você trabalha."
       }
     },
     "localStorageDebug": {
@@ -11441,7 +11447,8 @@
         "session_other": "{{count}} sessões",
         "summarize_now": "Resumir agora",
         "tool": "ferramenta",
-        "when": "Quando"
+        "when": "Quando",
+        "the_cards_below_do_not_follow_the_store_picker_m": "Os cartões abaixo não seguem o seletor de armazenamento. As configurações de memória e o modelo de embeddings valem para toda a instalação, as lições juntam o armazenamento global com o do espaço de trabalho ativo, e o navegador de memória vetorial lê o armazenamento ao qual esta sessão está vinculada."
       },
       "portabilityTab": {
         "archive_contents": "Conteúdo do arquivo:",
@@ -11768,6 +11775,81 @@
         "vector_memory": "Memória vetorial",
         "vector_memory_is_initializing_the_embedding_mode": "A memória vetorial está inicializando. O modelo de embeddings (~610MB) é baixado automaticamente em segundo plano e a memória legada é migrada por conta própria — nenhuma ação é necessária.",
         "verifying_model_integrity": "Verificando a integridade do modelo…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "Um armazenamento novo começa vazio e guarda sua memória no próprio arquivo de banco de dados, então nada que um agente lembre nele chega a outro armazenamento. Daqui não é possível desfazer a declaração de um armazenamento: isso deixaria órfão tudo o que ele lembrou, então exige um passo deliberado fora desta página.",
+        "a_store_with_that_name_is_already_declared_pick": "Já existe um armazenamento declarado com esse nome. Escolha-o na lista em vez de declarar de novo.",
+        "backups": "Backups: <v/>",
+        "cancel": "Cancelar",
+        "crew_silo": "Armazenamento do agente",
+        "declare_store": "Declarar armazenamento",
+        "episodes": "Episódios: <v/>",
+        "facts_and_directives": "Fatos e diretivas: <v/>",
+        "lessons": "Lições: <v/>",
+        "memory_store": "Armazenamento de memória",
+        "new_memory_store": "Novo armazenamento de memória",
+        "new_store": "Novo armazenamento",
+        "newest_backup": "Backup mais recente: <v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "Só o proprietário do painel com a sessão iniciada pode acessar um armazenamento de memória pelo nome. Tudo nesta página continua lendo o armazenamento ao qual esta sessão está vinculada.",
+        "schema_lineage": "Linhagem do esquema: <v/>",
+        "shared_default_store": "Armazenamento padrão compartilhado",
+        "store_name": "Nome do armazenamento",
+        "that_name_cannot_be_used_for_a_store_directory_u": "Esse nome não pode ser usado como diretório de armazenamento. Use letras minúsculas, dígitos e hifens.",
+        "the_picker_drives_this_card_the_preferences_proj": "O seletor controla este cartão, os documentos de preferências, projetos e histórico diário, e os cartões de divisão, aposentados e backups abaixo.",
+        "this_install_does_not_declare_a_memory_store_by": "Esta instalação já não declara nenhum armazenamento de memória com esse nome. Escolha outro armazenamento na lista acima.",
+        "this_store_has_no_database_file_that_can_be_read": "Este armazenamento ainda não tem um arquivo de banco de dados que possa ser lido. Ele é criado na primeira vez que algo é lembrado nele, então até lá não há nada para listar. Qualquer backup que ele já tenha continua restaurável abaixo.",
+        "this_store_is_declared_but_its_database_could_no": "Este armazenamento está declarado, mas não foi possível abrir seu banco de dados. Nada é exibido, em vez de servir a memória de outro armazenamento com este nome.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Este armazenamento usa o esquema compartilhado, então as facetas de divisão não se aplicam a ele.",
+        "unknown": "desconhecido"
+      },
+      "memoryRetiredCard": {
+        "actions": "Ações",
+        "an_episode_lands_here_when_a_later_fact_supersed": "Um episódio aparece aqui quando um fato mais recente o substitui.",
+        "episodes_a_later_fact_superseded_their_text_is_k": "Episódios que um fato mais recente substituiu. O texto deles é mantido, então uma aposentadoria que removeu algo que você ainda queria pode ser desfeita aqui.",
+        "memory": "Memória",
+        "not_recorded": "não registrado",
+        "nothing_has_been_retired": "Nada foi aposentado",
+        "restore": "Restaurar",
+        "retired": "Aposentada",
+        "retired_memories": "Memórias aposentadas",
+        "superseded_by": "Substituída por",
+        "times_retired": "Vezes aposentada",
+        "unknown": "desconhecido"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "Uma base de dados restaurada passa a ser lida na próxima vez que o gateway iniciar. Até lá, este armazenamento de memória continua a usar o ficheiro que foi substituído.",
+        "actions": "Ações",
+        "already_recent": "Já recentes: {{value}}",
+        "back_up_now": "Fazer backup agora",
+        "backups": "Backups",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "Os backups são feitos por um temporizador, e “Fazer backup agora” faz um na hora.",
+        "cancel": "Cancelar",
+        "confirm_restore": "Confirmar restauração",
+        "copies_taken": "Cópias feitas: {{value}}",
+        "failed": "Com falha: {{value}}",
+        "no_backups_yet": "Nenhum backup ainda",
+        "older_copies_removed": "Cópias antigas removidas: {{value}}",
+        "restore": "Restaurar",
+        "restored_the_database_it_replaced_was_kept_besid": "Restaurado. O banco de dados que foi substituído ficou guardado ao lado do arquivo do próprio armazenamento, em vez de ser sobrescrito, com este nome: <name/>",
+        "size": "Tamanho",
+        "taken": "Criada",
+        "this_replaces_the_store_s_live_database_the_file": "Isto substitui o banco de dados ativo do armazenamento. O arquivo que ele desloca fica guardado ao lado com um nome de substituído, então nada é apagado."
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "Uma contagem aparece quando algo é lembrado com este eixo registrado.",
+        "carve": "Divisão",
+        "clear_filter": "Limpar filtro",
+        "count_by": "Contar por",
+        "crew": "Agente",
+        "how_this_store_s_memory_divides_up_across_the_ax": "Como a memória deste armazenamento se divide entre os eixos que cada escrita marca. Escolha um valor para listar as memórias daquela fatia.",
+        "kind": "Tipo",
+        "memory": "Memória",
+        "no_live_memories_in_this_slice": "Nenhuma memória ativa nesta fatia",
+        "not_recorded": "não registrado",
+        "nothing_is_stamped_on_this_axis_yet": "Nada foi marcado neste eixo ainda",
+        "surface": "Superfície",
+        "the_count_includes_only_live_rows_so_a_slice_can": "A contagem inclui apenas linhas ativas, então uma fatia pode ficar vazia entre duas leituras.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Este armazenamento usa o esquema compartilhado, então as facetas de divisão não se aplicam. Suas linhas não trazem marcas de agente, superfície nem escopo para dividi-las, e isso é diferente de o armazenamento estar vazio."
       }
     },
     "overviewPage": {
@@ -14285,8 +14367,8 @@
       "member_count_many": "{{count}} membros",
       "member_count_one": "{{count}} membro",
       "member_count_other": "{{count}} membros",
-      "memory_dedicated_note": "As preferências e as notas de projeto vêm do armazenamento {{store}} em vez do padrão compartilhado. A memória de conversa e as lições ainda não estão separadas: o que você diz a este membro todos continuam sabendo.",
-      "memory_shared_note": "Os membros compartilham atualmente uma única memória. O que você diz a um deles todos saberão.",
+      "memory_dedicated_note": "As preferências, as notas de projeto, os factos guardados, as conversas recordadas e as lições vêm do armazenamento {{store}} e não do predefinido partilhado, por isso o que disser a este membro fica com ele.",
+      "memory_shared_note": "Membros no armazenamento de memória padrão compartilham uma única memória: o que você conta a um, todos sabem. Um membro vinculado ao próprio armazenamento lembra separadamente, de onde quer que você fale com ele.",
       "memory_store": "Armazenamento de memória",
       "model": "Modelo",
       "opening_thread": "Abrindo a conversa…",

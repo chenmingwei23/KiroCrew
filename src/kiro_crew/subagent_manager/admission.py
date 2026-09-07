@@ -55,6 +55,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         include_memory: bool = True,
         include_lessons: bool = True,
         include_project: bool = True,
+        memory_store: str = "",
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
@@ -365,6 +366,13 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     "include_memory": include_memory,
                     "include_lessons": include_lessons,
                     "include_project": include_project,
+                    # Queued alongside the context triple, and for the same
+                    # reason: the drain re-enters `spawn` from this dict alone, so
+                    # a field missing here is a scope the run silently regains.
+                    # For the store that means a delegation which happened to hit
+                    # the concurrency gate runs against the GLOBAL memory instead
+                    # of the crew it was handed to.
+                    "memory_store": memory_store,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
                 }
@@ -455,6 +463,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             include_memory=include_memory,
             include_lessons=include_lessons,
             include_project=include_project,
+            memory_store=memory_store or "",
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         self._manager._agents[agent_id] = info

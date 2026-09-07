@@ -356,14 +356,16 @@ export function MemoryStoreField({ options, value, onChange }: {
       info={i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')}
     >
       <SimpleSelect options={withCurrent(options, value)} value={value} onChange={onChange} aria-label={i18nT('pages.kiroCrewAgentsPage.memory_store')} />
-      {/* Show the "more coming" note only when `default` is the sole option —
-          an install that has declared extra `memory_stores` in config already
-          has a real choice here, and the copy must not contradict a picker
-          that is visibly offering other stores. */}
+      {/* The one thing the picker itself cannot offer: where a store comes from.
+          There is no create-a-store affordance anywhere, so an operator looking
+          at a single-option select has no other way to learn that the answer is
+          a config edit. Shown only when `default` is the sole option — on an
+          install that declared others it is both noise and a contradiction of a
+          picker visibly offering them. */}
       {options.length <= 1 && (
         <span className="flex items-start gap-1.5 text-[11.5px] leading-relaxed text-accent">
           <Sparkles className="lucide-inline h-3 w-3 mt-0.5 shrink-0" aria-hidden="true" />
-          {i18nT('pages.kiroCrewAgentsPage.additional_stores_coming_with_memory_v2')}
+          {i18nT('pages.kiroCrewAgentsPage.only_the_default_store_is_declared')}
         </span>
       )}
     </Field>
@@ -1471,13 +1473,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           askAgent={!sheet}
           testId="crews-editor-options-load-error"
         />
-        {/* Says out loud what the bindings below cannot: a crew's workspace and
-            memory store are shown and editable, but the isolation they imply is
-            only partly built — every crew still reads one shared semantic
-            memory. Page-level rather than per-card: the claim is about the whole
-            surface, and repeating it on every card would put two "?" glyphs on
-            each of them. The editor panel and the list header carry the same
-            copy as a tooltip, because neither can see this line. */}
+        {/* Says out loud what the bindings below cannot: an agent remembers
+            separately only once it is bound to a NAMED store, so a page of
+            visible bindings otherwise reads as if every agent already had a
+            memory of its own — and it names the fallback the rest are left
+            sharing. Page-level rather than per-card: the claim is about the
+            whole surface, and repeating it on every card would put two "?"
+            glyphs on each of them. The editor panel and the list header carry
+            their own binding tooltips, because neither can see this line. */}
         <div className="mb-3.5 flex items-start gap-2 rounded-lg border border-accent-subtle bg-bg-accent px-3 py-2.5">
           <Sparkles className="lucide-inline mt-0.5 shrink-0 text-accent" aria-hidden="true" />
           <span className="text-[12.5px] leading-relaxed text-muted">
@@ -1588,8 +1591,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   {/* `aria-label` keeps the column's accessible name to the
                       label itself. Without it the InfoTip's own name is
                       concatenated into the header, and a screen reader
-                      announces every cell in the column as "Workspace,
-                      Preview. Isolated memory per crew is…". */}
+                      announces every cell in the column as the label followed
+                      by the whole paragraph of tip prose. */}
                   <TableHead aria-label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}>
                     <span className="inline-flex items-center gap-1.5">
                       {i18nT('pages.kiroCrewAgentsPage.workspace_2')}

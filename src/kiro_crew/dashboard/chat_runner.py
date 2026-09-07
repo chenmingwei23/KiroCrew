@@ -54,6 +54,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.connections import get_visible_providers
 from kiro_crew.constants import strip_control_comments
+from kiro_crew.context import prepare_store_vectors
 from kiro_crew.context_blocks import (
     PHASE_PER_TURN,
     PHASE_SESSION_START,
@@ -7195,6 +7196,20 @@ async def _run_chat(
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
             _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            # Stand up this crew's OWN vector store before the offloaded build.
+            # It has to happen here, on the loop, because init() is blocking file
+            # IO (sqlite connect, migrations, a FAISS load) that build_message's
+            # sync resolver may not perform. A no-op for the default store.
+            #
+            # PREPARATION, never a precondition: the documented degrade is that a
+            # named store whose vectors cannot be stood up answers from markdown
+            # and keyword scoring rather than borrowing the global store's rows.
+            # So a failure here — including a builder that does not implement the
+            # step at all — must cost that store its vector tier for this turn and
+            # nothing else. Awaiting it bare made it a precondition, and any
+            # builder whose `ensure_store` is not awaitable took the whole turn
+            # down with it: no reply, no tool calls, no approval prompt.
+            await prepare_store_vectors(state.context_builder, memory_store)
             full_message, _ = await run_in_embed_pool(
                 state.context_builder.build_message,
                 message,

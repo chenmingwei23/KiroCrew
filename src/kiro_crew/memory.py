@@ -8,6 +8,13 @@ Structure:
         └── 2026-02-16.md   # Daily conversation summaries
 
     ~/.kiro/crew/memory_index.db  # FTS5 full-text search index
+
+The DEFAULT store's index sits in the data-home root, beside ``memory.db``, and
+not inside the markdown tree it describes: that is where the snapshot ``memory``
+component, ``portability``'s export zip and the remote-sync script all name it.
+A NAMED store's index lives inside that store's own directory instead. Which of
+the two a store gets is ``memory_stores.memory_index_path_for``'s decision, not
+this module's — see docs/system-specs/modules/memory-skills-hooks.md.
 """
 
 from __future__ import annotations
@@ -50,6 +57,12 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE_DIR_NAME = "workspace"
 MEMORY_DIR_NAME = "memory"
+#: FTS5 index filename. Only the NAME is owned here — WHERE a given store's
+#: index sits is store policy and belongs to
+#: ``memory_stores.memory_index_path_for``. Named so the snapshot, portability
+#: and remote-sync consumers that spell this file out have one definition to
+#: point at.
+INDEX_DB_FILE = "memory_index.db"
 HISTORY_DIR_NAME = "history"
 PREFERENCES_FILE = "preferences.md"
 PROJECTS_FILE = "projects.md"
@@ -158,13 +171,34 @@ def _fts5_literal_query(query: str) -> str:
 class MemoryStore:
     """Structured memory: preferences.md, projects.md, daily history, FTS5 search."""
 
-    def __init__(self, workspace: Path | None = None):
+    def __init__(self, workspace: Path | None = None, index_db: Path | None = None):
+        """*index_db* is the FTS index file; omitting it keeps the default store's.
+
+        The index location is STORE POLICY — the default store's sits in the
+        data-home root, a named store's inside that store's own directory — and
+        policy lives in ``memory_stores.memory_index_path_for``, which is the
+        one place that knows a store name. Passing the resolved path in keeps
+        this class store-agnostic: it holds no branch on which store it serves
+        and cannot answer differently from the resolver.
+
+        The fallback derivation carries a quirk worth knowing: a bare
+        ``MemoryStore()`` indexes to ``<home>/memory_index.db`` while
+        ``MemoryStore(workspace=workspace_dir())`` indexes to
+        ``<home>/workspace/memory_index.db``, though both share one
+        ``_workspace`` and one markdown tree. Both forms are in use (``cli.py``
+        takes the first, ``context.py`` the second) and both work, because
+        ``rebuild_index`` regenerates the whole index from preferences.md,
+        projects.md and history/*.md and reads no index state — so the cost is a
+        duplicated rebuild, not a wrong answer. Only the root copy is in the
+        snapshot ``memory`` component, so collapsing the two moves a default
+        path, which takes a store name at every call site to do safely.
+        """
         self._workspace = workspace or workspace_dir()
         self._memory_dir = self._workspace / MEMORY_DIR_NAME
         self._history_dir = self._memory_dir / HISTORY_DIR_NAME
         self._preferences_file = self._memory_dir / PREFERENCES_FILE
         self._projects_file = self._memory_dir / PROJECTS_FILE
-        self._index_db = (workspace or config_dir()) / "memory_index.db"
+        self._index_db = index_db or (workspace or config_dir()) / INDEX_DB_FILE
         self._vector_store: "VectorMemoryStore | None" = None
         # TTL cache for read_recent_history, keyed by `days` so callers using
         # different windows (context build=14, suggestions=2, dashboard=30) don't

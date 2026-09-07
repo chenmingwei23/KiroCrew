@@ -1450,6 +1450,8 @@
         "semantic_keys": [],
         "history_idle_hours": 3.0,
         "history_max_days": 365,
+        "backup_enabled": true,
+        "backup_keep": 7,
         "migrated": false
       }
     },
@@ -1706,6 +1708,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 365
+    },
+    {
+      "path": "memory.backup_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Automatic Memory Backups",
+      "help": "Take a daily rotating copy of every memory store. Memory is the only data here that cannot be rebuilt from another source, and a manual snapshot an operator never runs is not a backup.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.backup_keep",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Memory Backups Kept",
+      "help": "How many backups to keep per store. Bounded because the copy is unattended; values below 1 are treated as 1 so retention cannot empty the directory.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 7
     },
     {
       "path": "memory.migrated",

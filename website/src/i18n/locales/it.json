@@ -10611,12 +10611,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Un identificatore univoco per questo workspace. Gli agenti fanno riferimento ai workspace tramite il nome.",
-      "additional_stores_coming_with_memory_v2": "Per ora è disponibile solo l’archivio predefinito; presto arriverà il supporto per altri archivi di memoria.",
       "agent_template_is_required": "Il modello di agente è obbligatorio",
       "agents": "Agenti",
       "also_used_by_these_crews": "Usato anche da {{crews}}. Gli agenti che condividono un archivio possono leggere i file e la memoria degli altri.",
-      "bindings_preview_info": "Anteprima. La memoria isolata per agente è ancora in costruzione. Un agente ha la propria cartella, ma la memoria semantica, il richiamo delle conversazioni passate e le lezioni globali arrivano a ogni agente, quindi cambiare questo non separa ciò che un agente ricorda.",
-      "bindings_preview_notice": "Anteprima. Ogni agente legge e scrive già la propria cartella, ma ciò che ricorda non è ancora separato: la memoria semantica, il richiamo delle conversazioni passate e le lezioni globali arrivano a ogni agente. La memoria isolata per agente sta arrivando.",
+      "bindings_preview_info": "Un agente collegato al proprio archivio della memoria ora ricorda separatamente da qualunque punto venga richiamato: nella chat, da un canale di messaggistica e in un lavoro pianificato. Nella pagina Memoria, la persona proprietaria del pannello che ha effettuato l’accesso può puntare il selettore degli archivi su qualsiasi archivio dichiarato.",
+      "bindings_preview_notice": "Un agente collegato al proprio archivio della memoria tiene per sé ciò che ricorda. Gli agenti rimasti sull’archivio predefinito condividono ancora una sola memoria.",
       "cancel": "Annulla",
       "chat_with_this_crew": "Chatta con questo agente",
       "copy_from_optional": "Copia da (facoltativo)",
@@ -10696,7 +10695,7 @@
       "view_cards_tooltip": "Schede spaziose che mostrano cosa usa ogni agente",
       "view_list": "Elenco",
       "view_list_tooltip": "Tabella compatta, una riga per agente",
-      "which_store_its_lessons_and_history_are_written": "A quale archivio di memoria è collegato questo agente. Il collegamento viene registrato, ma non dà ancora all'agente una memoria propria.",
+      "which_store_its_lessons_and_history_are_written": "A quale archivio della memoria è collegato questo agente. Un agente con il proprio archivio conserva le sue preferenze, i progetti, la cronologia giornaliera, i fatti salvati, le conversazioni richiamate e le lezioni. Gli agenti rimasti sull’archivio predefinito condividono una sola memoria.",
       "workspace": "workspace",
       "workspace_2": "Workspace",
       "workspace_name_is_required": "Il nome del workspace è obbligatorio",
@@ -10709,7 +10708,8 @@
       "discard_unsaved_body": "Questa crew ha modifiche che non sono mai state salvate. Chiudere ora le eliminerà.",
       "discard_confirm": "Ignora le modifiche",
       "discard_also_crew_edits": "Anche le altre modifiche non salvate di questa crew andranno perse insieme a essa.",
-      "editor_options_load_failed": "Impossibile caricare le opzioni di workspace, modello e archivio della memoria dell'editor del crew."
+      "editor_options_load_failed": "Impossibile caricare le opzioni di workspace, modello e archivio della memoria dell'editor del crew.",
+      "only_the_default_store_is_declared": "Nel tuo file di configurazione è dichiarato solo l’archivio predefinito. Dichiarane un altro con Nuovo archivio nella pagina Memoria per dare a un agente una memoria propria."
     },
     "knowledge": {
       "detailView": {
@@ -10950,7 +10950,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "Limite di blocchi per origine",
+        "chunk_limit_desc": "Numero massimo di blocchi che una singola origine può acquisire per ciclo di scansione. Ogni blocco costa una chiamata di estrazione al LLM. 0 = nessun limite.",
+        "max_sources_label": "Numero massimo di origini",
+        "max_sources_desc": "Numero massimo di origini di conoscenza trovate automaticamente. Le origini aggiunte a mano non hanno un tetto. 0 = nessun limite.",
+        "auto_project_label": "Registra automaticamente i documenti del progetto",
+        "auto_project_desc": "Registra automaticamente come origine di conoscenza i documenti di ogni progetto su cui lavori."
       }
     },
     "localStorageDebug": {
@@ -11441,7 +11447,8 @@
         "session_other": "{{count}} sessioni",
         "summarize_now": "Riepiloga ora",
         "tool": "strumento",
-        "when": "Quando"
+        "when": "Quando",
+        "the_cards_below_do_not_follow_the_store_picker_m": "Le schede qui sotto non seguono il selettore di archivio. Le impostazioni della memoria e il modello di embedding valgono per tutta l’installazione, le lezioni uniscono l’archivio globale con quello del Workspace attivo e il browser della memoria vettoriale legge l’archivio a cui è associata questa sessione."
       },
       "portabilityTab": {
         "archive_contents": "Contenuto dell'archivio:",
@@ -11768,6 +11775,81 @@
         "vector_memory": "Memoria vettoriale",
         "vector_memory_is_initializing_the_embedding_mode": "La memoria vettoriale è in fase di inizializzazione. Il modello di embedding (~610 MB) viene scaricato automaticamente in background e la memoria legacy viene migrata da sé — non serve fare nulla.",
         "verifying_model_integrity": "Verifica dell’integrità del modello…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "Un archivio nuovo parte vuoto e tiene la sua memoria in un file di database proprio, quindi nulla di ciò che un agente vi ricorda raggiunge un altro archivio. Da qui non si può togliere la dichiarazione di un archivio: lascerebbe orfano tutto ciò che ha ricordato, quindi serve un passo deliberato fuori da questa pagina.",
+        "a_store_with_that_name_is_already_declared_pick": "Un archivio con quel nome è già dichiarato. Scegli quello dall’elenco invece di dichiararlo di nuovo.",
+        "backups": "Backup: <v/>",
+        "cancel": "Annulla",
+        "crew_silo": "Archivio dell’agente",
+        "declare_store": "Dichiara archivio",
+        "episodes": "Episodi: <v/>",
+        "facts_and_directives": "Fatti e direttive: <v/>",
+        "lessons": "Lezioni: <v/>",
+        "memory_store": "Archivio della memoria",
+        "new_memory_store": "Nuovo archivio della memoria",
+        "new_store": "Nuovo archivio",
+        "newest_backup": "Backup più recente: <v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "Solo il proprietario della dashboard con la sessione avviata può indirizzare un archivio della memoria per nome. Tutto in questa pagina continua a leggere l’archivio a cui è associata questa sessione.",
+        "schema_lineage": "Lignaggio dello schema: <v/>",
+        "shared_default_store": "Archivio predefinito condiviso",
+        "store_name": "Nome dell’archivio",
+        "that_name_cannot_be_used_for_a_store_directory_u": "Questo nome non può essere usato per una directory di archivio. Usa lettere minuscole, cifre e trattini.",
+        "the_picker_drives_this_card_the_preferences_proj": "Il selettore governa questa scheda, i documenti di preferenze, progetti e cronologia giornaliera e le schede di suddivisione, memorie ritirate e backup qui sotto.",
+        "this_install_does_not_declare_a_memory_store_by": "Questa installazione non dichiara più un archivio della memoria con quel nome. Scegli un altro archivio dall’elenco qui sopra.",
+        "this_store_has_no_database_file_that_can_be_read": "Questo archivio non ha ancora un file di database leggibile. Viene creato la prima volta che vi si memorizza qualcosa, quindi fino a quel momento non c’è nulla da elencare. Ogni backup che ha già resta ripristinabile qui sotto.",
+        "this_store_is_declared_but_its_database_could_no": "Questo archivio è dichiarato, ma non è stato possibile aprire il suo database. Non viene mostrato nulla anziché la memoria di un altro archivio sotto questo nome.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Questo archivio usa lo schema condiviso, quindi le sfaccettature di suddivisione non gli si applicano.",
+        "unknown": "sconosciuto"
+      },
+      "memoryRetiredCard": {
+        "actions": "Azioni",
+        "an_episode_lands_here_when_a_later_fact_supersed": "Un episodio finisce qui quando un fatto successivo lo sostituisce.",
+        "episodes_a_later_fact_superseded_their_text_is_k": "Episodi che un fatto successivo ha sostituito. Il loro testo resta, quindi un ritiro che ha rimosso qualcosa che volevi ancora può essere annullato qui.",
+        "memory": "Memoria",
+        "not_recorded": "non registrato",
+        "nothing_has_been_retired": "Non è stato ritirato nulla",
+        "restore": "Ripristina",
+        "retired": "Ritirata",
+        "retired_memories": "Memorie ritirate",
+        "superseded_by": "Sostituita da",
+        "times_retired": "Ritiri",
+        "unknown": "sconosciuto"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "Un database ripristinato viene letto dal successivo avvio del gateway. Fino a quel momento questo archivio della memoria continua a usare il file che è stato sostituito.",
+        "actions": "Azioni",
+        "already_recent": "Già recenti: {{value}}",
+        "back_up_now": "Esegui backup ora",
+        "backups": "Backup",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "I backup vengono eseguiti a intervalli regolari e “Esegui backup ora” ne crea uno subito.",
+        "cancel": "Annulla",
+        "confirm_restore": "Conferma ripristino",
+        "copies_taken": "Copie create: {{value}}",
+        "failed": "Non riuscite: {{value}}",
+        "no_backups_yet": "Ancora nessun backup",
+        "older_copies_removed": "Copie vecchie rimosse: {{value}}",
+        "restore": "Ripristina",
+        "restored_the_database_it_replaced_was_kept_besid": "Ripristinato. Il database sostituito è stato conservato accanto al file dell’archivio invece di essere sovrascritto, con questo nome: <name/>",
+        "size": "Dimensione",
+        "taken": "Creata",
+        "this_replaces_the_store_s_live_database_the_file": "Questo sostituisce il database attivo dell’archivio. Il file che viene spostato resta accanto con un nome da sostituito, quindi non si cancella nulla."
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "Un conteggio appare quando qualcosa viene ricordato con questo asse registrato.",
+        "carve": "Suddivisione",
+        "clear_filter": "Cancella filtro",
+        "count_by": "Conta per",
+        "crew": "Agente",
+        "how_this_store_s_memory_divides_up_across_the_ax": "Come la memoria di questo archivio si divide lungo gli assi che ogni scrittura marca. Scegli un valore per elencare le memorie di quella fetta.",
+        "kind": "Tipo",
+        "memory": "Memoria",
+        "no_live_memories_in_this_slice": "Nessuna memoria attiva in questa fetta",
+        "not_recorded": "non registrato",
+        "nothing_is_stamped_on_this_axis_yet": "Su questo asse non c’è ancora nulla",
+        "surface": "Superficie",
+        "the_count_includes_only_live_rows_so_a_slice_can": "Il conteggio include solo le righe attive, quindi una fetta può svuotarsi tra due letture.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Questo archivio usa lo schema condiviso, quindi le sfaccettature di suddivisione non si applicano. Le sue righe non portano marche di agente, superficie o ambito per dividerle, il che è diverso dal fatto che l’archivio sia vuoto."
       }
     },
     "overviewPage": {
@@ -14285,8 +14367,8 @@
       "member_count_many": "{{count}} membri",
       "member_count_one": "{{count}} membro",
       "member_count_other": "{{count}} membri",
-      "memory_dedicated_note": "Le preferenze e le note di progetto arrivano dall’archivio {{store}} invece che da quello predefinito condiviso. La memoria delle conversazioni e le lezioni non sono ancora separate: ciò che dici a questo membro lo sanno comunque tutti.",
-      "memory_shared_note": "I membri condividono attualmente una sola memoria. Ciò che dici a uno lo sanno tutti.",
+      "memory_dedicated_note": "Preferenze, note di progetto, fatti salvati, conversazioni richiamate e lezioni arrivano dall’archivio {{store}} e non da quello predefinito condiviso, quindi ciò che dici a questo membro resta con lui.",
+      "memory_shared_note": "I membri sull'archivio della memoria predefinito condividono una sola memoria: ciò che dici a uno lo sanno tutti. Un membro associato al proprio archivio ricorda separatamente, da qualunque punto gli parli.",
       "memory_store": "Archivio memoria",
       "model": "Modello",
       "opening_thread": "Apertura della conversazione…",

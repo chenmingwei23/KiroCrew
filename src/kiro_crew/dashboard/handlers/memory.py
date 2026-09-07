@@ -12,6 +12,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import memory_schema
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -52,7 +53,18 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
-from ._shared import _get_memory, _is_restricted_session, _redact_memory_field, read_bounded_json
+from ._shared import (
+    MEMORY_STORE_ABSENT_BINDING,
+    MEMORY_STORE_ABSENT_GLOBAL,
+    _get_memory,
+    _is_restricted_session,
+    _read_session_key,
+    _redact_memory_field,
+    markdown_memory_for_store,
+    read_bounded_json,
+    resolve_requested_memory_store,
+    vector_memory_for_store,
+)
 from .cron import _recognize_session
 
 logger = logging.getLogger(__name__)
@@ -63,6 +75,15 @@ logger = logging.getLogger(__name__)
 # could commit the older content last. The event loop used to serialize these
 # accidentally (inline writes); these locks restore that ordering explicitly
 # while keeping the blocking I/O off the loop.
+#
+# ONE lock per endpoint, deliberately NOT one per (endpoint, store), even though
+# a ``?store=`` PUT addresses a different file: the lock exists for commit
+# ORDER within a single document, and two stores write two different documents,
+# so a silo's save waiting behind the global store's costs it one small atomic
+# write of latency and nothing a caller can observe. A per-store lock map is the
+# strictly worse trade — it needs its own lock to be built safely (the same trade
+# ``_shared._store_tier_lock`` makes) in exchange for concurrency on a path whose
+# whole cost is a single file replace.
 _prefs_write_lock = LoopBoundLock()
 _projects_write_lock = LoopBoundLock()
 _history_write_lock = LoopBoundLock()
@@ -103,11 +124,129 @@ def _sel():
     return _pkg.sel()
 
 
+async def _memory_write_gate(
+    state: DashboardState, request: web.Request, operation: str
+) -> web.Response | None:
+    """The memory-mutation authorization cascade, or ``None`` when the call may proceed.
+
+    The single implementation for every durable-memory write in this module. Order is
+    the control: the session-recognition probe first, because the restricted-mode
+    check answers False for an UNKNOWN key, so a route carrying only that half admits
+    a forged or never-established ``X-Session-Key``. Both refusals are SEL-audited and
+    both carry a machine-readable ``code``, since backend strings have no i18n catalog
+    path.
+
+    The key comes from ``_read_session_key`` rather than the raw header so both halves
+    compare the same canonical form: ``_is_restricted_session`` normalizes, so reading
+    the header directly here would let the two halves disagree on trailing whitespace
+    and would record an un-normalized ``caller`` in the audit trail.
+
+    ``blocks_persisted_mode=is_incognito_transcript`` because every caller mutates
+    durable memory: writes block every private persisted mode.
+    """
+    sk = _read_session_key(request)
+    refusal = await _recognize_session(
+        state, sk, operation,
+        blocks_persisted_mode=is_incognito_transcript,
+    )
+    if refusal is not None:
+        return refusal
+    if _is_restricted_session(state, request):
+        _sel().log_api_access(
+            caller=sk, operation=operation, outcome="denied",
+            source="dashboard", resources="restricted_session_block",
+        )
+        return web.json_response(
+            {
+                "error": "Memory writes are not allowed in this session mode.",
+                "code": "restricted_session",
+            },
+            status=403,
+        )
+    return None
+
+
+def _store_unavailable_response(store: str) -> web.Response:
+    """The shared 503 for a silo whose vector tier could not be stood up.
+
+    Reported rather than answered from the global store: a fallback there serves
+    the operator's own population under a crew's name, and nothing in the response
+    says so. Only a silo reaches this — the global tier is constructed on demand
+    rather than looked up — and the name is safe to echo either way, because the
+    caller passed the owner gate to name it (an absent parameter answers the global
+    store, which never reaches here).
+    Carries a machine-readable ``code`` like every other non-2xx body here, since
+    backend strings have no i18n catalog path.
+    """
+    return web.json_response(
+        {
+            "error": f"the vector store for memory store {store!r} is unavailable",
+            "code": "store_unavailable",
+        },
+        status=503,
+    )
+
+
+async def _vector_tier_for_request(
+    request: web.Request,
+    state: DashboardState,
+    operation: str,
+    *,
+    absent: str = MEMORY_STORE_ABSENT_GLOBAL,
+) -> tuple[Any, str, web.Response | None]:
+    """``(vector tier, store name, refusal)`` for the store this request addresses.
+
+    The two steps every store-scoped vector route takes, in the order it needs
+    them: resolve the store through the shared owner-gated seam, then stand up
+    that store's tier. The third element is a response to return AS-IS — an owner
+    denial, an undeclared ``?store=``, or the 503 above — and a caller that reads
+    the first element without checking it answers from a store it was refused.
+
+    An ABSENT ``?store=`` resolves the GLOBAL store, and ``""`` routes straight to
+    :func:`_get_vector_store_async` — so a request that names no store addresses
+    the same object an unscoped route resolves, down to the cached instance. That
+    equivalence is the property store scoping stands on: the operator's own memory
+    does not move.
+
+    *absent* is forwarded rather than fixed, because ``api_memory_carve`` alone
+    followed the caller's binding before this seam existed and must keep doing so.
+    Every other route here served the global store unconditionally; handing one of
+    them ``MEMORY_STORE_ABSENT_BINDING`` would let an unverified ``X-Session-Key``
+    redirect it to a silo with no gate in the way.
+    """
+    store, denial = await resolve_requested_memory_store(
+        request, state, operation, absent=absent
+    )
+    if denial is not None:
+        return None, "", denial
+    vector = await vector_memory_for_store(state, store)
+    if vector is None:
+        return None, store, _store_unavailable_response(store)
+    return vector, store, None
+
+
 async def api_memory_preferences(request: web.Request) -> web.Response:
-    """GET/PUT /api/memory/preferences."""
+    """GET/PUT /api/memory/preferences — the store named by ``?store=``, else the
+    GLOBAL store."""
     state: DashboardState = request.app["state"]
-    mem = _get_memory(state)
+    # Resolved before the method branch because the GET reads the store the PUT
+    # writes. For a store-bearing PUT that puts the parameter's owner gate ahead
+    # of the write gate below, which is the precedence it should have: naming
+    # another store is the OPERATOR's question, and a caller that may not ask it
+    # should not have its body read either. With no ``?store=`` the resolver cannot
+    # refuse at all, so the write gate is still the first thing such a PUT meets.
+    operation = "preferences.write" if request.method == "PUT" else "preferences.read"
+    store, denial = await resolve_requested_memory_store(request, state, operation)
+    if denial is not None:
+        return denial
+    mem = await markdown_memory_for_store(state, store)
     if request.method == "PUT":
+        # The PUT overwrites the whole preferences document, so it is a durable
+        # memory write and takes the same gate as the semantic write route. The
+        # GET below is a read path and is deliberately left alone.
+        gate = await _memory_write_gate(state, request, "preferences.write")
+        if gate is not None:
+            return gate
         body, body_err = await read_bounded_json(request, max_bytes=None)
         if body_err is not None:
             return body_err
@@ -130,10 +269,22 @@ async def api_memory_preferences(request: web.Request) -> web.Response:
 
 
 async def api_memory_projects(request: web.Request) -> web.Response:
-    """GET/PUT /api/memory/projects."""
+    """GET/PUT /api/memory/projects — the store named by ``?store=``, else the
+    GLOBAL store."""
     state: DashboardState = request.app["state"]
-    mem = _get_memory(state)
+    # Resolved ahead of the method branch for the same reason as the preferences
+    # route above.
+    operation = "projects.write" if request.method == "PUT" else "projects.read"
+    store, denial = await resolve_requested_memory_store(request, state, operation)
+    if denial is not None:
+        return denial
+    mem = await markdown_memory_for_store(state, store)
     if request.method == "PUT":
+        # Gated like the preferences PUT above: a whole-document overwrite of
+        # durable memory. The GET is a read path and stays ungated.
+        gate = await _memory_write_gate(state, request, "projects.write")
+        if gate is not None:
+            return gate
         body, body_err = await read_bounded_json(request, max_bytes=None)
         if body_err is not None:
             return body_err
@@ -147,10 +298,23 @@ async def api_memory_projects(request: web.Request) -> web.Response:
 
 
 async def api_memory_history(request: web.Request) -> web.Response:
-    """GET/PUT /api/memory/history — recent daily summaries."""
+    """GET/PUT /api/memory/history — recent daily summaries, for the store named by
+    ``?store=`` or the GLOBAL store."""
     state: DashboardState = request.app["state"]
-    mem = _get_memory(state)
+    # Resolved ahead of the method branch for the same reason as the preferences
+    # route above. The dated file the PUT writes is the RESOLVED store's, so a
+    # silo's daily summary never lands in the global store's history tree.
+    operation = "history.write" if request.method == "PUT" else "history.read"
+    store, denial = await resolve_requested_memory_store(request, state, operation)
+    if denial is not None:
+        return denial
+    mem = await markdown_memory_for_store(state, store)
     if request.method == "PUT":
+        # Gated like the two PUTs above: it overwrites today's summary file, a
+        # durable memory write. The GET is a read path and stays ungated.
+        gate = await _memory_write_gate(state, request, "history.write")
+        if gate is not None:
+            return gate
         body, body_err = await read_bounded_json(request, max_bytes=None)
         if body_err is not None:
             return body_err
@@ -174,6 +338,13 @@ async def api_memory_settings(request: web.Request) -> web.Response:
     """GET/PUT /api/memory/settings — memory consolidation config."""
     cfg = KiroCrewConfig.load()
     if request.method == "PUT":
+        # The body may carry `migrated`, which is the same install-wide flag
+        # /api/memory/migrate flips, so this PUT is a durable memory write and takes
+        # the same gate. Gated before the body is read, so a refused request costs
+        # nothing. The GET below is a read path and stays outside.
+        gate = await _memory_write_gate(request.app["state"], request, "settings.write")
+        if gate is not None:
+            return gate
         body, body_err = await read_bounded_json(request, max_bytes=None)
         if body_err is not None:
             return body_err
@@ -322,8 +493,16 @@ async def api_memory_semantic(request: web.Request) -> web.Response:
     bound is generous (≈4 MB worst case at the 4 KB per-value limit) so the
     dashboard memory card's client-side filter keeps full coverage for typical
     single-user stores; a store larger than this needs server-side search.
+
+    ``?store=`` addresses a store other than the GLOBAL one, owner-gated by the
+    shared resolver.
     """
-    store = await _get_vector_store_async(request.app["state"])
+    state: DashboardState = request.app["state"]
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "semantic.read"
+    )
+    if denial is not None:
+        return denial
     try:
         limit = min(int(request.query.get("limit", "1000")), 1000)
         offset = int(request.query.get("offset", "0"))
@@ -341,27 +520,25 @@ async def api_memory_semantic(request: web.Request) -> web.Response:
 
 
 async def api_memory_semantic_write(request: web.Request) -> web.Response:
-    """PUT /api/memory/semantic — create/update a semantic entry."""
+    """PUT /api/memory/semantic — create/update a semantic entry in the store named
+    by ``?store=``, else the GLOBAL store."""
     state: DashboardState = request.app["state"]
     # Session-recognition gate (shared with the lessons routes, #3226): the
     # restricted-mode check below returns False for an unknown key, so before
     # this gate a forged or never-established X-Session-Key could write
     # semantic memory that create-style routes would refuse. Writes block
     # every private persisted mode, mirroring ``api_lessons_create``.
-    sk = request.headers.get("X-Session-Key", "")
-    refusal = await _recognize_session(
-        state, sk, "semantic.write",
-        blocks_persisted_mode=is_incognito_transcript,
+    gate = await _memory_write_gate(state, request, "semantic.write")
+    if gate is not None:
+        return gate
+    # Resolution sits BEHIND the write gate, where the unscoped resolution sits.
+    # Both orders refuse a caller that fails either gate, and only this one leaves
+    # a request that names no store meeting its refusals in the original order.
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "semantic.write"
     )
-    if refusal is not None:
-        return refusal
-    if _is_restricted_session(state, request):
-        _sel().log_api_access(
-            caller=sk, operation="semantic.write", outcome="denied",
-            source="dashboard", resources="restricted_session_block",
-        )
-        return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
-    store = await _get_vector_store_async(request.app["state"])
+    if denial is not None:
+        return denial
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -404,7 +581,8 @@ async def api_memory_semantic_write(request: web.Request) -> web.Response:
 
 
 async def api_memory_semantic_delete(request: web.Request) -> web.Response:
-    """DELETE /api/memory/semantic/{key} — tombstone a semantic entry."""
+    """DELETE /api/memory/semantic/{key} — tombstone a semantic entry in the store
+    named by ``?store=``, else the GLOBAL store."""
     state: DashboardState = request.app["state"]
     # Same recognition gate as the write route: without it, this DELETE was
     # LESS protected than the lessons delete #3226 fixed — an unknown key
@@ -413,20 +591,16 @@ async def api_memory_semantic_delete(request: web.Request) -> web.Response:
     # unchanged: this route keeps blocking incognito AND temporary (the
     # ``_is_restricted_session`` check below), so the recovery-path probe
     # blocks every private mode to match.
-    sk = request.headers.get("X-Session-Key", "")
-    refusal = await _recognize_session(
-        state, sk, "semantic.delete",
-        blocks_persisted_mode=is_incognito_transcript,
+    gate = await _memory_write_gate(state, request, "semantic.delete")
+    if gate is not None:
+        return gate
+    # Behind the write gate, as on the write route above: the default path's
+    # refusal order is what must not change.
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "semantic.delete"
     )
-    if refusal is not None:
-        return refusal
-    if _is_restricted_session(state, request):
-        _sel().log_api_access(
-            caller=sk, operation="semantic.delete", outcome="denied",
-            source="dashboard", resources="restricted_session_block",
-        )
-        return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
-    store = await _get_vector_store_async(request.app["state"])
+    if denial is not None:
+        return denial
     key = request.match_info["key"]
     # Offload: acquires _db_lock internally (#1947) — see api_memory_semantic.
     ok = await asyncio.to_thread(store.delete_semantic, key, source="user_explicit")
@@ -435,9 +609,90 @@ async def api_memory_semantic_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def api_memory_carve(request: web.Request) -> web.Response:
+    """GET /api/memory/carve — count or list a store's rows by carve facet.
+
+    Read-only. Query parameters are the five facet names, ``kind``, ``count_by``,
+    ``limit`` and ``offset``; ``count_by`` switches the response from ``entries``
+    to ``counts``. A facet given as an empty value (``?crew=``) selects the rows
+    no writer attributed, which is a different question from omitting it.
+
+    **``?store=`` names another crew's silo, and it is safe here for a reason
+    rather than by convention.** The parameter's PRESENCE takes
+    ``require_owner_dashboard_request``, which needs a non-empty
+    ``request["user"]`` — and ``token_auth_middleware`` publishes that key on the
+    cookie/query-token path ONLY, never on its ``X-Internal-Secret`` branch. So a
+    dashboard or MCP AGENT cannot name a store: it has no identity to present, and
+    with the parameter absent it reads the one silo its own session is bound to,
+    which is the only store it can address. Answering another crew's rows to a
+    caller that never proved it is the operator is the one thing the file boundary
+    exists to prevent, and that is what the gate closes. The
+    operator can also inspect a specific store with
+    ``kirocrew memory carve --store``, from the host, where they already hold
+    every silo's bytes.
+
+    A session bound to no silo falls through to the global store, which is on the
+    v1 lineage and therefore refuses — the same refusal, with the same ``code``,
+    that the CLI prints. Every non-2xx body carries a machine-readable ``code``.
+
+    The filter mapping is keyed from ``memory_schema.FACET_NAMES`` and the query is
+    consulted for MEMBERSHIP, so no caller string reaches the builder as a column
+    name. An unrecognized query key is therefore ignored rather than refused, which
+    it has to be: a request legitimately carries keys that are not filters
+    (``?token=`` among them), and 400-ing on those would break query-token auth.
+    ``count_by`` and ``kind`` are the two parameters whose VALUE lands in a name or
+    a closed set, so those are validated and answer 400.
+    """
+    state: DashboardState = request.app["state"]
+    # ``silo`` is echoed in both response shapes below, so it must be the store
+    # actually read — the shared resolver's answer — and never the requested name.
+    # ``absent=BINDING``: this route, alone among the memory routes, resolved the
+    # caller's own binding before store scoping existed, and its contract is "the
+    # silo you are bound to". Every sibling keeps the global-store default.
+    store, silo, denial = await _vector_tier_for_request(
+        request, state, "carve.read", absent=MEMORY_STORE_ABSENT_BINDING
+    )
+    if denial is not None:
+        return denial
+    filters = {
+        name: request.query[name] for name in memory_schema.FACET_NAMES if name in request.query
+    }
+    kind = request.query.get("kind", "")
+    group_by = request.query.get("count_by", "")
+    try:
+        limit = int(request.query.get("limit", str(memory_schema.DEFAULT_FACET_PAGE)))
+        offset = int(request.query.get("offset", "0"))
+    except (ValueError, TypeError):
+        return web.json_response(
+            {"error": "limit/offset must be integers", "code": "invalid_pagination"}, status=400
+        )
+    try:
+        # Offload: both methods serialize on the store's _db_lock, and a worker
+        # holding it would otherwise block the gateway event loop here.
+        if group_by:
+            counts = await asyncio.to_thread(store.count_by_facet, group_by, filters, kind=kind)
+            return web.json_response({"store": silo, "counts": counts})
+        rows = await asyncio.to_thread(
+            store.list_by_facets, filters, kind=kind, limit=limit, offset=offset
+        )
+    except memory_schema.FacetsUnsupported as exc:
+        return web.json_response({"error": str(exc), "code": "facets_unsupported"}, status=409)
+    except memory_schema.UnknownFacet as exc:
+        return web.json_response({"error": str(exc), "code": "unknown_facet"}, status=400)
+    return web.json_response(
+        {"store": silo, "entries": [_redact_memory_field(dict(row)) for row in rows]}
+    )
+
+
 async def api_memory_events(request: web.Request) -> web.Response:
-    """GET /api/memory/events — paginated audit trail."""
-    store = await _get_vector_store_async(request.app["state"])
+    """GET /api/memory/events — paginated audit trail for the store named by
+    ``?store=``, else the GLOBAL store."""
+    state: DashboardState = request.app["state"]
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "events.read"
+    )
+    if denial is not None:
+        return denial
     try:
         limit = min(int(request.query.get("limit", "50")), 200)
         offset = int(request.query.get("offset", "0"))
@@ -1116,12 +1371,44 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
             status=500,
         )
 
-    # Persist config
+    # Persist config.
+    #
+    # The width comes off the LIVE backend, never a literal. `_load_model` refuses a
+    # model whose own `n_embd` disagrees with `memory.embedding_dim`, so persisting a
+    # fixed 1024 while a 768- or 1536-wide model is active makes that model
+    # unloadable on every later restart — a breakage nobody sees until the next boot
+    # and which needs a hand-edit of config.json to undo. `dim` is set when the
+    # backend is CONSTRUCTED, so reading it costs no model load.
+    try:
+        active_dim = int(get_shared_embedder().dim)
+    except Exception:
+        logger.exception("Refusing to persist embedding config: active vector width unreadable")
+        _embedding_setup_status = {"step": "error", "error": "embedding width unreadable"}
+        return web.json_response(
+            {
+                "error": "could not read the active embedding width",
+                "code": "embedding_dim_unreadable",
+            },
+            status=500,
+        )
+    if active_dim <= 0:
+        # Fail loudly rather than substituting a default: a non-positive width means
+        # the backend has not settled on one, and guessing here is exactly the
+        # persistent mismatch this read exists to prevent.
+        logger.error("Refusing to persist embedding config: active vector width is %d", active_dim)
+        _embedding_setup_status = {"step": "error", "error": "embedding width unreadable"}
+        return web.json_response(
+            {
+                "error": "the active embedding width is not usable",
+                "code": "embedding_dim_unreadable",
+            },
+            status=500,
+        )
 
     def _apply(data: dict) -> dict:
         memory = data.setdefault("memory", {})
         memory["embedding_provider"] = "llama_cpp"
-        memory["embedding_dim"] = 1024
+        memory["embedding_dim"] = active_dim
         memory["migrated"] = True
         return data
 
@@ -1161,8 +1448,14 @@ async def api_memory_disable_embeddings(request: web.Request) -> web.Response:
 
 
 async def api_memory_episodic_search(request: web.Request) -> web.Response:
-    """GET /api/memory/episodic/search?q=...&tags=t1,t2 — search episodic memories."""
-    store = await _get_vector_store_async(request.app["state"])
+    """GET /api/memory/episodic/search?q=...&tags=t1,t2 — search episodic memories in
+    the store named by ``?store=``, else the GLOBAL store."""
+    state: DashboardState = request.app["state"]
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "episodic.read"
+    )
+    if denial is not None:
+        return denial
     query = request.query.get("q", "")[:500]
     try:
         limit = min(int(request.query.get("limit", "20")), 50)
@@ -1193,8 +1486,14 @@ async def api_memory_episodic_search(request: web.Request) -> web.Response:
 
 
 async def api_memory_episodic_list(request: web.Request) -> web.Response:
-    """GET /api/memory/episodic?tags=t1,t2 — paginated list of episodic memories."""
-    store = await _get_vector_store_async(request.app["state"])
+    """GET /api/memory/episodic?tags=t1,t2 — paginated list of episodic memories from
+    the store named by ``?store=``, else the GLOBAL store."""
+    state: DashboardState = request.app["state"]
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "episodic.read"
+    )
+    if denial is not None:
+        return denial
     try:
         limit = min(int(request.query.get("limit", "50")), 100)
         offset = int(request.query.get("offset", "0"))
@@ -1210,33 +1509,20 @@ async def api_memory_episodic_list(request: web.Request) -> web.Response:
 
 
 async def api_memory_episodic_delete(request: web.Request) -> web.Response:
-    """DELETE /api/memory/episodic/{id} — tombstone an episodic memory."""
+    """DELETE /api/memory/episodic/{id} — tombstone an episodic memory in the store
+    named by ``?store=``, else the GLOBAL store."""
     state: DashboardState = request.app["state"]
-    # This route had NO session check at all — not even the restricted-mode
-    # one its semantic siblings carry — so any caller, restricted or forged,
-    # could tombstone episodic memories. Apply the shared recognition gate
-    # (#3226) plus the same live-slot restricted-mode policy as
-    # ``api_memory_semantic_delete``.
-    sk = request.headers.get("X-Session-Key", "")
-    refusal = await _recognize_session(
-        state, sk, "episodic.delete",
-        blocks_persisted_mode=is_incognito_transcript,
+    # Tombstoning an episodic row is a durable memory write, so it takes the same
+    # gate as its semantic siblings.
+    gate = await _memory_write_gate(state, request, "episodic.delete")
+    if gate is not None:
+        return gate
+    # Behind the write gate, as on the semantic routes above.
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "episodic.delete"
     )
-    if refusal is not None:
-        return refusal
-    if _is_restricted_session(state, request):
-        _sel().log_api_access(
-            caller=sk, operation="episodic.delete", outcome="denied",
-            source="dashboard", resources="restricted_session_block",
-        )
-        return web.json_response(
-            {
-                "error": "Memory writes are not allowed in this session mode.",
-                "code": "restricted_session",
-            },
-            status=403,
-        )
-    store = await _get_vector_store_async(state)
+    if denial is not None:
+        return denial
     mem_id = request.match_info["id"]
     # Offload: acquires _db_lock internally (#1947) — see api_memory_semantic.
     ok = await asyncio.to_thread(store.delete_episodic, mem_id)
@@ -1246,8 +1532,20 @@ async def api_memory_episodic_delete(request: web.Request) -> web.Response:
 
 
 async def api_memory_stats(request: web.Request) -> web.Response:
-    """GET /api/memory/stats — memory system statistics."""
-    store = await _get_vector_store_async(request.app["state"])
+    """GET /api/memory/stats — statistics for the store named by ``?store=``, else the
+    GLOBAL store.
+
+    Only the counts are per store. The three fields appended below stay
+    INSTALL-wide: the ``memory.*`` embedding provider, the migration flag and the
+    legacy-markdown probe describe one machine's configuration rather than one
+    store's rows, so a ``?store=`` does not change them.
+    """
+    state: DashboardState = request.app["state"]
+    store, _store_name, denial = await _vector_tier_for_request(
+        request, state, "stats.read"
+    )
+    if denial is not None:
+        return denial
     # Offload: serializes on _db_lock — see api_memory_semantic.
     stats = await asyncio.to_thread(store.memory_stats)
     # Add embedding status. The shadowing import is deliberate: resolving
@@ -1267,7 +1565,14 @@ async def api_memory_stats(request: web.Request) -> web.Response:
 
 async def api_memory_migrate(request: web.Request) -> web.Response:
     """POST /api/memory/migrate — migrate legacy markdown memory to vector store."""
-    store = await _get_vector_store_async(request.app["state"])
+    state: DashboardState = request.app["state"]
+    # A full markdown -> structured migration writes semantic AND episodic rows and
+    # can flip memory.migrated for the whole install, so it takes the same gate as
+    # the semantic write route rather than none at all.
+    gate = await _memory_write_gate(state, request, "memory.migrate")
+    if gate is not None:
+        return gate
+    store = await _get_vector_store_async(state)
 
     async with _migrate_lock:
         prev_embed_fn = store.embed_fn
@@ -1283,7 +1588,6 @@ async def api_memory_migrate(request: web.Request) -> web.Response:
     # Auto-set migrated=true if migration produced entries
     if counts.get("semantic", 0) > 0 or counts.get("episodic", 0) > 0:
         await _set_migrated(True)
-        state: DashboardState = request.app["state"]
         if state.consolidator:
             state.consolidator._migrated = True
     return web.json_response(counts)
@@ -1291,14 +1595,14 @@ async def api_memory_migrate(request: web.Request) -> web.Response:
 
 async def api_memory_import(request: web.Request) -> web.Response:
     """POST /api/memory/import — import memory from JSON (export format)."""
-    if _is_restricted_session(request.app["state"], request):
-        sk = request.headers.get("X-Session-Key", "")
-        _sel().log_api_access(
-            caller=sk, operation="memory.import", outcome="denied",
-            source="dashboard", resources="restricted_session_block",
-        )
-        return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
-    store = await _get_vector_store_async(request.app["state"])
+    state: DashboardState = request.app["state"]
+    # The restricted-mode half alone was LESS protection than its siblings carry: it
+    # answers False for an unrecognised key, so a forged X-Session-Key reached the
+    # import. The recognition probe inside the shared gate closes that.
+    gate = await _memory_write_gate(state, request, "memory.import")
+    if gate is not None:
+        return gate
+    store = await _get_vector_store_async(state)
     data, data_err = await read_bounded_json(request, max_bytes=None)
     if data_err is not None:
         return data_err
@@ -1339,13 +1643,12 @@ async def api_memory_context_preview(request: web.Request) -> web.Response:
 async def api_memory_consolidate(request: web.Request) -> web.Response:
     """POST /api/memory/consolidate — trigger immediate consolidation for testing."""
     state: DashboardState = request.app["state"]
-    if _is_restricted_session(state, request):
-        sk = request.headers.get("X-Session-Key", "")
-        _sel().log_api_access(
-            caller=sk, operation="memory.consolidate", outcome="denied",
-            source="dashboard", resources="restricted_session_block",
-        )
-        return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
+    # Consolidation writes memory, and the recognition half is what stops a forged
+    # or never-established X-Session-Key from dispatching a BILLED consolidation
+    # LLM turn against a session it does not own.
+    gate = await _memory_write_gate(state, request, "memory.consolidate")
+    if gate is not None:
+        return gate
     if not state.consolidator:
         return web.json_response({"error": "consolidator not available"}, status=503)
     body, body_err = await read_bounded_json(request, max_bytes=None)
@@ -1433,7 +1736,14 @@ async def api_memory_observability(request: web.Request) -> web.Response:
 
 async def api_memory_promote(request: web.Request) -> web.Response:
     """POST /api/memory/promote — promote repeated episodic patterns to semantic facts."""
-    store = await _get_vector_store_async(request.app["state"])
+    state: DashboardState = request.app["state"]
+    # Promotion writes semantic facts and TOMBSTONES the episodic rows it folded in,
+    # so it is a destructive durable write and takes the same gate as the semantic
+    # write route rather than none at all.
+    gate = await _memory_write_gate(state, request, "memory.promote")
+    if gate is not None:
+        return gate
+    store = await _get_vector_store_async(state)
     # allow_absent: every field below has a default, so a bodyless POST is
     # legitimate. A body that is present but malformed is still a 400 -- the
     # previous `except Exception: body = {}` answered 200-with-defaults to a

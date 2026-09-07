@@ -409,6 +409,43 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 
+#### Named memory stores
+
+A crew can keep its memory in its own silo instead of sharing the default one. The
+store is named on the crew (`agents.<crew>.memory_store`) and declared in
+`memory_stores`; a new store starts empty and nothing is copied into it.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `memory_stores` | Declared memory stores, one entry per name (`{"work": {"description": "..."}}`). A store not declared here does not exist | `{"default": {}}` |
+| `default_memory_store` | Store a crew falls back to when the one it names is not declared | `"default"` |
+| `agents.<crew>.memory_store` | Which declared store this crew's memory lives in | `"default"` |
+
+The `default` store keeps the files it already has — `~/.kiro/crew/workspace/memory/`,
+`~/.kiro/crew/memory.db` and `~/.kiro/crew/memory_index.db`. Nothing moves when you
+add a named store. A named store gets `~/.kiro/crew/memory_stores/<name>/`,
+owner-only, holding that crew's markdown memory, its full-text index and its own
+vector database. `kirocrew snapshot` covers the `default` store; a named store's files
+are not in a snapshot yet.
+
+**Store names are strict, and a bad one is refused rather than guessed at.** A name
+is lowercase, 1–80 characters, made of letters, digits and inner hyphens
+(`^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$`), a single path segment, not a Windows
+device name (`con`, `nul`, `aux`, `prn`, `com1`–`com9`, `lpt1`–`lpt9`), and does not
+end in a dot or a space. A name that breaks any of those is reported when the config
+loads and no memory directory is created for it — guessing what was meant is how two
+crews would end up sharing one directory. Your entry stays in `config.json` exactly as
+you wrote it so you can fix the spelling; until you do, a crew bound to it runs on
+`default_memory_store` and then `default`, with the reason logged.
+
+An unrecognized but well-formed name behaves the same way: it falls back to
+`default_memory_store` and then to `default`, with the reason logged. Memory keeps
+working; it just is not the silo you asked for, and the log says so.
+
+**The agent cannot read or write another crew's store.** `memory_stores/` is off
+limits to the agent's file and shell tools entirely. Its own default memory stays
+readable, which is what lets it recall your preferences.
+
 ### Skills
 
 | Key | Description | Default |
@@ -510,7 +547,10 @@ rules so they cannot be opted out of at all.
 | `~/.kiro/crew/notifications.jsonl` | Notification history |
 | `~/.kiro/crew/models/` | Embedding model, downloaded in the background at startup |
 | `~/.kiro/crew/history/` | Chat history (JSONL) |
-| `~/.kiro/crew/workspace/memory/` | Memory files |
+| `~/.kiro/crew/workspace/memory/` | Memory files (default store) |
+| `~/.kiro/crew/memory_index.db` | Full-text search index (default store) |
+| `~/.kiro/crew/memory.db` | Semantic, episodic and lesson memory (default store) |
+| `~/.kiro/crew/memory_stores/<name>/` | A named memory store: one crew's private memory, unreadable by the agent's file tools |
 | `~/.kiro/crew/session_map.json` | Session resume mapping |
 | `~/.kiro/crew/snapshots/` | Default output of `kirocrew snapshot` |
 | `~/.kiro/agents/kirocrew.json` | Installed agent config |

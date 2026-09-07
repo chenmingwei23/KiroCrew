@@ -1053,9 +1053,11 @@ def embedding_space_signature(model_id: str, dim: int) -> str:
 
     Single source of truth so vector memory and the knowledge library cannot
     disagree about whether stored vectors are still valid. The knowledge
-    library folds this model identity into its own per-item signature (which
+    library hashes this value into its own per-item signature (which
     additionally covers its content budget); vector memory compares it against
-    the signature the database was last embedded under.
+    the signature the database was last embedded under. Because the KB's
+    identity is DERIVED from this one rather than assembled beside it, any input
+    added here necessarily reaches both consumers.
     """
     return hashlib.sha256(f"{model_id}|{dim}".encode()).hexdigest()[:16]
 
@@ -1228,8 +1230,9 @@ class EmbeddingBackend(abc.ABC):
     - ``model_id`` + ``dim`` identify the vector space. Vectors produced under
       a different ``model_id`` or ``dim`` are incomparable — a swap requires
       re-embedding stored vectors (the knowledge library's sig-gated rebuild
-      keys off :func:`kiro_crew.knowledge.embedder.embed_signature`, which
-      folds ``model_id`` in; vector memory re-embeds via ``migrate``).
+      keys off :func:`kiro_crew.knowledge.embedder.embed_signature`, which is
+      built on :func:`embedding_space_signature` and so folds BOTH in; vector
+      memory re-embeds via ``migrate``).
     - Implementations must be thread-safe (callers invoke from worker threads).
     """
 

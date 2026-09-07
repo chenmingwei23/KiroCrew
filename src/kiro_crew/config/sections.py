@@ -1706,6 +1706,23 @@ class MemoryConfig:
         default=365,
         metadata=_meta("History Max Days", "Maximum days of history to retain."),
     )
+    backup_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Automatic Memory Backups",
+            "Take a daily rotating copy of every memory store. Memory is the only data "
+            "here that cannot be rebuilt from another source, and a manual snapshot an "
+            "operator never runs is not a backup.",
+        ),
+    )
+    backup_keep: int = field(
+        default=7,
+        metadata=_meta(
+            "Memory Backups Kept",
+            "How many backups to keep per store. Bounded because the copy is unattended; "
+            "values below 1 are treated as 1 so retention cannot empty the directory.",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),

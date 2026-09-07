@@ -31,10 +31,15 @@ Context window (reference budget 165,000 chars, ~55k tokens)
     lesson.* keys at confidence 1.0, user-explicit always wins
 ```
 
-Layers 1 to 3 are Markdown files under the workspace memory dir; layers 4 to 6
-are rows in `memory.db` behind one shared `VectorMemoryStore` (lessons fall back
-to `lessons.jsonl` only when that store is not initialized). Each layer is
-detailed in its own section below, with a single conflict ladder in "Conflict
+Layers 1 to 3 are Markdown files under a memory store's markdown root; layers 4
+to 6 are rows in that store's `memory.db` behind a `VectorMemoryStore` (lessons
+fall back to `lessons.jsonl` only when that store is absent or holds no lessons
+yet). There is ONE such store on the default path — the global one every
+install already runs — plus one per crew bound to a named memory store. Which
+surfaces reach which is in
+[Memory across surfaces and channels](#memory-across-surfaces-and-channels), and
+the honest answer today is "almost all of them reach the global one". Each layer
+is detailed in its own section below, with a single conflict ladder in "Conflict
 resolution: which layer wins".
 
 ## Memory (`memory.py`)
@@ -44,7 +49,59 @@ Structured files under `~/.kiro/crew/workspace/memory/`:
 - `projects.md` — active project context (replaced wholesale by consolidator)
 - `history/{date}.md` — daily conversation summaries (append-only, pruned by heartbeat)
 
-FTS5 search via `~/.kiro/crew/memory_index.db` (SQLite via `pysqlite3-binary` on Linux for FTS5/UPSERT compat, stdlib `sqlite3` on macOS). The virtual table is created with `tokenize='porter unicode61'`, so keyword matching is porter-stemmed inside SQLite. (This is a different stemmer from the `snowballstemmer` pass used by the vector store's keyword-fallback *scoring* in `vector_memory.py`; two independent code paths, do not conflate them.) Self-healing: corrupted DB auto-rebuilt. Incremental updates on writes, full rebuild on gateway startup and every `_FTS_REBUILD_TICKS = 15` heartbeat ticks (~15 min at the 60s default interval). Connection leak prevention: all FTS methods use try/finally.
+### A store's three paths, and where the index actually lives
+
+A memory store's markdown tree, vector file and FTS index are three separate on-disk
+paths, and which one a store name resolves to is owned by `memory_stores.py` — see
+[config](config.md#named-memory-stores-memory_storespy) for the resolvers, the
+store-name shape rule and the two-step degrade.
+
+| Path | Holds | `"default"` |
+|---|---|---|
+| markdown root (`memory_store_dir_for`) | `memory/preferences.md`, `memory/projects.md`, `memory/history/*.md` | `~/.kiro/crew/workspace/` |
+| vector file (`resolve_store_path`) | semantic, episodic and lesson rows | `~/.kiro/crew/memory.db` |
+| FTS index (`memory_index_path_for`) | the FTS5 virtual table | `~/.kiro/crew/memory_index.db` |
+
+**Two roots, not one, and conflating them is the sharpest hazard here.** The markdown
+root for `"default"` is `memory.workspace_dir()` = `config_dir()/"workspace"`, NOT the
+data home: answering with the data home would take every existing install's
+`preferences.md` out from under both the consolidator and `kirocrew memory search`.
+The vector file for `"default"` is `config_dir()/"memory.db"`, byte-exact with what
+`VectorMemoryStore()` already defaults to. Both default answers are the paths already
+on disk, which is what makes the default path a rename-free no-op.
+
+**The default store's index does not sit inside the markdown tree it describes**, and
+that is deliberate rather than tidy: `~/.kiro/crew/memory_index.db` is the spelling
+the off-store consumers hold — the snapshot `memory` component, `portability`'s
+export/import zip, `scripts/sync-to-remote.sh` — so relocating it drops the index
+from every backup while a restore writes a copy nothing reads. A NAMED store's index
+does live beside its own markdown, which is what makes the index per-store and puts
+it behind the `memory_stores/` fence; those three consumers name no per-store path,
+so a named store's index is simply outside their reach until one of them learns a
+store name.
+
+**A named store starts EMPTY.** Nothing is copied from the default store and nothing
+is inferred from it: no preferences, no projects, no history, no semantic or episodic
+rows, no lessons. A crew bound to a fresh store therefore knows nothing on its first
+turn, which is the point — the isolation is the file boundary, so there is no
+migration, no cutover and no `CONTRACT_VERSION` bump.
+
+`MemoryStore` takes the index path as `index_db=` instead of deriving it, so store
+policy stays in one place. Omitting it keeps the pre-existing derivation and its
+quirk: a bare `MemoryStore()` names `<home>/memory_index.db` while
+`MemoryStore(workspace=workspace_dir())` names `<home>/workspace/memory_index.db`,
+though both share one markdown tree — and both forms are live (`cli.py`, `context.py`).
+That costs a duplicated rebuild, not a wrong answer, because the index is fully
+DERIVED: `rebuild_index` regenerates it from `preferences.md`, `projects.md` and
+`history/*.md` and reads no index state. Only the root copy is in the snapshot, so
+closing the quirk means giving EVERY caller a store name. A named store already gets
+one — `get_memory_for` passes `index_db=memory_index_path_for(store)` explicitly — but
+the two default construction forms are deliberately untouched, so the quirk is still
+open on the default path and
+`TestIndexIsPerStore::test_the_two_default_construction_forms_still_disagree` still
+pins it.
+
+FTS5 search via that `memory_index.db` (SQLite via `pysqlite3-binary` on Linux for FTS5/UPSERT compat, stdlib `sqlite3` on macOS). The virtual table is created with `tokenize='porter unicode61'`, so keyword matching is porter-stemmed inside SQLite. (This is a different stemmer from the `snowballstemmer` pass used by the vector store's keyword-fallback *scoring* in `vector_memory.py`; two independent code paths, do not conflate them.) Self-healing: corrupted DB auto-rebuilt. Incremental updates on writes, full rebuild on gateway startup and every `_FTS_REBUILD_TICKS = 15` heartbeat ticks (~15 min at the 60s default interval). Connection leak prevention: all FTS methods use try/finally.
 
 Context injection includes source citations per section. Agent can update memory files via kiro-cli's file tools.
 
@@ -139,6 +196,13 @@ The prefs path does NOT advance the persisted `last_consolidated` marker — onl
 
 Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` call. `check_idle_sessions()` called every heartbeat tick (60s), fires history consolidation when `now - last_activity > history_idle_secs` and there are unconsolidated messages.
 
+**Both paths write to the store the SESSION names, not the one the consolidator was
+constructed with.** `_session_store_name(meta)` reads `memory_store` off the session's
+metadata and `_consolidate` resolves markdown, lessons and vectors from it; an absent
+key means the global store. Full rules, including why absence is the signal and why the
+key is slot-owned, are in
+[The write path](#the-write-path).
+
 Neither path owns a timer. The prefs path is checked inline on every
 `maybe_consolidate()`; the history path is driven entirely by the heartbeat
 calling `check_idle_sessions()`. Every embed-bearing step
@@ -154,7 +218,7 @@ outlive the incognito or temporary boundary that prohibits derived memory.
 
 ### Lesson Extraction from Chat
 
-The history consolidation prompt includes a `"lessons"` key that extracts only implicit correction patterns — corrections the user made without explicitly saying "remember" (those are already saved immediately via `learn_add`). All lesson writes go through `write_lesson()` which provides substring dedup and topic-overlap dedup (>50% keyword overlap → newer replaces older). When vector memory is not active, falls back to `lessons.jsonl` via `LessonStore.save()`.
+The history consolidation prompt includes a `"lessons"` key that extracts only implicit correction patterns — corrections the user made without explicitly saying "remember" (those are already saved immediately via `learn_add`). All lesson writes go through `write_lesson()` which provides substring dedup and topic-overlap dedup (shared keywords ≥ 50% of the LARGER of the two keyword sets → newer replaces older). When vector memory is not active, falls back to `lessons.jsonl` via `LessonStore.save()`.
 
 ### Configuration
 
@@ -167,14 +231,17 @@ Exposed on dashboard: Overview → Memory tab → Memory Settings card. Changes 
 
 ## Vector Memory (`vector_memory.py`)
 
-Structured memory system backed by SQLite + FAISS + in-process embeddings (vendored llama-cpp-python). Embeddings are ALWAYS-ON: `_coerce_embedding_provider` (config/loader.py) coerces EVERY `embedding_provider` value — including legacy `"ollama"` and `"none"` — to `"llama_cpp"`, so there is no config knob to disable them. While the model is still downloading or absent, memory degrades gracefully to keyword/FTS search and the lazy-rebind machinery in `vector_memory._try_embed` picks embeddings up when the model lands — no restart. Per-store overrides (`MemoryStoreConfig.embedding_provider`, enum `["", "llama_cpp"]`) can only inherit or restate the default — per-store disable is not supported.
+Structured memory system backed by SQLite + FAISS + in-process embeddings (vendored llama-cpp-python). Embeddings are ALWAYS-ON: `_coerce_embedding_provider` (config/loader.py) coerces EVERY `embedding_provider` value — including legacy `"ollama"` and `"none"` — to `"llama_cpp"`, so there is no config knob to disable them. While the model is still downloading or absent, memory degrades gracefully to keyword/FTS search and the lazy-rebind machinery in `vector_memory._try_embed` picks embeddings up when the model lands — no restart. Per-store overrides (`MemoryStoreConfig.embedding_provider`, enum `["", "llama_cpp"]`) can only inherit or restate the default — per-store disable is not supported, and the value reaches nothing: `context._build_store_vectors` configures a named store's `VectorMemoryStore` from top-level `cfg.memory`, and the embedder beneath it is the process-wide `get_shared_embedder()` singleton, so two stores cannot run two backends without two resident models and two incomparable vector spaces.
 
 ### Thread safety (`_db_lock`, `threading.RLock`)
 
-One `VectorMemoryStore` instance is shared by the gateway event loop (readers)
-and several worker threads (writers: consolidation via `run_in_embed_pool`, the
-dashboard memory handlers via `asyncio.to_thread`). It holds ONE `sqlite3`
-connection and ONE FAISS index, and neither is thread-safe: `sqlite3` caches
+One `VectorMemoryStore` instance **per `db_path`** is shared by the gateway event
+loop (readers) and several worker threads (writers: consolidation via
+`run_in_embed_pool`, the dashboard memory handlers via `asyncio.to_thread`). One
+per path is an invariant, not an optimization — two instances over one file do not
+share `_db_lock`, which voids everything below — and it is why `ensure_store`
+closes the loser of a construction race rather than keeping both. It holds ONE
+`sqlite3` connection and ONE FAISS index, and neither is thread-safe: `sqlite3` caches
 prepared statements per connection, so two threads stepping a statement at the
 same time corrupt each other's row iteration (observed as
 `DatabaseError("another row available")`, and on Windows CI as a `None` value for
@@ -219,6 +286,312 @@ notification, and it does not coordinate across separate Kiro Crew processes
 (gateway plus a one-shot CLI), so two processes writing the same key remain
 last-write-wins.
 
+### Two schema lineages
+
+One engine drives two schema lineages, and which one a vector file is on is a property of
+that FILE for the life of the file. A **crew silo created from this point forward** is a
+`memory_items` file on `schema_version` 1001 — one row table carrying three kinds plus the
+carve facets, with v1's relation names re-presented over it as views. **Every other vector
+file, above all `config_dir()/"memory.db"`, is the v1 lineage**, frozen at
+`schema_version` `{1, 2, 3}` with `semantic_memory` and `episodic_memories` as real
+tables. Two lineages, one engine: no cutover, no dual write, no backfill, and no
+`CONTRACT_VERSION` bump. `memory_schema.py` owns the crew lineage; `vector_memory.py`
+keeps owning v1's `_MIGRATIONS`.
+
+**`memory_events` and `memory_meta` have ONE definition, and it is not per-lineage.**
+They are the only product tables the engine reaches with no relation indirection —
+`_log_event`, `get_events`, `rotate_events` and `_read_meta`/`_write_meta` name them
+literally on both lineages — so their DDL lives once, as `memory_schema.MEMORY_EVENTS_SQL`
+and `MEMORY_META_SQL`, and `vector_memory._SCHEMA_V1` / `_MEMORY_META_TABLE` and
+`CREW_SCHEMA_SQL` all compose those constants. A second hand copy is the shape that fails
+silently: `MIGRATIONS_CREW` is one frozen entry, so a fourth `_MIGRATIONS` entry adding a
+column would reach every v1 file and NO silo, and the shared INSERT would then fail on
+silos alone — with v1, the lineage the rest of the suite exercises, still green.
+
+What each `init()` leaves on disk:
+
+| | every v1 file, incl. the default store | a new crew silo |
+|---|---|---|
+| `schema_version` | `{1, 2, 3}` | `{1001}` |
+| tables | `semantic_memory`, `episodic_memories`, `memory_events`, `memory_meta`, `schema_version` | `memory_items`, `memory_events`, `memory_meta`, `schema_version` |
+| views | none | `semantic_memory`, `episodic_memories` |
+| triggers | none | none |
+| `memory_meta` stamp rows | none | `schema_lineage`, `store_name` |
+
+**Which lineage a file gets is decided once, structurally, inside `init()` — and the
+ordering there is the load-bearing part.** `memory_schema.detect_lineage(db)` reads
+SQLite's own schema table FIRST: a file holding `memory_items` as a table is crew, a file holding
+either v1 relation as a table is v1, and only a file with no product table at all answers
+`None`. A path is consulted only for that third case, through
+`memory_stores.named_store_of_db`. Every vector file that exists on any install today
+holds `semantic_memory` as a real table, so it answers v1 before the path predicate is
+reached — which is what makes "the operator's running memory is untouched" a property of
+the code path rather than a claim a test asserts. There is no route from a populated file
+to `MIGRATIONS_CREW` at all, so a later edit to the path predicate cannot reach that file
+either. `detect_lineage` matches `type='table'` deliberately: on the crew lineage
+`semantic_memory` exists as a VIEW, and a check that accepted either kind would answer v1
+for a crew file and then run the v1 migrations against views.
+
+**The predicate is POSITIVE membership, not a negation.** `named_store_of_db(path)`
+answers the name of the named store whose vector file `path` is, or `""` — the inverse of
+`resolve_store_path`, and the only spelling of "this file is a crew silo". Written as
+`db_path != config_dir()/"memory.db"` it would be TRUE of four real non-silo paths and
+hand the crew schema to each: the eval runner's `ws/"vector_memory.db"`, the bench ingest
+path, the onboarding importer's `destination/"memory.db"`, and every `tmp_path` in the
+suite. The predicate answers `""` for all of those, for the literal
+`memory_stores/default/`, and for a malformed store name. Its containment test is
+IDENTITY (`parent.resolve() == memory_stores_root().resolve() / name`) rather than a
+resolved-parent check, for the reason `_named_store_dir` already refuses aliasing: with
+`memory_stores/acme` symlinked at `memory_stores/finance`, a parent check still sees the
+root and would answer `"acme"` for a file that physically belongs to `finance`.
+
+**The gate lives inside `init()` because no call-site check could cover the call sites.**
+`VectorMemoryStore` is constructed from many places, and one of them —
+`security.scan_memory` — sits outside the memory subsystem entirely and reaches the
+default store as a bare `VectorMemoryStore()`, so a per-construction decision would have
+to be re-derived by callers that know nothing about lineages.
+
+**The three kinds are a queryable column, not a dispatch axis.** `memory_items.kind` is
+`CHECK`-constrained to `directive` (behavioural preferences plus lessons), `fact`
+(projects, semantic and user facts) and `episode` (daily history plus episodic), and is
+stamped from the key prefix at write time by `kind_for_key` — `lesson.*` is a directive,
+every other semantic key is a fact. Nothing dispatches on it: the engine keeps
+discriminating lessons with `key LIKE 'lesson.%'` exactly as it does on v1, so `kind`
+never becomes a second, divergent notion of what a lesson is.
+
+**`semantic_memory` and `episodic_memories` survive as READ-ONLY VIEWS presenting v1's
+exact columns in v1's exact order.** The 36 read statements naming them in
+`vector_memory.py` are therefore unchanged, and `SELECT *` still hands `sqlite3.Row`
+the columns the engine expects. Splitting by `kind` is also what keeps the vector scorers
+partitioned by RELATION: episodic blobs are L2-normalized at write and semantic and
+lesson blobs are not, and three of the four places that score a stored blob take a bare
+dot product (the FAISS `IndexFlatIP` search, `_sqlite_vector_search`, and the promotion
+clusterer) while only `_stored_similarity_scorer` divides both norms out. One undivided
+`embedding` column would put un-normalized rows in front of the three that assume unit
+length.
+
+**The views must NEVER be given an `INSTEAD OF` trigger.**
+`snapshot_redact._refuse_update_triggers_that_destroy_rows` refuses a database whose
+UPDATE trigger writes a relation other than the trigger's own, and its exemption requires
+`target == tbl_name` — which an `INSTEAD OF` trigger on a view can never satisfy, because
+its `tbl_name` IS the view while its body names the physical table. The refusal keys on
+the trigger's name and rejects the whole DATABASE rather than the one relation, so a file
+carrying such a trigger can never be proven redacted and any bundle staging it refuses
+instead of uploading — permanently, since the trigger is part of the schema.
+
+Writes therefore name the physical table: `semantic_relation(lineage)` /
+`episodic_relation(lineage)` resolve it and
+`semantic_guard` / `episodic_guard` supply the trailing `AND kind …` clause that keeps a
+semantic write off an episode sharing the table; both render EMPTY on v1, so the 15
+interpolated write statements are byte-identical to the literals they replace. The four
+that differ in their COLUMN LIST — semantic insert, semantic upsert, and the two episodic
+inserts — carry two spellings plus a param builder in `memory_schema`, side by side so a
+change to one is visibly a change to the other. The one writer outside the engine that
+names a view directly is the bench ingest harness's `created_at` backdate, and it is safe
+only because a bench path is never a silo.
+
+**The facet columns are deliberately ABSENT from both views, which is what makes them
+carve axes rather than ranking signals.** `scope`, `surface`, `crew`, `session_key` and
+`derived_from` exist on `memory_items` and appear in neither view, so no existing ranker
+can read one. "A facet partitions, it never scores" is thereby a fact about the relation
+instead of a convention someone has to police.
+
+#### Who stamps a facet
+
+`memory_schema.MemoryFacets` is a frozen dataclass whose five fields all default to `""`,
+matching the columns' `NOT NULL DEFAULT ''`: for a carve, "absent" and "not applicable"
+are the same answer, and a nullable axis would make every future filter spell
+`IS NULL OR = ''`. It is a keyword argument on `set_semantic`, `write_episodic` and
+`write_lesson` — the additive-with-a-safe-default shape — so a caller threads identity
+once and both lineages accept the call. `VectorMemoryStore._stamp_facets` applies it
+through `FACET_STAMP_SQL` and returns immediately on v1, where the columns do not exist.
+
+**A stamp is additive, and never fails a write.** Each axis is written through a
+`CASE WHEN ? = '' THEN <column> ELSE ? END`, so a second writer that knows only the
+surface cannot blank a scope the first established. `_stamp_facets` swallows every
+exception and logs, because a raise would land inside `HistoryConsolidator._consolidate`'s
+try while `billed` is still `False` — the attempt would be recorded as never having
+happened and all four consolidation entry points would re-arm on every idle tick, forever,
+with no backoff. A lost facet costs one carve filter; nothing else reads the column.
+
+**Two writers hold real identity, and only those two thread it.** The history
+consolidator builds the facets in `_session_facets(meta, key)` and passes them to both
+`_write_structured_memory` and `_save_lessons`: `crew` from the session's `agent`
+metadata — the **crew alias**, never the kiro-cli agent template, whose namespace is
+disjoint and whose use here would resolve `default` for exactly the crew that configured
+otherwise — `surface` from `messaging.link.telemetry_channel_of`, which returns a bounded
+label and never the raw session key, and `session_key` verbatim. `promote_episodic_patterns`
+stamps `derived_from` with the canonical episode's id, which is the only surviving trace
+of provenance because that method tombstones the cluster it promoted. `write_lesson`
+mirrors its existing `repo_scope` onto `scope` when the caller named none.
+
+`scope` is an INDEX-ONLY PROJECTION: `value_json` stays authoritative and the lesson
+reader keeps reading it, because two sources of truth for a scope is how a carve silently
+widens. The doc's `repo_url` / `code_path` / `package` trio is deliberately not built —
+no deterministic source for it exists here (the git-origin probe answers `None` for every
+worktree and spawns a subprocess per call, the branch helper returns an egress-redacted
+value that will not compare equal later, and the manifest the doc reads for `package` is
+not part of this build), so `scope` carries the one repository axis that has a live
+evaluator and a live carve.
+
+Every other writer — the CLI, the dashboard memory routes, the task runner, the channel
+gateways — stamps nothing, and its rows carry the `''` defaults. Those callers hold no
+crew or surface identity at the point of the write, so a stamp there would be an invented
+value rather than a recorded one.
+
+#### Who reads a facet
+
+Two methods on `VectorMemoryStore`, and they are the only readers: `list_by_facets` pages
+the rows matching a carve, and `count_by_facet` answers "what is actually in this store's
+memory" — how much each crew, surface, scope, session or kind contributed. Both take
+`filters` as a **mapping from facet name to exact value**, ANDed together, plus an optional
+`kind`.
+
+A mapping and deliberately not a `MemoryFacets`: the dataclass spells absence and "not
+applicable" identically (both `""`), which is right for a stamp and would make one carve
+unaskable here. **An axis the mapping omits is unconstrained; an axis mapped to `""`
+selects the rows no writer attributed** — and "which rows did nothing stamp" is the first
+question an operator asks when a carve comes back short. Live rows only, like every other
+reader in the engine, which is also what lets the query use the `(column, is_deleted)`
+indexes.
+
+**The SQL lives in `memory_schema`, not in the engine, and that placement is load-bearing
+twice over.** It names `memory_items`, a relation only the crew lineage has, so the same
+literal inside `vector_memory.py` would be a statement that raises on every v1 file — which
+is exactly what `test_memory_lineage_drift`'s "every relation the module names exists in
+both lineages" refuses. And it keeps the one place a facet NAME is spliced into SQL beside
+the dataclass those names come from.
+
+**Names come from an allowlist derived from the dataclass; values are bound.**
+`FACET_NAMES` is `tuple(field.name for field in fields(MemoryFacets))`, and the builders
+iterate THAT tuple, consulting the caller's mapping for membership only — so the identifier
+reaching a statement is always one of the module's own literals, however a caller spells
+its key. An unknown key, an unknown group axis, and an unknown `kind` all raise
+`UnknownFacet` rather than being dropped, because a silently ignored filter WIDENS a carve:
+a caller asking for one crew would be handed every crew's rows under a heading naming
+theirs. `GROUPABLE_COLUMNS` is `FACET_NAMES` plus `kind` — `kind` is the row type rather
+than a stamped attribution, so it stays out of the filter allowlist's derivation while
+remaining a legitimate group axis.
+
+**A facet query on the v1 lineage REFUSES**, with `memory_schema.FacetsUnsupported`, and
+the refusal is the same at every surface. An empty page there would say "this crew has no
+memories" about `config_dir()/"memory.db"` holding thousands of unfaceted rows — the one
+wrong answer this seam can give, since an operator reads it as a writer bug. The
+discrimination is `self._lineage`, resolved once in `init()` from the file's own schema:
+never a `hasattr` probe and never a `try`/`except` around `no such column`.
+
+**Three of the five axes are indexed, and the docstring says which.** `scope`, `crew` and
+`surface` each have a `(column, is_deleted)` index and seek; `kind` alone rides
+`idx_mi_kind_live`; `session_key` and `derived_from` have **no index** and scan. That is
+left as it is on purpose: both are high-cardinality identifiers reached from a row the
+operator already has in hand, so they are needle lookups rather than store-wide aggregates,
+and two more indexes on a write-heavy table are paid for by every consolidation pass.
+Pairing an unindexed axis with an indexed one recovers the seek. The plans are pinned by
+test, so the claim cannot rot into a wrong promise.
+
+Both reads are bounded by the builder rather than by each surface: `MAX_FACET_PAGE` rows per
+page and `MAX_FACET_GROUPS` distinct values per count, the latter because `session_key`
+cardinality is unbounded. The count is ordered by population, so the truncation drops the
+least populous tail. Paging orders `created_at DESC, id` — the tie-break on the primary key
+is what makes a page stable, since one `created_at` tie is enough to show a row twice and
+hide another.
+
+**Two surfaces, and the store they read is answered differently.** `kirocrew memory carve`
+takes `--store`, one flag per facet, `--kind`, `--count-by`, `--limit` and `--offset`; it
+dispatches BEFORE `_memory_cmd`'s shared store is opened, for the same reason the backup
+verbs do — that store is hardwired to the default store's path. `GET /api/memory/carve`
+routes through the shared `?store=` resolver every store-scoped memory route uses (see
+[Which store a dashboard route reads](#which-store-a-dashboard-route-reads-store)):
+with the parameter ABSENT it resolves the silo from the caller's own recorded binding
+(`_session_memory_store`, the same resolver the lessons routes use), so a session that
+cannot name a store still reads only the store it is bound to; with it PRESENT the request
+takes the owner gate, so naming another crew's silo requires the dashboard owner's own
+identity and is unavailable to an agent or an MCP tool, which have none to present. What
+must not grow here is a store dimension that skips that resolver — a hand-read `?store=`
+in this handler would be exactly the cross-silo read the file boundary exists to prevent.
+A session bound to no silo falls through to the global store and gets the v1
+refusal, `409` with `code: "facets_unsupported"`. An unknown `count_by` or `kind` is `400`
+`unknown_facet`; a silo whose vector tier cannot be stood up is `503` `store_unavailable`,
+reported rather than answered from the global store.
+
+An unrecognized *query key* is ignored rather than refused, and that asymmetry with the
+store's `UnknownFacet` is intended: a request legitimately carries keys that are not filters
+(`?token=` among them), so a route that 400'd on those would break query-token auth. The
+route never forwards a caller key as a column name, so the enumerable inputs — `count_by`
+and `kind` — are the two it validates.
+
+**Neither read is an MCP tool, and that is a judgement rather than an omission.** No verb
+in the `kirocrew memory` group has an MCP twin: the facets are attribution metadata about
+who wrote a row, not recallable content, and an agent already receives its memory through
+context injection and `learn_list`. There is also nothing for a model to do with the answer,
+and the safe shape of the capability — read only the caller's own bound store — is precisely
+the shape that makes it useless as a tool, since an agent cannot ask about a store it is not
+in.
+
+**There is no `embedding_dim` column, although the design asks for one.** Its stated
+purpose — "store the dim, do not assume 1024" — is already met without storing anything:
+a vector's width **is** `length(embedding) / 4`, derivable from the blob whenever it is
+wanted, and the two comparability checks read the blob's byte length rather than any
+column. As stored data the width could only DRIFT from the vector it describes, and it
+would: six lazy-backfill and repair statements set `embedding` alone, so a backfilled row
+would carry a fresh vector beside a stale or NULL width. A write-only column that can
+disagree with its own subject is worse than no column. A `GENERATED ALWAYS` column would
+make the drift impossible, and is still rejected: it requires SQLite 3.31+, this build
+documents no SQLite floor, and no generated column exists anywhere else here — an
+undeclared version floor is a poor price for a column nothing reads. Note the unrelated
+config key `memory.embedding_dim`, which is the live embedder's width and IS read.
+
+**The two version series are disjoint on purpose** (`{1, 2, 3}` against `{1001}`) and
+`init()` applies migrations by set membership, so neither lineage's DDL is reachable
+through the other's loop. That is the third barrier, and it fails LOUD rather than
+silently: were detection ever bypassed on a crew file, v1's
+`CREATE TABLE IF NOT EXISTS semantic_memory` silently no-ops against the view and then
+`_migrate_v2`'s `ALTER TABLE semantic_memory ADD COLUMN embedding` raises
+`Cannot add a column to a view`, which `_migrate_v2` re-raises because it swallows only
+`duplicate column`. That happens inside `init()`, before any write.
+
+**Timestamps are TEXT ISO-8601, never the `REAL` a numeric schema would reach for.**
+Seven sites rank `created_at` / `updated_at` by lexicographic string comparison and two
+more parse them with `datetime.fromisoformat`; one of the seven is
+`_enforce_episodic_cap`, the episodic CAP EVICTION, where a wrong order tombstones the
+wrong memories. SQLite also sorts REAL before TEXT, so a mixed column is worse than
+either choice on its own.
+
+**`UNIQUE (key)`, not per-kind uniqueness.** v1 spells this `key TEXT PRIMARY KEY` — one
+row per key, period — and per-kind uniqueness is strictly WEAKER: it would let
+`pref.color` exist as both a directive and a fact, and the `semantic_memory` view would
+then return two rows where every statement in the engine expects at most one. SQLite
+treats NULLs as distinct in a unique index, so episodes (`key IS NULL`) stay
+unconstrained and are identified by `id` alone. A semantic row's `id` is deterministic
+from its key (`semantic_item_id`, the `key:` namespace), which is why no writer needs
+`last_insert_rowid()` — the engine has no such call.
+
+**A silo that already exists keeps the v1 lineage for the life of the file. This is a
+limitation, not a footnote.** `detect_lineage` answers from the schema table, so a silo
+whose `memory.db` predates the crew lineage is v1 forever: no `memory_items`, no kinds, no
+facet columns, no stamp rows. There is no upgrade path and none is planned — the crew
+lineage is reachable only through a store whose vector file does not exist yet, and such a
+store starts empty by definition (see
+[A store's three paths](#a-stores-three-paths-and-where-the-index-actually-lives)).
+
+**The two `memory_meta` rows are ADVISORY.** A crew silo records `schema_lineage` and,
+once at creation, `store_name`, so a file restored or copied into the wrong directory is
+detectable instead of silently serving another crew — the identity recorded is the STORE,
+since several crews may bind one. Structure stays authoritative: `detect_lineage` reads
+the schema table, so a lost, hand-edited or forged stamp cannot misclassify a file. Neither
+row is written on the v1 lineage, because adding rows to the operator's own `memory.db` is
+the one thing this seam exists to avoid.
+
+**What this inherits and does NOT close.** `memory_stores/` appears in no snapshot,
+portability or redaction component: `snapshot.py`'s `memory` component names `memory.db`
+and `memory_index.db` at the data-home root plus the `workspace/memory` and
+`workspace/knowledge` trees, and nothing anywhere names a per-store path. So a silo's rows
+— crew lineage or v1 — are not backed up, not carried by an export/import zip, and never
+reach the egress redaction pass. The injection audit is the exception: `scan_memory`
+opens every DECLARED store's vector file directly and labels each finding with its store.
+The crew lineage changes none of the rest; it is the same fence listed under
+[What is NOT isolated yet](#what-is-not-isolated-yet).
+
 ### Semantic Memory
 
 SQLite table `semantic_memory` — structured key-value store with:
@@ -232,6 +605,10 @@ SQLite table `semantic_memory` — structured key-value store with:
 
 Context injection: formatted as `key: value` pairs in `[Semantic Memory]` block. The cap is passed in by the caller: `build_session_context()` supplies `caps.semantic`, which is `_SEMANTIC_MEMORY_CAP` (7.7% of the base = 12,705 chars) at the reference window and scales down with the model window. Excludes `lesson.*` keys (they have their own `[Learned corrections]` block). Uses hybrid retrieval when a query is supplied: `_SEMANTIC_VECTOR_WEIGHT` 0.6 × vector_score + `_SEMANTIC_KEYWORD_WEIGHT` 0.4 × keyword_score, where vector_score reads the STORED write-time vectors via `_stored_similarity_scorer` — one blocking embed per request (the query), never per row. When the query embed succeeded, EVERY row scores on that weighted scale (a row without a stored vector contributes 0.0 on the vector term) so un-backfilled legacy rows cannot keep the unweighted keyword score and outrank embedded ones; without embeddings entirely it falls back to keyword-only scoring (word overlap on keys and values, key matches weighted 3×, with `snowballstemmer` expansion). `build_session_context()` passes the user's first message as the query, so new-session injection is relevance-ranked; an empty query keeps recency order.
 
+The keyword half's ROW side — the regex scan, set build, and Snowball expansion over a row's key and value — depends only on that row's own text, so it is memoized by `_row_stem_tokens`, bounded at `_ROW_STEM_CACHE_SIZE` entries. The memo is keyed on the TEXT rather than on a row key or rowid: an updated value hashes to a different entry, so no write path has an invalidation step to forget and a stale token set can never be served for text the row no longer holds. Only the row side goes through it — query text has one distinct value per user message, so memoizing it would evict the bounded row population the memo exists to keep. This is a separate memo from the per-word `_stem_one` cache (`_STEM_CACHE_SIZE`), which the row memo populates on a miss.
+
+**A scan wider than the cache bypasses the memo, by design.** Both row-side callers (`get_semantic_context` and `_rank_lessons`) ask `_row_stem_tokens_for_scan()` for the form to use, passing the number of entries the pass will touch — two per row for the semantic scan, one per lesson — and get `_row_stem_tokens_uncached` when that exceeds `_ROW_STEM_CACHE_SIZE`. A repeated full-table scan is LRU's worst case: past the bound every lookup evicts the entry the next one needs, so the hit rate is not degraded but exactly zero, and the memo costs the wrapper plus the retained frozensets while returning nothing. Nothing caps `semantic_memory` — only `_MAX_SEMANTIC_PER_CONSOLIDATION` per run, and `promote`/`import`/`migrate` bulk-write — so a store crosses that width on its own, which is why the width is checked per scan rather than assumed. Note also that the bound is in ENTRIES and therefore does not bound bytes: an entry retains its text plus a frozenset of words and stems, so a filled cache spans roughly 9 MiB for ordinary values to ~296 MiB for `_MAX_VALUE_BYTES` values of short words, held for the process's life. Size the constant against that ceiling.
+
 ### Episodic Memory
 
 SQLite table `episodic_memories` — conversation fragments with optional embeddings:
@@ -239,13 +616,194 @@ SQLite table `episodic_memories` — conversation fragments with optional embedd
 - **Injection screening (XPIA defense-in-depth)**: episodic text is derived from conversation transcripts, so a poisoned turn could persist steering instructions that get re-injected into future contexts. `write_episodic()` runs `_contains_injection()` (before the embed call) and, on match, drops the entry and emits an auditable `injection_blocked` event with `memory_type='episodic'`. The stored audit snippet is scrubbed with `redact_exfiltration_urls()` + `redact_credentials()` first, since `/api/memory/events` surfaces it verbatim on the dashboard. This mirrors the semantic-KV screen at `validate_semantic()`. **Residual (accepted risk)**: this is a best-effort regex screen: a determined owner can still steer their own long-term memory with phrasing that evades the patterns; long-term memory poisoning is an accepted residual. The screen raises the bar against accidental/opportunistic XPIA persistence, not against a motivated self-owner.
 - **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-rate×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6). The decay rate is `_DEFAULT_DECAY_RATE` = 0.03/day, configurable per tag via `memory.decay_rates` (`_decay_rate_for`): keys are tags (case-insensitive, matching `_matches_tags`), the reserved `default` key replaces the built-in fallback, a multi-tag row uses the SLOWEST matching rate (smallest = maximum retention, so a broad tag can never age out a long-retention one), values are clamped to [0, 10] and non-numeric entries are dropped with a warning at store construction (`_sanitize_decay_rates`). Both vector rungs (FAISS and the stdlib fallback) resolve the rate through the same helper; the keyword rung does no decay scoring at all.
 - **MMR reranking**: Maximal Marginal Relevance balances relevance with diversity. Greedy iterative selection penalizes candidates similar to already-selected results. Prevents redundant episodic fragments from consuming the context budget. Configurable via `mmr=False` parameter to disable. The candidate pool is deliberately NOT truncated toward `limit` (that tail pick is the point of MMR); the only bound is the recall-safe `_MMR_MAX_POOL` = 1000 ceiling for pathological inputs.
-- **Relevance threshold**: `_EPISODIC_RELEVANCE_THRESHOLD` = 0.55 cosine required for context injection (empirically determined from a 100-query benchmark: 50 relevant + 50 irrelevant, F1=0.980), relaxed to `_EPISODIC_LONG_TEXT_THRESHOLD` = 0.42 for entries longer than `_EPISODIC_LONG_TEXT_CHARS` = 300 chars, because long texts dilute cosine scores. The threshold reads the RAW `cosine_sim`, not the decay-adjusted score, so age and importance affect ordering but never admission. Admission runs BEFORE the decay ranking, MMR, and the `limit` cut: `get_episodic_context()` calls `search_episodic(relevance_filter=True)`, which drops sub-threshold candidates first, so a highly relevant but old memory cannot be ordered past `limit` by a cluster of recent-but-irrelevant rows that the gate would then remove — a case that otherwise returned empty context while an exact match sat in the store. `search_episodic()` defaults to `relevance_filter=False` and returns the full ranked set for dashboard/API/CLI use. The keyword fallback is unaffected because those rows carry no `cosine_sim` key at all.
-- **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, stdlib cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors.
+- **Relevance threshold**: `_EPISODIC_RELEVANCE_THRESHOLD` = 0.55 cosine required for context injection, relaxed to `_EPISODIC_LONG_TEXT_THRESHOLD` = 0.42 for entries longer than `_EPISODIC_LONG_TEXT_CHARS` = 300 chars, on the reasoning that long texts dilute cosine scores. **Neither value is tuned, and the two classes it separates overlap** — measured, both are looser than the best achievable cut and the long-text relaxation is about twice the dilution it compensates for. Do not read 0.55 as a discovered boundary: [The admission gate is a loose cut, not a tuned one](#the-admission-gate-is-a-loose-cut-not-a-tuned-one) carries the measurement and the harness that produced it. The threshold reads the RAW `cosine_sim`, not the decay-adjusted score, so age and importance affect ordering but never admission. Admission runs BEFORE the decay ranking, MMR, and the `limit` cut: `get_episodic_context()` calls `search_episodic(relevance_filter=True)`, which drops sub-threshold candidates first, so a highly relevant but old memory cannot be ordered past `limit` by a cluster of recent-but-irrelevant rows that the gate would then remove — a case that otherwise returned empty context while an exact match sat in the store. `search_episodic()` defaults to `relevance_filter=False` and returns the full ranked set for dashboard/API/CLI use. The keyword fallback is unaffected because those rows carry no `cosine_sim` key at all.
+- **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors. Inside that rung the per-row dot product itself has two rungs, guarded by `_HAS_NUMPY` exactly as `_stored_similarity_scorer` is: the query vector is converted once outside the row loop, then numpy does the products where it is installed and `struct.unpack` + `sum` does them where it is not. Every numpy rung dots in float32, matching the stored dtype and the FAISS path, because this cosine is also what the relevance gate compares against a fixed admission threshold: the resident tier and the per-call read must not hand the same query two different cosines.
 - **Resident scoring set (the middle rung, with numpy)**: scoring reads only the embedding, `tags`, `importance`, `created_at` and the text LENGTH, and none of that changes between two searches with no write in between — so `_EpisodicScoringSet` holds those columns as numpy arrays and the search resolves row BODIES (`text`, `conversation_id`, `last_accessed_at`) for the ranked pool only, through the same `_get_episodic_batch` the FAISS path uses. Decay is a vectorized expression over the cached arrays, not a per-row Python dict build. Filtering still runs across the FULL population before `limit` — `tag_filter` and the relevance gate are masks over the cached arrays, never a top-k window, because a tag matching few rows would otherwise miss the pool entirely and return nothing where it returns hits today. The pool handed to MMR stays `_MMR_MAX_POOL`-bounded rather than `limit`, since the rerank reads each candidate's text.
 - **Scoring-set invalidation**: the validity token is `(in-process generation, PRAGMA data_version)`. `_invalidate_episodic_scoring()` bumps the generation and is called by **every** writer that changes which rows are scored or what they score as — `write_episodic`, `delete_episodic`, `_delete_episodic_row`, `_enforce_episodic_cap`, `_retire_stale_episodic`, `reconcile_embedding_space`, and `backfill_missing_embeddings`. Two of those are traps a naive append-only cache falls into: the backfill rebuilds the FAISS index only `if _HAS_FAISS`, which is False on exactly the install this rung serves, and a body lookup can never repair it (it drops ids that vanished but cannot surface ids that appeared, so recall degrades with no error); and `PRAGMA data_version` is the only in-band signal that a SECOND PROCESS committed to the same file, since the FAISS consistency gate compares two in-process structures. `_touch_last_accessed` is deliberately NOT a writer here — `last_accessed_at` is never scored and is re-read per search with the bodies. A ratchet test (`test_every_episodic_writer_invalidates_the_scoring_set`) fails on a new `episodic_memories` writer that skips the hook. The set is bounded by `_EPISODIC_SCORING_MAX_BYTES` (64 MiB, ~10 MiB for 2,600 rows at dim 1024) and is disabled outright on an sqlite with no `data_version` pragma; either way the rung falls back to reading the population per call.
 - **Cap**: `_DEFAULT_EPISODIC_MAX` = 10,000 active entries. `_enforce_episodic_cap()` tombstones `ORDER BY importance ASC, created_at ASC` (lowest-importance oldest first) on write once the count reaches the cap.
 
 Context injection: `_DEFAULT_EPISODIC_LIMIT` = 8 results in an `[Episodic Memory]` block, each fragment sliced to 1,500 chars, total bounded by `min(_EPISODIC_INJECT_CAP, caps.episodic)` where `_EPISODIC_INJECT_CAP` = 3,000. Injected on the first message of new sessions through the single `memory.get_context()` call in `build_session_context()`, which passes the user's message as the query; episodic is query-gated inside `get_context`, so callers without a message (eval runner) inject none, and follow-up turns never re-inject (ACP native history provides in-thread context).
+
+#### The admission gate is a loose cut, not a tuned one
+
+`_EPISODIC_RELEVANCE_THRESHOLD` is a binary classifier over (query, fragment)
+pairs, so the only honest description of it carries both error rates and the two
+cosine distributions it has to separate. Measured over the real
+Qwen3-Embedding-0.6B GGUF and a real `VectorMemoryStore`, against the committed
+50-topic corpus in `src/kiro_crew/eval/bench/admission_corpus.py` — each topic
+stating one fact twice, once under the 300-char cutoff and once above it, so both
+branches of the gate are scored on the same facts:
+
+| | relevant cosine (n=50) | irrelevant cosine (n=2,450) | at the shipped gate |
+|---|---|---|---|
+| short, ≤300 ch, gate 0.55 | min 0.555 · p50 0.750 · p90 0.826 · p99 0.875 · max 0.875 | min 0.136 · p50 0.367 · p90 0.475 · p99 0.550 · max 0.617 | P 0.649 · R 1.000 · **F1 0.787** |
+| long, >300 ch, gate 0.42 | min 0.452 · p50 0.671 · p90 0.755 · p99 0.840 · max 0.840 | min 0.143 · p50 0.337 · p90 0.434 · p99 0.512 · max 0.570 | P 0.132 · R 1.000 · **F1 0.234** |
+
+Pooled, that is P 0.220 · R 1.000 · F1 0.360, over all 5,000 pairs. Recall is
+1.000 in every view — the gate drops nothing relevant — while it admits 27 of
+2,450 irrelevant short fragments (1.1%) and 328 of 2,450 irrelevant long ones
+(13.4%). It is loose, not selective.
+
+**The two distributions overlap, so no threshold value separates them.** Irrelevant
+short cosines reach 0.617 while relevant ones start at 0.555; irrelevant long reach
+0.570 while relevant start at 0.452. Every cut therefore either admits irrelevant
+fragments or drops relevant ones, and the constant is choosing a point on that
+trade-off rather than applying a boundary someone located. The best single value on
+a 0.01 grid is 0.62 short and 0.57 long, both F1 0.958 at P 1.000 · R 0.920 —
+perfect precision bought by dropping 4 of 50 relevant fragments. **That is a
+finding, not a pending change**: moving the constant changes what is admitted on
+every existing install, which is a behaviour change and is deliberately out of
+scope for the measurement.
+
+**An F1 near 0.98 is reproducible here and is not evidence of tuning.** Give each
+query exactly one distractor — the 1:1 shape a "50 relevant + 50 irrelevant"
+protocol describes — and the shipped gate scores F1 0.976 pooled (0.990 short,
+0.962 long). But under that same balance *every* threshold from 0.51 to 0.58 scores
+F1 ≥ 0.98 on short fragments, so such a number is consistent with any value in an
+eight-step band and cannot have selected 0.55. A 1:1 benchmark is the wrong
+instrument for this constant: it asks the gate to beat one distractor, while
+`search_episodic` scores the query against every embedded row in the store. Report
+the distributions, or the headline hides the overlap.
+
+**The long-text relaxation over-corrects, and is the larger of the two errors.**
+Dilution is real but small — the same fact stated long scores 0.079 lower at the
+median (0.671 vs 0.750). The 0.13 relaxation is roughly twice that, and it ignores
+the irrelevant class shifting down by a similar amount (median 0.337 vs 0.367, max
+0.570 vs 0.617). The per-branch optima differ by 0.05, not 0.13, which is why long
+fragments' precision is a fifth of short fragments'.
+
+**The overlap is only a real finding if the labels are**, so the harness prints the
+highest wrongly-admitted pairs for review. The top short ones are a password-reset
+window matched by a credential-rotation period (0.617) and a page-escalation timing
+matched by an app-store review time (0.615): same shape, "how long until X",
+different fact. That is the confusion a cosine gate cannot resolve, and the reason
+a high cosine must not be read as relevance.
+
+Every number above moves with the embedding model, so the harness prints them
+rather than a test asserting them; a model upgrade is a reason to re-measure, not a
+red build. To reproduce (this run: `sqlite_cosine` backend, faiss absent — the two
+vector rungs agree to float64 epsilon, so the rung does not move the numbers):
+
+```bash
+KIROCREW_BENCH_ADMISSION=1 KIROCREW_EMBED_MODEL_PATH=/path/to/qwen3-embedding-0.6b.gguf \
+    pytest test/test_episodic_admission_bench.py -q -n0 -s
+# outside pytest, with a JSON dump of the full sweep:
+KIROCREW_EMBED_MODEL_PATH=/path/to/model.gguf \
+    python -m kiro_crew.eval.bench.admission --json admission.json
+```
+
+The corpus checks and the metric arithmetic run in the default suite (17 tests,
+~4s). Only the model-backed pass is opt-in, because the model costs ~700MB resident
+and the pass takes ~140s with the GGUF cold and ~45s with it in the page cache; it
+skips with a reason when no model is resident and never substitutes the toy
+embedder, which would turn a semantic threshold measurement into a term-overlap one
+while still printing a plausible F1.
+
+### Supersession retirement, and why it is bounded
+
+`_retire_stale_episodic` is the only rule in the engine where a **similarity judgement
+deletes**. When a semantic write supersedes a value, it tombstones episodes that
+reference the old one — and because consolidation rewrites the same keys every cycle, it
+applies once per key per cycle, forever. Measured on a store hours old: 21 of 101
+episodes already retired, 14 of them by this rule. That compounding is invisible, since
+every reader filters `is_deleted = 0`.
+
+Three bounds make it acceptable, and each is pinned by
+[`test/test_episodic_retirement.py`](../../../test/test_episodic_retirement.py):
+
+- **Textual containment, not similarity alone.** A candidate must contain the superseded
+  value (case-folded, JSON quotes stripped) as well as clearing the cosine bar. Cosine
+  alone let the query `"<key suffix>: <old value>"` retire any episode on the same
+  topic. The requirement keeps the documented case — "User prefers red" for an old value
+  of `red` — and drops the guesses, which turns the vector arm into a **ranking over
+  textually-linked candidates** rather than a judgement about what is now false.
+- **A per-write ceiling**, `_MAX_EPISODIC_RETIRED_PER_WRITE` = 3. A candidate beyond the
+  cap stays **alive**: a stale episode is outranked by the newer semantic row that
+  contradicts it, while a wrongly retired one is invisible to every reader, so the
+  overflow direction is "keep" and the cap drops the DELETE rather than deferring it.
+- **Reversibility, which is the only reason a heuristic may delete at all.** Nothing in
+  the module ever hard-deletes an episode — the sole hard `DELETE` is on `memory_events`
+  — so a tombstoned row keeps its id, text and vector. `get_retired_episodic()` lists
+  them newest-first with the semantic key that superseded each (carried in the
+  `conflict_retire` event's `new_value`, since `memory_key` must hold the episode's id
+  for the listing to join on it), and `restore_episodic()` clears the tombstone in
+  place. Restoring rather than re-inserting is deliberate: a new row would look like a
+  new memory and would re-enter the similarity dedup that may have removed it.
+
+The listing keys on the `conflict_retire` / `semantic_update` event pair rather than on
+`is_deleted` alone, so a user's own delete is **not** offered for restoration — the two
+deletions mean different things and only one of them was a guess.
+
+Reversibility is only worth what its surfaces reach. `GET /api/memory/retired` and
+`POST /api/memory/retired/restore` take the shared `?store=` / `"store"` field, so the
+operator can undo a retirement in a SILO — the store where a wrong retirement is least
+visible, because nothing else reads that file. `kirocrew memory retired` has no
+`--store` and runs on the default store alone: it opens `_memory_cmd`'s shared store,
+which is hardwired to the default path, so the two surfaces have deliberately different
+reach and the CLI is not the recovery path for a silo.
+
+### Automatic backups (`memory_backup.py`)
+
+Memory is the only data here that cannot be rebuilt from another source: config can be
+retyped and sessions replayed, but a superseded preference nobody remembers stating is
+gone. Every store therefore gets a **daily rotating hot copy**, taken by the heartbeat on
+its own tick counter (`_MEMORY_BACKUP_TICKS`, offset from `_PRUNE_TICKS` so the two
+minutes-long maintenance passes do not land on the same second) and offloaded to
+`maintenance_executor` because the copy is blocking.
+
+**SQLite's online backup API, never a file copy**, and the difference is the whole
+feature. The gateway holds the store open under WAL, so copying `memory.db` alone
+captures a file whose committed tail lives in a `-wal` sibling that was not taken — and
+the result *parses*, so nothing complains; it is simply missing recent writes. The backup
+API walks a consistent snapshot with the writer still running and emits one
+self-contained file with no WAL to pair.
+
+- **Placement**: beside the store they came from, in a `backups/` directory, so a silo's
+  backups inherit the fence that silo already sits behind and no new sensitive-path entry
+  is needed. Files are owner-only.
+- **Naming**: `<stem>.<UTC stamp>.db`, and retention orders by that NAME rather than
+  mtime — a copied or restored file carries a new mtime while its name still says when
+  its contents were taken.
+- **Atomicity**: written to `.partial` and renamed, so an interrupted run leaves nothing
+  that looks like a backup.
+- **Retention**: `memory.backup_keep` (default 7), clamped to at least 1. A retention
+  policy that can empty the directory is a scheduled deletion, not retention.
+- **Enumeration**: from the DECLARED stores, never a glob of `memory_stores/` — a glob
+  would adopt an abandoned or restored directory the operator never declared and then
+  copy it forever. Each resolved path is confirmed to belong to the store that asked for
+  it, because `resolve_store_path` degrades onto the default store rather than raising.
+- **Fail soft per store**: one unreadable silo must not cost the default store its
+  backup, so the loop counts failures instead of propagating them.
+
+**Restore is non-destructive.** `restore_from_backup` refuses a source that fails
+`PRAGMA integrity_check` *before* displacing anything (restoring damage over damage
+leaves the operator strictly worse off), then moves the existing file aside as
+`memory.db.superseded.<stamp>` rather than overwriting it — a restore is performed by
+someone who has already lost data once, and what they are replacing may be the last copy
+of something. The displaced file's `-wal`/`-shm` are removed, since they describe a
+database that is no longer there and SQLite would otherwise try to apply them to the
+restored one.
+
+**Three surfaces, one set of primitives.** The heartbeat's own tick, the
+`kirocrew memory backup` / `backups` / `restore` verbs, and the dashboard's
+`POST /api/memory/backup`, `GET /api/memory/backups?store=` and
+`POST /api/memory/restore` all call `back_up_all_stores` / `list_backups` /
+`restore_from_backup` rather than reimplementing the copy, the retention order or the
+integrity check. The dashboard surface adds exactly two rules of its own, both because
+its caller is a browser: a backup is named, never pathed (a path discloses the
+data-home and `memory_stores/` layout), and the name is resolved inside that store's
+own `backups/` directory with the resolved path re-checked for containment, so a
+caller-supplied filename cannot walk out of it. Which store each surface may address is
+[the shared `?store=` rule](#which-store-a-dashboard-route-reads-store) on the
+dashboard and `--store` on the CLI.
+
+`kirocrew memory backup` / `backups` / `restore` are dispatched **before** the vector
+store is opened, and that ordering is the point: `store.init()` runs
+`PRAGMA journal_mode=WAL`, which raises `file is not a database` on exactly the corrupt
+file these verbs exist to recover. Opening first would make the recovery path unreachable
+in the only situation it is for. `carve` dispatches ahead of it too, for the other reason a
+verb can need to: it opens the store NAMED on the command line, and the shared open is
+hardwired to the default store's path.
 
 ### Fading: three independent decay mechanisms
 
@@ -285,7 +843,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - Failed model loads (corrupt file, bad native libs) are retried only after a 300s cooldown so a broken state can't spawn a loader thread per embed call
 
-**Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` folds `model_id` in, so a swap automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
+**Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` is derived from `embedding_space_signature` and so folds BOTH in, meaning a swap (including a width change at a constant model id) automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
 
 **Sync embedding cache** (`make_sync_embed_fn()`, no args): The sync callable used by `vector_memory.py` wraps the shared embedder and caches results via `functools.lru_cache` keyed by `(input text, backend model_id)` — after a backend swap, the old model's cached vectors can never be served for the new model. Embeddings are deterministic (same text → same vector for a given model), so caching is safe. Bounded to 128 entries (~4 MB with Python boxed floats). Failures (None) are not cached — a still-downloading model is retried. Cache stats logged every 20 misses. Cache lives per `make_sync_embed_fn()` call — reset on gateway restart. Embedding through the cache never blocks on the model load (kicked in the background); callers get `None` until the model is resident.
 
@@ -371,25 +929,201 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 
 | Method | Path | Purpose |
 |--------|------|---------|
+| GET | `/api/memory/preferences` | Read the markdown preferences document |
+| PUT | `/api/memory/preferences` | Overwrite it (gated — see below) |
+| GET | `/api/memory/projects` | Read the markdown projects document |
+| PUT | `/api/memory/projects` | Overwrite it (gated) |
+| GET | `/api/memory/history` | Read the recent daily summaries |
+| PUT | `/api/memory/history` | Overwrite today's summary file (gated) |
 | GET | `/api/memory/semantic` | List all semantic entries |
-| PUT | `/api/memory/semantic` | Create/update (validates key, allowlist, injection) |
-| DELETE | `/api/memory/semantic/{key}` | Tombstone + log event |
+| PUT | `/api/memory/semantic` | Create/update (validates key, allowlist, injection; gated) |
+| DELETE | `/api/memory/semantic/{key}` | Tombstone + log event (gated) |
 | GET | `/api/memory/events` | Recent audit trail |
+| GET | `/api/memory/carve` | Filter or count one crew store by carve facet. Query: the five facet names, `kind`, `count_by`, `limit`, `offset`, plus the shared `?store=`. Absent, the silo is the caller's own binding; present, it is owner-gated like every other store-scoped route. 409 `facets_unsupported` on the v1 lineage, 400 `unknown_facet`, 400 `invalid_pagination`, 503 `store_unavailable`. Every answer echoes the `store` it read. See [Who reads a facet](#who-reads-a-facet) |
 | GET | `/api/memory/episodic` | Paginated episodic list |
 | GET | `/api/memory/episodic/search?q=` | Search episodic memories |
-| DELETE | `/api/memory/episodic/{id}` | Tombstone episodic entry |
+| DELETE | `/api/memory/episodic/{id}` | Tombstone episodic entry (gated) |
 | GET | `/api/memory/stats` | Counts, index size, provider status |
 | GET | `/api/memory/embedding-status` | Embedding health + download progress. `enabled` always true; `setup_step` in legacy vocabulary (done/error/idle/downloading); raw `download_step` (idle/downloading/verifying/waiting_retry/ready/failed) + `download_attempt` + `bytes_downloaded`/`bytes_total`; `model_id` + `model_dim` disclose the embedding model + vector dimension; `reembed` reports background re-embed progress (`step` idle/applying/running/done/failed + `done`/`total`/`error`) |
-| POST | `/api/memory/enable-embeddings` | Non-blocking: kicks/adopts the background model download and returns `{"ok": true, "status": "downloading"}` when the model is absent; wires embeddings + updates config when present |
+| POST | `/api/memory/enable-embeddings` | Non-blocking: kicks/adopts the background model download and returns `{"ok": true, "status": "downloading"}` when the model is absent; wires embeddings + updates config when present. The persisted `memory.embedding_dim` is the width of the **live** backend (`get_shared_embedder().dim`), never a literal — a width that cannot be read, or is not positive, is a 500 `embedding_dim_unreadable` that persists nothing, because `_load_model` refuses a model whose `n_embd` disagrees with the stored width and a wrong value leaves that model unloadable on every later restart |
 | POST | `/api/memory/embedding-model` | Change the embedding model. `{"path", "validate_only": true}` validates only; **omitting `validate_only` applies** (no `apply` flag exists). Empty path reverts to bundled. 403 restricted session, 409 while re-embedding, 409 `env_override_active` under `KIROCREW_EMBED_MODEL_PATH` |
 | POST | `/api/memory/disable-embeddings` | HTTP 410 stub — embeddings are always-on; kept only until the frontend removes its Disable button |
-| POST | `/api/memory/migrate` | Migrate markdown → structured memory |
-| POST | `/api/memory/import` | Import from JSON export |
+| POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
+| POST | `/api/memory/import` | Import from JSON export (gated) |
+| POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
+
+**The memory-mutation gate ("gated" above).** Every route that writes durable
+memory runs one two-step cascade, `_memory_write_gate` in
+`dashboard/handlers/memory.py`, in this order:
+
+1. `_recognize_session(state, sk, operation, blocks_persisted_mode=is_incognito_transcript)`
+   — the shared session-recognition probe documented in
+   [learn-cron-dashboard](learn-cron-dashboard.md). 400 `missing_session_key` with no
+   header, 400 `unknown_session` for a key that matches no live slot, restricted-key
+   entry, channel namespace, or persisted transcript.
+2. `_is_restricted_session(state, request)` — 403 `restricted_session` for an
+   incognito or temporary slot.
+
+Both halves are load-bearing and neither substitutes for the other: the
+restricted-mode check answers `False` for a key it has never seen, so on its own a
+forged or never-established `X-Session-Key` reaches the write. Every refusal emits a
+SEL `log_api_access` record (`outcome="denied"`, `source="dashboard"`, `resources`
+`missing_session_key` / `unknown_session` / `restricted_session_block`) under the
+route's own operation name (`preferences.write`, `projects.write`, `history.write`,
+`semantic.write`, `semantic.delete`, `episodic.delete`, `memory.migrate`,
+`memory.import`, `memory.promote`), and every non-2xx body carries a machine-readable
+`code`.
+
+The matching GET on each markdown route is a **read** path and is deliberately
+ungated — gating it would blank the Memory tab for every session the probe cannot
+recognise.
+
+### Which store a dashboard route reads (`?store=`)
+
+These routes take an OPTIONAL `?store=<name>`: the three markdown GET/PUT pairs, the
+semantic GET/PUT/DELETE, the episodic list, search and DELETE, `stats`, `events` and
+`carve`. One resolver answers for all of them,
+`resolve_requested_memory_store(request, state, operation)` in `handlers/_shared.py`,
+and the two tiers it hands back are `markdown_memory_for_store` (preferences,
+projects, daily history, FTS) and `vector_memory_for_store` (semantic, episodic,
+lessons). The embedding, migrate, import, promote, consolidate, context-preview and
+`settings` routes take no store: each is an install-wide action or reads the
+process-wide embedder, so a store name there would be a parameter that changes
+nothing.
+
+| Caller sends | Store read | Gate |
+|---|---|---|
+| no `?store=` | the caller's OWN session binding — the one answer available to a surface that cannot pass the gate | none added |
+| `?store=default` | the global store | owner |
+| `?store=<declared silo>` | that silo | owner |
+| `?store=<undeclared or malformed>` | nothing — 404 `unknown_memory_store` | owner |
+
+**The parameter's PRESENCE is the whole gate, and that is what makes it safe.** An
+absent parameter answers from the caller's own recorded binding, so an agent, an MCP
+tool, a subagent and every channel surface read exactly the one store their session is
+bound to and have no way to name another. A present one is asking to address a store
+the caller was not bound to — the operator's question, not a caller's — and it takes
+`require_owner_dashboard_request`, which needs the dashboard-user claim
+(`request["app"] == ""`, which refuses an App Kit token too) and a non-empty
+`request["user"]` that is the configured owner. `token_auth_middleware` publishes that
+key on the cookie/query-token path ONLY and
+never on its `X-Internal-Secret` branch, so the gate excludes an agent POSITIVELY:
+kiro-cli, the MCP servers and subagents authenticate as the installation and carry no
+identity to present, so they fail a check for "the caller proved it is the dashboard
+owner" rather than being recognised and refused. Gating on presence rather than on
+"the name differs from my binding" is deliberate: `?store=default` names the
+operator's own global memory, which a mismatch rule would wave through for any unbound
+caller. Full argument, with the audit record: [security](security.md).
+
+**An undeclared name is a 404 and never a degrade.** `resolve_store_path` degrades an
+unknown name onto the default store, so answering it would render the operator's own
+preferences, semantic rows and stats under the label of a store that does not exist,
+and the response would look like it worked. A malformed name gets the same 404 as an
+unknown one, because telling them apart would report whether a given name is declared
+to a caller that has not passed the gate.
+
+`vector_memory_for_store` answers `None` for a silo whose vector tier cannot be stood
+up, and every route reports that as 503 `store_unavailable`. Never a fall back to the
+global store: serving the operator's own memory under a crew's name is invisible in
+the response, which is the one failure the file boundary exists to prevent.
+
+Adding the parameter changes no write authorization. Every PUT/POST still runs
+`_memory_write_gate`, so a store-scoped write is gated twice — the session cascade above
+decides whether this caller may write durable memory at all, the owner gate decides
+whether it may aim that write at a store it is not bound to. On a PUT the store is
+resolved FIRST, and that precedence is deliberate: naming another store is the
+operator's question, so a caller that may not ask it should not have its body read
+either. With no `?store=` the resolver cannot refuse at all, so such a PUT still meets
+the write gate first, unchanged. Because a refusal is audited under the route's own
+operation, the READ paths now carry names too (`preferences.read`, `projects.read`,
+`history.read`, `semantic.read`, `episodic.read`, `events.read`, `stats.read`,
+`carve.read`) — the GET itself stays ungated, and the name exists for the denial the
+owner gate can emit on it.
+
+### Store administration (`memory_admin.py`)
+
+`memory.py` serves the CONTENTS of one store; this module answers the operator's
+questions ABOUT the stores. **Every route here takes the owner gate
+UNCONDITIONALLY, not on the parameter's presence**, because each one either
+enumerates every silo or mutates a store — and because a route gated on presence
+alone would become reachable by a non-owner simply by omitting `?store=`. The
+routes that also take a store still run it through
+`resolve_requested_memory_store`, so the declared-name rule has one implementation;
+the unconditional gate is the stronger check layered in front of it.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/memory/stores` | Enumerate every store for the picker: `name`, `is_default`, `lineage` (`v1`/`crew`), `exists`, `semantic_count`, `episodic_count`, `lessons_count`, `facets_supported`, `backup_count`, `newest_backup`. Takes no `?store=` — it answers for all of them |
+| GET | `/api/memory/retired?store=&limit=&offset=` | Episodes a semantic write superseded, newest first: `id`, `text`, `superseded_by`, `retired_times`, `ts`. 400 `invalid_pagination` |
+| POST | `/api/memory/retired/restore` | Body `{"id", "store"}` — clears the tombstone in place. 400 `invalid_episode_id`, 404 `unknown_retired_episode` for an id that is not a restorable retirement in that store |
+| GET | `/api/memory/backups?store=` | That store's hot copies: `name`, `size_bytes`, `taken_at` |
+| POST | `/api/memory/backup` | Body `{"store"}` — take one now; `{"backed_up", "skipped", "pruned", "failed"}` |
+| POST | `/api/memory/restore` | Body `{"store", "name"}` — `{"ok": true, "superseded": "memory.db.superseded.<stamp>"}`, or `superseded: null` for a store that had no file to displace. 400 `invalid_backup_name` for a name that is not a plain filename in that store's own backup directory, 404 `backup_not_found`, 409 `backup_corrupt` when the source fails its integrity check (nothing is displaced) |
+| POST | `/api/memory/stores` | Body `{"name"}` — declare a store in `config.json`'s `memory_stores` table and create its directory; 201 `{"ok": true, "name"}`. 400 `invalid_memory_store_name`, 409 `memory_store_exists`, 500 `config_unreadable` / `memory_stores_unreadable` |
+
+- **A POST names its store in the BODY, under the same `store` key the query string
+  uses.** One spelling for both transports, read only by `_admin_store`: a second
+  spelling is how one route starts answering for a store the seam never resolved. The
+  body is consulted first and the query resolver handles the absent case, so a POST that
+  names no store still lands on the caller's own binding.
+- **The store list is best-effort PER STORE.** A store whose file is missing or
+  unreadable reports `exists: false` with NULL counts and does not fail the response,
+  because one damaged silo would otherwise hide every healthy one from the picker —
+  the same fail-soft-per-store rule the injection audit and the backup sweep follow.
+  `exists` answers "are the counts beside this real", so it is false both for a store
+  nobody has written yet and for a file carrying no product table; nulls rather than
+  zeros, because three zeros read as "this crew remembers nothing" and send the
+  operator looking for the memory instead of for the file. The backup summary is
+  independent of the counts, so an unreadable `backups/` directory costs only that
+  half. Order comes from `declared_store_names()` (default first, then sorted) and is
+  not re-sorted here: two passes over one install that disagree on order are how the
+  picker and a report stop describing the same list.
+- **The probe opens each store READ-ONLY, and resolves-then-confirms its path.** A
+  read-only URI (built by `memory_backup`'s own builder, so a `?` or `#` in a data-home
+  path cannot truncate it into a different database) because opening a silo read-write
+  to count it would CREATE and migrate the very file whose absence the row is
+  reporting; and `owned_store_path` rather than a bare `resolve_store_path`, which
+  degrades an unknown name onto the default store and would count the operator's own
+  memory under a silo's name.
+- **`lineage` and `facets_supported` are read from the FILE, never from the name or the
+  config.** They come from `detect_lineage` over that store's own schema (see
+  [Two schema lineages](#two-schema-lineages)), so the picker cannot offer a carve the
+  file cannot serve: a silo whose `memory.db` predates the crew lineage is v1 forever,
+  and `facets_supported: false` is what tells the UI to say so instead of rendering an
+  empty carve that reads as "this crew remembers nothing".
+- **A backup is addressed by NAME, never by path.** The listing returns
+  `memory.<stamp>.db` and nothing else; a filesystem path would disclose the
+  data-home layout, and for a silo the `memory_stores/<name>/` layout the fence exists
+  to keep out of the browser. `POST /api/memory/restore` resolves that name INSIDE the
+  store's own `backups/` directory, in the validate-then-re-check-after-composition
+  pairing `memory_stores._named_store_dir` uses: the name must be a SINGLE path segment
+  (checked on both separators, and refused BEFORE the join, because
+  `Path(dir) / "/etc/passwd"` is `/etc/passwd` — an absolute right-hand side overrides
+  the base), and the resolved path must then be EXACTLY the composed one. **Identity,
+  not containment**, and the difference is the attack that survives a containment test:
+  a link planted at the name is refused when it escapes the directory and ACCEPTED when
+  it redirects inside it, which is enough to restore another store's file under this
+  store's name. The directory itself is resolved first, so a root reached through a
+  symlinked ancestor (`/tmp` on macOS) still passes.
+- **Creating a store is a config write, taken under the repo's locked writer**
+  (`run_config_write` → `update_config_locked`), the pattern the `settings` PUT
+  already uses, so it serializes against the CLI and every other writer generation and
+  none of it runs on the gateway loop. The name is validated by
+  `memory_store_name_defect` — one predicate, in the module that owns the shape rule —
+  and a defect is 400 `invalid_memory_store_name`, an existing name 409
+  `memory_store_exists`.
+- **There is deliberately NO delete route.** Undeclaring a store orphans its markdown
+  tree, index and vector file, or destroys them, and a store's contents are the one
+  thing here that cannot be rebuilt from another source. That needs explicit operator
+  direction on the host, not a dashboard button whose confirmation dialog is the only
+  thing between a mis-click and a crew's whole memory.
 
 ### CLI
 
-`kirocrew memory {list,search,show,stats,audit,export,migrate,import}` — manage memory from the command line:
+`kirocrew memory {list,search,show,stats,audit,export,migrate,import,carve}` — manage memory from the command line:
+- `carve --store <name>` — filter or count one store's rows by their carve facets; see [Who reads a facet](#who-reads-a-facet). Dispatched before the shared vector store is opened, because it opens the store NAMED on the command line rather than the default one
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
 - `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking
 - `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
@@ -422,7 +1156,7 @@ Parses legacy markdown files into structured memory:
    - **The sweep probes before it loads.** `wait_ready()` kicks the GGUF load, so asking the model to be ready is not a free question — it costs ~1GB of RSS for the process's lifetime (measured: `VmRSS` +1069 MiB, of which `RssAnon` +455 MiB is private KV/compute buffers and `RssFile` +614 MiB is the mmap'd weights). A steady-state boot has nothing to embed, so the sweep asks two **non-loading** questions first and returns 0 when both say no: `store.has_pending_embeddings()` (three `SELECT 1 … LIMIT 1` reads over the same predicates the three sub-sweeps use) and `store_embedding_space_is_stale(store)` (a signature comparison over `model_id`/`dim`, which are set when the backend is *constructed*). Only when there IS work does it wait on readiness, reconcile, and sweep — so a stale vector space still reconciles and re-embeds, and rows deferred with `defer_embedding=True` are still picked up on a later boot. The non-mutating probe is used deliberately rather than `reconcile_store_embedding_space()`, which is destructive and refuses to clear against an unready backend. A store that does not implement the probe keeps the old always-load behaviour rather than silently losing its sweep.
    - **The model still loads lazily on the first real embedding need.** `_start_embeddings()` binds `embed_fn`/`embed_fn_factory` without loading anything: `make_sync_embed_fn()` returns a closure, and the load is kicked inside `embed_batch()` the first time it finds `_llm is None` (returning `None` so that caller degrades to keyword search).
    - **Two producers of NULL-vector rows**, not just one: rows migrated before the model landed, and rows written by a bulk writer that passed `write_episodic(defer_embedding=True)` — the foreign-agent importer does this so its apply request is not held for minutes by per-chunk inference (see `docs/system-specs/modules/onboarding-import.md`). Import schedules its own sweep, so this boot sweep is the standing retry, not the only path.
-   - The sweep needs **numpy only, not faiss**. Faiss is an optional accelerator and not a declared dependency, so requiring it made the sweep a silent no-op on a stock install. Only the index rebuild is faiss-gated; `search_episodic` falls back to `_sqlite_vector_search` (stdlib cosine over the stored blobs), so the vectors are useful either way.
+   - The sweep needs **numpy only, not faiss**. Faiss is an optional accelerator and not a declared dependency, so requiring it made the sweep a silent no-op on a stock install. Only the index rebuild is faiss-gated; `search_episodic` falls back to `_sqlite_vector_search` (cosine over the stored blobs, numpy-accelerated when present and stdlib otherwise), so the vectors are useful either way.
 
 The backend `POST /api/memory/migrate` endpoint and the `kirocrew memory migrate` CLI remain as a manual escape hatch, but the dashboard no longer calls them.
 
@@ -554,7 +1288,7 @@ whose `repo_scope` is present but unusable counts as neither.
   a shared branch". Note the direction of that trade: attaching a condition to a rule
   makes its text longer and its guidance NARROWER, so the row that survives can be the
   one that applies in fewer cases.
-- Topic-overlap dedup: "use light mode" replaces "use dark mode" (>50% keyword overlap → newer wins)
+- Topic-overlap dedup: "use light mode" replaces "use dark mode" (shared keywords ≥ 50% of the LARGER keyword set → newer wins)
 - Allowlist validation, injection scanning, audit logging
 
 Substring-delete and topic-overlap are not independent: verbatim containment at word
@@ -643,19 +1377,274 @@ lesson beat a contradicting preference in the same prompt.
 |----------|------------|-----------|
 | Lesson contradicts a preference | Lesson wins via the `[Learned corrections]` framing | `context.py` |
 | Two semantic writes to one key | `user_explicit` overrides all; else higher confidence; confidences within 0.1 count as equal so newer wins | `vector_memory._write_semantic()` |
-| Duplicate lessons | Substring dedup (contained-in-stored declines; contains-a-stored-one DELETES it, "longer wins"), then topic-overlap dedup (≥50% of the smaller keyword set → newer replaces older), then embedding dedup (cosine > 0.85 → longer text wins). Every deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
+| Duplicate lessons | Substring dedup (contained-in-stored declines; contains-a-stored-one DELETES it, "longer wins"), then topic-overlap dedup (≥50% of the LARGER keyword set → newer replaces older — dividing by the smaller set let a terse rule score ~1.0 against a detailed one and delete it), then embedding dedup (cosine > 0.85 → longer text wins). Every deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
 | Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `vector_memory.search_episodic()` |
 | A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | `vector_memory._write_semantic()` step 9 |
 
 ### Memory across surfaces and channels
 
-All surfaces share ONE memory store. `ContextBuilder.get_memory_for()` hands
-every non-default workspace the default workspace's `VectorMemoryStore`, so
-semantic, episodic, and lesson rows are global: a lesson taught in a Slack DM
-applies in the dashboard and vice versa. The Markdown layers
+**A silo exists for exactly one thing: a crew bound to an explicit NON-DEFAULT memory
+store.** Everything else — every workspace, every channel, every surface that names no
+store — reads and writes the ONE global store an install already has, by a
+byte-identical code path. `test/test_memory_v1_golden.py` pins that path and is the
+proof; it is not to be edited to accommodate a change here.
+
+On the **default path** a workspace splits three of the six layers and no more:
+`get_memory_for()` hands every non-default *workspace* the default workspace's
+`VectorMemoryStore`, so semantic, episodic and lesson rows are global — a lesson taught
+in a Slack DM applies in the dashboard and vice versa. The Markdown layers
 (`preferences.md`, `projects.md`, `history/`) and the JSONL `LessonStore` are
 per-workspace-directory, so those ARE isolated when channels are configured onto
 different workspaces.
+
+On a **named store** all six layers are isolated, because all three handles are that
+store's own: its markdown tree, its FTS index, and its `memory.db` holding its semantic,
+episodic and lesson rows. **A named store must never be handed the global
+`VectorMemoryStore`.** Handing it one is what reduces the crew editor's Memory Store
+control to a read-side illusion: markdown splits, and every crew's semantic, episodic and
+lesson rows still land in one table. A silo whose `memory.db` already exists stays on the
+v1 lineage for the life of that file — only a newly created one gets the crew schema (see
+[Two schema lineages](#two-schema-lineages)).
+
+The JSONL lessons tier is per-target for the same reason. When the resolved store has no
+vector lessons to answer with, a named store reads its OWN `lessons.jsonl` through
+`get_lessons_for(workspace, memory_store)`; the default and workspace paths read
+`self.lessons`, the global store the builder was constructed with. Without that split a
+crew's `[Learned corrections]` block is the operator's global corrections, which is the
+one thing a silo exists to prevent.
+
+The three `/api/lessons` routes (`handlers/cron.py`) are bound by the same rule and reach
+it the same way: `_session_memory_store` reads the caller's binding off its session
+metadata, that binding picks the vector tier, and `_lesson_jsonl_store` picks the JSONL
+tier — **the destination follows the BINDING, never the population.** A named store starts
+empty and nothing is ever copied into it, so "this store holds no lesson rows" is the
+ordinary state of a freshly bound crew, and the answer to it is that store's own
+`lessons.jsonl`. Key the fallback on population instead and an empty silo lists the
+operator's lessons, substring-deletes one of them, and files the crew's own correction into
+the one file every other crew is injected with. A silo also takes no workspace union or
+`scope: "workspace"` arm: a store name and a workspace name are separate namespaces and the
+store is the tighter scope, exactly as `_target_key` resolves them.
+
+#### Two namespaces, two arguments
+
+`get_memory_for(workspace=None, memory_store=None)` and
+`get_lessons_for(workspace=None, memory_store=None)` take a workspace and a store
+SEPARATELY, and must keep doing so. A store name and a workspace name are different
+namespaces, so a single key cannot hold both: collapse them and a crew bound to store
+`acme` alongside a workspace also called `acme` shares one cache slot and one path
+resolution, letting whichever is built first decide where the other one reads.
+`_target_key(workspace, memory_store)` is the only thing that mints cache keys, and
+there are three shapes:
+
+| Key | Means | Vectors |
+|---|---|---|
+| `"default"` | the global store; seeded eagerly in `ContextBuilder.__init__` | the global `VectorMemoryStore` |
+| `"ws:<name>"` | a named workspace on the default path | the global one, shared |
+| `"store:<name>"` | a named memory store | that store's OWN, or none |
+
+`:` cannot appear in a store name (`validate_memory_store_name`), so the prefixes
+cannot collide with each other or with `"default"`.
+
+#### The five resolution cases
+
+`_resolved_store_name(memory_store)` answers with a non-default store name, or `""`
+meaning "use the default path". `""` is the answer whenever a caller cannot name a real
+silo, which is what keeps a silo unreachable by accident:
+
+| Caller passes | Resolves to | Cache key |
+|---|---|---|
+| `None` or `""` | `""` | `"default"`, or `"ws:<name>"` when a workspace is given |
+| `"default"` | `""` — short-circuited before any config read | as above |
+| a declared, usable non-default name | that name | `"store:<name>"` |
+| an **undeclared** name | `degrade_store_name`'s landing spot: `default_memory_store` when that is itself declared and usable, else the `"default"` floor | `"store:<landing>"`, or the default key when it lands on the floor |
+| a **malformed** name | `""`, because `resolve_declared_store` RAISES on a shape defect and the raise is caught and logged here | the default key |
+
+The malformed row is the one that reads as an inconsistency and is not: repairing
+`../work` or `Work` onto `work` is the single case that would silently merge two crews'
+memory into one directory, so path composition fails closed — and at this seam the safe
+landing is the global store, which is where the crew already was. A malformed name in a
+CONFIG never reaches here anyway: `usable_store_names` drops it, so the crew's binding
+degrades it first (see [config](config.md#a-malformed-name-is-undeclared-for-resolution)).
+
+#### `ensure_store` is async, and separate on purpose
+
+`await ContextBuilder.ensure_store(name)` stands up a named store's own
+`VectorMemoryStore` once and caches it in `_vector_stores`, keyed by resolved store name.
+It returns `None` for the default store (whose vector store is the global one, wired at
+startup) and `None` when the store cannot be stood up.
+
+It cannot live inside `get_memory_for`. That method is synchronous, is called
+unconditionally on every context build, and holds `_stores_lock`; `VectorMemoryStore.init()`
+is blocking file IO end to end (owner-only sweeps, `sqlite3.connect`, the WAL pragma,
+three migrations, a FAISS load) whose documented caller contract is to offload it. A
+blocking init there would stall the event loop for every caller that builds context
+inline and serialize every embed worker on a store's first touch. `init()` also has no
+idempotence guard — it reassigns `self._db` — so a lazily-initializing sync resolver is
+exactly the shape that leaks a connection. One instance per `db_path` is likewise an
+invariant rather than an optimization: two instances over one file do not share
+`_db_lock`, which voids the serialization the store's own writes depend on, so a
+construction race closes the loser.
+
+**A caller that skips `ensure_store` gets a working store with no vector tier.** Its
+`vector_store` is `None`, so reads answer from markdown plus the keyword/FTS path and
+writes skip the vector tier — it never borrows the global store's rows. That is the
+deliberate direction: losing a semantic row is recoverable, reading or overwriting
+another crew's rows is not.
+
+#### How a turn-running surface names its store
+
+There are exactly two ways a call site answers "which silo does this turn read", and
+which one applies is decided by what identity the surface holds:
+
+- **A crew alias in scope** → `resolve_agent_bindings(cfg, alias, project).memory_store_name`.
+  This is the dashboard chat turn (`chat_runner`) and a `spawn_run(crew=…)` subagent,
+  where the crew is what the caller was asked for.
+- **Only a session key in scope** → `context.store_of_session(conversation_log, key)`,
+  which reads `meta["memory_store"]` through `memory_stores.named_store_or_empty`. This
+  is every channel surface. `context.session_store_for_turn(ctx_builder, key)` is the
+  pair a turn needs — that resolution, then `prepare_store_vectors` — and it is what
+  Slack (native and transport), Discord, Telegram, the shared `messaging/dispatch`
+  pipeline, auto-nudge, and both subagent-completion injections call.
+
+`store_of_session` reads the SAME metadata key `history_consolidation._session_store_name`
+resolves the write side from, which is the point: one conversation's reads and its
+consolidations name one silo. `dashboard/handlers/_shared._session_memory_store` is a
+thin adapter over it (a `DashboardState` rather than a log), not a second implementation
+— two copies is how the dashboard's answer and a channel's answer drift apart for one
+session. Both answer `""` for an absent key, a blank, the literal `default`, a
+non-string, a missing log, and any read that raises, so a conversation that never named
+a silo runs the v1 path unchanged.
+
+**Never derive the store from `agent`.** On every channel surface that field is a
+kiro-cli agent name — a namespace disjoint from `cfg.agents` — so a store derived from
+one resolves to `default` for exactly the crew that configured otherwise, silently, and
+toward the operator's own memory. `scripts/check_memory_store_seam.py`'s
+`store-not-derived-from-agent` rule fails the build for it.
+
+#### The write path
+
+A consolidation learns its store from the session's OWN metadata, not from the
+consolidator's constructor:
+
+- `session_control.create_session` records `memory_store` in birth metadata **only when
+  the resolved binding is not the default store.** ABSENCE means global, so a default
+  user's metadata line stays byte-identical and a session carrying no such key is
+  unambiguously global rather than "global as of whenever it was saved". The birth dict is
+  the only record for a session that is created and then sits idle.
+- `memory_store` is in `history.SLOT_OWNED_META_KEYS`, so absence can RETRACT it. A crew
+  rebound from a named store back to the default writes no key at all, and an unowned key
+  is carried forward forever by `carry_unowned_metadata` — the rebind would be
+  un-erasable and the session would keep consolidating into the silo it left.
+- `_session_store_name(meta)` reads that key and answers `""` for no key, the literal
+  default, a blank value, and a non-string. It never raises: a metadata read that cannot
+  be trusted must not stop a consolidation, and erring toward the global store costs
+  nothing a default install is not already doing.
+- `_consolidate` then resolves all three handles for a named store — markdown via
+  `get_memory_for(memory_store=…)`, lessons via `get_lessons_for(memory_store=…)`,
+  vectors via `await ensure_store(…)` — and passes them into
+  `_write_structured_memory(result, key, vector_store)` and
+  `_save_lessons(raw, vector_store, lesson_store)`. Omitting them keeps the global
+  handles, which is what the workspace and default arms want.
+
+The riskiest read on that path is `get_all_semantic`: those rows go into the
+consolidation prompt and the prompt instructs the model to update and DELETE them, so a
+global fetch under a crew's consolidation would show crew B the operator's own semantic
+table and let its turn delete it. That fetch reads the resolved store, never
+`self._vector_store`.
+
+#### Routing a task to a crew
+
+Two tools, one grammar. `route_crew(task)` RANKS the crews whose `triggers` match and
+reports each one's score, `description` and resolved `memory_store`; `select_crew`
+returns the roster for the model to judge. They exist together because the questions
+differ — the same task should reach the same crew when a caller wants determinism, and a
+model should weigh prose when it does not.
+
+Scoring lives in `trigger_match`, shared with `SkillsLoader.get_triggered_skills`. One
+definition on purpose: two would agree on the easy phrasings and diverge on the ones that
+decide a route, and the symptom would be a task handled by the wrong crew — the leak a
+per-crew silo exists to prevent, arriving through the router rather than through the
+store. A crew with no `triggers` is not a candidate, which is the operator's opt-out, and
+no match returns NOTHING rather than the closest crew.
+
+Acting on a route means `spawn_run(crew=…)`, which is the only spawn form that carries a
+crew's store and template together. `spawn_run(agent=<crew name>)` is accepted and runs
+against the DEFAULT store, because `agent` is a template namespace — the reason
+`select_crew`'s guidance names `crew=` explicitly.
+
+#### What is NOT isolated yet
+
+Every surface that HOLDS a crew identity now names its store. It is still not finished,
+and reading it as finished is the failure mode to avoid:
+
+- **The unattended and offline surfaces read the global store, because nothing in
+  their scope names a crew.** Cron (both the sequential `agent_sequence` path and the
+  parallel one), the heartbeat, the webhook agent runner
+  (`dashboard/handlers/hooks.py`), the task runner's planner and executor, and
+  `eval/runner.py` pass no store. That is the correct answer for each rather than a
+  pending fix: a `CronJob` has no crew field and its `agent_id` / `agent_sequence`
+  entries are kiro agent names; the heartbeat is one process-wide key on the fixed
+  `kirocrew-heartbeat` template; the webhook's `agent` is validated against INSTALLED
+  kiro templates and its `hook:` session is ephemeral, so it records no binding; the
+  task runner's per-step session keys are synthesized, and giving a run the store of
+  the conversation it was started FROM is a design decision about whose memory a task
+  run belongs to rather than a resolution of identity in scope; the eval harness runs a
+  synthetic key in a throwaway workspace. The omission stays visible in
+  `test_memory_store_seam.EXPECTED_BACKLOG` rather than being papered over with a
+  keyword that changes nothing.
+
+  What IS covered: the dashboard chat turn and `spawn_run` resolve a crew alias through
+  `resolve_agent_bindings`; Slack (native and transport), Discord, Telegram, the shared
+  `messaging/dispatch` pipeline, auto-nudge, and both subagent-completion injections
+  resolve the session's own recorded binding through `context.session_store_for_turn`.
+  The store is RESOLVED or CARRIED, never derived from `agent`.
+
+  Crew-mode topics and delegated runs are likewise covered: `SubagentInfo` carries a
+  `memory_store`, `crew_chat` passes the parent slot's store at both dispatch and
+  respawn, and `spawn_run(crew=…)` resolves a named crew's store through
+  `resolve_agent_bindings`.
+
+  A channel conversation reaches a silo exactly when its session records one — a thread
+  taken over from (or resumed into) a crew-bound dashboard session, or a channel slot
+  whose crew was switched from the dashboard. A channel that was never bound to a crew
+  records no key and runs the v1 path, which is nearly every channel conversation.
+- **The dashboard Memory panel reaches any DECLARED store, for the OWNER only.** The
+  markdown documents, semantic rows, episodic rows, events, carve and stats are read
+  and edited per store through the owner-gated `?store=`, and the retired, backup,
+  restore and store-declaration routes are store-scoped in the same way (see
+  [Which store a dashboard route reads](#which-store-a-dashboard-route-reads-store)).
+  What is still GLOBAL-store-only is every route that carries no store parameter and
+  opens the gateway's own handles: the memory graph, `observability`,
+  `context-preview`, `promote`, `migrate` and `import`. So a silo can be browsed and
+  edited from the UI while promotion and the graph still describe the operator's own
+  memory, whichever store the panel is showing. `consolidate` is the exception that
+  needs no parameter: it triggers one SESSION's consolidation, and the consolidator
+  resolves that session's own store from its metadata. A non-owner dashboard session
+  keeps reading its own binding, exactly as before.
+- **`security.scan_memory` DOES scan a named store** — it is the one reader on this list
+  that reaches one. It enumerates the declared table through `usable_store_names`, opens
+  each store's `resolve_store_path` directly, and attributes every finding with a `store`
+  key; see [security](security.md). What it still does not reach is a silo that is not
+  DECLARED, which is deliberate rather than pending.
+- **The markdown export surfaces cannot read a named store.** `markdown_snapshot` and
+  `read_history_entries` go through `_guarded_entry` →
+  `hooks.safe_read_file_bytes_nolink`, whose resolved-path check calls `is_sensitive_path`
+  — True for anything under the `memory_stores/` fence — so a named store answers with
+  empty entries. Nothing reaches it today: both callers are `kirocrew memory` CLI verbs
+  anchored on `_markdown_memory_store()`, the default store. The ordinary context read
+  path does plain reads and is unaffected, and so are the store-scoped dashboard
+  markdown routes — `read_preferences` / `read_projects` / `read_recent_history` read
+  plainly and never enter `_guarded_entry`, which is why a silo's documents are
+  editable from the Memory panel while `markdown_snapshot` still answers empty for it.
+- **Auto-skills are not per-store.** `_run_skill_detection` / `_process_auto_skills` write
+  through `SkillsLoader` into the single skills root; a crew's consolidation can promote a
+  skill every crew then sees.
+- **Per-store `embedding_provider` has no effect, and cannot be given one as written.**
+  `MemoryStoreConfig.embedding_provider` is merged into `effective_memory_config` by
+  `resolve_memory_store_config`, but `_build_store_vectors` reads top-level `cfg.memory`,
+  and the embedder underneath is `get_shared_embedder()` — a process-wide singleton
+  holding one ~700MB model. Two stores on two backends would mean two resident models and
+  two incomparable vector spaces, so this stays inherit-or-restate.
 
 What differs per channel is what gets *recorded* and what reaches the model:
 

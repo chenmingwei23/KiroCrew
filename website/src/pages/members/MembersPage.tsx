@@ -1460,12 +1460,14 @@ export default function MembersPage() {
               <dd className="min-w-0 truncate">{String(active.memory_store ?? '')}</dd>
             </div>
           </dl>
-          {/* Honest disclosure, always rendered, worded for this member's store.
-              Only the markdown layer (preferences, project notes) is read from a
-              named memory_store; conversation memory and lessons live in the
-              one global vector store every member reads, so "what you tell it
-              is known to all of them" stays true on a dedicated store too.
-              Store identity is a config fact — never inferred from the roster. */}
+          {/* Honest disclosure, always rendered, placed under the store row it
+              qualifies and worded for that row's value: a member remembers
+              separately only once the row names a store other than the default,
+              so the row on its own reads as if every member already had a memory
+              of its own. A named store is a separate file — its own markdown
+              tree, vector rows and FTS index — so the dedicated wording is a
+              claim about isolation, not about a partial one. Store identity is a
+              config fact, never inferred from the roster. */}
           <div className="mt-3 text-[11px] text-muted border border-border rounded-md px-2.5 py-2">
             {String(active.memory_store || 'default') === 'default'
               ? t('pages.membersPage.memory_shared_note')

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, event_is_spawn_run
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
@@ -617,6 +618,17 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(sessions, session_key)
+        # This conversation's own silo, from the session's RECORDED binding and
+        # never from ``turn.agent``: that field carries a kiro-cli template id, a
+        # namespace disjoint from ``cfg.agents``, so a store derived from it
+        # resolves to ``default`` for exactly the crew that configured otherwise.
+        # Resolved on the shared seam rather than per adopter for the same reason
+        # ``minimal_context`` is: every channel on this pipeline has the same
+        # exposure, and one that forgot would silently read the operator's memory.
+        # Awaited before the offloaded build because it stands up the silo's vector
+        # tier (blocking file IO), and best-effort throughout, so this adds no
+        # failure mode to a turn a user is waiting on.
+        memory_store = await session_store_for_turn(ctx_builder, session_key)
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             ctx_builder.build_message,
@@ -625,6 +637,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             session_key,
             channel_id=turn.conversation_id,
             agent=turn.agent,
+            memory_store=memory_store,
             resumed=resumed,
             minimal_context=turn.minimal_context,
             runtime_source=turn.channel_type,

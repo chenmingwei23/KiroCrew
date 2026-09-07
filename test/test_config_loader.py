@@ -48,6 +48,7 @@ from kiro_crew.config.loader import (
     validate_kiro_agent_references,
     workspace_dir_for,
 )
+from kiro_crew.memory_stores import memory_store_name_defect
 from kiro_crew.stt import limits as stt_limits
 from kiro_crew.stt import models as stt_models
 
@@ -455,6 +456,19 @@ _safe_name_st = st.text(
     min_size=1,
     max_size=15,
 )
+
+# Memory-store names are stricter than the generic identifier alphabet above: a
+# store name becomes a single path segment, so ``memory_store_name_defect``
+# refuses an underscore, an outer hyphen and a Windows device basename. Such a
+# name is UNDECLARED for resolution however the config spells it, which is what
+# stops ``resolve_agent_bindings`` from handing a crew a store no resolver will
+# compose a path for. A property about a store a crew is genuinely BOUND to
+# therefore has to generate a name the shape rule accepts.
+_store_name_st = st.text(
+    alphabet=st.sampled_from("abcdefghijklmnopqrstuvwxyz0123456789-"),
+    min_size=1,
+    max_size=15,
+).filter(lambda n: memory_store_name_defect(n) is None)
 
 # Strategy for KiroCrewAgentConfig instances
 _kirocrew_agent_config_st = st.builds(
@@ -1113,7 +1127,7 @@ class TestAgentWorkspaceBindingsProperties:
     @given(
         agent_name=_safe_name_st,
         ws_name=_safe_name_st,
-        store_name=_safe_name_st,
+        store_name=_store_name_st,
         kiro_agent_name=st.text(min_size=1, max_size=20),
         ws_dir=st.text(min_size=1, max_size=30),
         store_desc=st.text(min_size=0, max_size=20),
@@ -1175,7 +1189,7 @@ class TestAgentWorkspaceBindingsProperties:
         missing_ws=_safe_name_st,
         missing_store=_safe_name_st,
         fallback_ws_name=_safe_name_st,
-        fallback_store_name=_safe_name_st,
+        fallback_store_name=_store_name_st,
         fallback_ws_dir=st.text(min_size=1, max_size=30),
     )
     @settings(deadline=None)
@@ -1462,6 +1476,62 @@ class TestAgentWorkspaceBindingsProperties:
         # Resolve bindings → uses migrated default agent
         result = resolve_agent_bindings(cfg)
         assert result.kiro_agent == expected_kiro
+
+
+class TestMemoryStoreBindingFloor:
+    """A crew that named no silo stays on the store the whole install already has.
+
+    ``"default"`` is the FLOOR, the way ``ACP_BACKEND_KIRO`` is the harness floor: it
+    names the markdown tree and vector file every install already carries, so it counts
+    as declared whether or not the operator's ``memory_stores`` table mentions it. The
+    resolvers in ``memory_stores`` union it in; ``resolve_agent_bindings`` must union
+    the same thing, or the two membership tests disagree.
+
+    Without the union, an operator who declares one store and points
+    ``default_memory_store`` at it relocates EVERY crew into that silo — including
+    crews whose config literally says ``"memory_store": "default"`` — because the raw
+    table has no ``"default"`` key, so the name reads as undeclared and degrades onto
+    the configured default. Nothing reports it, and each crew starts reading and
+    writing an empty store instead of the memory the operator has been building.
+    """
+
+    @pytest.mark.parametrize(
+        "bound",
+        ["default", "", None],
+        ids=["explicit-default", "empty-string", "key-absent"],
+    )
+    def test_a_crew_that_named_no_silo_resolves_to_the_default_store(self, bound) -> None:
+        # ``None`` stands for the key being absent from the crew's config entry: the
+        # field's own default is the floor, and this pins that the two agree.
+        assert KiroCrewAgentConfig().memory_store == "default"
+        agent_kwargs: dict = {"kiro_agent": "kirocrew", "workspace": "default"}
+        if bound is not None:
+            agent_kwargs["memory_store"] = bound
+
+        config = KiroCrewConfig(
+            agents={
+                "floor": KiroCrewAgentConfig(**agent_kwargs),
+                # A crew that DID choose a silo, and a crew whose choice cannot be
+                # resolved. Both in the same config, so the floor union cannot be
+                # satisfied by answering "default" unconditionally, and cannot have
+                # broken ``default_memory_store`` as the repair target for a name that
+                # WAS chosen and is unusable.
+                "chose": KiroCrewAgentConfig(kiro_agent="kirocrew", memory_store="work"),
+                "broken": KiroCrewAgentConfig(kiro_agent="kirocrew", memory_store="gone"),
+            },
+            default_agent="floor",
+            workspaces={"default": WorkspaceConfig(dir="workspace")},
+            default_workspace="default",
+            # The operator's table names ONLY other stores, and ``default_memory_store``
+            # is one of them. This is the exact config shape that relocated every crew.
+            memory_stores={"work": MemoryStoreConfig(), "email": MemoryStoreConfig()},
+            default_memory_store="work",
+        )
+        assert "default" not in config.memory_stores, "the floor must not be declared here"
+
+        assert resolve_agent_bindings(config, agent_name="floor").memory_store_name == "default"
+        assert resolve_agent_bindings(config, agent_name="chose").memory_store_name == "work"
+        assert resolve_agent_bindings(config, agent_name="broken").memory_store_name == "work"
 
 
 class TestResourceIndependence:
@@ -1927,7 +1997,7 @@ class TestMultiAgentOrchestrationProperties:
     @given(
         agent_name=_safe_name_st,
         ws_name=_safe_name_st,
-        store_name=_safe_name_st,
+        store_name=_store_name_st,
         kiro_agent_name=st.text(min_size=1, max_size=15),
         ws_dir=st.text(min_size=1, max_size=20),
     )

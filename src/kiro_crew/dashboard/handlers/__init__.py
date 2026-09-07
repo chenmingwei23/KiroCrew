@@ -235,6 +235,7 @@ from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
     _get_vector_store,
     _redact_memory_field,
     _set_migrated,
+    api_memory_carve,
     api_memory_consolidate,
     api_memory_context_preview,
     api_memory_disable_embeddings,
@@ -258,6 +259,17 @@ from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
     api_memory_semantic_write,
     api_memory_settings,
     api_memory_stats,
+)
+
+# ── Memory store administration (handlers/memory_admin.py) ──
+from kiro_crew.dashboard.handlers.memory_admin import (  # noqa: E402, F401
+    api_memory_backup,
+    api_memory_backups,
+    api_memory_restore,
+    api_memory_retired,
+    api_memory_retired_restore,
+    api_memory_store_create,
+    api_memory_stores,
 )
 
 # ── Messaging (extracted to handlers/messaging.py) ──

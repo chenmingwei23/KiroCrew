@@ -394,7 +394,26 @@ class ContinuationCoordinator(ManagerComponent):
             include_memory=inc_memory,
             include_lessons=inc_lessons,
             include_project=inc_project,
+            # Inherited for the same reason as the context groups above: a
+            # continuation is another turn of the SAME run. Without it a crew
+            # topic's first message reads the crew's silo and every routed
+            # follow-up reads the global store -- a split nothing reports.
+            memory_store=self._manager._inherited_memory_store(conv_id),
         )
+
+    def _inherited_memory_store_impl(self, conv_id: str) -> str:
+        """The memory silo run *conv_id* is executing in, or ``""`` for global.
+
+        Live record only, deliberately. Its context-group twin falls back to
+        ``state.json`` because a withheld group must not be silently regained;
+        here the fallback would be the opposite kind of guess -- ``state.json``
+        records no store, so inventing one from an absent field is how a
+        continuation would land in a silo the original run never used. An
+        unknown run therefore continues on the global store, which is where every
+        continuation ran before silos existed.
+        """
+        live = self._manager._agents.get(conv_id)
+        return getattr(live, "memory_store", "") or "" if live is not None else ""
 
     def recorded_cwd_impl(self, conv_id: str) -> str:
         """The cwd run *conv_id* executed in, or "" if it never had one.

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.discord.attachments import (
     append_attachment_context,
     process_discord_attachments,
@@ -729,6 +730,16 @@ class DiscordDispatcher:
             # Publish this turn's session identity so managed MCP tools resolve
             # X-Session-Key; one shared writer lives in messaging.identity.
             await publish_turn_identity(self.sessions, session_key)
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``agent``: that value is a kiro agent name, a namespace
+            # disjoint from ``cfg.agents``, so a store derived from it resolves to
+            # ``default`` for exactly the crew that configured otherwise. A resumed
+            # dashboard session carries its crew's key here, which is what keeps a
+            # `!sessions` resume of a crew-bound conversation out of the operator's
+            # own memory. Awaited before the offloaded build because it stands up
+            # the silo's vector tier (blocking file IO), and best-effort, so a silo
+            # that cannot be prepared costs this turn its vectors only.
+            _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -737,6 +748,7 @@ class DiscordDispatcher:
                 session_key,
                 channel_id=chan_id,
                 agent=agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 runtime_source="discord",
             )

@@ -184,7 +184,6 @@ src/kiro_crew/connections/l0_probe.py
 src/kiro_crew/connections/l0_record.py
 src/kiro_crew/connections/registry.py
 src/kiro_crew/connections/tool_aliases.py
-src/kiro_crew/crew_chat.py
 src/kiro_crew/cron_history.py
 src/kiro_crew/dashboard/cautious_boot.py
 src/kiro_crew/dashboard/channel_folders.py
@@ -350,10 +349,8 @@ src/kiro_crew/slack/interactions.py
 src/kiro_crew/slack/sessions_view.py
 src/kiro_crew/subagent_persistence.py
 src/kiro_crew/subagent_scale.py
-src/kiro_crew/suggestions.py
 src/kiro_crew/testing/channel_fixtures.py
 src/kiro_crew/testing/fake_acp_backend.py
-src/kiro_crew/vector_memory.py
 src/kiro_crew/webhooks.py
 src/kiro_crew/weixin/client.py
 src/kiro_crew/workflows/agent_exec.py

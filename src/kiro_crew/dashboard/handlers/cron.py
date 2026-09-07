@@ -12,12 +12,13 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.config.loader import config_dir
+from kiro_crew.context import ContextBuilder
 from kiro_crew.cron import (
     CronPendingMismatch,
     CronStoreBusy,
@@ -71,8 +72,12 @@ from ._shared import (
     _is_restricted_session,
     _probe_persisted_session,
     _redact_memory_field,
+    _session_memory_store,
     read_bounded_json,
 )
+
+if TYPE_CHECKING:
+    from kiro_crew.learn import LessonStore
 
 logger = logging.getLogger(__name__)
 
@@ -1922,6 +1927,39 @@ async def _recognize_session(
     return None
 
 
+def _lesson_jsonl_store(
+    state: DashboardState,
+    silo: str,
+    scope: str = "global",
+    workspace: str | None = None,
+) -> LessonStore:
+    """The JSONL lessons file a caller bound to *silo* reads and writes.
+
+    THE DESTINATION FOLLOWS THE BINDING, NEVER THE POPULATION. A named store starts
+    empty and nothing is ever copied into it, so "this store holds no lessons" is the
+    ordinary state of a freshly bound crew — and the answer to it is that store's OWN
+    ``lessons.jsonl``, reached through the same ``get_lessons_for`` seam the context
+    builder and the consolidator use. Keying the choice on whether rows exist is what
+    let an empty silo read the operator's global lessons, substring-delete one of them,
+    and file the crew's own correction into the one file every other crew is injected
+    with. ``state.lessons`` and the per-workspace stores are reachable only from the
+    GLOBAL binding, which is where every install without a silo writes.
+
+    A silo takes no *workspace* arm even when *scope* asks for one: a store name and a
+    workspace name are separate namespaces and the store is the tighter scope, the same
+    precedence ``context._target_key`` applies. *scope* carries the
+    ``ALLOWED_LESSON_SCOPES`` wire value, and its default is the value
+    ``LEARN_ADD_SCHEMA`` supplies when a caller names none — which is also what the
+    read-only list route passes, since that route unions the workspace tier rather than
+    selecting between the two.
+    """
+    if silo:
+        return ContextBuilder.get_lessons_for(memory_store=silo)
+    if scope == "workspace":
+        return _get_lessons(state, workspace)
+    return state.lessons
+
+
 async def api_lessons_create(request: web.Request) -> web.Response:
     """POST /api/lessons — add a lesson (vector store or JSONL fallback)."""
     from kiro_crew.learn import Lesson  # noqa: F811
@@ -1986,7 +2024,19 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # the vector store rather than injecting a scoped lesson the other withholds.
     repo_scope = cleaned.get("repo_scope") or None
     # Write to vector store if available, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo = _session_memory_store(state, sk)
+    _lesson_mem = (
+        ContextBuilder.get_memory_for(memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     if vs:
         # Embed the rule once off the event loop and reuse it for both the
         # contradiction scan and write_lesson's own dedup pass — the store
@@ -2058,11 +2108,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             repo_scope=repo_scope,
             ts=datetime.now(timezone.utc).isoformat(),
         )
-        store = (
-            _get_lessons(state, cleaned.get("workspace"))
-            if scope == "workspace"
-            else (state.lessons)
-        )
+        store = _lesson_jsonl_store(state, _lesson_silo, scope, cleaned.get("workspace"))
         # save_or_enrich, not save: a re-submit of a stored rule carrying a new
         # NOT-clause has to attach it rather than be skipped as a duplicate.
         # Off the loop because it reads the file and rewrites it whole -- the
@@ -2070,10 +2116,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         #
         # This store answers with the same three words the vector store's outcome uses
         # (inserted / enriched / unchanged) and validates no content, so it has no
-        # refusing outcome to report. Its value is echoed as-is: ``state.lessons`` is a
-        # real ``LessonStore`` at every construction site, and its ``save_or_enrich``
-        # is annotated ``-> str`` with three string-literal returns, so there is
-        # nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
+        # refusing outcome to report. Its value is echoed as-is: every arm of
+        # ``_lesson_jsonl_store`` answers with a real ``LessonStore``, and its
+        # ``save_or_enrich`` is annotated ``-> str`` with three string-literal returns,
+        # so there is nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
         # LessonWriteOutcome's wire values against those three words, so the two
         # stores cannot drift apart in silence.
         outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
@@ -2166,14 +2212,27 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         return web.json_response({"error": "rule substring required"}, status=400)
     scope = body.get("scope", "global")
     # Delete from vector store if active, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo = _session_memory_store(state, sk)
+    _lesson_mem = (
+        ContextBuilder.get_memory_for(memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
-    if vs_lessons:
+    # `vs and` rather than `vs_lessons` alone: the rows do not narrow the store,
+    # and the store is a real union now that it is resolved per caller instead of
+    # arriving untyped from the global getter.
+    if vs and vs_lessons:
         ok = await asyncio.to_thread(vs.delete_lesson, rule_sub)
     else:
-        store = (
-            _get_lessons(state, body.get("workspace")) if scope == "workspace" else (state.lessons)
-        )
+        store = _lesson_jsonl_store(state, _lesson_silo, scope, body.get("workspace"))
         # Off the loop. remove() now takes the store's shared lock, which a worker
         # thread can be holding across file I/O for a concurrent save_or_enrich --
         # so calling it inline would let one lessons write stall every task on the
@@ -2442,7 +2501,19 @@ async def api_lessons(request: web.Request) -> web.Response:
         return {"rule": safe_rule, "category": safe_category, "ts": ts}
 
     # Read from vector store if it has lessons, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo = _session_memory_store(state, request.headers.get("X-Session-Key", ""))
+    _lesson_mem = (
+        ContextBuilder.get_memory_for(memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
     if vs_lessons:
         # Deferred import: ``vector_memory`` pulls snowballstemmer plus the
@@ -2467,14 +2538,19 @@ async def api_lessons(request: web.Request) -> web.Response:
             raw_category = decoded.get("category") if isinstance(decoded, dict) else None
             data.append(_safe_lesson(rule, raw_category, e.get("updated_at", "")))
     else:
-        # Merge global + workspace-scoped lessons
-        global_lessons = state.lessons.load_all()
-        ws = workspace or _get_active_workspace(state)
-        if ws != "default":
-            ws_lessons = _get_lessons(state, ws).load_all()
-            seen = {le.rule.lower().strip() for le in global_lessons}
-            for le in ws_lessons:
-                if le.rule.lower().strip() not in seen:
-                    global_lessons.append(le)
-        data = [_safe_lesson(le.rule, le.category, le.ts) for le in global_lessons[-50:]]
+        # The JSONL tier of the store this caller is BOUND to, which for a silo is its
+        # own file and never the operator's -- an empty silo answers "no lessons", not
+        # "here are the global ones". A silo also takes no workspace union: the two are
+        # separate namespaces, so another target's rows are not this store's to show.
+        rows = _lesson_jsonl_store(state, _lesson_silo).load_all()
+        if not _lesson_silo:
+            # Merge global + workspace-scoped lessons
+            ws = workspace or _get_active_workspace(state)
+            if ws != "default":
+                ws_lessons = _get_lessons(state, ws).load_all()
+                seen = {le.rule.lower().strip() for le in rows}
+                for le in ws_lessons:
+                    if le.rule.lower().strip() not in seen:
+                        rows.append(le)
+        data = [_safe_lesson(le.rule, le.category, le.ts) for le in rows[-50:]]
     return web.json_response({"lessons": data})

@@ -245,6 +245,20 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     "live_target.json",
     "backup",
     "mcp-apps",
+    # Named memory stores (``memory_stores.py``): one subdirectory per crew, each
+    # holding that crew's private markdown memory, FTS index and vector database.
+    # HIDDEN rather than read-only, and the reason is the direction the harm runs in:
+    # the value of the fence is that a crew cannot READ another crew's memory, so
+    # exposing the tree read-only would preserve exactly the exposure. Nothing inside
+    # the sandbox opens a store — the consolidator and the context builder run in the
+    # gateway, and the in-sandbox MCP servers reach memory through gateway endpoints
+    # rather than constructing a store — so masking it costs no live consumer.
+    #
+    # The DEFAULT store is untouched by this entry, deliberately: its files
+    # (``workspace/memory/``, ``memory.db``) are the agent's OWN memory and are not on
+    # the sensitive list at all. See docs/system-specs/modules/security.md for why that
+    # asymmetry is a decision.
+    "memory_stores",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",

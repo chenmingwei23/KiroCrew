@@ -10611,12 +10611,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Un identifiant unique pour cet espace de travail. Les agents référencent les espaces de travail par leur nom.",
-      "additional_stores_coming_with_memory_v2": "Seul le magasin par défaut est disponible pour l’instant ; la prise en charge d’autres magasins de mémoire arrive bientôt.",
       "agent_template_is_required": "Le modèle d'agent est obligatoire",
       "agents": "Agents",
       "also_used_by_these_crews": "Aussi utilisé par {{crews}}. Les agents qui partagent un stockage peuvent lire les fichiers et la mémoire des autres.",
-      "bindings_preview_info": "Aperçu. La mémoire isolée par agent est encore en construction. Un agent a son propre dossier, mais la mémoire sémantique, le rappel des conversations passées et les leçons globales atteignent tous les agents, donc changer ceci ne sépare pas ce dont un agent se souvient.",
-      "bindings_preview_notice": "Aperçu. Chaque agent lit et écrit déjà son propre dossier, mais ce dont il se souvient n’est pas encore séparé : la mémoire sémantique, le rappel des conversations passées et les leçons globales atteignent tous les agents. Une mémoire isolée par agent arrive bientôt.",
+      "bindings_preview_info": "Un agent lié à son propre magasin de mémoire se souvient désormais séparément quel que soit le point d’appel : dans le chat, depuis un canal de messagerie et lors d’une tâche planifiée. Sur la page Mémoire, la personne propriétaire du tableau de bord connectée peut pointer le sélecteur de magasins vers n’importe quel magasin déclaré.",
+      "bindings_preview_notice": "Un agent lié à son propre magasin de mémoire garde pour lui ce qu’il retient. Les agents restés sur le magasin par défaut partagent toujours une seule mémoire.",
       "cancel": "Annuler",
       "chat_with_this_crew": "Discuter avec cet agent",
       "copy_from_optional": "Copier depuis (facultatif)",
@@ -10696,7 +10695,7 @@
       "view_cards_tooltip": "Cartes aérées montrant ce qu’utilise chaque agent",
       "view_list": "Liste",
       "view_list_tooltip": "Tableau compact, une ligne par agent",
-      "which_store_its_lessons_and_history_are_written": "À quel magasin de mémoire cet agent est rattaché. Le rattachement est enregistré, mais il ne donne pas encore à l’agent une mémoire qui lui soit propre.",
+      "which_store_its_lessons_and_history_are_written": "Le magasin de mémoire auquel cet agent est lié. Un agent doté de son propre magasin conserve ses préférences, ses projets, son historique quotidien, les faits enregistrés, les conversations retrouvées et les leçons. Les agents restés sur le magasin par défaut partagent une seule mémoire.",
       "workspace": "espace de travail",
       "workspace_2": "Espace de travail",
       "workspace_name_is_required": "Le nom de l’espace de travail est obligatoire",
@@ -10709,7 +10708,8 @@
       "discard_unsaved_body": "Cet équipage a des modifications qui n'ont jamais été enregistrées. Fermer maintenant les supprimera.",
       "discard_confirm": "Abandonner les modifications",
       "discard_also_crew_edits": "Les autres modifications non enregistrées de cet équipage seront supprimées avec elle.",
-      "editor_options_load_failed": "Impossible de charger les options d'espace de travail, de modèle et de magasin de mémoire de l'éditeur de crew."
+      "editor_options_load_failed": "Impossible de charger les options d'espace de travail, de modèle et de magasin de mémoire de l'éditeur de crew.",
+      "only_the_default_store_is_declared": "Seul le magasin par défaut est déclaré dans votre fichier de configuration. Déclarez-en un autre avec Nouveau magasin sur la page Mémoire pour donner à un agent une mémoire qui lui est propre."
     },
     "knowledge": {
       "detailView": {
@@ -10950,7 +10950,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "Limite de fragments par source",
+        "chunk_limit_desc": "Nombre maximal de fragments qu’une seule source peut ingérer par cycle d’analyse. Chaque fragment coûte un appel d’extraction au LLM. 0 = sans limite.",
+        "max_sources_label": "Sources max",
+        "max_sources_desc": "Nombre maximal de sources de connaissances découvertes automatiquement. Les sources ajoutées à la main ne sont pas plafonnées. 0 = sans limite.",
+        "auto_project_label": "Enregistrer automatiquement les documents du projet",
+        "auto_project_desc": "Enregistre automatiquement comme source de connaissances les documents de chaque projet sur lequel tu travailles."
       }
     },
     "localStorageDebug": {
@@ -11441,7 +11447,8 @@
         "session_other": "{{count}} sessions",
         "summarize_now": "Résumer maintenant",
         "tool": "outil",
-        "when": "Quand"
+        "when": "Quand",
+        "the_cards_below_do_not_follow_the_store_picker_m": "Les cartes ci-dessous ne suivent pas le sélecteur de magasin. Les paramètres de mémoire et le modèle d’embeddings valent pour toute l’installation, les leçons fusionnent le magasin global avec celui de l’espace de travail actif, et l’explorateur de mémoire vectorielle lit le magasin auquel cette session est rattachée."
       },
       "portabilityTab": {
         "archive_contents": "Contenu de l'archive :",
@@ -11768,6 +11775,81 @@
         "vector_memory": "Mémoire vectorielle",
         "vector_memory_is_initializing_the_embedding_mode": "La mémoire vectorielle s'initialise. Le modèle d'embedding (~610MB) se télécharge automatiquement en arrière-plan et l'ancienne mémoire est migrée d'elle-même — aucune action requise.",
         "verifying_model_integrity": "Vérification de l’intégrité du modèle…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "Un nouveau magasin démarre vide et garde sa mémoire dans son propre fichier de base de données, donc rien de ce qu’un agent y mémorise n’atteint un autre magasin. Impossible de retirer la déclaration d’un magasin depuis ici : cela rendrait orphelin tout ce qu’il a mémorisé, il faut donc une étape délibérée en dehors de cette page.",
+        "a_store_with_that_name_is_already_declared_pick": "Un magasin portant ce nom est déjà déclaré. Choisis-le dans la liste au lieu de le déclarer à nouveau.",
+        "backups": "Sauvegardes : <v/>",
+        "cancel": "Annuler",
+        "crew_silo": "Magasin de l’agent",
+        "declare_store": "Déclarer le magasin",
+        "episodes": "Épisodes : <v/>",
+        "facts_and_directives": "Faits et directives : <v/>",
+        "lessons": "Leçons : <v/>",
+        "memory_store": "Magasin de mémoire",
+        "new_memory_store": "Nouveau magasin de mémoire",
+        "new_store": "Nouveau magasin",
+        "newest_backup": "Sauvegarde la plus récente : <v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "Seul le propriétaire du tableau de bord connecté peut désigner un magasin de mémoire par son nom. Tout sur cette page lit encore le magasin auquel cette session est rattachée.",
+        "schema_lineage": "Lignée du schéma : <v/>",
+        "shared_default_store": "Magasin par défaut partagé",
+        "store_name": "Nom du magasin",
+        "that_name_cannot_be_used_for_a_store_directory_u": "Ce nom ne peut pas servir de répertoire de magasin. Utilise des lettres minuscules, des chiffres et des tirets.",
+        "the_picker_drives_this_card_the_preferences_proj": "Le sélecteur pilote cette carte, les documents de préférences, projets et historique quotidien, ainsi que les cartes de répartition, de mémoires retirées et de sauvegardes ci-dessous.",
+        "this_install_does_not_declare_a_memory_store_by": "Cette installation ne déclare plus de magasin de mémoire portant ce nom. Choisis un autre magasin dans la liste ci-dessus.",
+        "this_store_has_no_database_file_that_can_be_read": "Ce magasin n’a pas encore de fichier de base de données lisible. Il est créé la première fois que quelque chose y est mémorisé, donc il n’y a rien à lister d’ici là. Toute sauvegarde qu’il possède déjà reste restaurable ci-dessous.",
+        "this_store_is_declared_but_its_database_could_no": "Ce magasin est déclaré, mais sa base de données n’a pas pu être ouverte. Rien n’est affiché plutôt que la mémoire d’un autre magasin sous ce nom.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Ce magasin utilise le schéma partagé, donc les facettes de répartition ne s’y appliquent pas.",
+        "unknown": "inconnu"
+      },
+      "memoryRetiredCard": {
+        "actions": "Actions",
+        "an_episode_lands_here_when_a_later_fact_supersed": "Un épisode arrive ici quand un fait plus récent le remplace.",
+        "episodes_a_later_fact_superseded_their_text_is_k": "Épisodes qu’un fait plus récent a remplacés. Leur texte est conservé, donc un retrait qui a supprimé quelque chose que tu voulais garder peut être annulé ici.",
+        "memory": "Mémoire",
+        "not_recorded": "non renseigné",
+        "nothing_has_been_retired": "Rien n’a été retiré",
+        "restore": "Restaurer",
+        "retired": "Retirée",
+        "retired_memories": "Mémoires retirées",
+        "superseded_by": "Remplacée par",
+        "times_retired": "Retraits",
+        "unknown": "inconnu"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "Une base de données restaurée n’est lue qu’au prochain démarrage de la passerelle. En attendant, ce magasin de mémoire continue d’utiliser le fichier qui a été remplacé.",
+        "actions": "Actions",
+        "already_recent": "Déjà récentes : {{value}}",
+        "back_up_now": "Sauvegarder maintenant",
+        "backups": "Sauvegardes",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "Les sauvegardes sont prises selon une minuterie, et « Sauvegarder maintenant » en prend une tout de suite.",
+        "cancel": "Annuler",
+        "confirm_restore": "Confirmer la restauration",
+        "copies_taken": "Copies créées : {{value}}",
+        "failed": "En échec : {{value}}",
+        "no_backups_yet": "Aucune sauvegarde pour l’instant",
+        "older_copies_removed": "Anciennes copies supprimées : {{value}}",
+        "restore": "Restaurer",
+        "restored_the_database_it_replaced_was_kept_besid": "Restaurée. La base de données remplacée a été conservée à côté du fichier du magasin au lieu d’être écrasée, sous ce nom : <name/>",
+        "size": "Taille",
+        "taken": "Créée",
+        "this_replaces_the_store_s_live_database_the_file": "Cela remplace la base de données active du magasin. Le fichier déplacé est conservé à côté sous un nom de remplacé, donc rien n’est supprimé."
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "Un décompte apparaît dès que quelque chose est mémorisé avec cet axe renseigné.",
+        "carve": "Répartition",
+        "clear_filter": "Effacer le filtre",
+        "count_by": "Compter par",
+        "crew": "Agent",
+        "how_this_store_s_memory_divides_up_across_the_ax": "Comment la mémoire de ce magasin se répartit selon les axes que chaque écriture estampille. Choisis une valeur pour lister les mémoires de cette tranche.",
+        "kind": "Type",
+        "memory": "Mémoire",
+        "no_live_memories_in_this_slice": "Aucune mémoire active dans cette tranche",
+        "not_recorded": "non renseigné",
+        "nothing_is_stamped_on_this_axis_yet": "Rien n’est encore estampillé sur cet axe",
+        "surface": "Surface",
+        "the_count_includes_only_live_rows_so_a_slice_can": "Le décompte ne compte que les lignes actives, donc une tranche peut se vider entre deux lectures.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Ce magasin utilise le schéma partagé, donc les facettes de répartition ne s’appliquent pas. Ses lignes ne portent aucune marque de agent, de surface ni de portée pour les diviser, ce qui n’est pas la même chose qu’un magasin vide."
       }
     },
     "overviewPage": {
@@ -14286,8 +14368,8 @@
       "member_count_many": "{{count}} membres",
       "member_count_one": "{{count}} membre",
       "member_count_other": "{{count}} membres",
-      "memory_dedicated_note": "Les préférences et les notes de projet viennent du magasin {{store}} plutôt que du magasin partagé par défaut. La mémoire de conversation et les leçons ne sont pas encore séparées : ce que tu dis à ce membre reste connu de tous.",
-      "memory_shared_note": "Les membres partagent actuellement une seule mémoire. Ce que vous dites à l'un est connu de tous.",
+      "memory_dedicated_note": "Les préférences, les notes de projet, les faits enregistrés, les conversations retrouvées et les leçons viennent du magasin {{store}} et non du magasin partagé par défaut, donc ce que vous confiez à ce membre reste avec lui.",
+      "memory_shared_note": "Les membres sur le magasin de mémoire par défaut partagent une seule mémoire : ce que tu dis à l'un est connu de tous. Un membre rattaché à son propre magasin mémorise séparément, où que tu lui parles.",
       "memory_store": "Mémoire",
       "model": "Modèle",
       "opening_thread": "Ouverture de la conversation…",

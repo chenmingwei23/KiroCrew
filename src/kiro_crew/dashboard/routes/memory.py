@@ -41,6 +41,7 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/memory/semantic", handlers.api_memory_semantic_write)
     app.router.add_delete("/api/memory/semantic/{key:.+}", handlers.api_memory_semantic_delete)
     app.router.add_get("/api/memory/events", handlers.api_memory_events)
+    app.router.add_get("/api/memory/carve", handlers.api_memory_carve)
     app.router.add_get("/api/memory/embedding-status", handlers.api_memory_embedding_status)
     app.router.add_post("/api/memory/enable-embeddings", handlers.api_memory_enable_embeddings)
     app.router.add_post("/api/memory/embedding-model", handlers.api_memory_embedding_model)
@@ -58,6 +59,18 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/memory/observability", handlers.api_memory_observability)
     app.router.add_get("/api/memory/graph", handlers.api_memory_graph)
     app.router.add_post("/api/memory/promote", handlers.api_memory_promote)
+
+    # Memory store administration (owner-gated; handlers/memory_admin.py).
+    # ``/api/memory/retired/restore`` is registered BEFORE its parent literal so
+    # the two-segment path can never be reached through a pattern that grows on
+    # ``/api/memory/retired`` later.
+    app.router.add_post("/api/memory/retired/restore", handlers.api_memory_retired_restore)
+    app.router.add_get("/api/memory/retired", handlers.api_memory_retired)
+    app.router.add_get("/api/memory/stores", handlers.api_memory_stores)
+    app.router.add_post("/api/memory/stores", handlers.api_memory_store_create)
+    app.router.add_get("/api/memory/backups", handlers.api_memory_backups)
+    app.router.add_post("/api/memory/backup", handlers.api_memory_backup)
+    app.router.add_post("/api/memory/restore", handlers.api_memory_restore)
 
     # Crons, lessons, spawn, taskrunner, send-message, notifications
     # are registered via _register_mcp_routes() above.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,13 +61,35 @@ if TYPE_CHECKING:
     from kiro_crew.channel_history import ChannelHistory
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
+    from kiro_crew.vector_memory import VectorMemoryStore
 
 logger = logging.getLogger(__name__)
 
-# Lazy cache of MemoryStore instances keyed by workspace name.
+# Lazy caches of per-target stores. The key is NOT a bare name: a memory store
+# and a workspace are two namespaces, and a single key cannot hold both. A crew
+# bound to store "acme" and a workspace also called "acme" collapsed into one
+# cache slot and one path resolution, so whichever arrived first decided where
+# the other one read. ``_target_key`` is the only thing that mints these keys:
+#
+#   "default"        the global v1 store -- UNCHANGED spelling, seeded eagerly
+#                    in ``ContextBuilder.__init__`` and what every existing
+#                    caller resolves to.
+#   "ws:<name>"      a named workspace on the v1 path (markdown under that
+#                    workspace, vectors shared with the global store).
+#   "store:<name>"   a named memory store: its own markdown tree, its own FTS
+#                    index and its OWN vector file. Never shares vectors.
+#
+# ``:`` cannot appear in a store name (``validate_memory_store_name``), so the
+# two prefixes cannot collide with each other or with "default".
 _memory_stores: dict[str, MemoryStore] = {}
-# Lazy cache of LessonStore instances keyed by workspace name.
 _lesson_stores: dict[str, LessonStore] = {}
+# Lazy cache of per-store VectorMemoryStore instances, keyed by RESOLVED store
+# name (never a workspace). One instance per db_path is an invariant, not an
+# optimization: two instances over one file do not share ``_db_lock``, which
+# voids the serialization the store's own writes depend on. Populated only by
+# ``ContextBuilder.ensure_store``, which is async because ``init()`` is blocking
+# file IO end to end.
+_vector_stores: dict[str, "VectorMemoryStore"] = {}
 
 # Message roles included in session replay, thread-history compression, and the
 # context-builder recent-message path. "inject" is included so cron results and
@@ -75,6 +99,243 @@ RECALL_ROLES: frozenset[str] = frozenset({"user", "assistant", "inject"})
 # (run_in_embed_pool at every async call site), so two threads can race the
 # check-then-insert for the same workspace key. Double-checked with the lock.
 _stores_lock = threading.Lock()
+
+#: Cache key for the global v1 store. The literal spelling is load-bearing:
+#: ``ContextBuilder.__init__`` seeds it and every existing caller resolves to it.
+_DEFAULT_KEY = "default"
+_WS_KEY_PREFIX = "ws:"
+_STORE_KEY_PREFIX = "store:"
+
+
+def _resolved_store_name(memory_store: str | None) -> str:
+    """*memory_store* resolved to a NON-DEFAULT store name, or ``""``.
+
+    ``""`` means "use the v1 path", and it is the answer for the default store,
+    for a blank name, for an undeclared name that degrades onto the default, and
+    for any resolution failure. Answering with the empty string rather than
+    raising is what keeps memory v2 unreachable by accident: a caller that cannot
+    name a real silo gets today's global store, never a half-built one.
+    """
+    from kiro_crew.memory_stores import (
+        DEFAULT_MEMORY_STORE,
+        named_store_or_empty,
+        resolve_declared_store,
+    )
+
+    memory_store = named_store_or_empty(memory_store)
+    if not memory_store:
+        return ""
+    try:
+        name = resolve_declared_store(memory_store)
+    except Exception:
+        # A malformed name raises rather than degrading, because degrading there
+        # could merge two crews into one directory. At this seam the safe answer
+        # is the global store, which is where the crew already was.
+        logger.warning(
+            "memory store %r could not be resolved; using the global store",
+            memory_store,
+            exc_info=True,
+        )
+        return ""
+    return "" if name == DEFAULT_MEMORY_STORE else name
+
+
+def _target_key(workspace: str | None, memory_store: str | None) -> tuple[str, str]:
+    """``(cache key, resolved store name)`` for a memory target.
+
+    A non-empty store name always wins over *workspace*: a crew's silo is the
+    tighter scope, and the two are separate namespaces rather than two spellings
+    of one thing. The second element is ``""`` on the v1 path, which is what
+    every caller branches on.
+    """
+    store_name = _resolved_store_name(memory_store)
+    if store_name:
+        return _STORE_KEY_PREFIX + store_name, store_name
+    key = workspace or _DEFAULT_KEY
+    if key == _DEFAULT_KEY:
+        return _DEFAULT_KEY, ""
+    return _WS_KEY_PREFIX + key, ""
+
+
+async def prepare_store_vectors(ctx_builder: object, memory_store: str | None) -> None:
+    """Best-effort: stand up *memory_store*'s own vector store before a turn or run.
+
+    PREPARATION, never a precondition. The documented degrade is that a named
+    store whose vectors cannot be stood up answers from markdown and keyword
+    scoring -- never from the global store's rows -- so a failure here must cost
+    that store its vector tier and nothing else. Three shapes reached this code
+    and all three used to take the caller down with them: a builder that does not
+    implement the step, one whose implementation is not awaitable, and any error
+    ``ensure_store`` does not swallow itself.
+
+    Lives here, next to :meth:`ContextBuilder.ensure_store`, because both the
+    dashboard turn and the subagent run need it and a second copy is how the two
+    drift on what a failed prepare costs. ``subagent.py`` imports it at module
+    scope, which is what ``bind_component_globals`` needs: it rebinds every
+    ``*_impl`` function's globals to that module's namespace, so the name has to
+    resolve THERE -- an import satisfies that exactly as a definition would.
+
+    DEBUG, not warning: on the default store the step is a no-op on every turn,
+    and a per-turn warning is how a log stops being read.
+    """
+    if not memory_store:
+        return
+    ensure = getattr(ctx_builder, "ensure_store", None)
+    if ensure is None:
+        return
+    try:
+        result = ensure(memory_store)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.debug(
+            "could not prepare the vector store for memory store %r; it reads from "
+            "markdown and keyword scoring instead",
+            memory_store,
+            exc_info=True,
+        )
+
+
+def store_of_session(conversation_log: object, session_key: str) -> str:
+    """The NAMED silo *session_key* is bound to, or ``""`` for the global store.
+
+    The ONE definition of "which silo does this session read", and it answers from
+    the session's own RECORDED binding rather than from anything a surface can
+    infer. That matters twice over:
+
+    * ``meta["memory_store"]`` is the same key ``history_consolidation``'s
+      ``_session_store_name`` resolves the WRITE side from, so a turn assembled
+      through this reads the silo its own consolidations land in. Resolving the two
+      differently is a split brain with no error on either side.
+    * The alternative a channel surface has in scope is its ``agent``, which carries
+      a kiro-cli template id -- a namespace DISJOINT from ``cfg.agents``. Deriving a
+      store from one answers ``default`` for exactly the crew that configured
+      otherwise, silently, toward the operator's own memory.
+
+    Never raises, and answers ``""`` on anything it cannot read: the global store is
+    where every session that names no silo already was, so erring toward it costs a
+    default install nothing, while refusing would drop a turn the user is waiting on.
+
+    Safe to call ON the event loop. ``get_metadata`` reads one line behind an
+    mtime-keyed cache and its retry path deliberately does not sleep while a loop is
+    running, so it is the same cost class as the surrounding per-turn config reads.
+    """
+    if not session_key or conversation_log is None:
+        return ""
+    try:
+        from kiro_crew.memory_stores import named_store_or_empty
+
+        get_metadata = getattr(conversation_log, "get_metadata", None)
+        if get_metadata is None:
+            return ""
+        return named_store_or_empty(get_metadata(session_key).get("memory_store"))
+    except Exception:
+        logger.debug("could not resolve the memory store for %r", session_key, exc_info=True)
+        return ""
+
+
+async def session_store_for_turn(ctx_builder: object, session_key: str) -> str:
+    """*session_key*'s silo, with its vector tier stood up, ready for a turn.
+
+    The pair every turn-running surface needs, in the order it needs them: resolve
+    the store, then stand up its vectors BEFORE the build is offloaded, because
+    ``VectorMemoryStore.init()`` is blocking file IO that ``get_memory_for``'s sync
+    resolver deliberately does not perform. Both halves are best-effort, so a
+    surface gains no new failure mode from asking.
+
+    One helper rather than two lines at each of eight call sites: the ordering is the
+    part that is easy to get wrong, and the store a caller resolves is the store its
+    vectors must be prepared for.
+    """
+    store = store_of_session(getattr(ctx_builder, "conversation_log", None), session_key)
+    await prepare_store_vectors(ctx_builder, store)
+    return store
+
+
+@functools.lru_cache(maxsize=1)
+def _shared_embed_fn() -> "Callable[[str], list[float] | None]":
+    """The ONE embed closure every named store shares.
+
+    ``make_sync_embed_fn`` is not memoized upstream: each call builds its own
+    ``lru_cache`` (sized in ``embeddings._EMBED_CACHE_MAX``, roughly 4 MB) and its
+    own thread-local. Calling it per store therefore cost N silos N copies of that
+    cache and re-embedded the same query text once per store — the exact waste the
+    comment at the call site claimed to avoid while the code did the opposite.
+
+    Sharing is correct because the cache key is ``(text, model id)``: two stores
+    asking about the same text under the same model want the same vector. A model
+    SWAP is handled elsewhere — a store's recorded embedding space is what decides
+    whether its stored vectors are still comparable, not which closure produced
+    them.
+    """
+    from kiro_crew.embeddings import make_sync_embed_fn
+
+    return make_sync_embed_fn()
+
+
+async def _build_store_vectors(name: str) -> "VectorMemoryStore | None":
+    """Construct, init and wire a named store's own VectorMemoryStore.
+
+    Every blocking step is offloaded. ``_stores_lock`` is held only around the
+    cache check-and-insert, never across ``init()``, so a slow first touch of one
+    store cannot serialize every embed worker.
+    """
+    from kiro_crew.embeddings import (
+        make_sync_embed_fn,
+        model_file_present,
+        reconcile_store_embedding_space,
+    )
+    from kiro_crew.memory_stores import resolve_store_path
+    from kiro_crew.vector_memory import VectorMemoryStore
+
+    mem = KiroCrewConfig.load().memory
+    store = VectorMemoryStore(
+        db_path=resolve_store_path(name),
+        confidence_threshold=mem.semantic_confidence_threshold,
+        extra_prefixes=mem.semantic_keys or None,
+        episodic_limit=mem.episodic_max_results,
+        embedding_dim=mem.embedding_dim,
+        decay_rates=mem.decay_rates or None,
+    )
+    await asyncio.to_thread(store.init)
+    # ONE embed closure across all stores, not one per store. make_sync_embed_fn
+    # is not memoized: each call builds its own LRU cache and its own
+    # thread-local, and the cache key is (text, model id) — so sharing is both
+    # correct and what keeps N silos from costing N copies of that cache and N
+    # redundant embeds of the same text.
+    store.embed_fn_factory = make_sync_embed_fn
+    if model_file_present():
+        store.embed_fn = _shared_embed_fn()
+    # Stamp the store's embedding space. An unstamped store is ASSERTED to hold
+    # bundled-model vectors, which for a store an operator fills under a different
+    # backend is a lie that scores incomparable vectors confidently. The stamp may
+    # refuse when the active backend is not ready; a brand-new store has nothing
+    # to lose by staying unstamped until a later boot.
+    try:
+        await asyncio.to_thread(reconcile_store_embedding_space, store)
+    except Exception:
+        logger.debug("could not stamp the embedding space for store %r", name, exc_info=True)
+    # DECIDE under the lock, CLOSE after it. The lock is a threading.Lock and
+    # ``get_memory_for`` takes it synchronously, so awaiting anything while
+    # holding it blocks the loop thread for every other caller -- the exact stall
+    # this function's contract promises it avoids.
+    with _stores_lock:
+        existing = _vector_stores.get(name)
+        if existing is None:
+            _vector_stores[name] = store
+            cached = _memory_stores.get(_STORE_KEY_PREFIX + name)
+            if cached is not None:
+                cached.vector_store = store
+    if existing is not None:
+        # Lost a race. One instance per db_path is an invariant -- two instances
+        # over one file do not share ``_db_lock`` -- so drop ours.
+        try:
+            await asyncio.to_thread(store.close)
+        except Exception:
+            logger.debug("could not close a redundant vector store", exc_info=True)
+        return existing
+    return store
+
 
 # Per-section budget BASE — the char count each section's percentage cap is
 # taken from. Kept at 165k so memory / lessons / history keep their existing
@@ -1972,41 +2233,125 @@ class ContextBuilder:
     """
 
     @staticmethod
-    def get_memory_for(workspace: str | None = None) -> MemoryStore:
-        """Return a MemoryStore for the given workspace, creating lazily.
+    def get_memory_for(
+        workspace: str | None = None, memory_store: str | None = None
+    ) -> MemoryStore:
+        """Return a MemoryStore for a workspace or a NAMED memory store.
 
-        Thread-safe: build_message now runs on worker threads (offloaded via
+        *memory_store* wins when it names a non-default store, because a crew's
+        silo is the tighter scope; *workspace* is the v1 path and stays the
+        meaning of a lone positional argument. Pass the store name already
+        resolved (``ResolvedBindings.memory_store_name``) — this does not derive a
+        store from an agent name, since ``agent=`` at every call site carries a
+        kiro-cli template id, a namespace disjoint from ``cfg.agents``.
+
+        A named store is a SILO: its own markdown tree, its own FTS index and its
+        own vector file. It never inherits the global vector store, so an
+        unprepared store answers from markdown and keyword scoring rather than
+        borrowing another crew's rows. Its vectors come from
+        :meth:`ensure_store`, which the caller must await first; see there for why
+        this method cannot do it.
+
+        Thread-safe: build_message runs on worker threads (offloaded via
         run_in_embed_pool from every async call site), so concurrent first
-        requests for the same workspace must not double-init the store.
+        requests for the same target must not double-init the store.
         """
-        key = workspace or "default"
+        key, store_name = _target_key(workspace, memory_store)
         if key not in _memory_stores:
             with _stores_lock:
                 if key not in _memory_stores:
-                    ws_path = workspace_dir_for(key)
-                    store = MemoryStore(workspace=ws_path)
-                    store.init()
-                    # Share the global VectorMemoryStore so all agents get
-                    # semantic/episodic reads
-                    default = _memory_stores.get("default")
-                    if default is not None and default.vector_store is not None:
-                        store.vector_store = default.vector_store
+                    if store_name:
+                        from kiro_crew.memory_stores import (
+                            ensure_memory_store_dir,
+                            memory_index_path_for,
+                        )
+
+                        store = MemoryStore(
+                            workspace=ensure_memory_store_dir(store_name),
+                            index_db=memory_index_path_for(store_name),
+                        )
+                        store.init()
+                        # NO shared-vector hop. Attaching the global store here is
+                        # what made the crew editor's Memory Store control a
+                        # read-side illusion: markdown split while every crew's
+                        # semantic, episodic and lesson rows stayed in one table.
+                        store.vector_store = _vector_stores.get(store_name)
+                    else:
+                        ws_path = workspace_dir_for(workspace or _DEFAULT_KEY)
+                        store = MemoryStore(workspace=ws_path)
+                        store.init()
+                        # Share the global VectorMemoryStore so all agents get
+                        # semantic/episodic reads
+                        default = _memory_stores.get(_DEFAULT_KEY)
+                        if default is not None and default.vector_store is not None:
+                            store.vector_store = default.vector_store
                     _memory_stores[key] = store
         return _memory_stores[key]
 
     @staticmethod
-    def get_lessons_for(workspace: str | None = None) -> LessonStore:
-        """Return a LessonStore for the given workspace, creating lazily.
+    def get_lessons_for(
+        workspace: str | None = None, memory_store: str | None = None
+    ) -> LessonStore:
+        """Return a LessonStore for a workspace or a NAMED memory store.
+
+        Same target resolution as :meth:`get_memory_for`. A named store's lessons
+        live in its own directory, which ``LessonStore`` accepts because that
+        directory is one it owns (see ``learn._is_owned_store_root``).
 
         Thread-safe — same double-checked locking as :meth:`get_memory_for`.
         """
-        key = workspace or "default"
+        key, store_name = _target_key(workspace, memory_store)
         if key not in _lesson_stores:
             with _stores_lock:
                 if key not in _lesson_stores:
-                    ws_path = workspace_dir_for(key)
-                    _lesson_stores[key] = LessonStore(base_dir=ws_path)
+                    if store_name:
+                        from kiro_crew.memory_stores import ensure_memory_store_dir
+
+                        base = ensure_memory_store_dir(store_name)
+                    else:
+                        base = workspace_dir_for(workspace or _DEFAULT_KEY)
+                    _lesson_stores[key] = LessonStore(base_dir=base)
         return _lesson_stores[key]
+
+    @staticmethod
+    async def ensure_store(memory_store: str | None) -> "VectorMemoryStore | None":
+        """Stand up *memory_store*'s OWN vector store, once, and return it.
+
+        Async because ``VectorMemoryStore.init()`` is blocking file IO end to end
+        (owner-only sweeps, ``sqlite3.connect``, WAL pragma, three migrations,
+        a FAISS load) and its documented caller contract is to offload it. It
+        therefore cannot live inside :meth:`get_memory_for`, which is sync, is
+        called unconditionally on every context build, and holds
+        ``_stores_lock`` — a blocking init there would stall the event loop on
+        the callers that build context inline and serialize every embed worker on
+        first touch. ``init()`` also has no idempotence guard (it reassigns
+        ``self._db``), so a lazily-initializing resolver is exactly the shape
+        that leaks a connection.
+
+        Returns ``None`` for the default store (its vector store is the global
+        one, wired at startup by the gateway) and ``None`` when the store cannot
+        be stood up. A caller that skips this gets a markdown-and-keyword store,
+        which is the correct failure: reading another crew's rows is not.
+        """
+        # No default-store guard of its own: `_resolved_store_name` answers ""
+        # for the default store, a blank name and an undeclared one alike, and the
+        # cache probe below is the only thing a resolved name is needed for.
+        name = _resolved_store_name(memory_store)
+        if not name:
+            return None
+        existing = _vector_stores.get(name)
+        if existing is not None:
+            return existing
+        try:
+            return await _build_store_vectors(name)
+        except Exception:
+            logger.warning(
+                "could not prepare the vector store for memory store %r; it will "
+                "answer from markdown and keyword scoring only",
+                name,
+                exc_info=True,
+            )
+            return None
 
     def __init__(
         self,
@@ -2034,7 +2379,7 @@ class ContextBuilder:
             # change what the model is told to answer to.
             self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
-        _memory_stores["default"] = self.memory
+        _memory_stores[_DEFAULT_KEY] = self.memory
 
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text."""
@@ -2888,8 +3233,11 @@ class ContextBuilder:
         # The user's preferences, project context, and learned corrections
         # are valuable regardless of which agent is running.
         # Temporary sessions skip all memory reads.
-        mem_key = memory_store or workspace
-        memory = self.get_memory_for(mem_key)
+        # Two arguments, not one key. A store name and a workspace name are
+        # separate namespaces: collapsing them meant a crew bound to store "acme"
+        # and a workspace also called "acme" shared one cache slot, so whichever
+        # was built first decided where the other one read.
+        memory = self.get_memory_for(workspace, memory_store)
         if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
             memory_ctx = memory.get_context(
                 prefs_cap=caps.prefs,
@@ -2956,9 +3304,12 @@ class ContextBuilder:
         # workspace no longer identifies one -- project identity lives on the
         # session (``slot.project``), which is what ``repo_scope`` keys on instead.
         #
-        # ``LessonStore`` and ``get_lessons_for`` are intentionally left intact:
-        # the per-member memory work re-targets the write side onto them, so the
-        # store is dormant here, not dead.
+        # The JSONL tier is per-target: a NAMED store reads its own
+        # ``lessons.jsonl`` via ``get_lessons_for``, while the default and
+        # workspace paths keep reading ``self.lessons``, the global store this
+        # builder was constructed with. Without the split a crew's lessons block
+        # is the operator's global corrections, which is the one thing a silo
+        # exists to prevent.
         lessons_ctx = ""
         if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_LESSONS):
             # The JSONL store answers when the vector store is absent OR not yet
@@ -2976,6 +3327,10 @@ class ContextBuilder:
             if memory.vector_store and memory.vector_store.has_any_lesson():
                 lessons_ctx = memory.vector_store.get_lessons_context(
                     query_text=query_text, cap=caps.lessons, project_dir=project
+                )
+            elif _resolved_store_name(memory_store):
+                lessons_ctx = self.get_lessons_for(workspace, memory_store).get_context(
+                    project_dir=project
                 )
             else:
                 lessons_ctx = self.lessons.get_context(project_dir=project)

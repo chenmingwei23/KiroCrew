@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import patch
 
 import pytest
@@ -25,6 +26,27 @@ _name_st = st.text(
     max_size=30,
 )
 
+# A store name is a single path segment, so its grammar is narrower than a
+# workspace's: lowercase alphanumerics and interior hyphens only. Generating an
+# invalid name here would only ever exercise the refusal path.
+_store_name_st = st.from_regex(r"\A[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?\Z", fullmatch=True)
+
+
+@contextlib.contextmanager
+def _declaring_store(name: str):
+    """Make *name* a declared, resolvable memory store for the duration.
+
+    Patches the one seam both membership tests read (``_declared_stores``) rather
+    than writing a config file, so no config cache has to be reset and the floor
+    is included exactly as production includes it.
+    """
+    from kiro_crew import memory_stores as ms_mod
+
+    with patch.object(
+        ms_mod, "_declared_stores", return_value=(frozenset({name, "default"}), "default")
+    ):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Property-based tests
@@ -33,7 +55,7 @@ _name_st = st.text(
 
 class TestMemoryStoreOverrideProperty:
     # Feature: multi-agent-orchestration, Property 7: Memory store parameter overrides workspace for memory lookup
-    @given(workspace=_name_st, memory_store=_name_st)
+    @given(workspace=_name_st, memory_store=_store_name_st)
     @settings(deadline=None)
     def test_memory_store_overrides_workspace_in_build_session_context(
         self, workspace: str, memory_store: str, tmp_path_factory
@@ -50,12 +72,19 @@ class TestMemoryStoreOverrideProperty:
             skills=SkillsLoader(skills_path=tmp / "skills", install_builtins=False),
         )
 
-        calls: list[str | None] = []
+        # Assert on the RESOLVED TARGET, not on the call shape. The resolver takes
+        # both names now, because a store name and a workspace name are separate
+        # namespaces -- so "was it called with the store value" no longer
+        # distinguishes the two, and a test that inspects one positional argument
+        # would keep passing while the store was ignored.
+        from kiro_crew import context as ctx_mod
+
+        calls: list[tuple[str | None, str | None]] = []
         original_get_memory = ContextBuilder.get_memory_for
 
-        def _tracking_get_memory(key=None):
-            calls.append(key)
-            return original_get_memory(key)
+        def _tracking_get_memory(ws=None, store=None):
+            calls.append((ws, store))
+            return original_get_memory(ws, store)
 
         with patch.object(ContextBuilder, "get_memory_for", side_effect=_tracking_get_memory):
             builder.build_session_context(
@@ -63,15 +92,34 @@ class TestMemoryStoreOverrideProperty:
                 memory_store=memory_store,
             )
 
-        # get_memory_for should have been called with memory_store, not workspace
+        assert calls, "build_session_context must resolve a memory target"
+        # Both names reach the resolver; the store is what it prefers.
         assert any(
-            c == memory_store for c in calls
-        ), f"Expected get_memory_for to be called with {memory_store!r}, got calls: {calls}"
-        # When memory_store differs from workspace, workspace should NOT appear
-        if memory_store != workspace:
-            assert not any(
-                c == workspace for c in calls
-            ), f"get_memory_for should NOT be called with workspace {workspace!r} when memory_store={memory_store!r}"
+            store == memory_store for _ws, store in calls
+        ), f"Expected the store name {memory_store!r} to reach get_memory_for, got {calls}"
+
+        # The store, not the workspace, must decide the target -- but ONLY for a
+        # store the config DECLARES. Asserting that against an arbitrary generated
+        # name is how this test went vacuous: an undeclared name degrades to the v1
+        # path by design (memory v2 is unreachable without a declared store), so
+        # every example took the degrade branch and the property held even with the
+        # store ignored outright. Declare it, then assert isolation.
+        ws_key, _ = ctx_mod._target_key(workspace, None)
+        undeclared_key, undeclared_name = ctx_mod._target_key(workspace, memory_store)
+        assert undeclared_name == "", (
+            f"{memory_store!r} is not declared in this config, so it must degrade "
+            f"to the v1 path, got {undeclared_name!r}"
+        )
+        assert undeclared_key == ws_key, (undeclared_key, ws_key)
+
+        with _declaring_store(memory_store):
+            store_key, store_name = ctx_mod._target_key(workspace, memory_store)
+        assert store_name == memory_store, (
+            f"a DECLARED store must win over the workspace; got {store_name!r} for "
+            f"{memory_store!r}"
+        )
+        assert store_key == f"store:{memory_store}", store_key
+        assert store_key != ws_key, "a declared store must not share the workspace's target"
 
 
 class TestContextBuilder:

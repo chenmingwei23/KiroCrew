@@ -10309,12 +10309,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "此工作区的唯一标识符。代理通过名称引用工作区。",
-      "additional_stores_coming_with_memory_v2": "目前仅提供默认存储，更多记忆存储即将推出。",
       "agent_template_is_required": "Agent 模板为必填项",
       "agents": "代理",
       "also_used_by_these_crews": "{{crews}} 也在用。共用一个存储的代理可以互相读取对方的文件和记忆。",
-      "bindings_preview_info": "预览。每个代理独立的记忆还在开发中。代理有自己的工作区文件夹，但语义记忆、过往对话回溯以及全局经验都会进入每个代理，所以改这里还不能分开它记住的内容。",
-      "bindings_preview_notice": "预览。每个代理已经读写自己的工作区文件夹，但它记住的内容还没有分开：语义记忆、过往对话回溯以及全局经验都会进入每个代理。每个代理独立的记忆即将推出。",
+      "bindings_preview_info": "绑定了自己的记忆存储的代理，现在无论从哪里被调用都会单独记忆：聊天、消息渠道、定时任务。在记忆页面，已登录的仪表板所有者可以把存储选择器指向任何已声明的存储。",
+      "bindings_preview_notice": "绑定了自己的记忆存储的代理，会把记住的内容留在自己这里。留在默认存储上的代理仍然共用一份记忆。",
       "cancel": "取消",
       "chat_with_this_crew": "与此代理聊天",
       "copy_from_optional": "复制来源（可选）",
@@ -10394,7 +10393,7 @@
       "view_cards_tooltip": "宽松卡片，显示每个代理使用的内容",
       "view_list": "列表",
       "view_list_tooltip": "紧凑表格，每个代理一行",
-      "which_store_its_lessons_and_history_are_written": "这个代理绑定到哪个记忆存储。绑定会记录下来，但还不会让它有自己的记忆。",
+      "which_store_its_lessons_and_history_are_written": "这个代理绑定到哪个记忆存储。使用自己存储的代理会保有自己的偏好、项目、每日历史、已保存的事实、回忆起的对话和教训。留在默认存储上的代理共用一份记忆。",
       "workspace": "工作区",
       "workspace_2": "工作区",
       "workspace_name_is_required": "工作区名称为必填项",
@@ -10407,7 +10406,8 @@
       "discard_unsaved_body": "此团队有从未保存的编辑内容。现在关闭将会丢弃它们。",
       "discard_confirm": "放弃更改",
       "discard_also_crew_edits": "此团队其他未保存的编辑内容也会随之丢弃。",
-      "editor_options_load_failed": "无法加载团队编辑器的工作区、模板和记忆存储选项。"
+      "editor_options_load_failed": "无法加载团队编辑器的工作区、模板和记忆存储选项。",
+      "only_the_default_store_is_declared": "你的配置文件里只声明了默认存储。在记忆页面用「新建存储」再声明一个，就能让某个代理拥有自己的记忆。"
     },
     "knowledge": {
       "detailView": {
@@ -10636,7 +10636,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "每个来源的分块上限",
+        "chunk_limit_desc": "单个来源每轮扫描最多可摄取的分块数。每个分块要消耗一次 LLM 抽取调用。0 表示不限。",
+        "max_sources_label": "最多来源数",
+        "max_sources_desc": "自动发现的知识来源的最大数量。手动添加的来源不受限制。0 表示不限。",
+        "auto_project_label": "自动注册项目文档",
+        "auto_project_desc": "把你参与的每个项目里的文档自动注册为知识来源。"
       }
     },
     "localStorageDebug": {
@@ -11117,7 +11123,8 @@
         "session_other": "{{count}} 个会话",
         "summarize_now": "立即总结",
         "tool": "工具",
-        "when": "时间"
+        "when": "时间",
+        "the_cards_below_do_not_follow_the_store_picker_m": "下面的卡片不跟随存储选择器。记忆设置和嵌入模型对整个安装环境生效，经验会把全局存储与当前工作区的存储合并，向量记忆浏览器读取当前会话绑定的存储。"
       },
       "portabilityTab": {
         "archive_contents": "压缩包内容：",
@@ -11442,6 +11449,81 @@
         "vector_memory": "向量记忆",
         "vector_memory_is_initializing_the_embedding_mode": "向量记忆正在初始化。嵌入模型（约 610MB）会在后台自动下载，旧版记忆也会自动迁移 — 无需任何操作。",
         "verifying_model_integrity": "正在校验模型完整性…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "新建存储从空开始，并把记忆保存在自己的数据库文件里，所以 代理 在里面记下的东西不会传到其他任何存储。这里无法取消声明一个存储：那会让它记下的内容变成孤儿，所以需要在本页之外有意为之。",
+        "a_store_with_that_name_is_already_declared_pick": "这个名称的存储已经声明过了。请从列表里选它，而不是再声明一次。",
+        "backups": "备份：<v/>",
+        "cancel": "取消",
+        "crew_silo": "代理独立存储",
+        "declare_store": "声明存储",
+        "episodes": "情景记忆：<v/>",
+        "facts_and_directives": "事实与指令：<v/>",
+        "lessons": "经验：<v/>",
+        "memory_store": "记忆存储",
+        "new_memory_store": "新建记忆存储",
+        "new_store": "新建存储",
+        "newest_backup": "最新备份：<v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "只有已登录的仪表板所有者才能按名称访问记忆存储。此页面的内容仍然读取当前会话绑定的存储。",
+        "schema_lineage": "架构谱系：<v/>",
+        "shared_default_store": "共享默认存储",
+        "store_name": "存储名称",
+        "that_name_cannot_be_used_for_a_store_directory_u": "这个名称不能用作存储目录。请使用小写字母、数字和连字符。",
+        "the_picker_drives_this_card_the_preferences_proj": "这个选择器控制本卡片、偏好设置、项目和每日历史文档，以及下面的切分、已退役和备份卡片。",
+        "this_install_does_not_declare_a_memory_store_by": "此安装环境已不再声明这个名称的记忆存储。请从上面的列表里换一个存储。",
+        "this_store_has_no_database_file_that_can_be_read": "这个存储还没有可读取的数据库文件。文件会在第一次往里记东西时创建，在那之前没有可列出的内容。它已有的备份仍然可以在下面恢复。",
+        "this_store_is_declared_but_its_database_could_no": "这个存储已声明，但它的数据库打不开。这里什么都不显示，而不是把另一个存储的记忆挂在这个名字下。",
+        "this_store_uses_the_shared_schema_so_carve_facet": "这个存储使用共享架构，所以切分维度对它不适用。",
+        "unknown": "未知"
+      },
+      "memoryRetiredCard": {
+        "actions": "操作",
+        "an_episode_lands_here_when_a_later_fact_supersed": "当后来的事实取代某个情景记忆时，它就会出现在这里。",
+        "episodes_a_later_fact_superseded_their_text_is_k": "被后来的事实取代的情景记忆。它们的文本会保留，所以如果退役删掉了你还想留的内容，可以在这里撤销。",
+        "memory": "记忆",
+        "not_recorded": "未记录",
+        "nothing_has_been_retired": "还没有任何退役记录",
+        "restore": "恢复",
+        "retired": "退役时间",
+        "retired_memories": "已退役的记忆",
+        "superseded_by": "取代者",
+        "times_retired": "退役次数",
+        "unknown": "未知"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "恢复后的数据库要等网关下次启动才会被读取。在那之前，该记忆存储仍在使用被替换掉的文件。",
+        "actions": "操作",
+        "already_recent": "已是最新：{{value}}",
+        "back_up_now": "立即备份",
+        "backups": "备份",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "备份按计时器自动创建，点“立即备份”会马上创建一份。",
+        "cancel": "取消",
+        "confirm_restore": "确认恢复",
+        "copies_taken": "已创建副本：{{value}}",
+        "failed": "失败：{{value}}",
+        "no_backups_yet": "暂无备份",
+        "older_copies_removed": "已删除的旧副本：{{value}}",
+        "restore": "恢复",
+        "restored_the_database_it_replaced_was_kept_besid": "已恢复。被替换的数据库没有被覆盖，而是以这个名字保留在该存储自己的文件旁边：<name/>",
+        "size": "大小",
+        "taken": "创建时间",
+        "this_replaces_the_store_s_live_database_the_file": "这会替换该存储正在使用的数据库。被顶下来的文件不会删除，而是以“已被取代”的名字保留在旁边。"
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "一旦有内容带着这个维度被记下，就会出现计数。",
+        "carve": "切分",
+        "clear_filter": "清除筛选",
+        "count_by": "统计维度",
+        "crew": "代理",
+        "how_this_store_s_memory_divides_up_across_the_ax": "这个存储的记忆，按每次写入所标记的各维度分布。选一个值即可列出该切片里的记忆。",
+        "kind": "类型",
+        "memory": "记忆",
+        "no_live_memories_in_this_slice": "这个切片里没有存活的记忆",
+        "not_recorded": "未记录",
+        "nothing_is_stamped_on_this_axis_yet": "这个维度上还没有任何标记",
+        "surface": "来源",
+        "the_count_includes_only_live_rows_so_a_slice_can": "计数只包含存活的行，所以一个切片可能在两次读取之间变空。",
+        "this_store_uses_the_shared_schema_so_carve_facet": "这个存储使用共享架构，所以切分维度不适用。它的行上没有 代理、来源或范围标记可以用来划分，这和存储为空是两回事。"
       }
     },
     "overviewPage": {
@@ -13921,8 +14003,8 @@
       "empty_roster": "还没有团队成员。在团队管理页创建一个 crew 后会显示在这里。",
       "inherited": "继承",
       "member_count_other": "{{count}} 位成员",
-      "memory_dedicated_note": "偏好与项目笔记读取自 {{store}} 存储，而非共享的默认存储。对话记忆与经验尚未分开：告诉这位成员的内容，其他成员仍然知道。",
-      "memory_shared_note": "成员目前共享同一份记忆：告诉一位成员的内容，其他成员也知道。",
+      "memory_dedicated_note": "偏好、项目笔记、已保存的事实、回忆起的对话和教训都来自 {{store}} 存储，而不是共享的默认存储，所以你告诉这个成员的内容会留在它那里。",
+      "memory_shared_note": "使用默认记忆存储的成员共享同一份记忆：告诉其中一位的内容，其他成员都会知道。绑定独立记忆存储后，无论你从哪里与它对话，成员都会分开记忆。",
       "memory_store": "记忆存储",
       "model": "模型",
       "opening_thread": "正在打开对话…",

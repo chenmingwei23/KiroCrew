@@ -23,6 +23,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.dashboard.chat_utils import (
     expire_slack_options,
     mint_options_token,
@@ -539,6 +540,14 @@ async def handle_message_transport(
 
         # ── Build message with context ──
         if context_builder:
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``_agent``: the values above are kiro agent names, a
+            # namespace disjoint from ``cfg.agents``, so a store derived from one
+            # resolves to ``default`` for exactly the crew that configured
+            # otherwise. Awaited before the offloaded build because it stands up
+            # the silo's vector tier (blocking file IO), and best-effort, so a
+            # silo that cannot be prepared costs this turn its vectors only.
+            _memory_store = await session_store_for_turn(context_builder, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -548,6 +557,7 @@ async def handle_message_transport(
                 channel_id=channel,
                 thread_ts=thread_ts or msg_ts,
                 agent=_agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 user_display_name=user_display_name,
                 # Temporary mode reads NO memory, and that is the half the

@@ -10611,12 +10611,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Un identificador único para este espacio de trabajo. Los agentes hacen referencia a los espacios de trabajo por su nombre.",
-      "additional_stores_coming_with_memory_v2": "Por ahora solo está disponible el almacén predeterminado; pronto habrá más almacenes de memoria.",
       "agent_template_is_required": "La plantilla de agente es obligatoria",
       "agents": "Agentes",
       "also_used_by_these_crews": "También lo usan {{crews}}. Los agentes que comparten un almacén pueden leer los archivos y la memoria de los demás.",
-      "bindings_preview_info": "Vista previa. La memoria aislada por agente aún se está construyendo. Un agente tiene su propia carpeta, pero la memoria semántica, el recuerdo de conversaciones anteriores y las lecciones globales llegan a todos los agentes, así que cambiar esto no separa lo que un agente recuerda.",
-      "bindings_preview_notice": "Vista previa. Cada agente ya lee y escribe su propia carpeta, pero lo que recuerda todavía no está separado: la memoria semántica, el recuerdo de conversaciones anteriores y las lecciones globales llegan a todos los agentes. La memoria aislada por agente está en camino.",
+      "bindings_preview_info": "Un agente vinculado a su propio almacén de memoria ahora recuerda de forma separada desde donde se le llame: en el chat, desde un canal de mensajería y en un trabajo programado. En la página Memoria, la persona propietaria del panel que haya iniciado sesión puede apuntar el selector de almacenes a cualquier almacén declarado.",
+      "bindings_preview_notice": "Un agente vinculado a su propio almacén de memoria guarda para sí lo que recuerda. Los agentes que siguen en el almacén predeterminado comparten una sola memoria.",
       "cancel": "Cancelar",
       "chat_with_this_crew": "Chatear con este agente",
       "copy_from_optional": "Copiar desde (opcional)",
@@ -10696,7 +10695,7 @@
       "view_cards_tooltip": "Tarjetas amplias que muestran lo que usa cada agente",
       "view_list": "Lista",
       "view_list_tooltip": "Tabla compacta, una fila por agente",
-      "which_store_its_lessons_and_history_are_written": "A qué almacén de memoria está vinculado este agente. El vínculo se guarda, pero todavía no le da al agente una memoria propia.",
+      "which_store_its_lessons_and_history_are_written": "A qué almacén de memoria está vinculado este agente. Un agente con su propio almacén conserva sus preferencias, proyectos, historial diario, datos guardados, conversaciones recordadas y lecciones. Los agentes que siguen en el almacén predeterminado comparten una sola memoria.",
       "workspace": "espacio de trabajo",
       "workspace_2": "Espacio de trabajo",
       "workspace_name_is_required": "El nombre del espacio de trabajo es obligatorio",
@@ -10709,7 +10708,8 @@
       "discard_unsaved_body": "Este equipo tiene ediciones que nunca se guardaron. Cerrar ahora las descartará.",
       "discard_confirm": "Descartar cambios",
       "discard_also_crew_edits": "Las demás ediciones sin guardar de este equipo se descartarán junto con ella.",
-      "editor_options_load_failed": "No se pudieron cargar las opciones de espacio de trabajo, plantilla y almacén de memoria del editor de crew."
+      "editor_options_load_failed": "No se pudieron cargar las opciones de espacio de trabajo, plantilla y almacén de memoria del editor de crew.",
+      "only_the_default_store_is_declared": "En tu archivo de configuración solo está declarado el almacén predeterminado. Declara otro con Nuevo almacén en la página Memoria para dar a un agente una memoria propia."
     },
     "knowledge": {
       "detailView": {
@@ -10950,7 +10950,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "Límite de fragmentos por fuente",
+        "chunk_limit_desc": "Máximo de fragmentos que una sola fuente puede ingerir por ciclo de escaneo. Cada fragmento cuesta una llamada de extracción al LLM. 0 = sin límite.",
+        "max_sources_label": "Fuentes máximas",
+        "max_sources_desc": "Número máximo de fuentes de conocimiento descubiertas automáticamente. Las fuentes añadidas a mano no tienen tope. 0 = sin límite.",
+        "auto_project_label": "Registrar documentos del proyecto automáticamente",
+        "auto_project_desc": "Registra automáticamente como fuente de conocimiento los documentos de cada proyecto en el que trabajas."
       }
     },
     "localStorageDebug": {
@@ -11441,7 +11447,8 @@
         "session_other": "{{count}} sesiones",
         "summarize_now": "Resumir ahora",
         "tool": "herramienta",
-        "when": "Cuándo"
+        "when": "Cuándo",
+        "the_cards_below_do_not_follow_the_store_picker_m": "Las tarjetas de abajo no siguen al selector de almacén. Los ajustes de memoria y el modelo de embeddings son de toda la instalación, las lecciones combinan el almacén global con el del espacio de trabajo activo, y el explorador de memoria vectorial lee el almacén al que está vinculada esta sesión."
       },
       "portabilityTab": {
         "archive_contents": "Contenido del archivo:",
@@ -11768,6 +11775,81 @@
         "vector_memory": "Memoria vectorial",
         "vector_memory_is_initializing_the_embedding_mode": "La memoria vectorial está inicializándose. El modelo de embeddings (~610MB) se descarga automáticamente en segundo plano y la memoria antigua se migra por sí sola — no hace falta hacer nada.",
         "verifying_model_integrity": "Verificando la integridad del modelo…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "Un almacén nuevo empieza vacío y guarda su memoria en su propio archivo de base de datos, así que nada de lo que un agente recuerde en él llega a otro almacén. Desde aquí no se puede dejar de declarar un almacén: eso dejaría huérfano todo lo que haya recordado, así que hace falta un paso deliberado fuera de esta página.",
+        "a_store_with_that_name_is_already_declared_pick": "Ya hay un almacén declarado con ese nombre. Elígelo de la lista en vez de declararlo otra vez.",
+        "backups": "Copias de seguridad: <v/>",
+        "cancel": "Cancelar",
+        "crew_silo": "Almacén del agente",
+        "declare_store": "Declarar almacén",
+        "episodes": "Episodios: <v/>",
+        "facts_and_directives": "Datos y directivas: <v/>",
+        "lessons": "Lecciones: <v/>",
+        "memory_store": "Almacén de memoria",
+        "new_memory_store": "Nuevo almacén de memoria",
+        "new_store": "Nuevo almacén",
+        "newest_backup": "Copia más reciente: <v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "Solo el propietario del panel con la sesión iniciada puede dirigirse a un almacén de memoria por su nombre. Todo en esta página sigue leyendo el almacén al que está vinculada esta sesión.",
+        "schema_lineage": "Linaje del esquema: <v/>",
+        "shared_default_store": "Almacén predeterminado compartido",
+        "store_name": "Nombre del almacén",
+        "that_name_cannot_be_used_for_a_store_directory_u": "Ese nombre no se puede usar para un directorio de almacén. Usa letras minúsculas, dígitos y guiones.",
+        "the_picker_drives_this_card_the_preferences_proj": "El selector controla esta tarjeta, los documentos de preferencias, proyectos e historial diario, y las tarjetas de desglose, retirados y copias de seguridad de abajo.",
+        "this_install_does_not_declare_a_memory_store_by": "Esta instalación ya no declara ningún almacén de memoria con ese nombre. Elige otro almacén de la lista de arriba.",
+        "this_store_has_no_database_file_that_can_be_read": "Este almacén todavía no tiene un archivo de base de datos que se pueda leer. Se crea la primera vez que se recuerda algo en él, así que hasta entonces no hay nada que listar. Cualquier copia de seguridad que ya tenga sigue siendo restaurable abajo.",
+        "this_store_is_declared_but_its_database_could_no": "Este almacén está declarado, pero no se pudo abrir su base de datos. No se muestra nada en lugar de servir la memoria de otro almacén bajo este nombre.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Este almacén usa el esquema compartido, así que las facetas de desglose no se le aplican.",
+        "unknown": "desconocido"
+      },
+      "memoryRetiredCard": {
+        "actions": "Acciones",
+        "an_episode_lands_here_when_a_later_fact_supersed": "Un episodio aparece aquí cuando un dato posterior lo sustituye.",
+        "episodes_a_later_fact_superseded_their_text_is_k": "Episodios que un dato posterior sustituyó. Su texto se conserva, así que un retiro que quitó algo que aún querías se puede deshacer aquí.",
+        "memory": "Memoria",
+        "not_recorded": "sin registrar",
+        "nothing_has_been_retired": "No se ha retirado nada",
+        "restore": "Restaurar",
+        "retired": "Retirada",
+        "retired_memories": "Memorias retiradas",
+        "superseded_by": "Sustituida por",
+        "times_retired": "Veces retirada",
+        "unknown": "desconocido"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "Una base de datos restaurada se lee a partir del siguiente arranque de la pasarela. Hasta entonces, este almacén de memoria sigue usando el archivo que se reemplazó.",
+        "actions": "Acciones",
+        "already_recent": "Ya recientes: {{value}}",
+        "back_up_now": "Hacer copia ahora",
+        "backups": "Copias de seguridad",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "Las copias de seguridad se hacen con un temporizador, y “Hacer copia ahora” hace una de inmediato.",
+        "cancel": "Cancelar",
+        "confirm_restore": "Confirmar restauración",
+        "copies_taken": "Copias creadas: {{value}}",
+        "failed": "Con error: {{value}}",
+        "no_backups_yet": "Aún no hay copias",
+        "older_copies_removed": "Copias antiguas eliminadas: {{value}}",
+        "restore": "Restaurar",
+        "restored_the_database_it_replaced_was_kept_besid": "Restaurada. La base de datos que reemplazó se conservó junto al propio archivo del almacén en lugar de sobrescribirse, con este nombre: <name/>",
+        "size": "Tamaño",
+        "taken": "Creada",
+        "this_replaces_the_store_s_live_database_the_file": "Esto reemplaza la base de datos activa del almacén. El archivo que desplaza se conserva a su lado con un nombre de sustituido, así que no se borra nada."
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "Aparece un recuento cuando algo se recuerda con este eje registrado.",
+        "carve": "Desglose",
+        "clear_filter": "Borrar el filtro",
+        "count_by": "Contar por",
+        "crew": "Agente",
+        "how_this_store_s_memory_divides_up_across_the_ax": "Cómo se reparte la memoria de este almacén entre los ejes que estampa cada escritura. Elige un valor para listar las memorias de ese corte.",
+        "kind": "Tipo",
+        "memory": "Memoria",
+        "no_live_memories_in_this_slice": "No hay memorias activas en este corte",
+        "not_recorded": "sin registrar",
+        "nothing_is_stamped_on_this_axis_yet": "Aún no hay nada marcado en este eje",
+        "surface": "Superficie",
+        "the_count_includes_only_live_rows_so_a_slice_can": "El recuento solo incluye filas activas, así que un corte puede quedarse vacío entre dos lecturas.",
+        "this_store_uses_the_shared_schema_so_carve_facet": "Este almacén usa el esquema compartido, así que las facetas de desglose no se aplican. Sus filas no llevan marcas de agente, superficie ni alcance por las que dividirlas, y eso no es lo mismo que el almacén esté vacío."
       }
     },
     "overviewPage": {
@@ -14286,8 +14368,8 @@
       "member_count_many": "{{count}} miembros",
       "member_count_one": "{{count}} miembro",
       "member_count_other": "{{count}} miembros",
-      "memory_dedicated_note": "Las preferencias y las notas de proyecto vienen del almacén {{store}} en lugar del predeterminado compartido. La memoria de conversación y las lecciones todavía no están separadas: lo que le digas a este miembro lo seguirán sabiendo todos.",
-      "memory_shared_note": "Los miembros comparten actualmente una sola memoria. Lo que le digas a uno lo sabrán todos.",
+      "memory_dedicated_note": "Las preferencias, las notas de proyecto, los datos guardados, las conversaciones recordadas y las lecciones vienen del almacén {{store}} y no del predeterminado compartido, así que lo que le cuentes a este miembro se queda con él.",
+      "memory_shared_note": "Los miembros en el almacén de memoria predeterminado comparten una sola memoria: lo que le dices a uno lo saben todos. Un miembro vinculado a su propio almacén recuerda por separado, desde donde sea que le hables.",
       "memory_store": "Almacén de memoria",
       "model": "Modelo",
       "opening_thread": "Abriendo la conversación…",

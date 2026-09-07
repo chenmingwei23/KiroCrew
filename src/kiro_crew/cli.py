@@ -2381,6 +2381,65 @@ Examples:
         help="Also include the markdown layer (preferences, projects, daily history)",
     )
     mem_sub.add_parser("migrate", help="Migrate legacy markdown memory to vector store")
+    mem_backup = mem_sub.add_parser("backup", help="Back up every memory store now")
+    mem_backup.add_argument(
+        "--keep", type=int, default=None, help="How many backups to keep per store"
+    )
+    mem_backups = mem_sub.add_parser("backups", help="List memory backups, newest first")
+    mem_backups.add_argument("--store", default=None, help="Only this store")
+    mem_restore = mem_sub.add_parser("restore", help="Restore a memory store from a backup")
+    mem_restore.add_argument(
+        "--store", default=None, help="Store to restore (default: the default store)"
+    )
+    mem_restore.add_argument(
+        "--from",
+        dest="from_backup",
+        default=None,
+        help="Backup file to restore (default: the newest for that store)",
+    )
+    mem_carve = mem_sub.add_parser(
+        "carve", help="Filter or count a crew store's memory by its carve facets"
+    )
+    mem_carve.add_argument(
+        "--store",
+        default=None,
+        help="Memory store to read (default: the default store, which carries no facets)",
+    )
+    # One flag per field of memory_schema.MemoryFacets, and each argparse dest IS the
+    # column name, so `_memory_carve` reads them by facet name instead of restating the
+    # list. The five FLAG SPELLINGS stay literal because they cannot be generated cleanly
+    # (`--session-key` -> `session_key`), but the two closed SETS below are derived: a
+    # restated set is a set that silently stops covering a sixth axis. The import costs
+    # 1.4 ms against a ~460 ms CLI import and pulls in nothing on
+    # test_cli_lazy_imports._BANNED_AFTER_CLI_IMPORT (measured, including numpy).
+    from kiro_crew import memory_schema as _memory_schema
+
+    mem_carve.add_argument("--scope", default=None, help="Only rows carved to this repo scope")
+    mem_carve.add_argument("--surface", default=None, help="Only rows from this surface")
+    mem_carve.add_argument("--crew", default=None, help="Only rows this crew produced")
+    mem_carve.add_argument("--session-key", default=None, help="Only rows from this conversation")
+    mem_carve.add_argument(
+        "--derived-from", default=None, help="Only rows synthesized from this item id"
+    )
+    mem_carve.add_argument(
+        "--kind",
+        default=None,
+        choices=list(_memory_schema.ALL_KINDS),
+        help="Only rows of this kind",
+    )
+    mem_carve.add_argument(
+        "--count-by",
+        default=None,
+        choices=list(_memory_schema.GROUPABLE_COLUMNS),
+        help="Report counts grouped by this axis instead of listing rows",
+    )
+    mem_carve.add_argument("--limit", type=int, default=50, help="How many rows to list")
+    mem_carve.add_argument("--offset", type=int, default=0, help="Rows to skip when listing")
+    mem_retired = mem_sub.add_parser(
+        "retired", help="List episodes a semantic write superseded, and restore one"
+    )
+    mem_retired.add_argument("--restore", dest="restore_id", default=None, help="Restore this id")
+    mem_retired.add_argument("--limit", type=int, default=20, help="How many to list")
     mem_import = mem_sub.add_parser("import", help="Import memory from JSON file")
     mem_import.add_argument("file", help="Path to JSON file (export format)")
 

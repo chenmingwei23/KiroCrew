@@ -202,6 +202,223 @@ The parent directory is created on first call if it doesn't exist.
 
 The CLI (`cli.py:main()`) auto-detects and sets the env var at startup.
 
+## Named Memory Stores (`memory_stores.py`)
+
+`cfg.agents[<crew>].memory_store` names the memory silo a crew runs on. A store is
+a separate on-disk silo — its own markdown tree, its own FTS index and its own
+vector-store SQLite file. There is no workspace column, no cutover, and no `CONTRACT_VERSION` bump; the
+file boundary IS the isolation. A named store starts EMPTY: nothing is copied or
+inferred from the default store.
+
+This section owns the resolvers, the shape rule and the degrade. What CONSUMES a
+resolved store name — the cache-key scheme, the read path, the consolidator's write
+path, and the sizeable list of surfaces that are still global — is in
+[memory-skills-hooks](memory-skills-hooks.md#memory-across-surfaces-and-channels).
+
+### There are two roots
+
+Conflating them is the sharpest hazard in this area, because the resolvers answer
+for the same store name with different paths.
+
+| Resolver | Answers | `"default"` resolves to |
+|---|---|---|
+| `memory_store_dir_for(store)` | the MARKDOWN root (`memory/preferences.md`, `memory/projects.md`, `memory/history/*.md`) | `memory.workspace_dir()` = `config_dir()/"workspace"` |
+| `resolve_store_path(store)` | the VECTOR FILE (semantic / episodic / lessons) | `config_dir()/"memory.db"` |
+| `memory_index_path_for(store)` | the FTS5 INDEX file | `config_dir()/"memory_index.db"` |
+
+**Every default answer is byte-exact with what already exists on disk, so no data
+moves.** Returning `config_dir()` from the first would take every install's
+`preferences.md` out from under the consolidator and `kirocrew memory search`; the
+second must stay identical to `VectorMemoryStore()`'s own default; and the third is
+the one that does **not** follow the markdown root. The default store's index stays
+in the data-home root because that root-relative spelling is what the off-store
+consumers hold — the snapshot `memory` component's `files` tuple, `portability`'s
+export/import zip and `scripts/sync-to-remote.sh`. Moving it beside the markdown
+tree drops it from every backup while a restore writes a copy nothing reads, and no
+existing test catches that because they all synthesize the index at the root
+themselves rather than driving a real `MemoryStore`
+(`test/test_memory_stores.py::TestARealStoreSurvivesSnapshotAndRestore` is the one
+that does).
+
+A declared name resolves under `config_dir()/memory_stores/<name>/`, index included:
+a named store's index sits beside its own markdown, which is what makes the index
+per-store and puts it behind the `memory_stores/` fence. None of the three off-store
+consumers names a per-store path, so a named store's index remains outside their reach —
+snapshot, export and remote sync still carry only the default store's copy. Since the
+index is fully derived, what that costs is search results until the next rebuild, never
+memory.
+
+`MemoryStore` takes the index path as a constructor argument (`index_db=`) rather
+than deriving it, so it holds no branch on which store it serves and cannot answer
+differently from `memory_index_path_for`. Omitting it keeps the pre-existing
+derivation, **quirk included**: a bare `MemoryStore()` indexes to
+`<home>/memory_index.db` while `MemoryStore(workspace=workspace_dir())` indexes to
+`<home>/workspace/memory_index.db`, though both share one `_workspace` and one
+markdown tree, and both forms are live (`cli.py` takes the first, `context.py` the
+second). Neither answer is wrong — `rebuild_index` reads no index state, so the cost
+is a duplicated rebuild — but only the root copy is in the snapshot. Closing it means
+giving EVERY caller a store name. `context.get_memory_for` supplies one for a NAMED
+store (`index_db=memory_index_path_for(store)`) and deliberately leaves both default
+construction forms alone, so the quirk is still live on the default path and
+`TestIndexIsPerStore::test_the_two_default_construction_forms_still_disagree` still
+pins it.
+
+`ensure_memory_store_dir(store)` creates a named store's root owner-only, tightening
+the `memory_stores/` root **before** its first child exists so the Windows
+`(OI)(CI)` grants are inherited. It returns `"default"`'s root untouched —
+`MemoryStore.init()` owns that directory.
+
+### Resolution reads the loaded config, never the raw dict
+
+The resolvers read `KiroCrewConfig.load()`. The raw `config.json` dict carries no
+`memory_stores` key until a write-back migration adds one, and that migration is
+skipped whenever the load degraded a section — so a raw-dict resolver reports
+`"default"` as undeclared on a fresh install and keeps doing so on any install with
+a malformed section. `DEFAULT_MEMORY_STORE` is additionally treated as declared
+unconditionally: it is the floor, the way `ACP_BACKEND_KIRO` is the harness floor, so it
+stays resolvable even when the config cannot be read at all.
+
+**Both membership tests union that floor** — the resolvers' `_declared_stores` and a
+crew's binding in `resolve_agent_bindings` — and the binding side is what keeps a crew
+that named no silo out of one. Without it, an operator who declares
+`memory_stores: {"work": {}}` and sets `default_memory_store: "work"` moves EVERY crew
+into `work`, including crews whose config literally says `"memory_store": "default"`:
+the loaded table synthesizes a `"default"` entry only when the section was EMPTY, so a
+section naming one store leaves `"default"` undeclared and it degrades onto the
+configured default. The store the whole install already has must count as declared
+whether or not the operator's table mentions it.
+
+### An empty binding lands on the floor, not on `default_memory_store`
+
+`agent_cfg.memory_store or DEFAULT_MEMORY_STORE` is what the binding degrades. An empty
+binding is the ABSENCE of a choice, not a broken name, so it resolves to `"default"` —
+the same answer an absent key gives, since `AgentConfig.memory_store` itself defaults to
+`"default"`. The two spellings must not diverge: the dashboard PUT persists whatever the
+request body carries, so a picker emitting `""` for "nothing selected" would otherwise
+move that crew into whichever silo the operator configured.
+
+`default_memory_store` keeps its one job: it is the REPAIR target for a name that WAS
+chosen and cannot be resolved. It is not a fallback for having chosen nothing.
+
+### Two failure postures, deliberately different
+
+**An UNDECLARED name degrades** (`degrade_store_name`) — two hops, each logged
+with its reason: the requested name, then `cfg.default_memory_store` if that is
+itself declared and well-formed, then the literal `"default"`. The house pattern is
+`acp_backends.resolve_selected_backend` and the workspace degrade in
+`resolve_agent_bindings`. Why not raise: a raise lands inside
+`HistoryConsolidator._consolidate`'s `try`, where it is caught with `billed` still
+False — so no backoff attempt is recorded, all four consolidation entry points
+re-arm on every 60s idle tick forever, and `kirocrew consolidate` swallows it.
+
+**A MALFORMED name handed straight to a resolver raises** `UnknownMemoryStore`.
+Repairing it is what would silently merge two crews' memory into one directory —
+`../work` and `Work` must not be sanitized onto `work` — so path composition fails
+closed. The shape rule (`validate_memory_store_name`) is applied BEFORE any path
+composition:
+
+- lowercase, 1–`MEMORY_STORE_NAME_MAX` (80) characters
+- matches `^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$` — the same dialect
+  `members._SLUG_RE` uses for member slugs
+- a SINGLE path segment, checked against both separators
+- not a Windows reserved device basename (`con`, `nul`, `aux`, `prn`, `com1`–`com9`,
+  `lpt1`–`lpt9`), on every platform — a config written on Linux is carried to Windows
+- no trailing dot or space
+
+Containment is **re-checked after composition** (`_named_store_dir`): the composed
+path must be a direct child of `memory_stores/`, so a store directory replaced with
+a link pointing outside the fenced root is refused even though its name was valid.
+Same validate-then-re-check pairing as `members.validate_slug` / `members.member_dir`.
+
+The shape rule also runs at config load, on every `memory_stores` key and on
+`default_memory_store`, so the operator sees the problem at boot rather than at the
+first memory write. It is **reported, never repaired**: the entry is kept verbatim so
+a `to_dict()`/`save()` round-trip cannot erase the operator's own declaration.
+
+### A malformed name is UNDECLARED for resolution
+
+Keeping the entry means declaredness alone is not usability, and that gap is what
+makes the two postures cohere. `usable_store_names(cfg.memory_stores)` drops every
+malformed key, and **both** membership tests in the tree run through it: the
+resolvers' (`_declared_stores`) and a crew's binding
+(`resolve_agent_bindings`). So a crew bound to `Bad_Name` degrades at the binding,
+and the raise above is unreachable from a config — what is left for it to catch is a
+caller composing a path from a name it invented.
+
+Without the filter the two disagree in the worst direction: the binding hands on a
+name the config declares, the resolver refuses it, and the refusal surfaces at the
+first memory write rather than at boot. `degrade_store_name` is the shared two-hop
+degrade, pure and config-free so the binding can call it without re-entering the
+loader.
+
+### The write boundary refuses a shape, not an undeclared name
+
+Both postures above are what RESOLUTION does with a name already on disk. The
+surfaces that PUT one there — `POST /api/agents`, `PUT /api/agents/{name}`,
+`kirocrew agent create` and `kirocrew agent update` — apply
+`memory_store_binding_defect`, which is `memory_store_name_defect` plus one
+exception, and reject a malformed binding with `code: "invalid_memory_store"` (exit
+1 on the CLI). One predicate for all four, in the module that owns the rule, so a
+stricter surface is not decoration the operator can walk around through the other
+one.
+
+`POST /api/memory/stores` writes the other side of the same relation — a `memory_stores`
+KEY rather than a crew's binding to one — and it applies the bare
+`memory_store_name_defect` (`code: "invalid_memory_store_name"`), without the `""`
+exception below: a store must be NAMED to have a directory, so "nothing selected" is
+not a value it can carry.
+
+`""` is the exception, and it passes. It is the absence of a choice rather than a
+broken name: `resolve_agent_bindings` maps it onto the `"default"` floor, and the
+crew editor's picker spells "nothing selected" that way while sending the field on
+every save, so refusing it would leave a crew whose stored binding is already empty
+unsavable. A NON-string is still refused — it lands in `config.json` verbatim, every
+reader downstream is annotated `str`, and `kirocrew agent list` formats the field
+through a width spec, so one bad write takes out the command that would show it to
+you.
+
+An UNDECLARED but well-formed name is **accepted**, and the arrival of a create
+endpoint does not change that. `POST /api/memory/stores` (owner-gated,
+[learn-cron-dashboard](learn-cron-dashboard.md#key-endpoints)) declares a store and
+creates its directory, applying `memory_store_name_defect` — the same predicate, so
+the two surfaces cannot disagree on the shape rule — and refusing an existing name
+with 409 `memory_store_exists`. The table is still hand-editable, the create route is
+not the only way a name gets there, and there is no delete route, so a 400 on the
+BINDING would make the field unsettable ahead of the operator's own edit — and
+unsavable for a crew already holding a name whose store was later removed, since the
+editor echoes the stored value back on every save. What the write adds instead is `warn_if_binding_degrades`: it names the crew
+AND the store the crew will actually run on, taking that target from
+`degrade_store_name` rather than a second rule so it cannot claim a store resolution
+would not pick. The degrade itself is otherwise reported at the first memory read,
+by a line attributed to no crew, however long after the choice was made — and a crew
+bound to a store nobody declared reads and writes a silo it did not ask for, which
+is the whole failure per-crew memory exists to prevent. Same unknown-but-accepted
+posture, for the same reason, as the create verb's `kiro_agent` template check.
+
+### The stores root is read+write fenced
+
+`memory_stores/` is a keystone leaf in `security._CREW_SECRET_LEAVES`, under every
+crew home prefix. The default store's own `memory.db` and `workspace/memory/` stay
+readable — a deliberate asymmetry, documented with its reason in
+[security](security.md).
+
+## Workspace fall-through is logged
+
+`workspace_dir_for(name)` also reads the LOADED config's `workspaces` table rather
+than the raw bytes, so it and `resolve_agent_bindings` cannot answer the same
+question two ways. An unmapped name falls back to `default_workspace` and then to
+`WorkspaceConfig().dir`, and the fall-through is logged: two DISTINCT names both
+resolving to `<home>/workspace` warns, because that is how a workspace split becomes
+a shared tree nobody notices. An install that simply has no `workspaces` section is
+the ordinary fresh state and logs at debug. It **never raises** —
+`default_project_dir` and the workspace-identity block are built on it, so a raise
+would break a fresh install and take both with it.
+
+Consequence worth knowing: a legacy FLAT `{"name": "dir"}` workspaces entry is a
+type mismatch the schema validator removes before the loader sees it, so such an
+entry is absent from the loaded table. `resolve_agent_bindings` has always answered
+from that table; `workspace_dir_for` now agrees with it.
+
 ## Superseded Defaults (reported, never rewritten)
 
 `config.json` is a full materialization of the schema -- every field is written to

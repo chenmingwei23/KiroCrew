@@ -369,8 +369,31 @@ def ensure_data_home() -> Path:
     is a cheap cached lookup. Idempotent (the process-lifetime cache makes a
     second call a no-op) and safe to call unconditionally. Returns the resolved
     data home.
+
+    Also the one place the data home itself is tightened to owner-only, which
+    makes the guarantee a property of establishing the home rather than of one
+    subsystem happening to write there. The alternative — leaning on
+    ``VectorMemoryStore.init``'s ``make_owner_only_dir(db_path.parent)`` — only
+    reaches the data home while the DEFAULT store's ``memory.db`` sits directly
+    in it, so a home whose crews all use NAMED memory stores would never be
+    tightened at all. The per-store call still tightens its own directory, which
+    is what covers the files SQLite creates inside it.
+
+    Best-effort: ``restrict_dir_to_owner`` is fail-loud by contract, and a home
+    that could not be tightened must still be usable — a permission warning is
+    the right outcome, an unbootable gateway is not.
     """
-    return config_dir()
+    home = config_dir()
+    try:
+        from kiro_crew.platform_compat import restrict_dir_to_owner
+
+        restrict_dir_to_owner(home)
+    except OSError:
+        logger.warning(
+            "Cannot restrict the data home to owner-only; it may be readable by other users",
+            exc_info=True,
+        )
+    return home
 
 
 def config_package_dir() -> Path:

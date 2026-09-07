@@ -10309,12 +10309,11 @@
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "このワークスペースの一意な識別子。エージェントは名前でワークスペースを参照します。",
-      "additional_stores_coming_with_memory_v2": "現在はデフォルトストアのみが利用可能です — より多くのメモリストアのサポートは近日予定です。",
       "agent_template_is_required": "エージェントテンプレートは必須です",
       "agents": "エージェント",
       "also_used_by_these_crews": "{{crews}}でも使用されています。ストアを共有するエージェントは相互にファイルとメモリを読むことができます。",
-      "bindings_preview_info": "プレビュー。エージェントごとに分離されたメモリはまだ開発中です。エージェントには自分のワークスペースフォルダーがありますが、意味記憶、過去の会話の想起、グローバルなレッスンはすべてのエージェントに届くため、ここを変えてもエージェントが記憶する内容はまだ分離されません。",
-      "bindings_preview_notice": "プレビュー。各エージェントはすでに自分のワークスペースフォルダーを読み書きしていますが、記憶している内容はまだ分離されていません。意味記憶、過去の会話の想起、グローバルなレッスンはすべてのエージェントに届きます。エージェントごとに分離されたメモリは近日予定です。",
+      "bindings_preview_info": "自分のメモリストアに紐づいたエージェントは、どこから呼ばれても別々に記憶するようになりました。チャット、メッセージングチャネル、スケジュールされたジョブのいずれでも同じです。メモリページでは、サインインしているダッシュボードの所有者がストアの選択を任意の宣言済みストアに向けられます。",
+      "bindings_preview_notice": "自分のメモリストアに紐づいたエージェントは、記憶した内容を自分のなかにとどめます。既定のストアに残っているエージェントは、引き続き一つの記憶を共有します。",
       "cancel": "キャンセル",
       "chat_with_this_crew": "このエージェントとチャット",
       "copy_from_optional": "コピー元（オプション）",
@@ -10394,7 +10393,7 @@
       "view_cards_tooltip": "各エージェントが使用するものを示す広々としたカード",
       "view_list": "リスト",
       "view_list_tooltip": "コンパクトな表、エージェントごとに1行",
-      "which_store_its_lessons_and_history_are_written": "このエージェントがどのメモリストアに紐づいているか。紐づけは記録されますが、それによってエージェントが自分専用のメモリを持つようにはまだなりません。",
+      "which_store_its_lessons_and_history_are_written": "このエージェントがどのメモリストアに紐づいているか。自分のストアを持つエージェントは、独自の設定、プロジェクト、日々の履歴、保存した事実、思い出した会話、学びを保持します。既定のストアに残っているエージェントは一つの記憶を共有します。",
       "workspace": "ワークスペース",
       "workspace_2": "ワークスペース",
       "workspace_name_is_required": "ワークスペース名は必須です",
@@ -10407,7 +10406,8 @@
       "discard_unsaved_body": "このクルーには保存されていない編集があります。今閉じると破棄されます。",
       "discard_confirm": "変更を破棄",
       "discard_also_crew_edits": "このクルーの他の未保存の編集も一緒に破棄されます。",
-      "editor_options_load_failed": "クルーエディターのワークスペース、テンプレート、メモリストアの選択肢を読み込めませんでした。"
+      "editor_options_load_failed": "クルーエディターのワークスペース、テンプレート、メモリストアの選択肢を読み込めませんでした。",
+      "only_the_default_store_is_declared": "設定ファイルには既定のストアだけが宣言されています。メモリページの「新しいストア」でもう一つ宣言すると、エージェントに専用のメモリを持たせられます。"
     },
     "knowledge": {
       "detailView": {
@@ -10636,7 +10636,13 @@
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
-        "retry": "Retry"
+        "retry": "Retry",
+        "chunk_limit_label": "ソースごとのチャンク上限",
+        "chunk_limit_desc": "1 つのソースが 1 回のスキャンで取り込めるチャンクの上限です。チャンクごとに LLM の抽出呼び出しを 1 回消費します。0 は無制限です。",
+        "max_sources_label": "最大ソース数",
+        "max_sources_desc": "自動的に見つかった知識ソースの最大数です。手動で追加したソースには上限がありません。0 は無制限です。",
+        "auto_project_label": "プロジェクト文書を自動登録",
+        "auto_project_desc": "作業している各プロジェクトの文書を、自動的に知識ソースとして登録します。"
       }
     },
     "localStorageDebug": {
@@ -11117,7 +11123,8 @@
         "session_other": "{{count}} セッション",
         "summarize_now": "今すぐ要約",
         "tool": "ツール",
-        "when": "時間"
+        "when": "時間",
+        "the_cards_below_do_not_follow_the_store_picker_m": "下のカードはストアの選択に追随しません。メモリ設定と埋め込みモデルはインストール全体に効き、レッスンはグローバルストアと現在のワークスペースのストアを統合し、ベクトルメモリブラウザーはこのセッションが紐づいているストアを読み取ります。"
       },
       "portabilityTab": {
         "archive_contents": "アーカイブの内容:",
@@ -11442,6 +11449,81 @@
         "vector_memory": "ベクトルメモリ",
         "vector_memory_is_initializing_the_embedding_mode": "ベクトルメモリが初期化中です。埋め込みモデル（約610MB）はバックグラウンドで自動的にダウンロードされ、レガシーメモリは自動的に移行します — 操作は不要です。",
         "verifying_model_integrity": "モデルの整合性を確認中…"
+      },
+      "memoryStoreCard": {
+        "a_new_store_starts_empty_and_keeps_its_memory_in": "新しいストアは空の状態で始まり、メモリを自分専用のデータベースファイルに保持します。そのため、エージェントがそこで覚えたことは他のどのストアにも届きません。ここからストアの宣言を取り消すことはできません。取り消せば覚えた内容が行き先を失うため、このページの外で意図的な手順を踏む必要があります。",
+        "a_store_with_that_name_is_already_declared_pick": "その名前のストアはすでに宣言されています。もう一度宣言せず、リストから選んでください。",
+        "backups": "バックアップ：<v/>",
+        "cancel": "キャンセル",
+        "crew_silo": "エージェント専用ストア",
+        "declare_store": "ストアを宣言",
+        "episodes": "エピソード：<v/>",
+        "facts_and_directives": "ファクトと指示：<v/>",
+        "lessons": "レッスン：<v/>",
+        "memory_store": "メモリストア",
+        "new_memory_store": "新しいメモリストア",
+        "new_store": "新しいストア",
+        "newest_backup": "最新のバックアップ：<v/>",
+        "only_the_signed_in_dashboard_owner_can_address_a": "サインイン済みのダッシュボード所有者だけが、メモリストアを名前で指定できます。このページの表示はいずれも、このセッションが紐づいているストアを読み取ります。",
+        "schema_lineage": "スキーマ系統：<v/>",
+        "shared_default_store": "共有の既定ストア",
+        "store_name": "ストア名",
+        "that_name_cannot_be_used_for_a_store_directory_u": "この名前はストアのディレクトリには使えません。小文字、数字、ハイフンを使ってください。",
+        "the_picker_drives_this_card_the_preferences_proj": "このセレクターは、このカードと、優先度・プロジェクト・日次履歴の各ドキュメント、そして下の内訳・引退・バックアップの各カードを切り替えます。",
+        "this_install_does_not_declare_a_memory_store_by": "このインストールでは、その名前のメモリストアはもう宣言されていません。上のリストから別のストアを選んでください。",
+        "this_store_has_no_database_file_that_can_be_read": "このストアには、まだ読み取れるデータベースファイルがありません。ファイルは最初に何かを記憶したときに作られるので、それまでは一覧に出るものがありません。すでにあるバックアップは、下から今も復元できます。",
+        "this_store_is_declared_but_its_database_could_no": "このストアは宣言されていますが、データベースを開けませんでした。この名前で別のストアのメモリを見せるのではなく、何も表示しません。",
+        "this_store_uses_the_shared_schema_so_carve_facet": "このストアは共有スキーマを使うため、内訳のファセットは適用されません。",
+        "unknown": "不明"
+      },
+      "memoryRetiredCard": {
+        "actions": "アクション",
+        "an_episode_lands_here_when_a_later_fact_supersed": "後の事実がエピソードを置き換えると、ここに入ります。",
+        "episodes_a_later_fact_superseded_their_text_is_k": "後の事実に置き換えられたエピソードです。本文は残るので、まだ必要だったものを引退で消してしまった場合は、ここで取り消せます。",
+        "memory": "メモリ",
+        "not_recorded": "記録なし",
+        "nothing_has_been_retired": "引退したものはありません",
+        "restore": "復元",
+        "retired": "引退日時",
+        "retired_memories": "引退したメモリ",
+        "superseded_by": "置き換えたもの",
+        "times_retired": "引退回数",
+        "unknown": "不明"
+      },
+      "memoryBackupsCard": {
+        "a_restored_database_is_read_from_the_next_time_t": "復元したデータベースは、次にゲートウェイを起動したときに読み込まれます。それまでは、このメモリストアは置き換えられたファイルを使い続けます。",
+        "actions": "アクション",
+        "already_recent": "すでに最新：{{value}}",
+        "back_up_now": "今すぐバックアップ",
+        "backups": "バックアップ",
+        "backups_are_taken_on_a_timer_and_back_up_now_tak": "バックアップはタイマーで取得され、「今すぐバックアップ」を押すとその場で取得されます。",
+        "cancel": "キャンセル",
+        "confirm_restore": "復元を確認",
+        "copies_taken": "作成したコピー：{{value}}",
+        "failed": "失敗：{{value}}",
+        "no_backups_yet": "バックアップはまだありません",
+        "older_copies_removed": "削除した古いコピー：{{value}}",
+        "restore": "復元",
+        "restored_the_database_it_replaced_was_kept_besid": "復元しました。置き換えられたデータベースは上書きされず、そのストア自身のファイルの隣にこの名前で残しています：<name/>",
+        "size": "サイズ",
+        "taken": "取得日時",
+        "this_replaces_the_store_s_live_database_the_file": "これはストアの稼働中データベースを置き換えます。押し出されたファイルは「置き換え済み」という名前で隣に残るので、何も削除されません。"
+      },
+      "memoryCarveCard": {
+        "a_count_appears_once_something_is_remembered_wit": "この軸が記録された状態で何かが覚えられると、件数が出ます。",
+        "carve": "内訳",
+        "clear_filter": "フィルタをクリア",
+        "count_by": "集計軸",
+        "crew": "エージェント",
+        "how_this_store_s_memory_divides_up_across_the_ax": "このストアのメモリが、書き込みごとに付く軸でどう分かれているか。値を選ぶと、その区分のメモリを一覧できます。",
+        "kind": "種類",
+        "memory": "メモリ",
+        "no_live_memories_in_this_slice": "この区分に有効なメモリはありません",
+        "not_recorded": "記録なし",
+        "nothing_is_stamped_on_this_axis_yet": "この軸にはまだ何も付いていません",
+        "surface": "サーフェス",
+        "the_count_includes_only_live_rows_so_a_slice_can": "件数には有効な行だけが入るため、区分は読み取りの合間に空になることがあります。",
+        "this_store_uses_the_shared_schema_so_carve_facet": "このストアは共有スキーマを使うため、内訳のファセットは適用されません。行にはエージェント・サーフェス・スコープの印が付いていないので分ける手がかりがなく、これはストアが空であることとは別です。"
       }
     },
     "overviewPage": {
@@ -13921,8 +14003,8 @@
       "empty_roster": "クルーメンバーはまだいません。クルー管理ページで作成するとここに表示されます。",
       "inherited": "継承",
       "member_count_other": "{{count}} 名のメンバー",
-      "memory_dedicated_note": "設定とプロジェクトメモは、共有のデフォルトではなく「{{store}}」ストアから読み込まれます。会話の記憶とレッスンはまだ分離されていません。このメンバーに伝えた内容は、引き続き全員が知ることになります。",
-      "memory_shared_note": "メンバーは現在同じメモリを共有しています。あるメンバーに伝えた内容は全員が知ることになります。",
+      "memory_dedicated_note": "設定、プロジェクトのメモ、保存した事実、思い出した会話、学びはいずれも共有の既定ストアではなく {{store}} ストアから来ます。そのため、このメンバーに伝えた内容はこのメンバーのなかにとどまります。",
+      "memory_shared_note": "既定のメモリストアを使うメンバーは 1 つのメモリを共有します。あるメンバーに伝えた内容は全員が知ることになります。独自のストアに紐づいたメンバーは、どこから話しかけても別々に記憶します。",
       "memory_store": "メモリストア",
       "model": "モデル",
       "opening_thread": "会話を開いています…",

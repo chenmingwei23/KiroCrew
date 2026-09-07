@@ -99,6 +99,11 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.memory_stores import (
+    DEFAULT_MEMORY_STORE,
+    memory_store_binding_defect,
+    warn_if_binding_degrades,
+)
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
@@ -3262,6 +3267,32 @@ def _crew_effort_rejected(raw: object) -> str | None:
     return "reasoning_effort must be one of: " + ", ".join(("(empty)", *EFFORT_LEVELS))
 
 
+def _crew_memory_store_rejected(raw: object) -> str | None:
+    """Reason a crew's memory-store binding is unusable, or ``None`` to allow it.
+
+    The rules themselves are ``memory_stores``' and are never restated here: a
+    second copy of the shape rule is how the write boundary comes to accept a name
+    the resolvers refuse to compose a path for, and that refusal would then surface
+    at the crew's first memory write rather than on the form that authored it.
+
+    Rejects rather than degrading, for the same reason as
+    :func:`_crew_effort_rejected`: the value has an author on the other end, and a
+    name quietly degraded onto another crew's silo reads back as a save that was
+    lost while the crew files its memory somewhere it was never bound.
+
+    Only the SHAPE is refused. An undeclared but well-formed name is accepted and
+    warned about at the write — see ``memory_stores.warn_if_binding_degrades`` for
+    why that direction is not a 400.
+    """
+    defect = memory_store_binding_defect(raw)
+    if defect is None:
+        return None
+    return (
+        f"memory_store {raw!r} is not a usable store name ({defect}); use lowercase "
+        "letters, digits and hyphens, or '' for the default store"
+    )
+
+
 def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
@@ -3463,6 +3494,14 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # An absent field is the floor, not an unset binding: the crew is bound to the
+    # global store every install already has.
+    memory_store = body.get("memory_store", DEFAULT_MEMORY_STORE)
+    memory_store_reason = _crew_memory_store_rejected(memory_store)
+    if memory_store_reason:
+        return web.json_response(
+            {"error": memory_store_reason, "code": "invalid_memory_store"}, status=400
+        )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
@@ -3473,7 +3512,7 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         cfg.agents[name] = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
-            memory_store=body.get("memory_store", "default"),
+            memory_store=memory_store,
             model=model,
             reasoning_effort=reasoning_effort,
             description=body.get("description", ""),
@@ -3481,6 +3520,12 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             source=body.get("source", "kirocrew"),
             session_color=session_color,
             avatar=avatar,
+        )
+        warn_if_binding_degrades(
+            name,
+            memory_store,
+            getattr(cfg, "memory_stores", None),
+            getattr(cfg, "default_memory_store", ""),
         )
         cfg.save()
     # A crew APPEARING changes what the effort chain resolves even with no pin of
@@ -3554,6 +3599,12 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "starred must be a boolean", "code": "invalid_starred"}, status=400
         )
+    if "memory_store" in body:
+        memory_store_reason = _crew_memory_store_rejected(body["memory_store"])
+        if memory_store_reason:
+            return web.json_response(
+                {"error": memory_store_reason, "code": "invalid_memory_store"}, status=400
+            )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
@@ -3577,7 +3628,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             agent.workspace = body["workspace"]
             changed.append("workspace")
         if "memory_store" in body:
+            # Already shape-validated above; "" is the inherit sentinel and rebinds
+            # the crew to the global store, which is what retracts a silo.
             agent.memory_store = body["memory_store"]
+            warn_if_binding_degrades(
+                name,
+                agent.memory_store,
+                getattr(cfg, "memory_stores", None),
+                getattr(cfg, "default_memory_store", ""),
+            )
             changed.append("memory_store")
         if "model" in body:
             # "auto"/"" both mean inherit; store the single "" spelling so the

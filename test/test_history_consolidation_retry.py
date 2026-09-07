@@ -126,7 +126,9 @@ class _FakeRequest:
 
     def __init__(self, state: Any, body: dict) -> None:
         self.app = {"state": state}
-        self.headers: dict[str, str] = {}
+        # The handler's session-recognition gate refuses a request with no
+        # X-Session-Key; the browser UI's static key is the recognised caller.
+        self.headers: dict[str, str] = {"X-Session-Key": "dashboard:ui"}
         self._body = body
 
     async def json(self) -> dict:

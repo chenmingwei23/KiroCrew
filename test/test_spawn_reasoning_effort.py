@@ -434,6 +434,9 @@ class TestRecordAndRetry:
             include_memory=True,
             include_lessons=True,
             include_project=True,
+            # Reused by the retry alongside the context triple: a retry must not
+            # widen a delegated run to the global store.
+            memory_store="",
             done=True,
             outcome="failed",
         )

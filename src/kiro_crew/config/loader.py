@@ -340,6 +340,15 @@ from kiro_crew.instances.constants import DEFAULT_TUNNEL_BASE_PORT as _DEFAULT_T
 from kiro_crew.instances.constants import DEFAULT_WARM_SET_CAP as _DEFAULT_WARM_SET_CAP
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
+# The memory-store shape rule, applied to store NAMES at load. Leaf module:
+# stdlib only at module scope (it imports this one lazily), so no cycle.
+from kiro_crew.memory_stores import (
+    DEFAULT_MEMORY_STORE,
+    degrade_store_name,
+    memory_store_name_defect,
+    usable_store_names,
+)
+
 # The speech-to-text defaults and the model catalog come from the package that
 # owns them, so the model menu this schema advertises cannot name a model that
 # cannot be downloaded, and a tuning knob cannot document a default the session
@@ -1458,25 +1467,63 @@ def refresh_config_meta_stamp() -> bool:
 def workspace_dir_for(workspace: str | None = None) -> Path:
     """Resolve a named workspace to its directory path.
 
-    Reads the ``dir`` field from ``WorkspaceConfig`` objects (new structured
-    format) or falls back to raw string values (legacy flat format).
+    Reads the LOADED config's ``workspaces`` table, not the raw bytes on disk, so
+    this and ``resolve_agent_bindings`` cannot answer the same question two ways:
+    the loaded table is the one the validator has repaired and the write-back
+    migration has normalized, and it is what every other consumer already reads.
 
     Values starting with ``/`` or ``~`` are treated as absolute paths.
     Otherwise the value is relative to ``config_dir()`` (``~/.kiro/crew/``).
-    Unmapped workspace names fall back to ``"workspace"``.
-    """
-    data = _raw_config()
-    ws = workspace or data.get("default_workspace", "default")
-    mapping = data.get("workspaces", {})
-    raw_value = mapping.get(ws, "workspace")
 
-    # Extract the directory string from either format
-    if isinstance(raw_value, dict):
-        dirname = raw_value.get("dir", "workspace")
-    elif isinstance(raw_value, str):
-        dirname = raw_value
-    else:
-        dirname = "workspace"
+    An unmapped name falls back to the ``WorkspaceConfig`` default directory —
+    NOT to ``default_workspace``'s directory, which could be an absolute path
+    outside the data home — and the fall-through is LOGGED. Two DISTINCT names
+    both resolving to the same ``<home>/workspace`` is how a workspace split
+    turns into a shared tree nobody notices, so that case warns. An install that
+    simply has no ``workspaces`` section yet is the ordinary fresh state and logs
+    at debug — it is one workspace, not a collision.
+
+    Never raises. ``default_project_dir`` and the workspace-identity block are
+    built on this, so a raise here would break a fresh install and take both
+    with it; a config that cannot be loaded resolves to the default directory.
+    """
+    mapping: dict[str, WorkspaceConfig] = {}
+    ws = workspace or ""
+    configured_default = ""
+    try:
+        cfg = KiroCrewConfig.load()
+        mapping = cfg.workspaces
+        configured_default = cfg.default_workspace
+        ws = workspace or configured_default
+    except Exception:
+        logger.warning(
+            "could not load config to resolve workspace %r; using the default directory",
+            workspace,
+            exc_info=True,
+        )
+
+    entry = mapping.get(ws)
+    if entry is None:
+        # An unmapped name resolves to the BASE workspace directory, never to the
+        # configured default's directory. That distinction is the boundary: this
+        # answer becomes a filesystem root, and one caller
+        # (``dashboard/handlers/files.py``'s ``?workspace=``) takes the name from a
+        # request without the ``is_sensitive_path`` check its ``?project=`` sibling
+        # applies. Hopping to ``default_workspace`` would let an unrecognized name
+        # reach whatever absolute ``dir`` that workspace declares, so an unmapped
+        # name stays inside the data home by construction.
+        #
+        # It is still a fail-OPEN worth naming: two DISTINCT declared-looking names
+        # both landing here share one tree, which is how a workspace split becomes a
+        # shared tree nobody notices. An install with no ``workspaces`` section is
+        # the ordinary fresh state and is one workspace, not a collision.
+        report = logger.debug if ws == configured_default else logger.warning
+        report(
+            "workspace %r is not declared in workspaces; falling back to the base "
+            "workspace directory",
+            ws,
+        )
+    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
 
     p = Path(dirname).expanduser()
     if p.is_absolute():
@@ -2691,26 +2738,61 @@ class KiroCrewConfig:
             raw_workspaces = {}
         workspaces = _migrate_workspaces(raw_workspaces)
 
-        # Parse memory_stores; synthesize default if missing
+        # Parse memory_stores; synthesize default if missing.
+        #
+        # A store NAME becomes a single path segment under
+        # ``memory_stores.MEMORY_STORES_DIR_NAME``, so the shape rule is applied
+        # here too — at BOOT, where the operator can see it — rather than only at
+        # the first memory write. Reported, never REPAIRED: the entry is kept
+        # verbatim so a ``to_dict()``/``save()`` round-trip cannot erase the
+        # operator's own declaration, and no name is rewritten into a usable one,
+        # because sanitizing ``../work`` or ``Work`` into ``work`` is the one
+        # thing that would merge two crews' memory into one directory.
+        #
+        # Kept, but not usable: ``memory_stores.usable_store_names`` drops a
+        # malformed name from the resolvable set, so a crew bound to it degrades
+        # at ``resolve_agent_bindings`` instead of carrying the name to a
+        # resolver that would raise on it.
         raw_stores = data.get("memory_stores", {})
         memory_stores: dict[str, MemoryStoreConfig] = {}
         if isinstance(raw_stores, dict) and raw_stores:
             for name, entry in raw_stores.items():
-                if isinstance(entry, dict):
-                    memory_stores[name] = MemoryStoreConfig(
-                        description=entry.get("description", ""),
-                        embedding_provider=entry.get("embedding_provider", ""),
+                if not isinstance(entry, dict):
+                    continue
+                defect = memory_store_name_defect(name)
+                if defect is not None:
+                    logger.warning(
+                        "memory_stores: store name %r is unusable (%s); any crew "
+                        "bound to it cannot resolve a memory directory",
+                        name,
+                        defect,
                     )
+                memory_stores[name] = MemoryStoreConfig(
+                    description=entry.get("description", ""),
+                    embedding_provider=entry.get("embedding_provider", ""),
+                )
         if not memory_stores:
-            memory_stores["default"] = MemoryStoreConfig()
+            memory_stores[DEFAULT_MEMORY_STORE] = MemoryStoreConfig()
 
         # Parse top-level default_agent and default_memory_store
         default_agent_val = data.get("default_agent", "")
         if not isinstance(default_agent_val, str):
             default_agent_val = ""
-        default_memory_store_val = data.get("default_memory_store", "default")
+        default_memory_store_val = data.get("default_memory_store", DEFAULT_MEMORY_STORE)
         if not isinstance(default_memory_store_val, str):
-            default_memory_store_val = "default"
+            default_memory_store_val = DEFAULT_MEMORY_STORE
+        # Reported, not repaired, for the same reason as the store names above.
+        # ``memory_stores.degrade_store_name`` steps over a malformed
+        # ``default_memory_store`` on the second hop and lands on the floor, so
+        # the value can be preserved without ever becoming a path.
+        elif memory_store_name_defect(default_memory_store_val) is not None:
+            logger.warning(
+                "default_memory_store %r is not a usable store name (%s); memory "
+                "store resolution will degrade to %r",
+                default_memory_store_val,
+                memory_store_name_defect(default_memory_store_val),
+                DEFAULT_MEMORY_STORE,
+            )
 
         # Capture unknown top-level sections verbatim so a section this core does
         # not model (e.g. an edition-contributed section written by a companion)
@@ -5175,6 +5257,23 @@ def resolve_agent_bindings(
     # the requested name never advertise a binding that is not running.
     requested_resolved = (not agent_name) or alias_hit or bool(passthrough)
 
+    # The store names a crew may actually be bound to. Filtered rather than read
+    # straight off ``config.memory_stores``, because the load REPORTS a malformed
+    # store name and keeps the operator's entry verbatim: a raw membership test
+    # would hand a crew a name ``memory_stores``' resolvers refuse to compose a
+    # path for, and the refusal would surface at the first memory write instead of
+    # here. Same filter AND the same floor union as ``memory_stores``' own
+    # ``_declared_stores``, so the two cannot answer differently.
+    #
+    # The floor union is what keeps a crew that named NO silo out of one. Without
+    # it, an operator who declares ``memory_stores: {"work": {}}`` and sets
+    # ``default_memory_store: "work"`` moves every crew into ``work`` — including
+    # crews whose config literally says ``"memory_store": "default"`` — because
+    # ``"default"`` is absent from the raw table and degrades onto the configured
+    # default. The store the whole install already has must count as declared
+    # whether or not the operator's table mentions it.
+    declared_stores = usable_store_names(config.memory_stores) | {DEFAULT_MEMORY_STORE}
+
     # Step 1: explicit agent_name
     if agent_name and agent_name in config.agents:
         agent_cfg = config.agents[agent_name]
@@ -5198,7 +5297,9 @@ def resolve_agent_bindings(
         logger.warning("No agents configured, using bare defaults")
         return ResolvedBindings(
             workspace_dir=Path("workspace"),
-            memory_store_name=config.default_memory_store,
+            memory_store_name=degrade_store_name(
+                config.default_memory_store, declared_stores, config.default_memory_store
+            ),
             effective_memory_config=_dc.asdict(config.memory),
             kiro_agent=passthrough or config.agent.default_agent,
             requested_resolved=requested_resolved,
@@ -5217,15 +5318,23 @@ def resolve_agent_bindings(
         fallback_ws = config.workspaces.get(config.default_workspace)
         ws_dir = Path(fallback_ws.dir) if fallback_ws else Path("workspace")
 
-    # Resolve memory store
-    store_name = agent_cfg.memory_store
-    if store_name not in config.memory_stores:
-        logger.warning(
-            "Agent memory_store '%s' not found, falling back to '%s'",
-            store_name,
-            config.default_memory_store,
-        )
-        store_name = config.default_memory_store
+    # Resolve memory store. Two hops with their own logging, shared with
+    # ``memory_stores``' resolvers so a name that survives here is one they can
+    # turn into a path.
+    #
+    # An EMPTY binding is the absence of a choice, not a broken name, so it lands
+    # on the floor rather than degrading onto ``default_memory_store``. An absent
+    # key already resolves that way (the field's own default is the floor), and
+    # the two spellings must not diverge: the dashboard PUT persists whatever the
+    # body carries, so a picker that emits ``""`` for "nothing selected" would
+    # otherwise move that crew into whichever silo the operator configured.
+    # ``default_memory_store`` stays what it is — the REPAIR target for a name
+    # that was chosen and cannot be resolved.
+    store_name = degrade_store_name(
+        agent_cfg.memory_store or DEFAULT_MEMORY_STORE,
+        declared_stores,
+        config.default_memory_store,
+    )
 
     kiro_agent = passthrough or agent_cfg.kiro_agent
 

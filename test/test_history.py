@@ -2798,7 +2798,7 @@ class TestConsolidationDoesNotBlockLoop:
             vector_store=vector_store, migrated=True,
         )
 
-        def _fake_write(result, key):
+        def _fake_write(result, key, vector_store=None, **_):
             # Simulate the blocking embed call; record the executing thread.
             write_thread_id["id"] = threading.get_ident()
 
@@ -2850,7 +2850,7 @@ class TestConsolidationDoesNotBlockLoop:
 
         original_save = c._save_lessons
 
-        def _instrumented_save(raw):
+        def _instrumented_save(raw, vector_store=None, lesson_store=None, **_):
             save_thread_id["id"] = threading.get_ident()
             original_save(raw)
 

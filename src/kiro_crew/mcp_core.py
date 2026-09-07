@@ -48,7 +48,7 @@ from kiro_crew.history import _SEARCH_SCAN_WINDOW as SEARCH_SCAN_WINDOW
 from kiro_crew.history import ConversationLog, is_incognito_transcript, snippet_needles
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.embedder import create_embedder_from_config
-from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.retrieval import HybridRetriever, vector_leg
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import current_caller
@@ -69,6 +69,7 @@ from kiro_crew.security import (
 from kiro_crew.sel import sel
 from kiro_crew.session_directive import refuse_if_markerless
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
     validate_tool_args,
@@ -89,6 +90,7 @@ _HANDLER_SURFACE = (
     sel,
     summarize_result,
     time,
+    vector_leg,
 )
 
 
@@ -2069,6 +2071,55 @@ def _format_anchor(anchor: dict) -> str:
     tail = quote[-100:]
     omitted = len(quote) - 200
     return f' [on: "{head}" [TRUNCATED: {omitted} chars omitted' f'{offset_info}] "{tail}"]'
+
+
+def _do_route_crew(task: str) -> str:
+    """Rank the crews whose triggers match *task* (the route_crew tool body).
+
+    The SCORED half of routing, next to ``select_crew``'s roster. Both exist
+    because they answer different questions: the roster asks the model to judge,
+    which is right when the task is prose and the crews are described in prose;
+    this ranks the same triggers mechanically, which is right when a caller wants
+    the same task to reach the same crew every time.
+
+    Shares ``trigger_match`` with the skills loader rather than scoring its own
+    way, so "this phrasing matches" cannot mean two things in one product. A
+    crew with no triggers is not a candidate — that is the operator's opt-out,
+    and it is the same rule the roster applies.
+
+    Reports rather than binds. Binding happens where a run is created
+    (``spawn_run(crew=...)``), because that is the only place the decision can be
+    honoured on both halves the caller cares about, memory and template.
+    """
+    if not task or not task.strip():
+        return json.dumps({"error": "task must be a non-empty string"}, ensure_ascii=False)
+    cfg = KiroCrewConfig.load()
+    default = cfg.default_agent
+    candidates = [(n, c.triggers) for n, c in cfg.agents.items() if n != default]
+    ranked = rank_triggered(task, candidates)
+    return json.dumps(
+        {
+            "task": task[:200],
+            "default_agent": default,
+            "matches": [
+                {
+                    "crew": name,
+                    "score": round(score, 3),
+                    "description": (cfg.agents[name].description or "").strip(),
+                    "memory_store": resolve_agent_bindings(cfg, name).memory_store_name,
+                }
+                for name, score in ranked
+            ],
+            "guidance": (
+                "Ranked by trigger overlap, best first. An empty list means no "
+                "crew claims this task -- handle it on the default crew rather "
+                "than picking the least-bad match. To act on a match, spawn with "
+                "crew=<name>: that is what gives the run that crew's memory and "
+                "template, and what keeps another crew's memory out of it."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _do_select_crew(crew: str) -> str:

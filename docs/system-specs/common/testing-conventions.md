@@ -119,6 +119,52 @@ violates the isolation rules below and costs seconds per test (an unstubbed
 `find_orphan_mcp_candidates` alone added ~9s to every `TestCleanupLoop`
 test). The sweep's own behavior belongs in its own module's tests.
 
+### Golden payload tests: the mechanism that makes "unchanged" checkable
+
+Some subsystems assemble one large output from many contributors. The first-turn
+context payload is the case that has one —
+[`test/test_memory_v1_golden.py`](../../../test/test_memory_v1_golden.py) pins the v1
+default memory path. Every contributor there already has behavioural tests, and none
+of them can see the property that matters when the subsystem is refactored: that the
+**whole assembled payload** is the same. A block can be added, reordered, doubled, or
+grown past its budget with every per-property test still green, which leaves "the
+default path is unchanged" an assertion nobody can check.
+
+A golden payload test closes that by pinning, in one place, what the assembled output
+IS: the SET of blocks, their ORDER, each one's character extent and the total, the
+recall order of rows inside each block, and the files the build touches. **It is
+re-run UNEDITED after every later change to the subsystem it covers. Needing to edit
+it is the definition of a regression** — the edit is the diff a reviewer reads, and
+its size is the change's real blast radius.
+
+Rules that decide whether one is worth having:
+
+- **The golden values live in the test file as explicit expected structures**, never
+  in a committed snapshot artifact. A `.txt` golden invites a blind `--update` that
+  re-baselines the regression instead of reporting it.
+- **Derive every budget from the production constant** (`context._resolve_caps`, the
+  module `_*_CAP` values), never a restated literal — a restated cap goes stale
+  silently and the test then pins a number the code no longer reads. Pair the extents
+  with an overflow case that lands exactly on the cap, so the extents stay tied to the
+  constant rather than to the size of the seed.
+- **Split what the golden covers from what it must not.** Content that changes for
+  reasons the golden does not cover — the shipped agent prompt, the real skill catalog
+  — gets a deterministic stand-in, and its presence on the real default path is
+  asserted separately. Otherwise every prompt reword edits the golden and the edit
+  stops meaning anything.
+- **Normalize only machine-specific absolute paths**, by exact-string substitution.
+  Extents are meaningless while a tmp dir's length is inside them, and a fuzzier
+  normalization would hide a content change.
+- **Pin the clock, and pin ages rather than timestamps** wherever production scores
+  against `now`. An absolute `created_at` behind an `exp(-rate * days_old)` decay term
+  drifts the ranking every day the suite runs.
+- **Make each ranked seed discriminating.** Write the most-relevant row FIRST, so the
+  ranked order is the reverse of the insertion order; a seed whose ranked order equals
+  its write order proves nothing about ranking.
+- **Mark the module `xdist_group`** when the subsystem holds module globals
+  (`context._memory_stores` / `_lesson_stores` behind `_stores_lock`), and reset those
+  globals through `monkeypatch`, never raw assignment.
+
 ## Which conftest you are standing on
 
 There are **two** testpaths (`setup.cfg`'s `testpaths = test

@@ -54,6 +54,7 @@ from kiro_crew.context import (
     ContextBuilder,
     build_cancelled_turn_preamble,
     compress_thread_history,
+    session_store_for_turn,
     window_for_provider_client,
 )
 from kiro_crew.cron import CronService
@@ -3338,6 +3339,19 @@ async def handle_message(
                         thread_ts,
                     )
 
+            # This conversation's own silo, resolved from the session's RECORDED
+            # binding and never from ``_agent`` -- on Slack that value is a kiro
+            # agent name, a namespace disjoint from ``cfg.agents``, so deriving a
+            # store from it answers ``default`` for exactly the crew that
+            # configured otherwise. A thread taken over from a crew-bound
+            # dashboard session carries that crew's key here, which is what stops
+            # the takeover from reading the operator's own memory instead.
+            #
+            # Awaited BEFORE the offloaded build: it stands up the silo's vector
+            # tier, which is blocking file IO the sync resolver does not perform.
+            # Best-effort, so a silo that cannot be prepared costs this turn its
+            # vectors rather than its answer.
+            _memory_store = await session_store_for_turn(context_builder, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -3347,6 +3361,7 @@ async def handle_message(
                 channel_id=channel,
                 thread_ts=thread_ts or msg_ts,
                 agent=_agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 user_display_name=user_display_name,
                 compressed_history=compressed,
