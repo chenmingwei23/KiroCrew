@@ -7354,9 +7354,13 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     at session-init time; config that changes afterwards (a newly added MCP
     server, an env or agent-spec fix) never reaches it. Reload is the in-place
     remedy: tear the process down exactly like the agent/workspace switch
-    handlers do, then eagerly re-arm the resume spawn, so the relaunched
-    process re-reads its agent spec and environment and re-initializes MCP
-    servers via session/load -- with the conversation preserved.
+    handlers do -- under the SAME two locks they take, slot._lock then the
+    session-keyed switch lock -- then eagerly re-arm the resume spawn for a
+    session this slot alone owns (a linked session suppresses it, see the
+    respawn site), so the
+    relaunched process re-reads its agent spec and environment and
+    re-initializes MCP servers via session/load -- with the conversation
+    preserved.
 
     Refused with 409 while a turn is in flight (killing an in-flight ACP
     process orphans the streaming prompt: resume refusals, empty responses)
@@ -7367,61 +7371,207 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     guard is the reset's skip_if_busy, which evaluates busyness atomically
     with the session pop (see _reset_slot_session for why the unblock half of
     the chokepoint is safe even when the guard declines).
+
+    Holding the session-keyed switch lock across the teardown is what ORDERS
+    reload against a concurrent switch handler's commit-then-reset span. Without
+    it, skip_if_busy declines only while a turn is in flight, and a switch that
+    has committed its new binding but not yet reset is not busy at the instant
+    reload probes, so the two teardowns interleave and the switch reports success
+    on a session this teardown has already replaced.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
-    # The session the reload will tear down. ``effective_session_key``, never
-    # ``_history_key_for``: a channel- or cron-born slot runs its turns under
-    # its linked key, and the dashboard-prefixed spelling names a session that
-    # never existed -- the reset would "succeed" against nothing while the
-    # live process kept its stale config.
-    session_key = effective_session_key(slot)
-    # App isolation, same policy as the cancel routes: reload is a teardown,
-    # so an app token must own both the slot and the session the teardown
-    # lands on, and a denial is indistinguishable from a missing slot.
-    denied = _app_cancel_denied(request, slot, "chat.slot_reload", session_key)
-    if denied is not None:
-        return denied
-    provider = state.sessions.get_provider(session_key)
-    if provider is not None and provider.has_active_turn():
-        return web.json_response(
-            {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+    # Two locks, the SAME two the commit-before-reset switch handlers take and
+    # in the SAME order documented at ``_slot_switch_session_lock``: slot._lock,
+    # then the session-keyed switch lock. Reload tears down the slot's effective
+    # session exactly as those handlers do, so it MUST join the ordering they
+    # establish -- otherwise reload's ``reset`` (the atomic pop) can land in the
+    # middle of a switch's commit-then-reset span, and the switch reports success
+    # for a session this teardown has already replaced. Reload commits no
+    # slot binding, so unlike the switch handlers it needs no rollback machinery;
+    # the lock is purely to order its teardown against theirs. An ExitStack for
+    # the same reason those handlers use one: the session lock's KEY is only known
+    # after the in-lock read below, so locking on an earlier read could hold the
+    # wrong session lock.
+    #
+    # The response return points below sit inside the ExitStack; that is
+    # deliberate -- ``async with`` releases both locks on the way out of every
+    # path, early return included.
+    async with contextlib.AsyncExitStack() as _stack:
+        await _stack.enter_async_context(slot._lock)
+        # The session the reload will tear down. ``effective_session_key``, never
+        # ``_history_key_for``: a channel- or cron-born slot runs its turns under
+        # its linked key, and the dashboard-prefixed spelling names a session that
+        # never existed -- the reset would "succeed" against nothing while the
+        # live process kept its stale config. Resolved INSIDE slot._lock: a switch
+        # that rebound ``linked_session_key`` while this request waited on the
+        # slot lock must be observed here, so the session lock is keyed on the
+        # value that is current now, not the one read before the wait (the switch
+        # handlers' ExitStack rationale).
+        session_key = effective_session_key(slot)
+        await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # App isolation, same policy as the cancel routes: reload is a teardown,
+        # so an app token must own both the slot and the session the teardown
+        # lands on, and a denial is indistinguishable from a missing slot.
+        denied = _app_cancel_denied(request, slot, "chat.slot_reload", session_key)
+        if denied is not None:
+            return denied
+        # A turn in flight on THIS session must refuse the reload -- but the
+        # session can be SHARED (an alias pair, both slots carrying the same
+        # linked_session_key), so "is a turn running on this session" is a
+        # SESSION-scoped question, not a slot-scoped one. Three probes, each
+        # covering a gap the others leave:
+        #   * ``slot.running`` -- THIS slot's turn, set at dispatch BEFORE
+        #     provider.start() registers a session, so a cold-starting first
+        #     turn on this slot is invisible to get_provider but not to this.
+        #   * ``session_key in state.running_session_keys()`` -- an ALIAS slot's
+        #     turn on the same session. That slot's ``running`` is a different
+        #     object and its cold-starting turn has not registered a provider
+        #     yet, so neither ``slot.running`` here nor get_provider sees it;
+        #     the session-scoped set does (it folds every slot through
+        #     effective_session_key). Without this an alias reload tears down a
+        #     session a sibling slot is mid-cold-start on and returns 200, and
+        #     that sibling then registers its stale-config provider.
+        #   * ``provider.has_active_turn()`` -- a registered live turn.
+        # A 409 is retryable once the turn completes.
+        #
+        # The eager-spawn cancel+await below is placed BEFORE this guard on
+        # purpose: it is the only real suspension point between resolving the
+        # session and the reset, so a send could otherwise start a turn (and post
+        # an approval card) DURING that await, after this guard had already passed
+        # -- and _reset_slot_session runs _unblock_pending_waits unconditionally,
+        # BEFORE its skip_if_busy decline, so that card is discarded even
+        # though the decline then answers 409. Cancelling
+        # the prefetch first, then reading this guard with no await before the
+        # reset (the _test_interleave hook is test-only), keeps the guard's answer
+        # true at the moment of the teardown.
+        #
+        # Cancel and AWAIT this slot's in-flight speculative session creation.
+        # schedule_eager_spawn cancels the slot's prior _eager_spawn_task as a
+        # side effect of scheduling a new one, but reload suppresses that call for
+        # a linked session (below), so without cancelling here a focus prefetch
+        # already mid-handshake from an earlier signal survives the teardown
+        # and registers a stale-config session after the reload reports success.
+        # AWAIT, not just cancel: the prefetch can be mid get_or_create, so the
+        # reset must not run until the task has settled, or it registers in the
+        # window between the cancel and the pop. The delete path
+        # (api_chat_slot_delete) cancels the same task for the same class of race.
+        #
+        # SCOPED TO THIS SLOT, deliberately. ``_eager_spawn_task`` is per-slot
+        # while the session can be SHARED, so an alias sibling's prefetch on this
+        # same key is NOT cancelled here and can still register a session after
+        # the teardown. Cancelling every sharer instead cannot be made correct
+        # from inside this endpoint: ``schedule_eager_spawn`` is also reached from
+        # the WS focus path (``ws.py``), which holds neither of this handler's
+        # locks, so a focus frame arriving during such a scan re-arms a prefetch
+        # on a slot the scan has already passed. Closing that needs the prefetch
+        # mechanism itself to become session-aware -- refuse or defer a prefetch
+        # for a session whose teardown is in flight -- rather than a per-caller
+        # patch, so it belongs with that mechanism and not with this handler.
+        _eager = getattr(slot, "_eager_spawn_task", None)
+        if _eager is not None and not _eager.done():
+            _eager.cancel()
+            try:
+                await _eager
+            except (asyncio.CancelledError, Exception):
+                # The task's own post-create liveness re-check tears down any
+                # session it managed to register before the cancel landed; here
+                # we only need it to have STOPPED before we read the guard + reset.
+                pass
+        # Re-authorize by IDENTITY across the await above. ``slot`` is resolved
+        # from ``state._slots`` before this handler takes any lock, and
+        # ``close_slot`` pops that mapping WITHOUT taking ``slot._lock`` -- so a
+        # same-name delete can complete while this request holds the old slot's
+        # lock, and a recreate can bind a NEW slot to the same session key. The
+        # ownership check above was decided against the slot read before the
+        # suspension, so continuing would apply that authorization to a different
+        # owner's session and tear down the replacement's idle session across the
+        # App Kit isolation boundary. The shared helper is the same decision the
+        # autocompact, context-inject, note and edit-resend paths make after their
+        # own awaits: identity on the slot OBJECT, an indistinguishable 404, the
+        # SEL app_isolation denial record, and a re-run of the ownership gate.
+        stale = _reauthorize_after_await(
+            state, slot, name, request.get("app", ""), "chat.slot_reload"
         )
-    # Children guard, shared with api_chat_slot_continue: RUNNING children die
-    # with the parent runtime, and _subagents_attached_response documents why
-    # queued children and in-flight deliveries count too.
-    denied_409 = _subagents_attached_response(state, slot, session_key, "reload")
-    if denied_409 is not None:
-        return denied_409
-    if _test_interleave is not None:
-        # Reload's teardown takes neither slot._lock nor the session-keyed switch
-        # lock, so nothing orders it against a switch's commit-then-reset span.
-        # Suspending here is the only way to hold the unguarded teardown open
-        # across another actor's whole transaction and observe what that produces.
-        await _test_interleave("reload:pre_reset")
-    reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
-    if not reloaded:
+        if stale is not None:
+            return stale
         provider = state.sessions.get_provider(session_key)
-        if provider is not None and provider.has_active_turn():
+        if (
+            slot.running
+            or session_key in state.running_session_keys()
+            or (provider is not None and provider.has_active_turn())
+        ):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
-        if provider is not None:
-            # A turn slipped into the guard window and already FINISHED: the
-            # declined reset left a live idle session untouched, and falling
-            # through would report success while the stale process survives --
-            # the silent failure this endpoint exists to prevent. Retry once;
-            # a second decline means another turn is genuinely racing, which
-            # is the turn-in-flight case.
-            reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
-            if not reloaded:
+        # Children guard, shared with api_chat_slot_continue: RUNNING children die
+        # with the parent runtime, and _subagents_attached_response documents why
+        # queued children and in-flight deliveries count too. Synchronous, so it
+        # adds no suspension point between the guard above and the reset below.
+        denied_409 = _subagents_attached_response(state, slot, session_key, "reload")
+        if denied_409 is not None:
+            return denied_409
+        if _test_interleave is not None:
+            # Held inside both locks now: a switch's commit-then-reset span blocks
+            # on the session lock while this point is suspended, so the seam can
+            # confirm the two teardowns are ORDERED rather than interleaved.
+            await _test_interleave("reload:pre_reset")
+        reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+        if not reloaded:
+            provider = state.sessions.get_provider(session_key)
+            if (
+                slot.running
+                or session_key in state.running_session_keys()
+                or (provider is not None and provider.has_active_turn())
+            ):
                 return web.json_response(
-                    {"error": "a turn is in flight", "code": "turn_in_flight"},
-                    status=409,
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
                 )
+            if provider is not None:
+                # A turn slipped into the guard window and already FINISHED: the
+                # declined reset left a live idle session untouched, and falling
+                # through would report success while the stale process survives --
+                # the silent failure this endpoint exists to prevent. Retry once;
+                # a second decline means another turn is genuinely racing, which
+                # is the turn-in-flight case. The session-scoped check above
+                # already refused an alias slot's cold-starting turn, so reaching
+                # here means the decline was this session's own settled turn.
+                reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+                if not reloaded:
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"},
+                        status=409,
+                    )
+        # Compare-and-set at the commit point, the switch handlers' rebind
+        # guard (chat_handlers.py:5909 and siblings). The reset await yields the
+        # event loop, and a slot's ``linked_session_key`` is bound OUTSIDE this
+        # lock -- an unbound cron/workflow slot gets linked when its first result
+        # is injected -- so a rebind can land between the resolve above and the
+        # reset returning. If it did, ``session_key`` names the OLD session this
+        # request just tore down (harmlessly: it is idle and detached from the
+        # slot), while the slot now runs on a DIFFERENT, live session that
+        # never saw the reload and keeps its stale config. Reporting 200 would be
+        # exactly the silent stale-config success this endpoint exists to
+        # prevent. Reload commits no binding, so unlike the switch handlers there
+        # is nothing to roll back -- just answer the same session_rebound 409 and
+        # skip the notice + respawn. The eager respawn is not reached, so the
+        # linked-session suppression below never has to consider the rebound key.
+        if effective_session_key(slot) != session_key:
+            return web.json_response(
+                {"error": "slot session was rebound during the reload", "code": "session_rebound"},
+                status=409,
+            )
+        # Fall out of the ExitStack -- both locks released -- before the feed
+        # notice and respawn. Holding the session-keyed lock across the multi-
+        # second eager-respawn handshake would serialize an unrelated switch on a
+        # different slot sharing the key behind work that does not race the
+        # teardown. The feed notice is slot-local. The eager respawn is NOT: for
+        # a shared (linked) session it can register the session from this slot's
+        # bindings, which is exactly why the respawn is suppressed for a linked
+        # session below rather than run outside the lock like the notice.
     logger.info("Slot %s session reloaded (had_live_session=%s)", name, reloaded)
     # Feed notice: the visible confirmation (and the durable record) that the
     # relaunch happened. Tagged so the last-real-message scans skip it on both
@@ -7437,7 +7587,24 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     )
     # Respawn + session/load now rather than on the next message, so the fresh
     # process (and its rebuilt toolset) is ready when the user comes back.
-    schedule_eager_spawn(state, slot, allow_resume=True)
+    #
+    # ONLY for a session this slot alone owns. The eager spawn is deliberately
+    # scheduled AFTER the locks release (it debounces, then handshakes for
+    # multiple seconds -- holding the session lock across it would serialize an
+    # unrelated switch behind work that does not race the teardown). But a LINKED
+    # session (``linked_session_key`` set -- a channel/cron slot, or an alias
+    # pair) can be shared by another slot, and that slot's per-slot lock is
+    # DISJOINT from this one's. So a respawn that escaped the session lock could
+    # win ``get_or_create``'s same-key race and bake THIS slot's bindings into a
+    # session an alias slot's switch just committed different bindings for, and
+    # the first turn then runs the wrong model and config.
+    # Suppressing it for a linked session is safe: reload has already torn the
+    # session down, so the next real turn cold-starts under whatever bindings are
+    # current at that moment, which is exactly the correct, race-free outcome.
+    # The common reload -- a plain ``dashboard:`` slot with no link -- keeps the
+    # speculative respawn.
+    if not getattr(slot, "linked_session_key", ""):
+        schedule_eager_spawn(state, slot, allow_resume=True)
     state.push_slots_update()
     return web.json_response({"ok": True})
 

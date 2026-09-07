@@ -20448,6 +20448,42 @@ class TestSessionReload:
         state.sessions.reset.assert_awaited_once_with("slack:123.456", skip_if_busy=True)
 
     @pytest.mark.asyncio
+    async def test_reload_suppresses_eager_respawn_for_a_linked_session(
+        self, tmp_path, monkeypatch
+    ):
+        """A LINKED (alias-shareable) session reloads but does NOT eager-respawn.
+
+        The eager spawn is scheduled after the session lock releases and then
+        handshakes for seconds, so it escapes the serialization. For a session
+        another slot can share (``linked_session_key`` set), that escaped respawn
+        could win get_or_create's same-key race and bake THIS slot's bindings
+        into a session an alias slot's switch just committed different bindings
+        for -- the first turn would run the wrong model and config. So reload
+        suppresses the speculative respawn for a linked
+        session; the next real turn cold-starts under the current bindings.
+        Removing the ``linked_session_key`` guard makes eager fire and reddens
+        the assert below.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.linked_session_key = "slack:123.456"
+        state.sessions.get_provider = MagicMock(return_value=self._idle_provider())
+        state.sessions.reset = AsyncMock(return_value=True)
+        eager = MagicMock(return_value=None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn", eager)
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/reload")
+
+        assert resp.status == 200
+        # The teardown still happened on the linked key -- reload is not skipped,
+        # only its speculative respawn is.
+        state.sessions.reset.assert_awaited_once_with("slack:123.456", skip_if_busy=True)
+        # The escaped respawn is suppressed for the shareable session.
+        eager.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_reload_refused_while_subagents_attached(self, tmp_path, monkeypatch):
         """409 while children are running/queued/delivering — the reset would
         tear down the shared subagent runtime and discard their work.
