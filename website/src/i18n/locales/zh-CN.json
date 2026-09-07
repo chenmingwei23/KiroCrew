@@ -3995,7 +3995,6 @@
         "no_messages": "编译器没有输出任何信息。",
         "typesetting_hints_other": "{{count}} 条排版提示"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "删除 {{file}}",
         "files": "文件",
@@ -9479,6 +9478,14 @@
         "copy_text_failed": "复制失败",
         "copy_text_unavailable": "当前环境禁止写入剪贴板。文案已选中——按 Ctrl+C / ⌘C 复制。你改过的卡片文字请直接从卡片上复制。",
         "export_failed": "无法生成分享卡片"
+      },
+      "escalationNotice": {
+        "deadline": "请在 {{time}} 前回复；若无回复，不会发生任何操作，该请求将保持待处理。",
+        "needs_you": "需要你",
+        "options": "如需作答，请在此会话中输入以下选项之一作为回复：{{list}}",
+        "reply_hint": "在此会话中回复即可作答。",
+        "veto": "如果你在 {{time}} 前没有回复，{{member}} 将：{{action}}",
+        "veto_generic": "如果你在 {{time}} 前没有回复，该成员将：{{action}}"
       }
     },
     "chatPage": {
@@ -14015,6 +14022,38 @@
       "filter_source_builtin_description": "{{productName}} 自带的成员",
       "filter_source_package_description": "由能力安装包安装的成员",
       "member_count_filtered": "显示 {{shown}} / {{count}} 位成员"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "需要你",
+        "working": "正在处理：{{purpose}}",
+        "working_generic": "正在处理…",
+        "view_process_other": "查看过程（{{count}} 步）",
+        "hide_process": "隐藏过程",
+        "silent_rounds_other": "{{count}} 次例行检查，无新进展",
+        "show_rounds": "显示例行检查",
+        "hide_rounds": "隐藏例行检查",
+        "escalation_title": "{{member}} 需要你",
+        "escalation_title_generic": "需要你",
+        "escalation_from": "来自 {{session}}",
+        "escalation_goal": "目标：{{goal}}",
+        "escalation_index_failed": "无法核对该成员的升级记录——此卡片可能已过期，正在重试。",
+        "escalation_deadline": "请在 {{time}} 前决定 · 剩余 {{remaining}}",
+        "escalation_expired": "决策窗口已关闭 — 按默认操作执行",
+        "escalation_expired_no_default": "决策窗口已关闭",
+        "escalation_default": "如果你不回复：{{action}}",
+        "escalation_answered": "已回复",
+        "escalation_pending": "等待你的回复",
+        "escalation_pick_hint": "先选一个选项，再点“发送答复”。",
+        "escalation_retracted": "已撤回",
+        "escalation_send": "发送回复",
+        "escalation_send_pick": "发送“{{option}}”",
+        "escalation_type_instead": "在下方输入消息同样算作你的答复。",
+        "escalation_default_applied": "已按默认执行：{{action}}",
+        "escalation_send_failed": "回复未发送，请重试。",
+        "escalation_sent": "回复已发送",
+        "escalation_title_from": "{{session}} 需要你"
+      }
     }
   },
   "privacyDisclosure": {

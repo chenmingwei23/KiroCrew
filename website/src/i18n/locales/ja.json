@@ -4046,7 +4046,6 @@
         "no_messages": "コンパイラーが何も報告していません。",
         "typesetting_hints_other": "{{count}} 件の植字ヒント"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "{{file}} を削除",
         "files": "ファイル",
@@ -9479,6 +9478,14 @@
         "copy_text_failed": "コピーできませんでした",
         "copy_text_unavailable": "この環境ではクリップボードがブロックされています。投稿テキストは選択済みです — Ctrl+C / ⌘C を押してください。編集したカードのテキストはカードから直接コピーしてください。",
         "export_failed": "共有カードを生成できませんでした"
+      },
+      "escalationNotice": {
+        "deadline": "{{time}}までに返信してください。返信がない場合は何も起こらず、依頼は未解決のままです。",
+        "needs_you": "あなたの判断が必要です",
+        "options": "回答するには、このスレッドで次のいずれかを入力して返信してください: {{list}}",
+        "reply_hint": "このスレッドで返信して回答してください。",
+        "veto": "{{time}}までに返信がない場合、{{member}}は次を実行します: {{action}}",
+        "veto_generic": "{{time}}までに返信がない場合、メンバーは次を実行します: {{action}}"
       }
     },
     "chatPage": {
@@ -14015,6 +14022,38 @@
       "filter_source_builtin_description": "{{productName}} に同梱されているクルー",
       "filter_source_package_description": "ケイパビリティパッケージによってインストールされたクルー",
       "member_count_filtered": "{{count}} 人中 {{shown}} 人のメンバー"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "あなたの判断が必要です",
+        "working": "作業中：{{purpose}}",
+        "working_generic": "作業中…",
+        "view_process_other": "プロセスを表示（{{count}} ステップ）",
+        "hide_process": "プロセスを非表示",
+        "silent_rounds_other": "{{count}} 回の定期チェック、新しい進展なし",
+        "show_rounds": "定期チェックを表示",
+        "hide_rounds": "定期チェックを非表示",
+        "escalation_title": "{{member}} があなたの判断を求めています",
+        "escalation_title_generic": "あなたの判断が必要です",
+        "escalation_from": "{{session}} から",
+        "escalation_goal": "目標：{{goal}}",
+        "escalation_index_failed": "メンバーのエスカレーション記録を確認できませんでした。このカードは最新でない可能性があります。再試行中です。",
+        "escalation_deadline": "{{time}} までに決定 · 残り {{remaining}}",
+        "escalation_expired": "回答期限が終了 — デフォルトの対応を実行します",
+        "escalation_expired_no_default": "回答期限が終了",
+        "escalation_default": "回答がない場合：{{action}}",
+        "escalation_answered": "回答済み",
+        "escalation_pending": "あなたの返信を待っています",
+        "escalation_pick_hint": "選択肢を選んでから「返信を送信」を押してください。",
+        "escalation_retracted": "取り下げ済み",
+        "escalation_send": "返信を送信",
+        "escalation_send_pick": "「{{option}}」を送信",
+        "escalation_type_instead": "下にメッセージを入力しても回答として扱われます。",
+        "escalation_default_applied": "デフォルトを適用：{{action}}",
+        "escalation_send_failed": "返信を送信できませんでした。もう一度お試しください。",
+        "escalation_sent": "返信を送信しました",
+        "escalation_title_from": "{{session}} があなたの判断を必要としています"
+      }
     }
   },
   "privacyDisclosure": {

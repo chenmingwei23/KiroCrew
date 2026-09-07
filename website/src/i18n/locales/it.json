@@ -4137,7 +4137,6 @@
         "typesetting_hints_one": "{{count}} nota di impaginazione",
         "typesetting_hints_other": "{{count}} note di impaginazione"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "Elimina {{file}}",
         "files": "File",
@@ -9753,6 +9752,14 @@
         "copy_text_failed": "Copia non riuscita",
         "copy_text_unavailable": "Gli appunti sono bloccati qui. Il testo del tuo post è selezionato: premi Ctrl+C / ⌘C. Il testo della card che hai modificato va copiato dalla card stessa.",
         "export_failed": "Impossibile generare la scheda di condivisione"
+      },
+      "escalationNotice": {
+        "deadline": "Rispondi entro {{time}}; senza risposta non succede nulla e la richiesta resta aperta.",
+        "needs_you": "Ha bisogno di te",
+        "options": "Per rispondere, scrivi una di queste opzioni come risposta in questo thread: {{list}}",
+        "reply_hint": "Rispondi in questo thread per dare la tua risposta.",
+        "veto": "Se non rispondi entro {{time}}, {{member}} farà: {{action}}",
+        "veto_generic": "Se non rispondi entro {{time}}, il membro farà: {{action}}"
       }
     },
     "chatPage": {
@@ -14379,6 +14386,42 @@
       "filter_source_builtin_description": "Crew inclusi in {{productName}}",
       "filter_source_package_description": "Crew installati da pacchetti di capacità",
       "member_count_filtered": "{{shown}} membri su {{count}}"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "Ha bisogno di te",
+        "working": "Al lavoro: {{purpose}}",
+        "working_generic": "Al lavoro…",
+        "view_process_one": "Vedi processo ({{count}} passaggio)",
+        "view_process_other": "Vedi processo ({{count}} passaggi)",
+        "view_process_many": "Vedi processo ({{count}} passaggi)",
+        "hide_process": "Nascondi procedura",
+        "silent_rounds_one": "{{count}} controllo senza novità",
+        "silent_rounds_other": "{{count}} controlli senza novità",
+        "silent_rounds_many": "{{count}} controlli senza novità",
+        "show_rounds": "Mostra controlli",
+        "hide_rounds": "Nascondi controlli",
+        "escalation_title": "{{member}} ha bisogno di te",
+        "escalation_title_generic": "Ha bisogno di te",
+        "escalation_from": "da {{session}}",
+        "escalation_goal": "Obiettivo: {{goal}}",
+        "escalation_index_failed": "Impossibile verificare le escalation del membro — questa scheda potrebbe non essere aggiornata; nuovo tentativo in corso.",
+        "escalation_deadline": "Decidi entro le {{time}} · {{remaining}} rimanenti",
+        "escalation_expired": "Termine scaduto — si applica l’azione predefinita",
+        "escalation_expired_no_default": "Termine scaduto",
+        "escalation_default": "Se non rispondi: {{action}}",
+        "escalation_answered": "Risposto",
+        "escalation_pending": "In attesa della tua risposta",
+        "escalation_pick_hint": "Scegli un'opzione, poi Invia risposta.",
+        "escalation_retracted": "Ritirata",
+        "escalation_send": "Invia risposta",
+        "escalation_send_pick": "Invia «{{option}}»",
+        "escalation_type_instead": "Anche un messaggio scritto qui sotto conta come risposta.",
+        "escalation_default_applied": "Azione predefinita applicata: {{action}}",
+        "escalation_send_failed": "Risposta non inviata: riprova.",
+        "escalation_sent": "Risposta inviata",
+        "escalation_title_from": "{{session}} ha bisogno di te"
+      }
     }
   },
   "privacyDisclosure": {

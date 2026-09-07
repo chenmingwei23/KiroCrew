@@ -4117,7 +4117,6 @@
         "typesetting_hints_one": "{{count}} Satzhinweis",
         "typesetting_hints_other": "{{count}} Satzhinweise"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "{{file}} löschen",
         "files": "Dateien",
@@ -9616,6 +9615,14 @@
         "copy_text_failed": "Kopieren fehlgeschlagen",
         "copy_text_unavailable": "Die Zwischenablage ist hier blockiert. Dein Beitragstext ist markiert — drücke Strg+C / ⌘C. Bearbeiteten Kartentext kopierst du direkt aus der Karte.",
         "export_failed": "Die Share-Karte konnte nicht erzeugt werden"
+      },
+      "escalationNotice": {
+        "deadline": "Antworte bis {{time}}; ohne Antwort passiert nichts und die Anfrage bleibt offen.",
+        "needs_you": "Braucht dich",
+        "options": "Zum Antworten tippe eine dieser Optionen als Antwort in diesem Thread: {{list}}",
+        "reply_hint": "Antworte in diesem Thread.",
+        "veto": "Wenn du nicht bis {{time}} antwortest, wird {{member}}: {{action}}",
+        "veto_generic": "Wenn du nicht bis {{time}} antwortest, wird das Mitglied: {{action}}"
       }
     },
     "chatPage": {
@@ -14197,6 +14204,40 @@
       "filter_source_builtin_description": "Crews, die mit {{productName}} ausgeliefert werden",
       "filter_source_package_description": "Crews, die von Capability-Paketen installiert wurden",
       "member_count_filtered": "{{shown}} von {{count}} Mitgliedern"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "Braucht dich",
+        "working": "Arbeitet: {{purpose}}",
+        "working_generic": "Arbeitet…",
+        "view_process_one": "Ablauf anzeigen ({{count}} Schritt)",
+        "view_process_other": "Ablauf anzeigen ({{count}} Schritte)",
+        "hide_process": "Ablauf ausblenden",
+        "silent_rounds_one": "{{count}} Routineprüfung ohne Neuigkeiten",
+        "silent_rounds_other": "{{count}} Routineprüfungen ohne Neuigkeiten",
+        "show_rounds": "Kontrollrunden anzeigen",
+        "hide_rounds": "Kontrollrunden ausblenden",
+        "escalation_title": "{{member}} braucht dich",
+        "escalation_title_generic": "Braucht dich",
+        "escalation_from": "aus {{session}}",
+        "escalation_goal": "Ziel: {{goal}}",
+        "escalation_index_failed": "Die Eskalationseinträge des Mitglieds konnten nicht geprüft werden — diese Karte ist möglicherweise veraltet; neuer Versuch läuft.",
+        "escalation_deadline": "Entscheide bis {{time}} · noch {{remaining}}",
+        "escalation_expired": "Frist abgelaufen — Standardaktion wird ausgeführt",
+        "escalation_expired_no_default": "Frist abgelaufen",
+        "escalation_default": "Wenn du nicht antwortest: {{action}}",
+        "escalation_answered": "Beantwortet",
+        "escalation_pending": "Wartet auf deine Antwort",
+        "escalation_pick_hint": "Wähle eine Option, dann „Antwort senden“.",
+        "escalation_retracted": "Zurückgezogen",
+        "escalation_send": "Antwort senden",
+        "escalation_send_pick": "„{{option}}“ senden",
+        "escalation_type_instead": "Auch eine unten eingegebene Nachricht zählt als deine Antwort.",
+        "escalation_default_applied": "Standard angewendet: {{action}}",
+        "escalation_send_failed": "Antwort wurde nicht gesendet – bitte erneut versuchen.",
+        "escalation_sent": "Antwort gesendet",
+        "escalation_title_from": "{{session}} braucht dich"
+      }
     }
   },
   "privacyDisclosure": {

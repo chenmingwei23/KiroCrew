@@ -278,6 +278,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Tailscale. Routing it would make dashboard startup depend on sandbox
         # availability, which is exactly the failure that property rules out.
         "dashboard/tailnet.py::_run_json_detail",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``). The member-escalation answer hook, when
+        # called from a thread with no running loop (the transcript persist
+        # path), drives the row's own async save coroutine to completion before
+        # marking the record answered — an in-process coroutine, no argv, no
+        # child. Same classification as the other ``asyncio.run`` sites in this
+        # list (cli_commands.py::_cleanup_app_crons_from_scheduler, cli_doctor.py::_doctor).
+        "dashboard/state.py::_mark_member_escalations_answered",
         # Tailnet publish/withdraw (same RFC): three fixed argv shapes —
         # ``serve status --json``, ``serve --bg --https=443 http://127.0.0.1:<port>``
         # and ``serve --https 443 off``. The only interpolated value is the

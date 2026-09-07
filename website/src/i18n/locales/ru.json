@@ -4208,7 +4208,6 @@
         "typesetting_hints_one": "{{count}} замечание по вёрстке",
         "typesetting_hints_other": "{{count}} замечания по вёрстке"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "Удалить {{file}}",
         "files": "Файлы",
@@ -9890,6 +9889,14 @@
         "copy_text_failed": "Не удалось скопировать",
         "copy_text_unavailable": "Буфер обмена здесь заблокирован. Текст твоего поста выделен — нажми Ctrl+C / ⌘C. Отредактированный текст карточки скопируй из самой карточки.",
         "export_failed": "Не удалось создать карточку для публикации"
+      },
+      "escalationNotice": {
+        "deadline": "Ответьте до {{time}}; без ответа ничего не произойдёт, и запрос останется открытым.",
+        "needs_you": "Требуется ваше решение",
+        "options": "Чтобы ответить, напишите один из вариантов в этой ветке: {{list}}",
+        "reply_hint": "Ответьте в этой ветке.",
+        "veto": "Если вы не ответите до {{time}}, {{member}} сделает: {{action}}",
+        "veto_generic": "Если вы не ответите до {{time}}, участник сделает: {{action}}"
       }
     },
     "chatPage": {
@@ -12397,7 +12404,6 @@
       "unknown_agent": "субагент",
       "unknown_model": "неизвестно"
     },
-    "sessionMemoryCard": {},
     "sessionStorage": {
       "age_option_few": "Старше {{days}} дней — {{count}} сессии · {{size}}",
       "age_option_many": "Старше {{days}} дней — {{count}} сессий · {{size}}",
@@ -14562,6 +14568,44 @@
       "filter_source_builtin_description": "Команды, входящие в {{productName}}",
       "filter_source_package_description": "Команды, установленные пакетами возможностей",
       "member_count_filtered": "{{shown}} из {{count}} участников"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "Требуется ваше решение",
+        "working": "В работе: {{purpose}}",
+        "working_generic": "В работе…",
+        "view_process_one": "Показать процесс ({{count}} шаг)",
+        "view_process_other": "Показать процесс ({{count}} шагов)",
+        "view_process_few": "Показать процесс ({{count}} шага)",
+        "view_process_many": "Показать процесс ({{count}} шагов)",
+        "hide_process": "Скрыть ход работы",
+        "silent_rounds_one": "{{count}} проверка без изменений",
+        "silent_rounds_other": "{{count}} проверок без изменений",
+        "silent_rounds_few": "{{count}} проверки без изменений",
+        "silent_rounds_many": "{{count}} проверок без изменений",
+        "show_rounds": "Показать проверки",
+        "hide_rounds": "Скрыть проверки",
+        "escalation_title": "{{member}} ждёт вашего решения",
+        "escalation_title_generic": "Требуется ваше решение",
+        "escalation_from": "из {{session}}",
+        "escalation_goal": "Цель: {{goal}}",
+        "escalation_index_failed": "Не удалось проверить записи об эскалациях участника — карточка может быть устаревшей; повторяем попытку.",
+        "escalation_deadline": "Решите до {{time}} · осталось {{remaining}}",
+        "escalation_expired": "Срок истёк — применяется действие по умолчанию",
+        "escalation_expired_no_default": "Срок истёк",
+        "escalation_default": "Если вы не ответите: {{action}}",
+        "escalation_answered": "Отвечено",
+        "escalation_pending": "Ожидается ваш ответ",
+        "escalation_pick_hint": "Выберите вариант, затем нажмите «Отправить ответ».",
+        "escalation_retracted": "Отозвано",
+        "escalation_send": "Отправить ответ",
+        "escalation_send_pick": "Отправить «{{option}}»",
+        "escalation_type_instead": "Сообщение, введённое ниже, тоже считается вашим ответом.",
+        "escalation_default_applied": "Применено действие по умолчанию: {{action}}",
+        "escalation_send_failed": "Ответ не отправлен — попробуйте ещё раз.",
+        "escalation_sent": "Ответ отправлен",
+        "escalation_title_from": "{{session}} ждёт вашего решения"
+      }
     }
   },
   "privacyDisclosure": {

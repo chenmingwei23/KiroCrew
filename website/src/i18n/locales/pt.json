@@ -4137,7 +4137,6 @@
         "typesetting_hints_one": "{{count}} aviso de composição",
         "typesetting_hints_other": "{{count}} avisos de composição"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "Eliminar {{file}}",
         "files": "Arquivos",
@@ -9753,6 +9752,14 @@
         "copy_text_failed": "Falha ao copiar",
         "copy_text_unavailable": "A área de transferência está bloqueada aqui. O texto da sua publicação está selecionado — pressione Ctrl+C / ⌘C. O texto do cartão que você editou, copie do próprio cartão.",
         "export_failed": "Não foi possível gerar o cartão de compartilhamento"
+      },
+      "escalationNotice": {
+        "deadline": "Responda até {{time}}; sem resposta, nada acontece e o pedido continua em aberto.",
+        "needs_you": "Precisa de você",
+        "options": "Para responder, digite uma destas opções como resposta neste tópico: {{list}}",
+        "reply_hint": "Responda neste tópico para dar sua resposta.",
+        "veto": "Se você não responder até {{time}}, {{member}} vai: {{action}}",
+        "veto_generic": "Se você não responder até {{time}}, o membro vai: {{action}}"
       }
     },
     "chatPage": {
@@ -14379,6 +14386,42 @@
       "filter_source_builtin_description": "Crews incluídos no {{productName}}",
       "filter_source_package_description": "Crews instalados por pacotes de capacidades",
       "member_count_filtered": "{{shown}} de {{count}} membros"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "Precisa de você",
+        "working": "Trabalhando: {{purpose}}",
+        "working_generic": "Trabalhando…",
+        "view_process_one": "Ver processo ({{count}} etapa)",
+        "view_process_other": "Ver processo ({{count}} etapas)",
+        "view_process_many": "Ver processo ({{count}} etapas)",
+        "hide_process": "Ocultar processo",
+        "silent_rounds_one": "{{count}} verificação sem novidades",
+        "silent_rounds_other": "{{count}} verificações sem novidades",
+        "silent_rounds_many": "{{count}} verificações sem novidades",
+        "show_rounds": "Mostrar verificações",
+        "hide_rounds": "Ocultar verificações",
+        "escalation_title": "{{member}} precisa de você",
+        "escalation_title_generic": "Precisa de você",
+        "escalation_from": "de {{session}}",
+        "escalation_goal": "Objetivo: {{goal}}",
+        "escalation_index_failed": "Não foi possível consultar os registros de escalação do membro — este cartão pode estar desatualizado; tentando novamente.",
+        "escalation_deadline": "Decida até {{time}} · restam {{remaining}}",
+        "escalation_expired": "Prazo encerrado — a ação padrão será aplicada",
+        "escalation_expired_no_default": "Prazo encerrado",
+        "escalation_default": "Se você não responder: {{action}}",
+        "escalation_answered": "Respondido",
+        "escalation_pending": "Aguardando sua resposta",
+        "escalation_pick_hint": "Escolha uma opção e depois Enviar resposta.",
+        "escalation_retracted": "Retirada",
+        "escalation_send": "Enviar resposta",
+        "escalation_send_pick": "Enviar “{{option}}”",
+        "escalation_type_instead": "Uma mensagem digitada abaixo também conta como sua resposta.",
+        "escalation_default_applied": "Padrão aplicado: {{action}}",
+        "escalation_send_failed": "A resposta não foi enviada — tente novamente.",
+        "escalation_sent": "Resposta enviada",
+        "escalation_title_from": "{{session}} precisa de você"
+      }
     }
   },
   "privacyDisclosure": {

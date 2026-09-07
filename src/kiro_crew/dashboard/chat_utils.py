@@ -2645,12 +2645,34 @@ def is_system_injection_item(item: dict) -> bool:
     return False
 
 
+def _is_human_reply_item(item: dict) -> bool:
+    meta = item.get("meta")
+    return isinstance(meta, dict) and meta.get("human_reply") is True
+
+
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
-    """Drain the queue: merge non-cron messages or pop the first one."""
+    """Drain the queue: merge non-cron messages or pop the first one.
+
+    In a crew member's DM thread the merge also breaks at a HUMAN-PROVENANCE
+    boundary: entries the owner's composer stamped ``human_reply`` never share
+    a merged row with entries nobody stamped (a peer's ``session_send``, a cron
+    prompt, an automation post). A merged row is the human's only if every
+    entry in it was — so one unstamped neighbour would otherwise strip the
+    stamp from the owner's reply, and the escalation that reply answered would
+    stay pending and run its default. Splitting keeps each reply on a row that
+    carries its own provenance; order is preserved (the boundary drains next).
+    """
     if merge_enabled and len(slot._queue) > 1:
+        split_on_provenance = getattr(slot, "mode", "") == "member"
         to_merge: list[dict] = []
         for item in list(slot._queue):
             if is_system_injection_item(item):
+                break
+            if (
+                split_on_provenance
+                and to_merge
+                and _is_human_reply_item(item) != _is_human_reply_item(to_merge[0])
+            ):
                 break
             to_merge.append(item)
         if len(to_merge) > 1:

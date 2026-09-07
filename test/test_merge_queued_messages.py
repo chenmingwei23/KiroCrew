@@ -117,6 +117,41 @@ class TestDequeueNextMessage:
         assert next_msg.startswith("[2 queued messages merged]")
         assert len(consumed) == 2
 
+    def test_member_thread_merge_breaks_at_a_human_provenance_boundary(self):
+        """In a member's DM thread the owner's stamped reply (``human_reply``,
+        here answering an escalation by id) never merges with an unstamped
+        neighbour: a merged row is the human's only if every entry was, so the
+        neighbour would strip the stamp and the escalation would stay pending.
+        The stamped entries drain on their own row; the neighbour drains next."""
+        slot = _ChatSlot("member-radar", mode="member")
+        slot._queue = [
+            {"id": "a", "content": "go", "meta": {"human_reply": True, "escalation_id": "esc-1"}},
+            {"id": "b", "content": "and ship it", "meta": {"human_reply": True}},
+            {"id": "c", "content": "[sent by session chat-9] status?"},
+            {"id": "d", "content": "one more", "meta": {"human_reply": True}},
+        ]
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert [c["id"] for c in consumed] == ["a", "b"]
+        assert next_msg.startswith("[2 queued messages merged]")
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert [c["id"] for c in consumed] == ["c"]  # the unstamped one, alone
+        assert next_msg == "[sent by session chat-9] status?"
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert [c["id"] for c in consumed] == ["d"]
+        assert len(slot._queue) == 0
+
+    def test_non_member_slots_still_merge_across_provenance(self):
+        """Only a member thread keys anything on ``human_reply``; an ordinary
+        chat slot merges exactly as before."""
+        slot = _ChatSlot("chat-1")
+        slot._queue = [
+            {"id": "a", "content": "go", "meta": {"human_reply": True}},
+            {"id": "b", "content": "[sent by session chat-9] status?"},
+        ]
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert [c["id"] for c in consumed] == ["a", "b"]
+        assert next_msg.startswith("[2 queued messages merged]")
+
     def test_multiple_messages_fifo_when_disabled(self):
         """When disabled, only first message is popped (original FIFO)."""
         slot = _ChatSlot("s1")

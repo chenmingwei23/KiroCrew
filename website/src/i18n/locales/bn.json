@@ -4066,7 +4066,6 @@
         "typesetting_hints_one": "{{count}}টি টাইপসেটিং পরামর্শ",
         "typesetting_hints_other": "{{count}}টি টাইপসেটিং পরামর্শ"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "{{file}} মুছুন",
         "files": "ফাইল",
@@ -9616,6 +9615,14 @@
         "copy_text_failed": "কপি করা যায়নি",
         "copy_text_unavailable": "এখানে ক্লিপবোর্ড ব্লক করা আছে। তোমার পোস্টের লেখাটা সিলেক্ট করা আছে — Ctrl+C / ⌘C চাপো। কার্ডের যে লেখা তুমি বদলেছ, সেটা কার্ড থেকেই কপি করো।",
         "export_failed": "শেয়ার কার্ড তৈরি করা যায়নি"
+      },
+      "escalationNotice": {
+        "deadline": "{{time}} এর মধ্যে উত্তর দিন; উত্তর না দিলে কিছুই হবে না এবং অনুরোধটি খোলা থাকবে।",
+        "needs_you": "আপনার সিদ্ধান্ত প্রয়োজন",
+        "options": "উত্তর দিতে, এই থ্রেডে এগুলির একটি টাইপ করে উত্তর দিন: {{list}}",
+        "reply_hint": "উত্তর দিতে এই থ্রেডে লিখুন।",
+        "veto": "আপনি {{time}} এর মধ্যে উত্তর না দিলে {{member}} এটি করবে: {{action}}",
+        "veto_generic": "আপনি {{time}} এর মধ্যে উত্তর না দিলে সদস্য এটি করবে: {{action}}"
       }
     },
     "chatPage": {
@@ -12061,7 +12068,6 @@
       "unknown_agent": "সাব-এজেন্ট",
       "unknown_model": "অজানা"
     },
-    "sessionMemoryCard": {},
     "sessionStorage": {
       "age_option_one": "{{days}} দিনের বেশি পুরোনো — {{count}}টি সেশন · {{size}}",
       "age_option_other": "{{days}} দিনের বেশি পুরোনো — {{count}}টি সেশন · {{size}}",
@@ -14198,6 +14204,40 @@
       "filter_source_builtin_description": "{{productName}}-এর সাথে আসা ক্রু",
       "filter_source_package_description": "ক্ষমতা প্যাকেজ দ্বারা ইনস্টল করা ক্রু",
       "member_count_filtered": "{{count}} জনের মধ্যে {{shown}} জন সদস্য"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "আপনার সিদ্ধান্ত প্রয়োজন",
+        "working": "কাজ চলছে: {{purpose}}",
+        "working_generic": "কাজ চলছে…",
+        "view_process_one": "প্রক্রিয়া দেখো ({{count}} ধাপ)",
+        "view_process_other": "প্রক্রিয়া দেখো ({{count}} ধাপ)",
+        "hide_process": "প্রক্রিয়া লুকান",
+        "silent_rounds_one": "{{count}} নিয়মিত পরীক্ষা, নতুন কিছু নেই",
+        "silent_rounds_other": "{{count}} নিয়মিত পরীক্ষা, নতুন কিছু নেই",
+        "show_rounds": "নিয়মিত পরীক্ষা দেখান",
+        "hide_rounds": "নিয়মিত পরীক্ষা লুকান",
+        "escalation_title": "{{member}} আপনার সিদ্ধান্ত চাইছে",
+        "escalation_title_generic": "আপনার সিদ্ধান্ত প্রয়োজন",
+        "escalation_from": "{{session}} থেকে",
+        "escalation_goal": "লক্ষ্য: {{goal}}",
+        "escalation_index_failed": "সদস্যের এসক্যালেশন রেকর্ড যাচাই করা যায়নি — এই কার্ডটি পুরোনো হতে পারে; আবার চেষ্টা করা হচ্ছে।",
+        "escalation_deadline": "{{time}}-এর মধ্যে সিদ্ধান্ত নিন · {{remaining}} বাকি",
+        "escalation_expired": "সময়সীমা শেষ — ডিফল্ট পদক্ষেপ প্রয়োগ হবে",
+        "escalation_expired_no_default": "সময়সীমা শেষ",
+        "escalation_default": "আপনি উত্তর না দিলে: {{action}}",
+        "escalation_answered": "উত্তর দেওয়া হয়েছে",
+        "escalation_pending": "আপনার উত্তরের অপেক্ষায়",
+        "escalation_pick_hint": "একটি অপশন বেছে নাও, তারপর উত্তর পাঠাও।",
+        "escalation_retracted": "প্রত্যাহার করা হয়েছে",
+        "escalation_send": "উত্তর পাঠাও",
+        "escalation_send_pick": "“{{option}}” পাঠাও",
+        "escalation_type_instead": "নিচে লেখা বার্তাও তোমার উত্তর হিসেবে গণ্য হবে।",
+        "escalation_default_applied": "ডিফল্ট প্রয়োগ হয়েছে: {{action}}",
+        "escalation_send_failed": "উত্তর পাঠানো যায়নি — আবার চেষ্টা করুন।",
+        "escalation_sent": "উত্তর পাঠানো হয়েছে",
+        "escalation_title_from": "{{session}} তোমাকে চায়"
+      }
     }
   },
   "privacyDisclosure": {

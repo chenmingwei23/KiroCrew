@@ -4188,7 +4188,6 @@
         "typesetting_hints_one": "{{count}} remarque de composition",
         "typesetting_hints_other": "{{count}} remarques de composition"
       },
-      "editor": {},
       "fileTree": {
         "delete_file": "Supprimer {{file}}",
         "files": "Fichiers",
@@ -9753,6 +9752,14 @@
         "copy_text_failed": "Échec de la copie",
         "copy_text_unavailable": "Le presse-papiers est bloqué ici. Le texte de ta publication est sélectionné — appuie sur Ctrl+C / ⌘C. Le texte de la carte que tu as modifié se copie depuis la carte elle-même.",
         "export_failed": "Impossible de générer la carte de partage"
+      },
+      "escalationNotice": {
+        "deadline": "Répondez avant {{time}} ; sans réponse, rien ne se passe et la demande reste ouverte.",
+        "needs_you": "A besoin de vous",
+        "options": "Pour répondre, tapez l'une de ces options en réponse dans ce fil : {{list}}",
+        "reply_hint": "Répondez dans ce fil pour donner votre réponse.",
+        "veto": "Sans réponse de votre part avant {{time}}, {{member}} fera : {{action}}",
+        "veto_generic": "Sans réponse de votre part avant {{time}}, le membre fera : {{action}}"
       }
     },
     "chatPage": {
@@ -12229,7 +12236,6 @@
       "unknown_agent": "sous-agent",
       "unknown_model": "inconnu"
     },
-    "sessionMemoryCard": {},
     "sessionStorage": {
       "age_option_many": "Plus de {{days}} jours — {{count}} sessions · {{size}}",
       "age_option_one": "Plus de {{days}} jours — {{count}} session · {{size}}",
@@ -14380,6 +14386,42 @@
       "filter_source_builtin_description": "Crews fournis avec {{productName}}",
       "filter_source_package_description": "Crews installés par des packages de capacités",
       "member_count_filtered": "{{shown}} membres sur {{count}}"
+    },
+    "members": {
+      "chat": {
+        "needs_you": "A besoin de vous",
+        "working": "En cours : {{purpose}}",
+        "working_generic": "En cours…",
+        "view_process_one": "Voir le déroulement ({{count}} étape)",
+        "view_process_other": "Voir le déroulement ({{count}} étapes)",
+        "view_process_many": "Voir le déroulement ({{count}} étapes)",
+        "hide_process": "Masquer le déroulement",
+        "silent_rounds_one": "{{count}} vérification sans nouveauté",
+        "silent_rounds_other": "{{count}} vérifications sans nouveauté",
+        "silent_rounds_many": "{{count}} vérifications sans nouveauté",
+        "show_rounds": "Afficher les vérifications",
+        "hide_rounds": "Masquer les vérifications",
+        "escalation_title": "{{member}} a besoin de vous",
+        "escalation_title_generic": "A besoin de vous",
+        "escalation_from": "depuis {{session}}",
+        "escalation_goal": "Objectif : {{goal}}",
+        "escalation_index_failed": "Impossible de consulter les escalades du membre — cette carte peut être obsolète ; nouvelle tentative en cours.",
+        "escalation_deadline": "Décidez avant {{time}} · {{remaining}} restant",
+        "escalation_expired": "Délai écoulé — l’action par défaut s’applique",
+        "escalation_expired_no_default": "Délai écoulé",
+        "escalation_default": "Sans réponse de votre part : {{action}}",
+        "escalation_answered": "Répondu",
+        "escalation_pending": "En attente de votre réponse",
+        "escalation_pick_hint": "Choisissez une option, puis Envoyer la réponse.",
+        "escalation_retracted": "Retirée",
+        "escalation_send": "Envoyer la réponse",
+        "escalation_send_pick": "Envoyer « {{option}} »",
+        "escalation_type_instead": "Un message saisi ci-dessous compte aussi comme votre réponse.",
+        "escalation_default_applied": "Action par défaut appliquée : {{action}}",
+        "escalation_send_failed": "La réponse n’a pas été envoyée — réessayez.",
+        "escalation_sent": "Réponse envoyée",
+        "escalation_title_from": "{{session}} a besoin de vous"
+      }
     }
   },
   "privacyDisclosure": {
