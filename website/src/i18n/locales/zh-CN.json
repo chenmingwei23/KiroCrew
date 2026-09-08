@@ -7085,6 +7085,7 @@
     },
     "selectionToolbar": {
       "ask": "随手问",
+      "ask_hint": "就选中内容在随手问面板里提问——独立的对话，不影响主聊天",
       "copy": "复制",
       "quote": "引用"
     },
@@ -14035,6 +14036,7 @@
       "patrol_last_wake_ago": "上次唤醒：{{when}}",
       "patrol_none": "未安排巡逻。",
       "patrol_error": "无法加载此成员的巡逻状态。",
+      "side_chat_draft_waiting": "这位成员的随手问里还有一条未发送的问题",
       "patrol_error_roster": "无法加载成员列表的巡逻状态。",
       "patrol_badge": "巡逻中 · {{cycle}}",
       "patrol_badge_stopped": "巡逻已停止",

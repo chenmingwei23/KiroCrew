@@ -7300,7 +7300,8 @@
       "will_be_removed_on_save": "Verrà rimosso al salvataggio."
     },
     "selectionToolbar": {
-      "ask": "Chiedi in Chat laterale",
+      "ask": "Chiedi di questo",
+      "ask_hint": "Fai una domanda sulla selezione in Chat laterale: una conversazione a parte; la chat principale resta intatta",
       "copy": "Copia",
       "quote": "Cita"
     },
@@ -14399,6 +14400,7 @@
       "patrol_last_wake_ago": "Ultima attivazione {{when}}",
       "patrol_none": "Nessuna pattuglia programmata.",
       "patrol_error": "Impossibile caricare lo stato di pattuglia di questo membro.",
+      "side_chat_draft_waiting": "Una domanda non inviata attende nella Chat laterale di questo membro",
       "patrol_error_roster": "Impossibile caricare lo stato di pattuglia dell'elenco.",
       "patrol_badge": "In pattuglia · {{cycle}}",
       "patrol_badge_stopped": "Pattuglia fermata",

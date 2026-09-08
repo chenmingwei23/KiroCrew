@@ -11,6 +11,9 @@ export interface SelectionAction {
   id: string
   icon: React.ReactNode
   label: string
+  /** Tooltip shown on hover when the label alone does not say where the
+   *  action lands. Falls back to the label; never the accessible name. */
+  hint?: string
   /** Called with selected text and the bounding rect of the selection */
   onClick: (text: string, rect: DOMRect) => void
 }
@@ -497,7 +500,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
                 onMouseDown={e => e.preventDefault()}
                 onClick={() => handleAction(action)}
                 aria-label={action.label}
-                title={action.label}
+                title={action.hint ?? action.label}
               >
                 {copiedId === action.id ? <Check size={12} className="text-ok" /> : action.icon}
                 {action.label}
@@ -529,12 +532,16 @@ export function useSelectionActions(
 
   // "Ask" opens the isolated /side conversation seeded with the selection so
   // the user can ask a scoped follow-up WITHOUT polluting the main chat
-  // context (unlike Quote, which injects into the main composer).
+  // context (unlike Quote, which injects into the main composer). The label
+  // says what the action does to the selection ("ask about this"); WHERE the
+  // question lands is the hint's job — a first-time reader has not met the
+  // Side Chat panel yet, so naming it on the button explained nothing.
   if (onAsk) {
     actions.push({
       id: 'ask',
       icon: <MessageCircleQuestionMark size={12} />,
       label: i18nT('components.selectionToolbar.ask'),
+      hint: i18nT('components.selectionToolbar.ask_hint'),
       onClick: onAsk,
     })
   }

@@ -4924,7 +4924,8 @@
       "will_be_removed_on_save": "Will be removed on save."
     },
     "selectionToolbar": {
-      "ask": "Ask in Side Chat",
+      "ask": "Ask about this",
+      "ask_hint": "Ask a question about the selection in Side Chat — a separate conversation; the main chat is left alone",
       "copy": "Copy",
       "quote": "Quote"
     },
@@ -6993,6 +6994,7 @@
       "patrol_last_wake_ago": "Last wake {{when}}",
       "patrol_none": "No patrol scheduled.",
       "patrol_error": "Couldn't load this member's patrol status.",
+      "side_chat_draft_waiting": "An unsent question is waiting in this member’s Side Chat",
       "patrol_error_roster": "Couldn't load patrol status for the roster.",
       "patrol_badge": "On patrol · {{cycle}}",
       "patrol_badge_stopped": "Patrol stopped",

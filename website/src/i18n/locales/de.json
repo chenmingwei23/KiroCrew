@@ -7192,7 +7192,8 @@
       "will_be_removed_on_save": "Wird beim Speichern entfernt."
     },
     "selectionToolbar": {
-      "ask": "Im Seitenchat fragen",
+      "ask": "Hierzu fragen",
+      "ask_hint": "Eine Frage zur Auswahl im Seitenchat stellen — ein separates Gespräch; der Hauptchat bleibt unberührt",
       "copy": "Kopieren",
       "quote": "Zitieren"
     },
@@ -14217,6 +14218,7 @@
       "patrol_last_wake_ago": "Letztes Aufwecken {{when}}",
       "patrol_none": "Keine Patrouille geplant.",
       "patrol_error": "Patrouillenstatus dieses Mitglieds konnte nicht geladen werden.",
+      "side_chat_draft_waiting": "Im Seitenchat dieses Mitglieds wartet eine nicht gesendete Frage",
       "patrol_error_roster": "Patrouillenstatus für die Liste konnte nicht geladen werden.",
       "patrol_badge": "Auf Patrouille · {{cycle}}",
       "patrol_badge_stopped": "Patrouille gestoppt",
