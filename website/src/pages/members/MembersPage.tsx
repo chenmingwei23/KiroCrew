@@ -28,16 +28,24 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Circle, Clock, ExternalLink, Goal, Pause, Pencil, Star, UserPen, UserPlus, Users, Webhook } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useTranslation } from 'react-i18next'
-import { api, type MemberActivityEntry, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
+import { api, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
+import {
+  MEMBERS_ROSTER_QUERY_KEY,
+  memberActivityQueryKey,
+  memberThreadQueryKey,
+  membersRosterQuery,
+  type MemberThreadOutcome,
+} from '../../api/membersQuery'
+import { defaultAgentQuery } from '../../api/defaultAgentQuery'
 import type { CronJob } from '../../types'
-import { wakesCrew, webhookBoundToCrew } from '../../components/crew/wakesCrew'
+import { crewWebhooksQueryKey, wakesCrew, webhookBoundToCrew } from '../../components/crew/wakesCrew'
 import {
   AUTONUDGE_LOOPS_QUERY_KEY,
   type AutoNudgeLoop,
   intervalText,
   nextCycle,
 } from '../../components/autoNudgeLoop'
-import { useQuery } from '@tanstack/react-query'
+import { skipToken, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { timeAgo } from '../../utils/timeAgo'
 import { fmtDateTimeNumeric } from '../../i18n/format'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
@@ -201,14 +209,26 @@ const PATROL_REFRESH_MS = 60_000
  *  an at-a-glance status, and a per-second re-render of the whole drawer for
  *  a readout that already drops seconds above a minute buys nothing. */
 const PATROL_TICK_MS = 15_000
+/** Stable empty roster for the not-yet-answered read, so the memos keyed on
+ *  `members` do not recompute on every render while the first fetch is out. */
+const EMPTY_ROSTER: readonly MemberRosterRow[] = []
 
 export default function MembersPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const location = useLocation()
-  const [members, setMembers] = useState<MemberRosterRow[]>([])
-  const [loaded, setLoaded] = useState(false)
-  const [loadError, setLoadError] = useState(false)
+  const queryClient = useQueryClient()
+  // The roster is a React Query read (issue #9418), not page state: a return
+  // to the page renders the cached list at once and refreshes it in the
+  // background, and a crew written anywhere else reaches it through the
+  // `['kirocrew-agents']` prefix invalidation (see membersQuery.ts). Three
+  // states, kept apart the way every block on this page keeps them: not yet
+  // answered, answered, failed with no answer to fall back on — a refetch
+  // error after a good read keeps showing the last roster.
+  const rosterQuery = useQuery(membersRosterQuery)
+  const members = rosterQuery.data ?? EMPTY_ROSTER
+  const loaded = rosterQuery.data !== undefined || rosterQuery.isError
+  const loadError = rosterQuery.data === undefined && rosterQuery.isError
   // Identity is the exact crew name (unique in the registry); the slug is not.
   const [activeName, setActiveName] = useState<string>('')
   // The URL is the one source of WHICH member is open; activeName follows it
@@ -229,17 +249,34 @@ export default function MembersPage() {
   // ref, not state: it is a note between two runs of one effect, and must
   // not re-arm it.
   const goneStandInRef = useRef('')
-  // name -> slot key / name -> error, filled ONLY by the thread endpoint's
-  // response. The roster's `bound`/`slot_key` are never trusted as mountable:
-  // dm.json outlives the live slot (a restart drops an unmessaged slot while
-  // the binding survives), and mounting an unconfirmed key would let the
-  // first message auto-create an ordinary UNPINNED slot on the member key.
+  // The open member's thread, as the thread endpoint last answered it. The
+  // roster's `bound`/`slot_key` are never trusted as mountable: dm.json
+  // outlives the live slot (a restart drops an unmessaged slot while the
+  // binding survives), and mounting an unconfirmed key would let the first
+  // message auto-create an ordinary UNPINNED slot on the member key.
   // POST /api/members/{slug}/thread is idempotent and is the only creator/
-  // repairer of member slots — so every open goes through it. Keying results
-  // by the member they were requested FOR makes a late completion of a
-  // previously selected member harmless.
-  const [slots, setSlots] = useState<Record<string, string>>({})
-  const [errors, setErrors] = useState<Record<string, string>>({})
+  // repairer of member slots — so every open goes through it (the mutation
+  // below), and its answer is cached per member NAME (memberThreadQueryKey)
+  // so a return to a member mounts the cached thread at once while the
+  // re-POST repairs in the background. Keying by the member the answer was
+  // requested FOR makes a late completion of a previously selected member
+  // harmless. `skipToken`: this entry is written by the mutation, never
+  // fetched — the read only subscribes to it.
+  const threadQuery = useQuery<MemberThreadOutcome>({
+    queryKey: memberThreadQueryKey(activeName),
+    queryFn: skipToken,
+  })
+  const threadOutcome = threadQuery.data
+  // The slot a row's live readings (presence, unread, patrol) resolve to: the
+  // thread endpoint's confirmed key for the open member, the roster binding
+  // for everyone else. The roster row is patched with the confirmed key the
+  // moment an open confirms one (see openThread), so a member opened earlier
+  // in this visit keeps resolving after the selection moves on.
+  const slotKeyOf = useCallback(
+    (m: MemberRosterRow) =>
+      (m.name === activeName ? threadOutcome?.slot_key : '') || m.slot_key,
+    [activeName, threadOutcome],
+  )
   // Roster width is user-adjustable on md+ (drag handle on the right edge),
   // mirroring the chat sidebar. Below md the roster is full-width single-pane
   // and the stored width is simply unused. Clamp + persist live in the shared
@@ -268,38 +305,21 @@ export default function MembersPage() {
   }, [liveSlots])
   const isRunning = useCallback(
     (m: MemberRosterRow) => {
-      const key = slots[m.name] || m.slot_key
+      const key = slotKeyOf(m)
       return key && key in liveRunning ? liveRunning[key] : m.running
     },
-    [slots, liveRunning],
+    [slotKeyOf, liveRunning],
   )
-
-  useEffect(() => {
-    let alive = true
-    api
-      .members()
-      .then((r) => {
-        if (!alive) return
-        setMembers(r.members)
-        setLoaded(true)
-      })
-      .catch(() => {
-        if (!alive) return
-        setLoadError(true)
-        setLoaded(true)
-      })
-    return () => {
-      alive = false
-    }
-  }, [])
 
   const active = useMemo(
     () => members.find((m) => m.name === activeName),
     [members, activeName],
   )
   // Most-recently-active first (like any IM member list); never-talked
-  // members fall to the bottom alphabetically. Sorted once from the roster
-  // snapshot — live re-sorting mid-session would move rows under the cursor.
+  // members fall to the bottom alphabetically. Sorted from the cached roster,
+  // which changes only when the cache does — a return to the page, a focus
+  // after the stale window, a registry write elsewhere — never on a live
+  // message, so rows do not move under the cursor mid-conversation.
   const [filter, setFilter] = useState('')
   // Persistent roster filters. The agent sync writes every package-installed
   // agent spec into the roster, so a host with a few dozen installed packages
@@ -335,33 +355,56 @@ export default function MembersPage() {
   // second click whose write also fails would revert to the FIRST click's
   // value and leave the row starred while the server is not.
   const [starPending, setStarPending] = useState<Set<string>>(() => new Set())
-  const toggleStar = useCallback((m: MemberRosterRow) => {
-    const next = !m.starred
-    setStarError(null)
-    setStarPending((prev) => new Set(prev).add(m.name))
-    setMembers((prev) => prev.map((r) => (r.name === m.name ? { ...r, starred: next } : r)))
-    api
-      .updateKirocrewAgent(m.name, { starred: next })
-      .catch((err: unknown) => {
-        setMembers((prev) => prev.map((r) => (r.name === m.name ? { ...r, starred: !next } : r)))
-        // Localized copy, never the raw server text: the client throws the
-        // response body (or `HTTP 500`), which is neither translated nor
-        // meant for a user. The journaled report is recovered from that
-        // message and handed to ErrorNotice so "Ask the agent" still carries
-        // endpoint / status / code / detail.
-        setStarError({
-          message: t('pages.membersPage.star_failed'),
-          report: findReport(err instanceof Error ? err.message : undefined),
-        })
+  // The optimistic flip and its revert are per-ROW functional patches on the
+  // roster cache, not a whole-roster snapshot restore: two members starred in
+  // quick succession must not have the second's failure undo the first.
+  const patchStar = useCallback(
+    (name: string, starred: boolean) =>
+      queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
+        rows?.map((r) => (r.name === name ? { ...r, starred } : r)),
+      ),
+    [queryClient],
+  )
+  const starMutation = useMutation({
+    mutationFn: ({ m, next }: { m: MemberRosterRow; next: boolean }) =>
+      api.updateKirocrewAgent(m.name, { starred: next }),
+    onMutate: async ({ m, next }) => {
+      // A roster refetch already in flight would land AFTER the optimistic
+      // patch and overwrite it with the pre-write row: stop it first.
+      await queryClient.cancelQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+      setStarError(null)
+      setStarPending((prev) => new Set(prev).add(m.name))
+      patchStar(m.name, next)
+    },
+    onError: (err: unknown, { m, next }) => {
+      patchStar(m.name, !next)
+      // Localized copy, never the raw server text: the client throws the
+      // response body (or `HTTP 500`), which is neither translated nor
+      // meant for a user. The journaled report is recovered from that
+      // message and handed to ErrorNotice so "Ask the agent" still carries
+      // endpoint / status / code / detail.
+      setStarError({
+        message: t('pages.membersPage.star_failed'),
+        report: findReport(err instanceof Error ? err.message : undefined),
       })
-      .finally(() => {
-        setStarPending((prev) => {
-          const n = new Set(prev)
-          n.delete(m.name)
-          return n
-        })
+    },
+    onSettled: (_data, _err, { m }) => {
+      setStarPending((prev) => {
+        const n = new Set(prev)
+        n.delete(m.name)
+        return n
       })
-  }, [t])
+    },
+    // No invalidation on success, deliberately: the roster row is the only
+    // reader of `starred`, and after a 2xx the optimistic row IS the server's
+    // state — a refetch would re-render the whole list to change nothing,
+    // and an in-flight refetch is exactly what a concurrent star must cancel.
+  })
+  const { mutate: mutateStar } = starMutation
+  const toggleStar = useCallback(
+    (m: MemberRosterRow) => mutateStar({ m, next: !m.starred }),
+    [mutateStar],
+  )
   // The chat side panel's right-dock mount preset — module-pure, so one
   // constant serves every render.
   const drawerMotion = sidePanelDockMotion('right')
@@ -404,8 +447,14 @@ export default function MembersPage() {
   // copy would be wrong then, since the roster is not empty.
   const filteredOut =
     loaded && !loadError && members.length > 0 && sortedMembers.length === 0 && !filter.trim()
-  const activeSlot = active ? slots[active.name] ?? '' : ''
-  const activeError = active ? errors[active.name] ?? '' : ''
+  const activeSlot = active ? threadOutcome?.slot_key ?? '' : ''
+  const activeError = !active
+    ? ''
+    : threadOutcome?.collision
+      ? t('pages.membersPage.slug_collision', { name: threadOutcome.collision })
+      : threadOutcome?.failed
+        ? t('pages.membersPage.thread_open_failed')
+        : ''
 
   // Sessions this member is driving: every live slot whose `created_by` is the
   // member's DM slot key. A member dispatches its real work into worker
@@ -432,90 +481,71 @@ export default function MembersPage() {
   const drivingExpanded = drivingExpandedFor === activeMemberKey
   const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
 
-  // Recent-activity pointers for the drawer, fetched when it opens for a
-  // member and cached for the page's lifetime. Keyed by the exact member
-  // NAME, not the slug — slugs are lossy, and the whole point of the
-  // backend's member filter is that two names sharing a slug have distinct
-  // histories. Real recorded signal only — the drawer derives its counts
-  // from these instead of fabricating stats. Three states per member:
-  // absent = still loading, 'error' = fetch failed, object = loaded.
-  // A pending or failed read must not render the affirmative "no activity".
-  const [activity, setActivity] = useState<
-    Record<string, { entries: MemberActivityEntry[]; capped: boolean } | 'error'>
-  >({})
+  // Recent-activity pointers for the drawer, read when it opens for a member
+  // and cached per exact member NAME, not slug — slugs are lossy, and the
+  // whole point of the backend's member filter is that two names sharing a
+  // slug have distinct histories. Real recorded signal only — the drawer
+  // derives its counts from these instead of fabricating stats. Three states
+  // per member: no answer yet = still loading, failed with no answer = error,
+  // answered = loaded. A pending or failed read must not render the
+  // affirmative "no activity"; a refetch error after a good read keeps the
+  // last entries. The finite staleTime is the roster's: a return to the
+  // drawer shows the cached pointers and refreshes them behind.
   const activeSlug = active?.slug ?? ''
   const activeMemberName = active?.name ?? ''
-  useEffect(() => {
-    if (!activeSlug || !activeMemberName || !drawerOpen) return
-    let cancelled = false
-    api
-      .memberActivity(activeSlug, activeMemberName)
-      .then((r) => {
-        if (!cancelled)
-          setActivity((prev) => ({
-            ...prev,
-            [activeMemberName]: { entries: r.entries, capped: !!r.capped },
-          }))
-      })
-      .catch(() => {
-        if (!cancelled) setActivity((prev) => ({ ...prev, [activeMemberName]: 'error' }))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activeSlug, activeMemberName, drawerOpen])
-  const activityState = activeMemberName ? activity[activeMemberName] : undefined
-  const activityLoading = activityState === undefined
-  const activityError = activityState === 'error'
+  const activityQuery = useQuery({
+    queryKey: memberActivityQueryKey(activeSlug, activeMemberName),
+    queryFn: () => api.memberActivity(activeSlug, activeMemberName),
+    enabled: !!activeSlug && !!activeMemberName && drawerOpen,
+    staleTime: membersRosterQuery.staleTime,
+  })
+  const activityLoading = activityQuery.data === undefined && !activityQuery.isError
+  const activityError = activityQuery.data === undefined && activityQuery.isError
   const activeEntries = useMemo(
-    () => (typeof activityState === 'object' ? activityState.entries : []),
-    [activityState],
+    () => activityQuery.data?.entries ?? [],
+    [activityQuery.data],
   )
-  const activityCapped = typeof activityState === 'object' && activityState.capped
+  const activityCapped = !!activityQuery.data?.capped
 
   // Wake sources — global lists (crons, webhook tokens, the default crew),
-  // fetched ONCE on the first drawer open and filtered per member at render.
-  // `failed` is kept distinct from empty: absence of an answer and an answer
-  // of "none" must not render the same (a failed fetch would otherwise show
-  // the affirmative "nothing wakes this member", a false statement).
-  const [wake, setWake] = useState<{
-    loaded: boolean
-    failed: boolean
-    jobs: CronJob[]
-    tokens: WebhookTokenEntry[]
-    defaultAgent: string
-  }>({ loaded: false, failed: false, jobs: [], tokens: [], defaultAgent: '' })
-  useEffect(() => {
-    if (!drawerOpen || wake.loaded || wake.failed) return
-    let cancelled = false
-    Promise.all([api.crons(), api.webhooks(), api.kirocrewAgents()])
-      .then(([crons, hooks, agents]) => {
-        if (cancelled) return
-        setWake({
-          loaded: true,
-          failed: false,
-          jobs: crons?.jobs || [],
-          tokens: hooks?.tokens || [],
-          defaultAgent: agents?.default_agent || '',
-        })
-      })
-      .catch(() => {
-        if (!cancelled) setWake((prev) => ({ ...prev, failed: true }))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [drawerOpen, wake.loaded, wake.failed])
+  // shared with the crew editor and the Schedule page through the same query
+  // keys (one fetch serves all of them; a mint / revoke / save anywhere
+  // reaches this drawer through their invalidations), read once the drawer
+  // opens and filtered per member at render. `failed` is kept distinct from
+  // empty: absence of an answer and an answer of "none" must not render the
+  // same (a failed fetch would otherwise show the affirmative "nothing wakes
+  // this member", a false statement). Every source must have answered before
+  // the block asserts anything; one failing with nothing cached is the error.
+  const cronsQuery = useQuery({
+    queryKey: ['cron-jobs'],
+    queryFn: () => api.crons().then((r) => (r.jobs || []) as CronJob[]),
+    enabled: drawerOpen,
+  })
+  const hooksQuery = useQuery<{ tokens?: WebhookTokenEntry[] }>({
+    queryKey: crewWebhooksQueryKey,
+    queryFn: () => api.webhooks(),
+    enabled: drawerOpen,
+  })
+  const defaultAgentQ = useQuery({ ...defaultAgentQuery, enabled: drawerOpen })
+  const wakeSources = [cronsQuery, hooksQuery, defaultAgentQ]
+  const wakeFailed = wakeSources.some((q) => q.data === undefined && q.isError)
+  const wakeLoaded = wakeFailed || wakeSources.every((q) => q.data !== undefined)
+  const wakeJobsAll = cronsQuery.data
+  const wakeTokens = hooksQuery.data?.tokens
+  const wakeDefaultAgent = defaultAgentQ.data ?? ''
   const wakeJobs = useMemo(
     () =>
-      active
-        ? wake.jobs.filter((j) => wakesCrew(j, active.name, active.name === wake.defaultAgent))
+      active && wakeJobsAll
+        ? wakeJobsAll.filter((j) => wakesCrew(j, active.name, active.name === wakeDefaultAgent))
         : [],
-    [active, wake.jobs, wake.defaultAgent],
+    [active, wakeJobsAll, wakeDefaultAgent],
   )
   const wakeHooks = useMemo(
-    () => (active ? wake.tokens.filter((t) => webhookBoundToCrew(t, active.name)) : []),
-    [active, wake.tokens],
+    () =>
+      active && wakeTokens
+        ? wakeTokens.filter((t) => webhookBoundToCrew(t, active.name))
+        : [],
+    [active, wakeTokens],
   )
   const { todayCount, weekCount, todayFloorTs, weekFloorTs } = useMemo(() => {
     const midnight = new Date()
@@ -562,10 +592,10 @@ export default function MembersPage() {
   const unreadSlots = useAppSelector((s) => s.dashboard.unreadSlots)
   const isUnread = useCallback(
     (m: MemberRosterRow) => {
-      const key = slots[m.name] || m.slot_key
+      const key = slotKeyOf(m)
       return !!key && unreadSlots.includes(key)
     },
-    [slots, unreadSlots],
+    [slotKeyOf, unreadSlots],
   )
 
   // Auto patrol: the auto-nudge loop (monitor / goal loop) bound to a member's
@@ -607,10 +637,10 @@ export default function MembersPage() {
   }, [patrolQuery.data, patrolQuery.isError])
   const patrolLoopOf = useCallback(
     (m: MemberRosterRow) => {
-      const key = slots[m.name] || m.slot_key
+      const key = slotKeyOf(m)
       return key ? patrol.loops[key] : undefined
     },
-    [slots, patrol.loops],
+    [slotKeyOf, patrol.loops],
   )
   /** Roster-level reading of a member's loop record: `active` while it
    *  patrols, `stopped` for a record that went inactive (any reason), and
@@ -648,6 +678,49 @@ export default function MembersPage() {
     return () => clearInterval(timer)
   }, [patrolTicking])
 
+  // The thread open. A mutation, not a query: the endpoint is a write (the
+  // idempotent creator/repairer of member slots), so it is issued on EVERY
+  // open — never served from cache — and its answer is what the cache holds.
+  // Outcomes are keyed by the member the POST was FOR, so a late answer for a
+  // member the user has already left lands in that member's entry, not the
+  // open one's. The roster row is patched with a freshly confirmed key so the
+  // row's live readings (presence dot, unread, patrol badge) resolve to the
+  // same slot the thread mounted on, without a roster refetch that would
+  // re-sort the list under the cursor.
+  const setThreadOutcome = useCallback(
+    (name: string, update: (prev: MemberThreadOutcome | undefined) => MemberThreadOutcome) =>
+      queryClient.setQueryData<MemberThreadOutcome>(memberThreadQueryKey(name), update),
+    [queryClient],
+  )
+  const openThread = useMutation({
+    mutationFn: (m: MemberRosterRow) => api.memberThread(m.slug),
+    onMutate: (m) => {
+      // A previous verdict for this member is retired while the re-POST is
+      // out: a confirmed key keeps rendering (the cached thread stays up), a
+      // collision or failure line comes down until the new answer is in.
+      setThreadOutcome(m.name, (prev) => ({ slot_key: prev?.slot_key ?? '' }))
+    },
+    onSuccess: (r, m) => {
+      if (r.member !== m.name) {
+        // The slug's thread belongs to another crew (lossy-slug collision,
+        // first-bound-wins). Mounting it would be a silent misroute — the
+        // defining failure for a page whose premise is identity.
+        setThreadOutcome(m.name, () => ({ slot_key: '', collision: r.member }))
+        return
+      }
+      setThreadOutcome(m.name, () => ({ slot_key: r.slot_key }))
+      if (m.slot_key !== r.slot_key) {
+        queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
+          rows?.map((row) => (row.name === m.name ? { ...row, slot_key: r.slot_key, bound: true } : row)),
+        )
+      }
+    },
+    onError: (_err, m) => {
+      setThreadOutcome(m.name, (prev) => ({ slot_key: prev?.slot_key ?? '', failed: true }))
+    },
+  })
+  const { mutate: postThread } = openThread
+
   // Open a member's thread and remember it as the last one opened. Called by
   // the URL sync effect only (plus the same-member re-click below), so every
   // way of arriving at a member — click, back/forward, shallow link, restore
@@ -659,46 +732,14 @@ export default function MembersPage() {
     (m: MemberRosterRow, remember = true) => {
       setActiveName(m.name)
       if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
-      setErrors((prev) => {
-        if (!(m.name in prev)) return prev
-        const next = { ...prev }
-        delete next[m.name]
-        return next
-      })
       // ALWAYS post, even when a slot key is already cached: the endpoint is
       // the idempotent creator/repairer, and the backend can lose the live
       // slot between opens (archive, restart with a stale binding) — a cached
       // key mounted without the POST would point at nothing. The cache only
       // decides what to render while the POST is in flight.
-      api
-        .memberThread(m.slug)
-        .then((r) => {
-          if (r.member !== m.name) {
-            // The slug's thread belongs to another crew (lossy-slug collision,
-            // first-bound-wins). Mounting it would be a silent misroute — the
-            // defining failure for a page whose premise is identity.
-            setSlots((prev) => {
-              if (!(m.name in prev)) return prev
-              const next = { ...prev }
-              delete next[m.name]
-              return next
-            })
-            setErrors((prev) => ({
-              ...prev,
-              [m.name]: t('pages.membersPage.slug_collision', { name: r.member }),
-            }))
-            return
-          }
-          setSlots((prev) => ({ ...prev, [m.name]: r.slot_key }))
-        })
-        .catch(() =>
-          setErrors((prev) => ({
-            ...prev,
-            [m.name]: t('pages.membersPage.thread_open_failed'),
-          })),
-        )
+      postThread(m)
     },
-    [t],
+    [postThread],
   )
 
   const openMember = useCallback(
@@ -991,7 +1032,7 @@ export default function MembersPage() {
                   <CrewStateAvatar
                     seed={m.name}
                     avatar={m.avatar}
-                    slotKey={slots[m.name] || m.slot_key}
+                    slotKey={slotKeyOf(m)}
                     running={!!isRunning(m)}
                     size={36}
                     working="subtle"
@@ -1564,11 +1605,11 @@ export default function MembersPage() {
               <ExternalLink size={12} className="lucide-inline" />
             </button>
           </div>
-          {!wake.loaded && !wake.failed ? (
+          {!wakeLoaded ? (
             <div className="mb-4 space-y-1.5" data-testid="member-wake-loading" aria-hidden>
               <div className="h-3 rounded bg-accent/40 animate-pulse" />
             </div>
-          ) : wake.failed ? (
+          ) : wakeFailed ? (
             <div className="text-[11px] text-muted mb-4" role="alert" data-testid="member-wake-error">
               {t('pages.membersPage.wake_error')}
             </div>

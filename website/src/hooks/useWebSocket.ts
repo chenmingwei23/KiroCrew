@@ -62,6 +62,8 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ['sessions-usage'] })
   qc.invalidateQueries({ queryKey: ['agents-installed'] })
   qc.invalidateQueries({ queryKey: ['mcp-tools'] })
+  // Prefix match on purpose: the Crew Members roster lives under this key
+  // (api/membersQuery.ts) and refreshes with the registry.
   qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
   qc.invalidateQueries({ queryKey: ['default-agent'] })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
