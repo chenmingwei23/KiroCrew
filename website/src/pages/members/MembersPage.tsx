@@ -28,16 +28,17 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Circle, Clock, ExternalLink, Goal, Pause, Pencil, Star, UserPen, UserPlus, Users, Webhook } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useTranslation } from 'react-i18next'
-import { api, type MemberActivityEntry, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
+import { api, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
 import type { CronJob } from '../../types'
-import { wakesCrew, webhookBoundToCrew } from '../../components/crew/wakesCrew'
+import { wakesCrew, webhookBoundToCrew, crewWebhooksQueryKey } from '../../components/crew/wakesCrew'
+import { defaultAgentQuery } from '../../api/defaultAgentQuery'
 import {
   AUTONUDGE_LOOPS_QUERY_KEY,
   type AutoNudgeLoop,
   intervalText,
   nextCycle,
 } from '../../components/autoNudgeLoop'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { timeAgo } from '../../utils/timeAgo'
 import { fmtDateTimeNumeric } from '../../i18n/format'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
@@ -75,6 +76,25 @@ const CREW_MANAGER_PATH = '/capabilities?tab=crews'
  *  is clickable here, but the write still happens in the one editor. */
 const crewAvatarEditPath = (name: string) =>
   `${CREW_MANAGER_PATH}&crew=${encodeURIComponent(name)}&avatar=1`
+/** The roster's cache entry. A CHILD of ['kirocrew-agents'] rather than the
+ *  bare key: invalidation matches by prefix, so the two sites that already
+ *  invalidate ['kirocrew-agents'] — useWebSocket on every server `refresh`
+ *  frame (which every crew create/rename/delete pushes) and nothing else —
+ *  reach this roster with zero new invalidation calls. It cannot BE the bare
+ *  key: that entry stores api.kirocrewAgents()'s shape, this one stores
+ *  GET /api/members, and sharing one key across two queryFns lets whichever
+ *  mounts first decide the other's shape (the crewWebhooksQueryKey rule). */
+export const MEMBERS_ROSTER_QUERY_KEY = ['kirocrew-agents', 'members-roster'] as const
+/** One pinned-DM-thread entry per member, keyed by exact NAME (slugs are
+ *  lossy — see the header comment). The queryFn is the idempotent
+ *  get-or-create POST: a cached entry mounts the thread instantly on return
+ *  to the page, and staleTime 0 re-runs the POST on every open, keeping the
+ *  endpoint's repairer role (the backend can lose the live slot between
+ *  opens; a cached key mounted without the POST would point at nothing). */
+const memberThreadQueryKey = (name: string) => ['member-thread', name] as const
+/** A member's recorded activity pointers, keyed by exact name for the same
+ *  identity reason as the thread. */
+const memberActivityQueryKey = (name: string) => ['member-activity', name] as const
 /** The open member rides the URL (`?member=<name>`) so a reload keeps it
  *  and a link lands on one. Switching members REPLACES the entry — the page
  *  holds one history entry, so Back leaves it in one press (the Sessions
@@ -206,9 +226,26 @@ export default function MembersPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const location = useLocation()
-  const [members, setMembers] = useState<MemberRosterRow[]>([])
-  const [loaded, setLoaded] = useState(false)
-  const [loadError, setLoadError] = useState(false)
+  const queryClient = useQueryClient()
+  // The roster, served from the shared cache: a return to this page renders
+  // the cached list instantly (no blank-then-repopulate flash) while React
+  // Query revalidates behind it, and a crew created or renamed anywhere else
+  // reaches it through the existing ['kirocrew-agents'] prefix invalidation
+  // (see MEMBERS_ROSTER_QUERY_KEY). A refetch failure after a good read keeps
+  // the last roster on screen rather than blanking the page.
+  const rosterQuery = useQuery({
+    queryKey: MEMBERS_ROSTER_QUERY_KEY,
+    queryFn: () => api.members(),
+  })
+  const members = useMemo<MemberRosterRow[]>(
+    () => rosterQuery.data?.members ?? [],
+    [rosterQuery.data],
+  )
+  // The page's original three-state reading: not loaded yet (skeletonless
+  // wait), failed with nothing to show, or loaded. Error with cached data in
+  // hand reads as loaded — stale rows beat an unprompted blank.
+  const loaded = rosterQuery.data !== undefined || rosterQuery.isError
+  const loadError = rosterQuery.data === undefined && rosterQuery.isError
   // Identity is the exact crew name (unique in the registry); the slug is not.
   const [activeName, setActiveName] = useState<string>('')
   // The URL is the one source of WHICH member is open; activeName follows it
@@ -229,17 +266,16 @@ export default function MembersPage() {
   // ref, not state: it is a note between two runs of one effect, and must
   // not re-arm it.
   const goneStandInRef = useRef('')
-  // name -> slot key / name -> error, filled ONLY by the thread endpoint's
-  // response. The roster's `bound`/`slot_key` are never trusted as mountable:
-  // dm.json outlives the live slot (a restart drops an unmessaged slot while
-  // the binding survives), and mounting an unconfirmed key would let the
-  // first message auto-create an ordinary UNPINNED slot on the member key.
-  // POST /api/members/{slug}/thread is idempotent and is the only creator/
-  // repairer of member slots — so every open goes through it. Keying results
-  // by the member they were requested FOR makes a late completion of a
-  // previously selected member harmless.
+  // name -> slot key, filled ONLY by the thread endpoint's response (mirrored
+  // off the thread query below). The roster's `bound`/`slot_key` are never
+  // trusted as mountable: dm.json outlives the live slot (a restart drops an
+  // unmessaged slot while the binding survives), and mounting an unconfirmed
+  // key would let the first message auto-create an ordinary UNPINNED slot on
+  // the member key. POST /api/members/{slug}/thread is idempotent and is the
+  // only creator/repairer of member slots — so every open goes through it
+  // (the thread query's staleTime-0 refetch). This map only upgrades what
+  // isRunning/isUnread read for rows visited earlier in the page's life.
   const [slots, setSlots] = useState<Record<string, string>>({})
-  const [errors, setErrors] = useState<Record<string, string>>({})
   // Roster width is user-adjustable on md+ (drag handle on the right edge),
   // mirroring the chat sidebar. Below md the roster is full-width single-pane
   // and the stored width is simply unused. Clamp + persist live in the shared
@@ -273,25 +309,6 @@ export default function MembersPage() {
     },
     [slots, liveRunning],
   )
-
-  useEffect(() => {
-    let alive = true
-    api
-      .members()
-      .then((r) => {
-        if (!alive) return
-        setMembers(r.members)
-        setLoaded(true)
-      })
-      .catch(() => {
-        if (!alive) return
-        setLoadError(true)
-        setLoaded(true)
-      })
-    return () => {
-      alive = false
-    }
-  }, [])
 
   const active = useMemo(
     () => members.find((m) => m.name === activeName),
@@ -339,11 +356,22 @@ export default function MembersPage() {
     const next = !m.starred
     setStarError(null)
     setStarPending((prev) => new Set(prev).add(m.name))
-    setMembers((prev) => prev.map((r) => (r.name === m.name ? { ...r, starred: next } : r)))
+    // Optimistic flip straight into the roster cache (the sanctioned
+    // setQueryData pattern), reverted below if the PUT fails.
+    const flipStar = (name: string, starred: boolean) =>
+      queryClient.setQueryData<{ members: MemberRosterRow[] }>(
+        MEMBERS_ROSTER_QUERY_KEY,
+        (prev) =>
+          prev && {
+            ...prev,
+            members: prev.members.map((r) => (r.name === name ? { ...r, starred } : r)),
+          },
+      )
+    flipStar(m.name, next)
     api
       .updateKirocrewAgent(m.name, { starred: next })
       .catch((err: unknown) => {
-        setMembers((prev) => prev.map((r) => (r.name === m.name ? { ...r, starred: !next } : r)))
+        flipStar(m.name, !next)
         // Localized copy, never the raw server text: the client throws the
         // response body (or `HTTP 500`), which is neither translated nor
         // meant for a user. The journaled report is recovered from that
@@ -361,7 +389,7 @@ export default function MembersPage() {
           return n
         })
       })
-  }, [t])
+  }, [t, queryClient])
   // The chat side panel's right-dock mount preset — module-pure, so one
   // constant serves every render.
   const drawerMotion = sidePanelDockMotion('right')
@@ -404,8 +432,62 @@ export default function MembersPage() {
   // copy would be wrong then, since the roster is not empty.
   const filteredOut =
     loaded && !loadError && members.length > 0 && sortedMembers.length === 0 && !filter.trim()
-  const activeSlot = active ? slots[active.name] ?? '' : ''
-  const activeError = active ? errors[active.name] ?? '' : ''
+  const activeSlug = active?.slug ?? ''
+  const activeMemberName = active?.name ?? ''
+  // The active member's pinned DM thread — the idempotent get-or-create POST
+  // as a cached query (see memberThreadQueryKey). Returning to a member
+  // mounts the cached slot key immediately (no "Opening thread…" flash for a
+  // thread shown seconds ago) while the POST re-runs behind it and repairs
+  // whatever the backend lost since; staleTime 0 keeps that repair on every
+  // open. React Query keys the answer to the member it was requested FOR, so
+  // a late completion of a previously selected member lands in that member's
+  // entry, never this one's. Focus-refetch is off: with staleTime 0 it would
+  // re-POST on every window focus — a chattier contract than "on every open".
+  const threadQuery = useQuery({
+    queryKey: memberThreadQueryKey(activeMemberName),
+    queryFn: () => api.memberThread(activeSlug),
+    enabled: !!active,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
+  })
+  const threadData = threadQuery.data
+  // A response whose `member` is a DIFFERENT name is a lossy-slug collision
+  // (first-bound-wins is the backend contract): the slot must not mount —
+  // a silent misroute is the defining failure for a page whose premise is
+  // identity — and the outcome is said out loud instead.
+  const threadCollision = !!active && !!threadData && threadData.member !== active.name
+  const activeSlot = active && threadData && threadData.member === active.name ? threadData.slot_key : ''
+  // While a repair refetch is in flight the previous failure is retired (the
+  // old code cleared the member's error on every activate); it comes back
+  // only if the retry fails too.
+  const activeError = !active
+    ? ''
+    : threadCollision
+      ? t('pages.membersPage.slug_collision', { name: threadData.member })
+      : threadQuery.isError && !threadQuery.isFetching
+        ? t('pages.membersPage.thread_open_failed')
+        : ''
+  // Mirror the confirmed key so isRunning/isUnread keep reading it for rows
+  // the user has visited and moved on from (their roster `slot_key` may be
+  // stale or empty). State derivation off the query's answer, not a fetch;
+  // a collision retires any earlier confirmed key for that name.
+  useEffect(() => {
+    if (!activeMemberName || !threadData) return
+    if (threadData.member !== activeMemberName) {
+      setSlots((prev) => {
+        if (!(activeMemberName in prev)) return prev
+        const next = { ...prev }
+        delete next[activeMemberName]
+        return next
+      })
+      return
+    }
+    setSlots((prev) =>
+      prev[activeMemberName] === threadData.slot_key
+        ? prev
+        : { ...prev, [activeMemberName]: threadData.slot_key },
+    )
+  }, [activeMemberName, threadData])
 
   // Sessions this member is driving: every live slot whose `created_by` is the
   // member's DM slot key. A member dispatches its real work into worker
@@ -433,89 +515,72 @@ export default function MembersPage() {
   const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
 
   // Recent-activity pointers for the drawer, fetched when it opens for a
-  // member and cached for the page's lifetime. Keyed by the exact member
-  // NAME, not the slug — slugs are lossy, and the whole point of the
-  // backend's member filter is that two names sharing a slug have distinct
-  // histories. Real recorded signal only — the drawer derives its counts
-  // from these instead of fabricating stats. Three states per member:
-  // absent = still loading, 'error' = fetch failed, object = loaded.
-  // A pending or failed read must not render the affirmative "no activity".
-  const [activity, setActivity] = useState<
-    Record<string, { entries: MemberActivityEntry[]; capped: boolean } | 'error'>
-  >({})
-  const activeSlug = active?.slug ?? ''
-  const activeMemberName = active?.name ?? ''
-  useEffect(() => {
-    if (!activeSlug || !activeMemberName || !drawerOpen) return
-    let cancelled = false
-    api
-      .memberActivity(activeSlug, activeMemberName)
-      .then((r) => {
-        if (!cancelled)
-          setActivity((prev) => ({
-            ...prev,
-            [activeMemberName]: { entries: r.entries, capped: !!r.capped },
-          }))
-      })
-      .catch(() => {
-        if (!cancelled) setActivity((prev) => ({ ...prev, [activeMemberName]: 'error' }))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activeSlug, activeMemberName, drawerOpen])
-  const activityState = activeMemberName ? activity[activeMemberName] : undefined
-  const activityLoading = activityState === undefined
-  const activityError = activityState === 'error'
+  // member and served from the shared cache after that — reopening the drawer
+  // on a member shown seconds ago renders the cached entries instead of
+  // re-skeletoning. Keyed by the exact member NAME, not the slug — slugs are
+  // lossy, and the whole point of the backend's member filter is that two
+  // names sharing a slug have distinct histories. Real recorded signal only —
+  // the drawer derives its counts from these instead of fabricating stats.
+  // Three states per member (pending / error / loaded): a pending or failed
+  // read must not render the affirmative "no activity". A failure is
+  // retryable through React Query rather than latched for the page's life.
+  const activityQuery = useQuery({
+    queryKey: memberActivityQueryKey(activeMemberName),
+    queryFn: () => api.memberActivity(activeSlug, activeMemberName),
+    enabled: !!activeSlug && !!activeMemberName && drawerOpen,
+  })
+  const activityLoading = activityQuery.data === undefined && !activityQuery.isError
+  const activityError = activityQuery.data === undefined && activityQuery.isError
   const activeEntries = useMemo(
-    () => (typeof activityState === 'object' ? activityState.entries : []),
-    [activityState],
+    () => activityQuery.data?.entries ?? [],
+    [activityQuery.data],
   )
-  const activityCapped = typeof activityState === 'object' && activityState.capped
+  const activityCapped = !!activityQuery.data?.capped
 
   // Wake sources — global lists (crons, webhook tokens, the default crew),
-  // fetched ONCE on the first drawer open and filtered per member at render.
-  // `failed` is kept distinct from empty: absence of an answer and an answer
-  // of "none" must not render the same (a failed fetch would otherwise show
-  // the affirmative "nothing wakes this member", a false statement).
-  const [wake, setWake] = useState<{
-    loaded: boolean
-    failed: boolean
-    jobs: CronJob[]
-    tokens: WebhookTokenEntry[]
-    defaultAgent: string
-  }>({ loaded: false, failed: false, jobs: [], tokens: [], defaultAgent: '' })
-  useEffect(() => {
-    if (!drawerOpen || wake.loaded || wake.failed) return
-    let cancelled = false
-    Promise.all([api.crons(), api.webhooks(), api.kirocrewAgents()])
-      .then(([crons, hooks, agents]) => {
-        if (cancelled) return
-        setWake({
-          loaded: true,
-          failed: false,
-          jobs: crons?.jobs || [],
-          tokens: hooks?.tokens || [],
-          defaultAgent: agents?.default_agent || '',
-        })
-      })
-      .catch(() => {
-        if (!cancelled) setWake((prev) => ({ ...prev, failed: true }))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [drawerOpen, wake.loaded, wake.failed])
+  // read from the SAME cache entries the Schedule page and the crew editor
+  // already keep, so opening this drawer dedupes against them instead of
+  // re-issuing requests they answered moments ago. `['cron-jobs']` carries
+  // the jobs array (its other consumers' exact queryFn spelling — sharing a
+  // key means sharing its shape); `crewWebhooksQueryKey` is the crew
+  // editor's THROWING webhooks entry, kept apart from the Webhooks page's
+  // bare `['webhooks']` because a failure here must render as unknown, not
+  // as "nothing wakes this member" (see wakesCrew.ts); the default crew is
+  // the one shared ['default-agent'] definition. Failed reads are distinct
+  // from empty AND retryable via React Query — the old one-shot fetch
+  // latched `failed` for the page's life, so a single blip blanked the
+  // block until a full remount.
+  const wakeCronsQuery = useQuery<CronJob[]>({
+    queryKey: ['cron-jobs'],
+    queryFn: () => api.crons().then(r => r.jobs || []),
+    enabled: drawerOpen,
+  })
+  const wakeHooksQuery = useQuery<{ tokens?: WebhookTokenEntry[] }>({
+    queryKey: crewWebhooksQueryKey,
+    queryFn: () => api.webhooks(),
+    enabled: drawerOpen,
+  })
+  const wakeDefaultQuery = useQuery({ ...defaultAgentQuery, enabled: drawerOpen })
+  const wakeLoaded =
+    wakeCronsQuery.data !== undefined &&
+    wakeHooksQuery.data !== undefined &&
+    wakeDefaultQuery.data !== undefined
+  const wakeFailed = wakeCronsQuery.isError || wakeHooksQuery.isError || wakeDefaultQuery.isError
   const wakeJobs = useMemo(
     () =>
       active
-        ? wake.jobs.filter((j) => wakesCrew(j, active.name, active.name === wake.defaultAgent))
+        ? (wakeCronsQuery.data ?? []).filter((j) =>
+            wakesCrew(j, active.name, active.name === (wakeDefaultQuery.data ?? '')),
+          )
         : [],
-    [active, wake.jobs, wake.defaultAgent],
+    [active, wakeCronsQuery.data, wakeDefaultQuery.data],
   )
   const wakeHooks = useMemo(
-    () => (active ? wake.tokens.filter((t) => webhookBoundToCrew(t, active.name)) : []),
-    [active, wake.tokens],
+    () =>
+      active
+        ? (wakeHooksQuery.data?.tokens ?? []).filter((tk) => webhookBoundToCrew(tk, active.name))
+        : [],
+    [active, wakeHooksQuery.data],
   )
   const { todayCount, weekCount, todayFloorTs, weekFloorTs } = useMemo(() => {
     const midnight = new Date()
@@ -651,65 +716,27 @@ export default function MembersPage() {
   // Open a member's thread and remember it as the last one opened. Called by
   // the URL sync effect only (plus the same-member re-click below), so every
   // way of arriving at a member — click, back/forward, shallow link, restore
-  // on return — runs one code path. `remember` is false only for the member
-  // opened IN PLACE OF one a link named that is gone: that open is the page's
-  // choice, not the user's, so one stale link must not overwrite the member
-  // they had actually chosen.
-  const activate = useCallback(
-    (m: MemberRosterRow, remember = true) => {
-      setActiveName(m.name)
-      if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
-      setErrors((prev) => {
-        if (!(m.name in prev)) return prev
-        const next = { ...prev }
-        delete next[m.name]
-        return next
-      })
-      // ALWAYS post, even when a slot key is already cached: the endpoint is
-      // the idempotent creator/repairer, and the backend can lose the live
-      // slot between opens (archive, restart with a stale binding) — a cached
-      // key mounted without the POST would point at nothing. The cache only
-      // decides what to render while the POST is in flight.
-      api
-        .memberThread(m.slug)
-        .then((r) => {
-          if (r.member !== m.name) {
-            // The slug's thread belongs to another crew (lossy-slug collision,
-            // first-bound-wins). Mounting it would be a silent misroute — the
-            // defining failure for a page whose premise is identity.
-            setSlots((prev) => {
-              if (!(m.name in prev)) return prev
-              const next = { ...prev }
-              delete next[m.name]
-              return next
-            })
-            setErrors((prev) => ({
-              ...prev,
-              [m.name]: t('pages.membersPage.slug_collision', { name: r.member }),
-            }))
-            return
-          }
-          setSlots((prev) => ({ ...prev, [m.name]: r.slot_key }))
-        })
-        .catch(() =>
-          setErrors((prev) => ({
-            ...prev,
-            [m.name]: t('pages.membersPage.thread_open_failed'),
-          })),
-        )
-    },
-    [t],
-  )
+  // on return — runs one code path. The get-or-create POST itself rides the
+  // thread query above: setting the active name changes its key, and the
+  // staleTime-0 refetch is the "ALWAYS post" repair every open must run.
+  // `remember` is false only for the member opened IN PLACE OF one a link
+  // named that is gone: that open is the page's choice, not the user's, so
+  // one stale link must not overwrite the member they had actually chosen.
+  const activate = useCallback((m: MemberRosterRow, remember = true) => {
+    setActiveName(m.name)
+    if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
+  }, [])
 
   const openMember = useCallback(
     (m: MemberRosterRow) => {
       // Re-clicking the open member is the repair gesture (re-POST); the URL
-      // is unchanged so the sync effect would not fire — call through. It is
-      // also an explicit choice of that member, so a swap notice still
-      // standing over it (the user was routed here from a dead link) has
-      // been acknowledged: retire it.
+      // is unchanged so the sync effect would not fire — refetch the thread
+      // query directly. It is also an explicit choice of that member, so a
+      // swap notice still standing over it (the user was routed here from a
+      // dead link) has been acknowledged: retire it.
       if (m.name === activeName) {
         activate(m)
+        void threadQuery.refetch()
         setGone(null)
         return
       }
@@ -726,7 +753,7 @@ export default function MembersPage() {
       // below-md back button pop instead of replace.
       setSearchParams({ [MEMBER_PARAM]: m.name }, { state: { fromRoster: true } })
     },
-    [activeName, urlMember, activate, setSearchParams],
+    [activeName, urlMember, activate, threadQuery, setSearchParams],
   )
 
   // URL -> open member. Once the roster is in: a URL that names a member
@@ -1564,11 +1591,11 @@ export default function MembersPage() {
               <ExternalLink size={12} className="lucide-inline" />
             </button>
           </div>
-          {!wake.loaded && !wake.failed ? (
+          {!wakeLoaded && !wakeFailed ? (
             <div className="mb-4 space-y-1.5" data-testid="member-wake-loading" aria-hidden>
               <div className="h-3 rounded bg-accent/40 animate-pulse" />
             </div>
-          ) : wake.failed ? (
+          ) : wakeFailed ? (
             <div className="text-[11px] text-muted mb-4" role="alert" data-testid="member-wake-error">
               {t('pages.membersPage.wake_error')}
             </div>

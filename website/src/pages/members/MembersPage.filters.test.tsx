@@ -16,6 +16,8 @@ vi.mock('../../api/client', () => ({
     crons: vi.fn(() => Promise.resolve({ jobs: [] })),
     webhooks: vi.fn(() => Promise.resolve({ tokens: [] })),
     kirocrewAgents: vi.fn(() => Promise.resolve({ agents: [], default_agent: '' })),
+    // The wake block reads the shared ['default-agent'] query (defaultAgentQuery).
+    defaultAgent: vi.fn(() => Promise.resolve({ default_agent: 'kirocrew' })),
     updateKirocrewAgent: vi.fn(() => Promise.resolve({ ok: true })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
   },
