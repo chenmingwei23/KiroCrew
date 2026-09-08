@@ -8175,6 +8175,17 @@
     "fileMenuContributions": {
       "app_actions": "Actions de l'application",
       "contributed_by": "Application : {{app}}"
+    },
+    "featurePreviewIntro": {
+      "learn_more": "Voir à quoi ça ressemble",
+      "learn_more_about": "Voir à quoi ressemble {{feature}}",
+      "gif_badge": "GIF",
+      "previous": "Capture précédente",
+      "next": "Capture suivante",
+      "captures": "Captures",
+      "capture_n_of_m": "Capture {{n}} sur {{m}}",
+      "where_to_find": "Où tu le verras",
+      "turn_on": "Activer cet aperçu"
     }
   },
   "hooks": {
@@ -10503,7 +10514,16 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "Jetons de webhooks entrants, contextes enregistrés et historique des exécutions. L'API fonctionne, mais la page n'est pas terminée.",
         "open_webhooks": "Ouvrir Webhooks",
         "the_crew_members_page_and_crew_mode_chats_both_a": "La page Membres de l'équipe et les chats Crew Mode. Les deux sont encore en construction : rien n'est proposé tant que cette option n'est pas activée.",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "intro": {
+          "webhooks_summary": "Permet à un système externe (CI, bot de revue, pipeline de déploiement) de lancer un tour d’agent sur cette machine en envoyant un POST avec un jeton d’accès que tu crées sur la page Webhooks.",
+          "webhooks_where": "Une fois activé, le lien « Ouvrir Webhooks » apparaît sur cette carte dans les Réglages ; c’est de là que s’ouvre la nouvelle page Webhooks. Elle n’apparaît pas dans la barre latérale tant qu’elle n’est pas terminée.",
+          "webhooks_media_page": "La page Webhooks : la liste des jetons à gauche, la configuration « Laisser un système externe réveiller ton agent » à droite.",
+          "crew_summary": "Crew Members est une page qui liste chacun de tes agents et ce qu’il pilote en ce moment. Une discussion en Crew Mode mène plusieurs tâches à la fois, chaque sujet dans sa propre sous-session, et répond quand elles aboutissent.",
+          "crew_where": "« Crew Members » apparaît dans la barre latérale sous Sessions et « Nouvelle discussion Crew Mode » dans le menu du bouton Nouveau, tous deux dès que ceci est activé.",
+          "crew_media_members": "La page Crew Members, avec un membre sélectionné et son panneau d’activité ouvert.",
+          "crew_media_menu": "Le menu du bouton Nouveau avec « Nouvelle discussion Crew Mode » ajouté, marqué Expérimental."
+        }
       }
     },
     "developerPage": {

@@ -7955,6 +7955,17 @@
     "fileMenuContributions": {
       "app_actions": "应用操作",
       "contributed_by": "应用：{{app}}"
+    },
+    "featurePreviewIntro": {
+      "learn_more": "看看它长什么样",
+      "learn_more_about": "看看 {{feature}} 长什么样",
+      "gif_badge": "GIF",
+      "previous": "上一张",
+      "next": "下一张",
+      "captures": "截图",
+      "capture_n_of_m": "第 {{n}} 张，共 {{m}} 张",
+      "where_to_find": "你会在哪看到它",
+      "turn_on": "开启此预览"
     }
   },
   "hooks": {
@@ -10203,7 +10214,16 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "入站 Webhook 令牌、已注册的上下文和运行历史。API 可用，但页面尚未完成。",
         "open_webhooks": "打开 Webhook",
         "the_crew_members_page_and_crew_mode_chats_both_a": "团队成员页面和 Crew Mode 聊天。两者仍在开发中，开启后才会显示。",
-        "webhooks": "Webhook"
+        "webhooks": "Webhook",
+        "intro": {
+          "webhooks_summary": "让外部系统（CI、评审机器人、部署流水线）用你在 Webhooks 页面创建的访问令牌 POST 一条消息，就能在这台机器上启动一次 agent 回合。",
+          "webhooks_where": "开启后，这张卡片在“设置”里会出现“打开 Webhooks”链接，新的 Webhooks 页面从那里进入；页面完成之前不会出现在侧栏里。",
+          "webhooks_media_page": "Webhooks 页面：左侧是 token 列表，右侧是“让外部系统唤醒你的 agent”的设置。",
+          "crew_summary": "Crew Members 是一个页面，列出你拥有的每个 agent 以及它当前在驱动什么。Crew Mode 聊天同时跑多个任务，每个主题各占一个子会话，完成后再汇总回答。",
+          "crew_where": "开启后，“Crew Members”会出现在侧栏的 Sessions 下方，“新建 Crew Mode 聊天”会出现在“新建”按钮的菜单里。",
+          "crew_media_members": "Crew Members 页面，选中了一个成员并打开了它的活动面板。",
+          "crew_media_menu": "“新建”按钮的菜单里多出“新建 Crew Mode 聊天”，标记为实验性。"
+        }
       }
     },
     "developerPage": {

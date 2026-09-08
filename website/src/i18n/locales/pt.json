@@ -8175,6 +8175,17 @@
     "fileMenuContributions": {
       "app_actions": "Ações do aplicativo",
       "contributed_by": "Aplicativo: {{app}}"
+    },
+    "featurePreviewIntro": {
+      "learn_more": "Ver como fica",
+      "learn_more_about": "Ver como fica {{feature}}",
+      "gif_badge": "GIF",
+      "previous": "Captura anterior",
+      "next": "Próxima captura",
+      "captures": "Capturas",
+      "capture_n_of_m": "Captura {{n}} de {{m}}",
+      "where_to_find": "Onde você vai ver",
+      "turn_on": "Ligar esta prévia"
     }
   },
   "hooks": {
@@ -10503,7 +10514,16 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "Tokens de webhooks de entrada, contextos registrados e histórico de execuções. A API funciona; a página não está concluída.",
         "open_webhooks": "Abrir Webhooks",
         "the_crew_members_page_and_crew_mode_chats_both_a": "A página Membros da equipe e os chats do Crew Mode. Ambos ainda estão em construção, por isso só aparecem quando esta opção é ativada.",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "intro": {
+          "webhooks_summary": "Permite que um sistema externo (CI, um bot de revisão, uma pipeline de deploy) inicie um turno do agente nesta máquina enviando um POST com um token de acesso que você cria na página Webhooks.",
+          "webhooks_where": "Quando isto estiver ligado, o link “Abrir Webhooks” aparece neste cartão em Configurações; é dali que a nova página Webhooks abre. Ela fica fora da barra lateral até estar pronta.",
+          "webhooks_media_page": "A página Webhooks: lista de tokens à esquerda e, à direita, a configuração “Deixe um sistema externo acordar seu agente”.",
+          "crew_summary": "Crew Members é uma página que lista cada agente que você tem e o que cada um está conduzindo agora. Um chat em Crew Mode executa vários trabalhos ao mesmo tempo, cada tema na própria subsessão, e responde quando terminam.",
+          "crew_where": "“Crew Members” aparece na barra lateral abaixo de Sessões e “Novo chat em Crew Mode” no menu do botão Novo, ambos assim que isto estiver ligado.",
+          "crew_media_members": "A página Crew Members com um membro selecionado e o painel de atividade aberto.",
+          "crew_media_menu": "O menu do botão Novo com “Novo chat em Crew Mode” adicionado, marcado como Experimental."
+        }
       }
     },
     "developerPage": {
