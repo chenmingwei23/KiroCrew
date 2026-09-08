@@ -31,11 +31,14 @@ export type TabKind = ViewKind | 'file' | 'diff' | 'artifact' | 'terminal' | 'fo
  *  currently have content. Order here = strip order.
  *
  *  `syncPinned` below is PARAMETERISED and would drop a view left out of the set
- *  it is handed, so the FUNCTION reads as content-gated on its own. It is not:
- *  the one production caller — `SidePanel`'s `syncPinned(PINNED_VIEWS)`,
- *  unconditional in an effect keyed only on the callback — always passes this
- *  whole list, so no pinned view is ever removed. Pinned at the render level by
- *  `sidePanelPinnedAlwaysPresent.test.tsx`.
+ *  it is handed, so the FUNCTION reads as content-gated on its own. It is not
+ *  content-gated: the chat page — `SidePanel`'s `syncPinned(PINNED_VIEWS)`,
+ *  unconditional in an effect — always passes this whole list, so there no
+ *  pinned view is ever removed (pinned at the render level by
+ *  `sidePanelPinnedAlwaysPresent.test.tsx`). The one subset caller is a HOST
+ *  withdrawal (`SidePanel.hiddenViews`): the Members page withholds `changes`
+ *  because it has no transcript index to feed it — a host decision, never a
+ *  reaction to content.
  *
  *  `issues` is deliberately NOT pinned: most sessions never mention an issue,
  *  so a permanent Issues tab would be an always-empty tab for the majority.
@@ -534,8 +537,18 @@ export function usePanelTabs(
    *  caller that cannot know the descriptors must never be the reason a user's
    *  persisted tab disappears. `[]` is a known-empty set and does hide app tabs. */
   panelTabDescriptors?: PanelTabDescriptor[],
+  opts?: {
+    /** Id of a HOST-OWNED leading tab (SidePanel's `leadingTab`): a tab that
+     *  sits ahead of the pinned block, is never in the bucket, and whose body the
+     *  host renders. The bucket only ever holds it as `activeId`. Naming it here
+     *  is what lets focus fall back to it — a fresh strip opens on it rather than
+     *  on the first pinned view, and it is never "repaired" away by `syncPinned`
+     *  for not being a stored tab. */
+    leadingId?: string
+  },
 ) {
   const key = bucketKey(slotKey)
+  const leadingId = opts?.leadingId
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
   // View-tab labels are re-resolved from `kind` on every read so the strip is in
@@ -577,9 +590,12 @@ export function usePanelTabs(
     () => (
       activeId !== null && prunedIds.has(activeId)
         ? (tabs.length ? tabs[tabs.length - 1].id : null)
-        : activeId
+        // A strip with no stored focus opens on the host's leading tab (a fresh
+        // member bucket, before `syncPinned` has written one). Without a leading
+        // tab this stays the stored `null`.
+        : (activeId ?? leadingId ?? null)
     ),
-    [tabs, activeId, prunedIds],
+    [tabs, activeId, prunedIds, leadingId],
   )
 
   /** Apply a bucket transform to the CURRENT slot's strip. */
@@ -621,8 +637,9 @@ export function usePanelTabs(
    *  effect that runs on every render.
    *
    *  The removal arm is reachable through the ARGUMENT, not through content: the
-   *  one production caller passes PINNED_VIEWS whole, so it does not fire in the
-   *  shipped app. See PINNED_VIEWS above. */
+   *  chat page passes PINNED_VIEWS whole; a host that withdraws a view it cannot
+   *  feed (`SidePanel.hiddenViews`, the Members page) passes the subset. See
+   *  PINNED_VIEWS above. */
   const syncPinned = useCallback((available: ViewKind[]) => {
     update(b => {
       const desired = PINNED_VIEWS.filter(k => available.includes(k))
@@ -631,17 +648,19 @@ export function usePanelTabs(
         k => b.tabs.find(t => t.id === k) ?? { id: k, kind: k, title: viewTitle(k) },
       )
       const nextTabs = [...pinned, ...dynamic]
-      // Refocus if the active tab was a pinned view that just went away.
-      const activeId = b.activeId && nextTabs.some(t => t.id === b.activeId)
+      // Refocus if the active tab was a pinned view that just went away. The
+      // host's leading tab is a valid focus even though it is never a stored
+      // tab; a strip with no usable focus lands on it (else the first pinned).
+      const activeId = b.activeId && (b.activeId === leadingId || nextTabs.some(t => t.id === b.activeId))
         ? b.activeId
-        : (nextTabs.length ? nextTabs[0].id : null)
+        : (leadingId ?? (nextTabs.length ? nextTabs[0].id : null))
       // Bail if nothing actually changed (id sequence + focus) — avoids churn.
       const sameOrder = nextTabs.length === b.tabs.length
         && nextTabs.every((t, i) => t.id === b.tabs[i].id)
       if (sameOrder && activeId === b.activeId) return b
       return { tabs: nextTabs, activeId }
     })
-  }, [update])
+  }, [update, leadingId])
 
   const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
@@ -762,13 +781,14 @@ export function usePanelTabs(
       const i = b.tabs.findIndex(t => t.id === id)
       if (i === -1) return b
       const next = b.tabs.filter(t => t.id !== id)
-      // Refocus a neighbor when closing the active tab (prefer the left one).
+      // Refocus a neighbor when closing the active tab (prefer the left one);
+      // an emptied strip falls back to the host's leading tab when there is one.
       const activeId = b.activeId !== id
         ? b.activeId
-        : next.length === 0 ? null : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
+        : next.length === 0 ? (leadingId ?? null) : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
       return { tabs: next, activeId }
     })
-  }, [update])
+  }, [update, leadingId])
 
   const closeAll = useCallback(() => { update(() => ({ tabs: [], activeId: null })) }, [update])
 

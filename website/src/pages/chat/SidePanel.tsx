@@ -207,9 +207,14 @@ const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context'])
  *  Grouped, and **emptied groups are dropped**: with Developer Mode off the
  *  whole diagnostics group disappears, and Terminal disabled shrinks Workspaces
  *  to two rows. A group that filtered down to nothing would otherwise render
- *  as a separator with no rows after it. */
+ *  as a separator with no rows after it.
+ *
+ *  `hiddenViews` is the HOST's withdrawal: views whose data this host cannot
+ *  feed (the Members page has no transcript link index, so Issues / Links /
+ *  Pins would render an affirmative "none" that is false). Withheld here and
+ *  from the pinned block alike — an empty view is worse than no view. */
 export function newMenuSections(
-  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean },
+  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean; hiddenViews?: ReadonlySet<ViewKind> },
 ): { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] {
   return NEW_MENU_GROUPS
     .map(group => ({
@@ -218,10 +223,25 @@ export function newMenuSections(
         (opts.terminalEnabled || item.kind !== 'terminal')
         && (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
         && (opts.summaryEnabled || item.kind !== 'summary')
+        && !(item.kind !== 'terminal' && opts.hiddenViews?.has(item.kind))
         && !(PINNED_VIEWS as string[]).includes(item.kind),
       ),
     }))
     .filter(group => group.items.length > 0)
+}
+
+export interface SidePanelLeadingTab {
+  /** Stable id — the value `usePanelTabs` stores as `activeId` while this tab is
+   *  focused. Must not collide with a `TabKind` (`'summary'` is the chat's
+   *  session-summary view; the Members page uses `'crew-summary'`). */
+  id: string
+  title: string
+  /** Strip glyph. A host may pass an identity (the member's avatar) rather than a
+   *  kind glyph — this is the one chip whose icon `KIND_ICON` does not own. */
+  icon: ReactNode
+  /** Body, rendered only while the tab is active (it is a query-driven view
+   *  like the category tabs, not a mounted editor). */
+  render: () => ReactNode
 }
 
 interface SidePanelProps {
@@ -267,8 +287,31 @@ interface SidePanelProps {
   slotTitle?: string
   chatMode?: string
   onFileSave: (filePath: string, content: string) => Promise<void>
-  /** Close the whole panel (hides the side column). */
-  onClose: () => void
+  /** Close the whole panel (hides the side column). ABSENT means the panel is
+   *  permanent: no close control renders in the strip and Escape inside a view
+   *  does nothing. A host that docks the panel as a fixed column (the Crew
+   *  Members page) omits it; a host whose panel the user opens and dismisses
+   *  (ChatPage, and the same page's narrow-window overlay) passes it. */
+  onClose?: () => void
+  /** A HOST-OWNED tab pinned AHEAD of the pinned views: non-closable, not
+   *  draggable, never in the + menu, and not stored in the tab bucket — the
+   *  host renders its body. The Crew Members page uses it for the member's
+   *  summary. Its `id` must also be handed to `usePanelTabs` as `leadingId` so
+   *  a fresh strip opens on it and focus can fall back to it. */
+  leadingTab?: SidePanelLeadingTab
+  /** Extra px the panel must keep clear to its left, on top of the shell's
+   *  own reserve (`measureSidePanelReservedW`, which budgets the nav rail and a
+   *  minimum chat pane). A host with more siblings in the row — the Members
+   *  page's roster column — passes their live width so a drag can never fold
+   *  the pane beside the panel to nothing. */
+  extraReserveW?: number
+  /** Views this host WITHDRAWS from the strip: dropped from the pinned block
+   *  and the + menu alike (a stored tab of such a kind is left in the bucket,
+   *  just not offered). For a host that cannot feed a view's data — the
+   *  Members page has no transcript link index or pins query — an empty view
+   *  would assert "nothing here", which is false, so the view is withheld until
+   *  the host can populate it. */
+  hiddenViews?: ReadonlySet<ViewKind>
   /** Is the whole panel mounted-but-invisible? A live app or browser tab keeps
    *  the subtree mounted through a close (its iframe / WebContentsView cannot
    *  survive a remount), and the find pane hides it while owning the dock — so
@@ -403,8 +446,13 @@ export default function SidePanel({
   pins, pinsLoading, onJumpToPin, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
+  leadingTab, extraReserveW = 0, hiddenViews,
 }: SidePanelProps) {
   const { tabs, activeId, openView, openPanelTab, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
+  // A permanent panel has no close control and answers Escape with nothing —
+  // the views' `onToggle` still needs a function, so it gets a no-op.
+  const closable = !!onClose
+  const closePanel = useCallback(() => { onClose?.() }, [onClose])
   // App-contributed side-panel tabs from the installed-app manifests. Empty ⇒
   // the "+" menu and launcher show nothing extra and the strip renders no app tab.
   const panelTabDescriptors = usePanelTabDescriptors()
@@ -432,6 +480,8 @@ export default function SidePanel({
   const { data: summaryMeta } = useQuery({
     queryKey: ['session-summary', slot],
     queryFn: () => api.sessionSummary(slot),
+    // No slot (a host whose thread is not confirmed yet) ⇒ nothing to ask about.
+    enabled: !!slot,
     staleTime: Infinity,
     retry: false,
   })
@@ -440,15 +490,21 @@ export default function SidePanel({
   // disabled server-side and Context breakdown unless Developer Mode is on, and
   // never list the permanently pinned views (Changes / Files / Artifacts) —
   // those are always present in the strip (see the syncPinned reconcile below).
-  const menuSections = newMenuSections({ devMode, terminalEnabled, summaryEnabled })
+  const menuSections = newMenuSections({ devMode, terminalEnabled, summaryEnabled, hiddenViews })
   // The empty-state launcher shows the same entries flat: its two-column grid
   // has nowhere to put a separator, but it must not disagree with the menu
   // about ORDER, so it reads the groups rather than its own list.
   const menuItems = menuSections.flatMap(section => section.items)
   // Files / Artifacts / Changes are ALWAYS present — pinned to the front,
   // non-closable, and never in the + menu — regardless of whether they
-  // currently have content.
-  useEffect(() => { syncPinned(PINNED_VIEWS) }, [syncPinned])
+  // currently have content. A host that WITHDRAWS one (`hiddenViews`) is the
+  // one caller that hands `syncPinned` a subset; the chat page always passes
+  // the whole list (see PINNED_VIEWS).
+  const pinnedAvailable = useMemo(
+    () => (hiddenViews ? PINNED_VIEWS.filter(k => !hiddenViews.has(k)) : PINNED_VIEWS),
+    [hiddenViews],
+  )
+  useEffect(() => { syncPinned(pinnedAvailable) }, [syncPinned, pinnedAvailable])
   // Split the strip: pinned (fixed, non-closable) vs. dynamic (draggable).
   const pinnedTabs = useMemo(() => tabs.filter(t => (PINNED_VIEWS as string[]).includes(t.id)), [tabs])
   const dynamicTabs = useMemo(() => tabs.filter(t => !(PINNED_VIEWS as string[]).includes(t.id)), [tabs])
@@ -510,13 +566,13 @@ export default function SidePanel({
   // Bottom dock only applies on desktop; mobile always renders as the
   // full-width inline panel regardless of the stored preference.
   const isBottom = canDockBottom && dock === 'bottom' && !isMobile
-  const [maxW, setMaxW] = useState(() => window.innerWidth - measureSidePanelReservedW())
+  const [maxW, setMaxW] = useState(() => window.innerWidth - measureSidePanelReservedW() - extraReserveW)
   // Bottom-dock height cap: leave the topbar row + a usable chat minimum
   // visible above the panel. Re-measured on resize.
   const [maxH, setMaxH] = useState(() => Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
   useEffect(() => {
     const recalc = () => {
-      setMaxW(window.innerWidth - measureSidePanelReservedW())
+      setMaxW(window.innerWidth - measureSidePanelReservedW() - extraReserveW)
       setMaxH(Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
     }
     recalc()
@@ -529,7 +585,9 @@ export default function SidePanel({
       .filter(c => !c.hasAttribute('data-topbar-overlay'))
       .forEach(c => ro.observe(c))
     return () => { window.removeEventListener('resize', recalc); ro.disconnect() }
-  }, [])
+    // `extraReserveW` is a sibling column's LIVE width (the Members roster is
+    // drag-resizable), so the clamp re-derives when it moves.
+  }, [extraReserveW])
   const effectiveWidth = sidePanelEffectiveWidth({ fillWidth, isMobile, expanded, width, maxW })
   const effectiveHeight = Math.max(MIN_H, Math.min(height, maxH))
   // While the user drags the resize handle, every mousemove shifts the whole
@@ -545,7 +603,7 @@ export default function SidePanel({
     onStart: () => { startWRef.current = widthRef.current; setResizing(true) },
     onMove: ({ dx }) => {
       // Left-edge handle with the right edge pinned: dragging left (dx < 0) widens.
-      const max = Math.min(Math.round(window.innerWidth * 0.7), window.innerWidth - measureSidePanelReservedW())
+      const max = Math.min(Math.round(window.innerWidth * 0.7), window.innerWidth - measureSidePanelReservedW() - extraReserveW)
       setWidth(Math.max(MIN_W, Math.min(startWRef.current - dx, max)))
     },
     onEnd: () => { setResizing(false); safeSetItem(WIDTH_KEY, String(widthRef.current)) },
@@ -606,6 +664,22 @@ export default function SidePanel({
             matches the active chip's corner-piece width, so a piece lands in the
             gap instead of over a neighbour. */}
         <div className="flex items-end gap-2 shrink-0 -mb-px">
+          {/* The host's leading tab, ahead of the pinned views: same pinned
+              chip (icon-only when inactive, no close control), never a
+              Reorder item — it is the strip's identity, not a document. */}
+          {leadingTab && (
+            <TabChip
+              key={leadingTab.id}
+              tab={{ title: leadingTab.title }}
+              icon={leadingTab.icon}
+              active={leadingTab.id === activeId}
+              closable={false}
+              pinned
+              onSelect={() => setActive(leadingTab.id)}
+              onClose={() => {}}
+              testId="side-panel-leading-tab"
+            />
+          )}
           {pinnedTabs.map(t => (
             <TabChip key={t.id} tab={t} active={t.id === activeId} closable={false} pinned onSelect={() => setActive(t.id)} onClose={() => {}} />
           ))}
@@ -712,8 +786,12 @@ export default function SidePanel({
         <div aria-hidden="true" className="flex-1 min-w-0" />
         {/* Panel chrome, trailing edge. Collapse (frequent) stays a one-tap
             button; the rarely-used dock toggle moves into a ⋯ menu so the two
-            panel-square glyphs are never adjacent look-alikes. */}
-        <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 self-center relative z-10" />
+            panel-square glyphs are never adjacent look-alikes. A permanent
+            panel (no onClose) that cannot dock has no chrome here at all — the
+            divider goes with it rather than ruling off an empty group. */}
+        {(closable || (canDockBottom && !isMobile)) && (
+          <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 self-center relative z-10" />
+        )}
         <div className="flex items-center gap-0.5 shrink-0 self-center">
         {canDockBottom && !isMobile && (
           <DropdownMenu>
@@ -737,14 +815,16 @@ export default function SidePanel({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
+        {closable && (
         <button
           className="pi-morph flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-          onClick={onClose}
+          onClick={closePanel}
           title={i18nT('pages.chat.sidePanel.close_panel')}
           aria-label={i18nT('pages.chat.sidePanel.close_panel')}
         >
           <PanelRightLight size={15} />
         </button>
+        )}
         </div>
       </div>
 
@@ -754,7 +834,16 @@ export default function SidePanel({
       {/* Content area: left + top border (square corner) so the border wraps
           only the content, NOT the tab strip above (which stays borderless). */}
       <div className="flex-1 min-h-0 relative">
-        {tabs.length === 0 && (
+        {/* The host's leading tab body. Mounted only while active, like the
+            category views: it is a query-driven summary, not an editor whose
+            buffer a switch would lose. Scrolls itself — the host renders plain
+            content, and this keeps the strip pinned above a long body. */}
+        {leadingTab && activeId === leadingTab.id && (
+          <div key={leadingTab.id} className="absolute inset-0 overflow-y-auto" data-testid="side-panel-leading-body">
+            {leadingTab.render()}
+          </div>
+        )}
+        {tabs.length === 0 && !leadingTab && (
           /* Empty state: launcher — the available views themselves, roomy and
              clickable, instead of a hint pointing at the + menu. */
           <div className="flex items-center justify-center h-full px-6">
@@ -840,7 +929,7 @@ export default function SidePanel({
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer
                   view={t.kind as 'changes' | 'issues' | 'links' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side' | 'git' | 'summary' | 'pins'}
-                  open onToggle={onClose} slot={slot}
+                  open onToggle={closePanel} slot={slot}
                   subagents={subagents} toolLog={toolLog}
                   sources={sources}
                   selectedSourceUrl={selectedSourceUrl}
@@ -1260,10 +1349,19 @@ function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onC
   )
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false }: { tab: PanelTab; active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean }) {
+function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, icon, testId }: {
+  /** A stored tab, or — for the host's leading tab — just a title: that chip has
+   *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
+  tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId'>>
+  active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean
+  /** Overrides the kind-derived glyph. Required when `tab.kind` is absent. */
+  icon?: ReactNode
+  testId?: string
+}) {
   // App-tab glyphs come from the manifest descriptor (resolved by name); a built-in
   // reads KIND_ICON. Reuses the shared ['apps'] query, so no extra fetch.
   const panelTabDescriptors = usePanelTabDescriptors()
+  const glyph = icon ?? (tab.kind ? iconForKind(tab.kind, panelTabDescriptors) : null)
   // Pinned views (Changes / Files / Artifacts) are icon-only when inactive and
   // expand to icon + label when active — a hybrid that keeps the strip compact
   // while still naming the current view. Dynamic (document / terminal) tabs
@@ -1284,6 +1382,7 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
       // label is also shown.
       aria-label={pinned ? tab.title : undefined}
       title={pinned && !showLabel ? tab.title : undefined}
+      data-testid={testId}
       // Browser-tab chip: 32px tall, top corners only (8px), bottom edge fused
       // into the panel body. Active = the body's own background (--bg) plus a
       // top/side hairline (--border, bottom open) so the silhouette survives a
@@ -1300,7 +1399,7 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
         active ? 'side-tab-active bg-bg text-accent border-x-border border-t-border border-b-transparent' : 'side-tab-inactive border-transparent text-muted hover:text-text'
       }`}
     >
-      <span className="shrink-0">{iconForKind(tab.kind, panelTabDescriptors)}</span>
+      <span className="shrink-0">{glyph}</span>
       {showLabel && (
         <span className="min-w-0 text-[12px] truncate text-left">
           {tab.kind === 'terminal' && tab.sessionId
