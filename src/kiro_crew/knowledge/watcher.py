@@ -150,12 +150,22 @@ class KnowledgeWatcher:
             except Exception:
                 logger.exception("Error scanning folder source %s", row["uri"])
 
-        # Single-file sources (local_file)
+        # Single-file sources (local_file), least-recently-synced first.
+        # ``last_synced`` is written by every successful ingest, so a source
+        # served this sweep sorts to the back of the next one and a deferred
+        # source rises toward the front: under sustained budget contention the
+        # sweep makes progress across ALL sources instead of letting a stable
+        # row order re-serve the same early rows every time. NULL (never
+        # synced) sorts first in ASC, which is also the right priority. The
+        # rotation state is the column the pipeline already maintains — no new
+        # cursor, no schema.
         rows = await self._store_rows(
             "SELECT id, uri, properties, sync_status FROM sources "
-            "WHERE source_type = 'local_file'"
+            "WHERE source_type = 'local_file' "
+            "ORDER BY last_synced ASC, id ASC"
         )
 
+        deferred = 0
         for row in rows:
             try:
                 uri = row["uri"]
@@ -178,6 +188,21 @@ class KnowledgeWatcher:
                             sync_status="missing", if_sync_status=row["sync_status"])
                     continue
 
+                # Global budget exhausted — defer this source's read and ingest
+                # to the next sweep. Deliberately BELOW the existence check and
+                # a ``continue`` rather than the folder loop's ``break``, so the
+                # zero-cost 'missing' marker above still lands for every row
+                # even on a sweep whose folder sources spent the whole budget.
+                # Deferral leaves the row's mtime/content_hash bookkeeping
+                # untouched, so the next sweep sees it as changed and resumes
+                # from it. This gate is what bounds the loop: without it a
+                # library with many changed local_file sources re-ingests all
+                # of them in one unpaced burst -- the burst the sweep budget
+                # exists to spread.
+                if sweep_budget and sweep_chunks_used >= sweep_budget:
+                    deferred += 1
+                    continue
+
                 mtime = os.stat(uri).st_mtime
                 props = self._parse_props(row["properties"])
                 stored_mtime = props.get("mtime", 0)
@@ -194,12 +219,50 @@ class KnowledgeWatcher:
                     )
                     if content_hash != props.get("content_hash"):
                         logger.info("Source changed: %s", uri)
+                        # Three callbacks the pipeline already offers, so no
+                        # signature change and no blocking get_job_status
+                        # read-back on the event loop:
+                        #
+                        # * ``on_progress`` reports the attempted chunk total
+                        #   once extraction is running -- extract_batch has
+                        #   spent one LLM call per chunk by then, so THAT is
+                        #   the number the sweep budget meters ("caps total
+                        #   extraction calls"). Charging only committed chunks
+                        #   would let a post-extraction partial failure spend
+                        #   the calls while charging nothing.
+                        # * ``on_committed`` fires inside the finalize hop,
+                        #   only on the branch that committed the whole group
+                        #   -- the same latch FolderWatcher detects rollbacks
+                        #   with.
+                        # * ``on_duplicate`` fires when the pre-ingest gate
+                        #   refuses byte-identical content: a terminal success
+                        #   for bookkeeping, though nothing new was written.
+                        committed: list[str] | None = None
+                        refused = False
+                        attempted_chunks = 0
+
+                        def _record_committed(ids: list[str]) -> None:
+                            nonlocal committed
+                            committed = list(ids)
+
+                        def _record_refused(_text_hash: str) -> None:
+                            nonlocal refused
+                            refused = True
+
+                        def _note_extraction(phase: str, done: int, total: int) -> None:
+                            nonlocal attempted_chunks
+                            if phase == "extracting":
+                                attempted_chunks = int(total)
+
                         try:
                             await self.pipeline.ingest_file(
                                 uri,
                                 source_id=row["id"],
                                 namespace=props.get("namespace", "default"),
                                 embed_priority=PRIORITY_BULK,
+                                on_progress=_note_extraction,
+                                on_committed=_record_committed,
+                                on_duplicate=_record_refused,
                             )
                         except FileTooLargeError:
                             # Warning already logged by the pipeline (names the file
@@ -209,6 +272,25 @@ class KnowledgeWatcher:
                             # (config is read live) then recovers it automatically.
                             await asyncio.to_thread(
                                 self.store.update_source, row["id"], sync_status="error")
+                            continue
+                        finally:
+                            # Charge the attempted extraction count against the
+                            # global sweep budget whatever the commit outcome,
+                            # so both loops draw from one counter and a failed
+                            # finalize cannot make its spend invisible. Runs on
+                            # the FileTooLargeError path too, where it is zero
+                            # (the size guard fires before chunking).
+                            sweep_chunks_used += attempted_chunks
+                        if committed is None and not refused:
+                            # The pipeline rolled back a partial ingest -- it
+                            # invokes on_committed only on the fully-committed
+                            # branch -- and its finalize already marked the
+                            # source 'error'. Leave mtime/content_hash
+                            # unrecorded so the next sweep retries, bounded by
+                            # the charge above. Persisting them here parked the
+                            # new content forever: the stored hash matched the
+                            # file, so the changed document was never re-read
+                            # while the superseded one stayed searchable.
                             continue
                         # Re-read props after ingest (ingest may update them)
                         source = await asyncio.to_thread(
@@ -243,6 +325,11 @@ class KnowledgeWatcher:
                 # error with a confusing one AND escaped the loop, abandoning
                 # every source after this one for the rest of the sweep.
                 logger.exception("Error checking source %s", row["uri"] or row["id"])
+        if deferred:
+            logger.info(
+                "Sweep chunk budget exhausted (%d/%d); deferred %d local_file "
+                "source(s) to next sweep", sweep_chunks_used, sweep_budget, deferred,
+            )
 
         # After file-level reconciliation, self-heal vectors left stale by an
         # embedding-setup change (model/budget) -- the file gates above never fire
