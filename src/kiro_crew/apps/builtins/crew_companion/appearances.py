@@ -73,6 +73,29 @@ class PackMeta:
         }
 
 
+#: Windows reserves these device names, and the reservation applies to the STEM, so
+#: ``nul.svg`` names the NUL device exactly as ``nul`` does. The two failure modes
+#: differ and both are bad: writing to a reserved name SUCCEEDS and silently
+#: discards every byte, while creating a directory with one fails outright.
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{n}" for n in range(1, 10)}
+    | {f"lpt{n}" for n in range(1, 10)}
+)
+
+
+def _is_windows_reserved(name: str) -> bool:
+    """True when ``name`` collides with a Windows device name.
+
+    Refused on EVERY platform rather than behind an ``IS_WINDOWS`` branch. A pack
+    is a transferable artifact: a member that a macOS export accepts but a Windows
+    import cannot write is a bug that surfaces on someone else's machine, and a
+    validator that answers differently per host makes the same bundle valid and
+    invalid at once. One rule for all hosts is the cheaper contract.
+    """
+    return name.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_STEMS
+
+
 def _safe_id(raw: Any) -> str | None:
     """Validate a pack id as a single safe path segment.
 
@@ -90,6 +113,8 @@ def _safe_id(raw: Any) -> str | None:
         return None
     # Letters, digits, dash and underscore only — no separators, no dots.
     if not all(c.isalnum() or c in "-_" for c in ident):
+        return None
+    if _is_windows_reserved(ident):
         return None
     return ident
 
@@ -618,5 +643,12 @@ def _safe_filename(raw: Any) -> str | None:
     # NTFS stream suffix). Pack files are `idle.svg` / `manifest.json` /
     # `random-<name>.png`, all of which this allows.
     if not all(c.isalnum() or c in "-_." for c in name):
+        return None
+    # Windows silently DROPS a trailing dot, so `idle.` and `idle` are one file on
+    # NTFS and two everywhere else. Allowing it would let a manifest overwrite a
+    # sibling member on one OS and not the other.
+    if name.endswith("."):
+        return None
+    if _is_windows_reserved(name):
         return None
     return name
