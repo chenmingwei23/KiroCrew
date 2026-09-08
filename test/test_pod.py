@@ -5636,13 +5636,19 @@ class TestSessionBus:
 
 @requires_posix_pod_lifecycle
 class TestBootTimeSettings:
-    """``pod up --approval`` / ``--crons`` are persisted per pod and applied at boot.
+    """``pod up --approval`` / ``--crons`` / ``--no-embeddings`` are persisted per
+    pod and applied at boot.
 
-    Neither can ride the unit file: both backends re-enter the pod as
+    None of them can ride the unit file: both backends re-enter the pod as
     ``kirocrew pod _run <name>`` with no flags. On systemd one template unit is
     shared by every instance, so it cannot carry per-pod flags; launchd writes a
     per-pod plist but still execs that same flagless argv. So they travel through
     the per-pod env file, exactly as ``SEED`` does.
+
+    ``--approval`` and ``--crons`` land on the gateway ARGV; ``--no-embeddings``
+    lands in the gateway's ENV instead, because the setting it expresses is an env
+    var the embedder reads rather than a flag the gateway parses. Hence two boot
+    helpers below.
     """
 
     def _booted_argv(
@@ -5661,6 +5667,32 @@ class TestBootTimeSettings:
         rt.boot(c, "x")
         assert len(seen) == 1, "boot did not exec exactly once"
         return seen[0][1:]  # drop argv[0], the venv binary path
+
+    def _booted_env(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+    ) -> dict[str, str]:
+        """Boot a ready pod with *env* merged into its env file; return the exec ENV.
+
+        The sibling of :meth:`_booted_argv` for a setting that travels in the
+        environment instead of the argv. Both are needed: asserting one says
+        nothing about the other, and an env-only option that accidentally grew an
+        argv flag (or the reverse) would pass a single-sided check.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(root / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(root / "pods"))
+        # A value inherited from the runner's own environment would make an
+        # assertion about what boot exports unfalsifiable.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        c = PodConfig.load()
+        rt.pin_checkout(c, "x", _ready_worktree(root, "x"))
+        if env:
+            rt.write_env_file(c, "x", env)
+        seen: list[dict[str, str]] = []
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(os, "execve", lambda path, argv, e: seen.append(e))
+        rt.boot(c, "x")
+        assert len(seen) == 1, "boot did not exec exactly once"
+        return seen[0]
 
     def test_boot_forwards_the_recorded_mode(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5926,6 +5958,7 @@ class TestBootTimeSettings:
             c, argparse.Namespace(name="demo", json=False, seed="", ttl="2h", provision=False)
         )
         assert "APPROVAL" not in rt.read_env_file(c, "demo")
+        assert "EMBEDDINGS" not in rt.read_env_file(c, "demo")
 
     def test_up_audits_the_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # `yolo` auto-approves every tool, so the SEL trail must name the mode
@@ -6000,6 +6033,158 @@ class TestBootTimeSettings:
         assert allowed, "pod.up allowed was never audited"
         assert "crons=on" in allowed[0][2]
 
+    # --- embeddings --------------------------------------------------------
+
+    def test_the_skip_download_env_name_matches_the_embedder(self) -> None:
+        # runtime.py restates the name instead of importing embeddings (which drags
+        # the vendored llama.cpp resolution onto the gateway boot path), so this is
+        # what keeps the two spellings from drifting. A typo here exports a variable
+        # nothing reads and the pod downloads the model anyway -- silently, since a
+        # pod with the model IS healthy.
+        from kiro_crew import embeddings
+
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV == embeddings._SKIP_DOWNLOAD_ENV
+
+    def test_boot_without_embeddings_skips_the_model_download(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_boot_leaves_the_model_download_alone_when_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The no-regression pin: a pod created before the EMBEDDINGS key existed,
+        # or created without it, boots exactly as it did -- the variable is absent
+        # rather than set to any value. Embeddings are ON by default, so the
+        # opposite polarity to CRONS: saying nothing must not disable them.
+        env = self._booted_env(tmp_path, monkeypatch, {})
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in env
+
+    def test_boot_accepts_alternative_falsy_spellings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The env file is hand-editable, so the obvious spellings are honoured.
+        for i, raw in enumerate(("false", "NO", " off ")):
+            env = self._booted_env(tmp_path / f"e{i}", monkeypatch, {"EMBEDDINGS": raw})
+            assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1", raw
+
+    def test_boot_ignores_an_unrecognised_embeddings_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Falls back to the pre-existing behavior (embeddings ON) rather than
+        # guessing, and the pod still boots. Note this is the SAFER answer here for
+        # the opposite reason it is with CRONS: a pod that unexpectedly kept its
+        # embeddings is a normal pod, whereas one that unexpectedly lost them
+        # answers search from a different index while looking perfectly healthy.
+        env = self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "maybe"})
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in env
+
+    def test_boot_announces_the_embedding_light_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # The journal is the only place this mode is observable after the fact, so a
+        # measurement taken against the pod stays attributable.
+        self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        out = capsys.readouterr().out
+        assert "embeddings off" in out and "keyword fallback" in out
+
+    def test_boot_stays_silent_about_embeddings_on_a_normal_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        self._booted_env(tmp_path, monkeypatch, {})
+        assert "embeddings off" not in capsys.readouterr().out
+
+    def test_the_embedding_option_changes_no_boot_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # It is an ENV passthrough, not a gateway flag: the gateway has no
+        # --no-embeddings to receive. Pinned so a later change cannot quietly start
+        # passing one to a target checkout that would reject the whole argv.
+        argv = self._booted_argv(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        assert argv == ["gateway", "--no-crons", "--no-tunnel"]
+
+    def test_boot_combines_no_embeddings_with_the_other_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._booted_env(
+            tmp_path, monkeypatch, {"EMBEDDINGS": "0", "CRONS": "1", "APPROVAL": "reads"}
+        )
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_build_pod_env_writes_the_skip_into_the_returned_env_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The whole promise of the option: a load test runs embedding-free without
+        # the operator's own environment or home losing its model. Setting it in
+        # os.environ would leak the mode into every later host command in this
+        # process, the live gateway included.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        cfg = PodConfig.load()
+        env = rt.build_pod_env(
+            cfg, tmp_path / "home", 7999, tmp_path / "co", skip_model_download=True
+        )
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in os.environ
+
+    def test_pod_context_carries_the_embedding_setting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `pod exec` / `pod env` reach the env through this seam. Without the
+        # setting here, a single `pod exec` against an embedding-light pod starts
+        # the download the pod was booted to do without -- and the measurement it
+        # was booted for is then taken against a pod that has the model.
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        cfg = PodConfig.load()
+        rt.pin_checkout(cfg, "x", _ready_worktree(tmp_path, "x"))
+        _, plain = rt.pod_context(cfg, "x")
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in plain
+        rt.write_env_file(cfg, "x", {"EMBEDDINGS": "0"})
+        _, embedless = rt.pod_context(cfg, "x")
+        assert embedless[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_up_records_no_embeddings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=True
+            ),
+        )
+        assert rt.read_env_file(c, "demo").get("EMBEDDINGS") == "0"
+
+    def test_up_leaves_the_key_absent_without_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=False
+            ),
+        )
+        assert "EMBEDDINGS" not in rt.read_env_file(c, "demo")
+
+    def test_up_audits_no_embeddings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A pod answering search from the keyword fallback is not the same instance
+        # as a normal pod, so a result measured on one must be attributable.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        seen: list[tuple] = []
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: seen.append(a))
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=True
+            ),
+        )
+        allowed = [a for a in seen if a[:2] == ("pod.up", "allowed")]
+        assert allowed, "pod.up allowed was never audited"
+        assert "embeddings=off" in allowed[0][2]
+
     def test_up_notes_every_deferred_flag_on_a_running_pod(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
@@ -6016,16 +6201,18 @@ class TestBootTimeSettings:
                 provision=False,
                 approval="yolo",
                 crons=True,
+                no_embeddings=True,
             ),
         )
         err = capsys.readouterr().err
         assert err.count("pod: note:") == 1
-        assert "--approval yolo --crons" in err
+        assert "--approval yolo --crons --no-embeddings" in err
 
     def test_up_merges_all_boot_settings_into_one_env_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # SEED / APPROVAL / CRONS share one write; the pinned CHECKOUT survives it.
+        # SEED / APPROVAL / CRONS / EMBEDDINGS share one write; the pinned CHECKOUT
+        # survives it.
         c = self._prep_up(tmp_path, monkeypatch, active=False)
         pod_cli._up(
             c,
@@ -6037,12 +6224,14 @@ class TestBootTimeSettings:
                 provision=False,
                 approval="reads",
                 crons=True,
+                no_embeddings=True,
             ),
         )
         env = rt.read_env_file(c, "demo")
         assert env.get("SEED") == "/tmp/fixture"
         assert env.get("APPROVAL") == "reads"
         assert env.get("CRONS") == "1"
+        assert env.get("EMBEDDINGS") == "0"
         # Compare path components, not a "/"-joined suffix: str(Path) uses "\"
         # on Windows, so endswith("wts/demo") fails there.
         checkout = Path(env.get("CHECKOUT", ""))

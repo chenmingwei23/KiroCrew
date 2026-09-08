@@ -83,9 +83,9 @@ def validate_name(name: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Per-pod env file (pinned CHECKOUT= / PORT= / SEED= / APPROVAL=). Values are
-# single-quoted on write and unquoted on read; unknown keys are preserved on
-# merge.
+# Per-pod env file (pinned CHECKOUT= / PORT= / SEED= / APPROVAL= / CRONS= /
+# EMBEDDINGS=). Values are single-quoted on write and unquoted on read; unknown
+# keys are preserved on merge.
 # --------------------------------------------------------------------------- #
 
 # Approval modes a pod's gateway may boot with, mirroring the choices on
@@ -101,6 +101,34 @@ APPROVAL_MODES: tuple[str, ...] = ("reads", "yolo", "interactive")
 # and these are the obvious alternatives. Anything else is treated as OFF, which
 # is the pre-existing ``--no-crons`` behavior and the safer of the two.
 CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+# Falsy spellings accepted for the ``EMBEDDINGS=`` key. Note the inverted
+# polarity against ``CRONS``: embeddings are ON for every pod that says nothing,
+# so this key exists to express the OFF request and an unrecognised value leaves
+# them ON -- which is the pre-existing behavior, hence the safer answer, by the
+# same reasoning ``CRONS`` uses for its own default. ``pod up --no-embeddings``
+# writes ``"0"``; the rest are accepted because the file is hand-editable.
+EMBEDDINGS_FALSE: frozenset[str] = frozenset({"0", "false", "no", "off"})
+
+#: The env var that turns the embedding-model download off, restated here rather
+#: than imported because this module runs on the gateway boot path and
+#: :mod:`kiro_crew.embeddings` carries the vendored llama.cpp resolution with it --
+#: the same reasoning that keeps the OAuth-grant suffixes below a local literal.
+#: ``test_the_skip_download_env_name_matches_the_embedder`` pins it equal to the
+#: embedder's own constant, so the two cannot drift.
+SKIP_MODEL_DOWNLOAD_ENV = "KIROCREW_SKIP_MODEL_DOWNLOAD"
+
+
+def embeddings_disabled(env_data: dict[str, str]) -> bool:
+    """Does this pod's env file ask to boot WITHOUT the embedding model?
+
+    Takes the already-parsed mapping rather than the pod name so the two
+    application points -- the gateway's own boot and every ``pod exec`` /
+    ``pod env`` command, which reach the env through :func:`pod_context` -- share
+    one parsing rule and cannot drift into disagreeing about the same file. Both
+    already read that file for ``CHECKOUT``, so this adds no second read.
+    """
+    return env_data.get("EMBEDDINGS", "").strip().lower() in EMBEDDINGS_FALSE
 
 
 def _parse_env_text(text: str) -> dict[str, str]:
@@ -2317,7 +2345,14 @@ def seeded_scenario_in_home(cfg: PodConfig, name: str) -> str | None:
         os.close(home_fd)
 
 
-def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> dict[str, str]:
+def build_pod_env(
+    cfg: PodConfig,
+    home_dir: Path,
+    port: int,
+    checkout: Path,
+    *,
+    skip_model_download: bool = False,
+) -> dict[str, str]:
     """Construct the isolated gateway environment for a pod.
 
     Scrubs messaging-identity creds so the pod can't inherit and re-use the live
@@ -2349,6 +2384,22 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     and ``acp/client.py`` / ``acp/runtime.py`` for the matching ``HOME`` remap
     on the pod's OWN kiro-cli children, which is what makes kiro-cli's writes
     land in this same tree.
+
+    ``skip_model_download`` boots the pod in the documented no-embedding-model
+    mode by exporting ``KIROCREW_SKIP_MODEL_DOWNLOAD=1`` into THIS env only. It is
+    a value in the returned mapping, never a write to the operator's shell,
+    profile or real data home -- the whole point is that a load test can run
+    embedding-free without the host losing its own model. The pod then serves
+    memory and knowledge search through the keyword fallback, which is a
+    supported mode rather than a broken one, so the instance stays usable.
+
+    Deliberately the existing skip-download switch rather than a
+    ``KIROCREW_EMBED_MODEL_URL`` pointed at an unreachable host. That spelling
+    reaches the same end state only after the downloader has spent its full
+    attempt budget on HTTPS requests to a host chosen to fail, and it carries a
+    live footgun: :func:`kiro_crew.embeddings._resolve_model_url` IGNORES any
+    override that is not ``https://`` and falls back to the real CDN, so one
+    malformed sentinel downloads the very model the option exists to avoid.
     """
     os_home = home_dir / "os-home"
     env = {
@@ -2429,6 +2480,10 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     # KIROCREW_PORT above is the target — so drop it unconditionally rather
     # than rely on resolution precedence alone.
     env.pop("KIROCREW_BOUND_PORT", None)
+    if skip_model_download:
+        # Set AFTER the scrub loop so no present-or-future scrub pattern can strip
+        # the guarantee back out.
+        env[SKIP_MODEL_DOWNLOAD_ENV] = "1"
     return env
 
 
@@ -3171,13 +3226,16 @@ def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
     from :func:`build_pod_env`, which means a command run against a pod inherits
     the SAME messaging-credential scrubbing as the pod's own gateway — a
     hand-rolled env here would silently let a throwaway instance act as the live
-    Slack / WeCom / Telegram identity.
+    Slack / WeCom / Telegram identity. The pod's ``EMBEDDINGS=`` setting travels
+    the same way, so a ``pod exec`` against an embedding-light pod does not
+    quietly download the model the pod was booted to do without.
 
     Raises :class:`PodError` when the pod has no pinned checkout (never brought
     up from inside a checkout) or that checkout has no provisioned venv.
     """
     validate_name(name)
-    checkout_str = read_env_file(cfg, name).get("CHECKOUT")
+    env_data = read_env_file(cfg, name)
+    checkout_str = env_data.get("CHECKOUT")
     if not checkout_str:
         raise PodError(
             f"pod {name!r} has no pinned checkout — run `kirocrew pod up {name}` "
@@ -3187,7 +3245,13 @@ def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
     bin_path = prov.venv_bin(checkout)
     if not (bin_path.exists() and os.access(bin_path, os.X_OK)):
         raise PodError(f"no kirocrew venv at {bin_path} (provision {name} first)")
-    env = build_pod_env(cfg, cfg.home_dir(name), derive_port(cfg, name), checkout)
+    env = build_pod_env(
+        cfg,
+        cfg.home_dir(name),
+        derive_port(cfg, name),
+        checkout,
+        skip_model_download=embeddings_disabled(env_data),
+    )
     return bin_path, env
 
 
@@ -3647,8 +3711,18 @@ def _boot_unguarded(cfg: PodConfig, name: str) -> int:
     _clear_refusal(cfg, name)
 
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
+    embedless = embeddings_disabled(env_data)
+    if embedless:
+        # The journal is the only place an operator can confirm the mode after the
+        # fact, and "no embed model" is not otherwise observable from a healthy pod:
+        # search still answers, just through the keyword fallback. Say it once here
+        # so a load measurement taken against this pod is attributable.
+        print(
+            f"kirocrew-pod: embeddings off ({SKIP_MODEL_DOWNLOAD_ENV}=1) — the model is "
+            f"not downloaded and memory/knowledge search uses the keyword fallback"
+        )
 
-    pod_env = build_pod_env(cfg, home_dir, port, checkout)
+    pod_env = build_pod_env(cfg, home_dir, port, checkout, skip_model_download=embedless)
     # Last gate before the gateway serves: a pod whose kiro-cli child cannot
     # bootstrap answers /health 200 while every agent turn fails, so it must
     # refuse HERE rather than present itself as up. Raises PodError, which
