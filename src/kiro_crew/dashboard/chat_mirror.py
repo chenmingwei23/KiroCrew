@@ -18,6 +18,7 @@ back to normal dashboard-token + CSRF auth. They must NOT be added to the strict
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from typing import Any
@@ -256,13 +257,23 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # conversation (for example, Discord creates a DM channel). Re-enter the
     # shared fail-closed governance ladder before that network side effect,
     # including when a profile changed after the transport connected.
+    #
+    # check_recipient=False, deliberately: this provisional link carries the
+    # configured-target SPELLING (``user:<id>``), not a conversation id, and
+    # ``may_send_to`` is a recipient predicate over conversation ids — the
+    # prefixed spelling can never match a roster of bare ids, so the recipient
+    # question is unanswerable at this point. Channel-scope governance and
+    # transport capability still run HERE, before the resolve's side effect;
+    # the recipient leg is decided below, against the resolved conversation id.
     provisional_link = ChannelLink(
         channel_type=channel_type,
         channel_id=target_id,
         thread_id=thread_id,
     )
     governed = await asyncio.to_thread(
-        _resolve_channel_target, state, session_key, provisional_link
+        functools.partial(
+            _resolve_channel_target, state, session_key, provisional_link, check_recipient=False
+        )
     )
     if governed is None:
         return web.json_response(
@@ -293,6 +304,50 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             status=409,
         )
     conversation_id, thread_id = resolved
+
+    # Recipient authorization, re-decided against the RESOLVED conversation id —
+    # the leg the pre-resolve ladder call above skipped (check_recipient=False),
+    # because only now does an id of the kind ``may_send_to`` judges exist. The
+    # principal comes from the target spelling, the posture
+    # ``handlers/messaging._deliver_channel_dm`` established for a ``user:<id>``
+    # target: the id came off the transport's own allow-list (the resolver just
+    # enforced membership), which is the authoritative answer a session-key
+    # derivation cannot reach here — a dashboard key names no channel peer. A
+    # non-``user:`` target (Webex ``room:``, Discord ``thread:``) names no single
+    # principal, and the empty string tells the transport so rather than handing
+    # a room id to a check that tests user rosters.
+    #
+    # Fail closed on a raising transport: an allow-list check that errored has
+    # authorized nobody, and this feeds a network egress boundary. The decision
+    # is audited on both outcomes below, before the branch.
+    target_kind, target_sep, target_value = target_id.partition(":")
+    recipient_principal = target_value if (target_sep and target_kind == "user") else ""
+    try:
+        recipient_permitted = transport.may_send_to(
+            conversation_id, thread_id, principal=recipient_principal
+        )
+    except Exception:
+        logger.warning(
+            "mirror-link: outbound authorization check failed for %s; refusing link",
+            channel_type,
+            exc_info=True,
+        )
+        recipient_permitted = False
+    # Audit the decision (allowed/denied) BEFORE branching, exactly like the
+    # resolver audit above: an authorization decision at a network egress
+    # boundary belongs on the SEL trail on BOTH outcomes, and a refused
+    # recipient silently losing the link looks exactly like a broken button.
+    sel().log_api_access(
+        caller=str(conversation_id or "unknown"),
+        operation="channel.proactive_send_authorize",
+        outcome="allowed" if recipient_permitted else "denied",
+        source=channel_type,
+        resources=f"{session_key} -> {channel_type}",
+    )
+    if not recipient_permitted:
+        return web.json_response(
+            {"error": "channel is not permitted", "code": "channel_not_permitted"}, status=403
+        )
 
     link = ChannelLink(
         channel_type=channel_type,
