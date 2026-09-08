@@ -3748,6 +3748,9 @@ class KiroCrewConfig:
             ),
             instances=InstancesConfig(
                 enabled=bool(instances_data.get("enabled", False)),
+                allow_loopback_transport=bool(
+                    instances_data.get("allow_loopback_transport", False)
+                ),
                 warm_set_cap=_safe_int(
                     instances_data.get("warm_set_cap", _DEFAULT_WARM_SET_CAP), _DEFAULT_WARM_SET_CAP
                 ),
