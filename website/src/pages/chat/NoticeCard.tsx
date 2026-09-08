@@ -55,12 +55,19 @@ function srSeverity(tone: NoticeTone): string {
  * center. The nudge is calc((1.25rem − 1em) / 2): leading-5 is a rem line box
  * while the glyph is 1em of the fixed 13px type, so a px constant would drift
  * under a non-16px root font-size.
+ *
+ * `tone` lets a caller that has ALREADY classified its row (CompactionCard's
+ * failure branch, whose ❌ lead is deliberately not one of parseNotice's three
+ * glyphs) name the severity directly; the text is still passed through
+ * parseNotice so a recognised glyph is stripped either way.
  */
-export default memo(function NoticeCard({ content }: { content: string }) {
+export default memo(function NoticeCard({ content, tone: toneOverride }: { content: string; tone?: NoticeTone }) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
   useLanguageGeneration()
-  const { tone, text } = parseNotice(content)
+  const parsed = parseNotice(content)
+  const tone = toneOverride ?? parsed.tone
+  const text = parsed.text
   const Icon = tone === 'blocked' ? Ban : tone === 'warn' ? TriangleAlert : Info
   const severity = srSeverity(tone)
   return (

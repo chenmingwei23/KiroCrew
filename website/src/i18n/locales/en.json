@@ -6117,6 +6117,10 @@
         "blocked": "Blocked",
         "warning": "Warning"
       },
+      "compactionCard": {
+        "summary_hint": "Summary folded — expand to read",
+        "title": "Context compacted"
+      },
       "recoveryCard": {
         "action_not_taken": "Action not taken",
         "announced_no_action_continuing": "announced but not done · continuation sent automatically",

@@ -9373,6 +9373,10 @@
         "blocked": "Bloqueado",
         "warning": "Advertencia"
       },
+      "compactionCard": {
+        "summary_hint": "Resumen plegado: despliégalo para leerlo",
+        "title": "Contexto compactado"
+      },
       "recoveryCard": {
         "action_not_taken": "Acción no realizada",
         "announced_no_action_continuing": "anunciado pero no realizado · continuación enviada automáticamente",

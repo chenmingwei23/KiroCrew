@@ -9117,6 +9117,10 @@
         "blocked": "차단됨",
         "warning": "경고"
       },
+      "compactionCard": {
+        "summary_hint": "요약이 접혀 있습니다 — 펼쳐서 보기",
+        "title": "컨텍스트가 압축되었습니다"
+      },
       "recoveryCard": {
         "action_not_taken": "작업이 실행되지 않음",
         "announced_no_action_continuing": "예고했지만 실행되지 않음 · 자동으로 후속 요청 전송됨",

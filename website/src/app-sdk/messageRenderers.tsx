@@ -30,6 +30,7 @@ import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
 import NoticeCard from '../pages/chat/NoticeCard'
+import CompactionCard, { isCompactionNotice } from '../pages/chat/CompactionCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import StopEventCard from '../pages/chat/StopEventCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
@@ -395,6 +396,18 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       />,
       true,
     ),
+  },
+  {
+    // Refines `assistant`, so it must precede it: a compaction notice is a
+    // gateway status row (kind="compaction") whose content is the backend's
+    // whole context summary. Folded behind a one-line card here so an embed
+    // surface (ChatEmbed, SideChat) never paints it as a reply either. The
+    // dashboard row set (pages/chat/transcriptRenderers) registers the same id
+    // and replaces this entry with an identical card.
+    id: 'compaction',
+    roles: ['assistant'],
+    match: isCompactionNotice,
+    render: (m, ctx) => ctx.row(<CompactionCard content={m.content} disclosureKey={ctx.key} />),
   },
   {
     id: 'assistant',
