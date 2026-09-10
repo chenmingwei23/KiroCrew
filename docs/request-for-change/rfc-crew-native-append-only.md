@@ -16,6 +16,17 @@ superseded-by: []
 
 How a crew keeps its state, how anyone reads it, and what happens when crews manage crews.
 
+In five lines:
+
+- Every crew has one ledger file. Facts are appended; nothing is ever edited.
+- Everything shown about a crew is computed from its ledger and pushed whole to the page.
+- An app or a hosted plugin reads a crew's ledger, computes in its own process, and hands back a
+  view; it may append facts under its own name and nothing else.
+- A crew that manages crews does not share ledgers with them. It is granted reads by the attach
+  event, writes signed dispatches into theirs, and its board is a view joined from several ledgers.
+- Of the studied runtime's 226 packages, about twenty are plugins in this sense and hostable; the
+  rest are that runtime itself and are not the target (section 8).
+
 ## 1. The one idea
 
 Every crew keeps a ledger. Anything that happens to the crew is written as one line at the end of
@@ -195,7 +206,102 @@ ledger at all.
 Classes are per type, not per line. Per-line access control is the thing this design exists to
 avoid.
 
-## 7. What exists today and what does not
+## 7. Examples
+
+Real shapes from the running code, trimmed for width.
+
+A ledger, three lines. The header names the crew; every later line is one fact with its position:
+
+```json
+{"type": "member", "version": 1, "id": "default", "name": "default", "createdAt": 1788998522808}
+{"type": "member/config", "seq": 0, "time": 1788998800689, "data": {"starred": false, "workspace": "default", "kiro_agent": "kirocrew"}}
+{"type": "member/config", "seq": 1, "time": 1788998824334, "data": {"starred": true,  "workspace": "default", "kiro_agent": "kirocrew"}}
+```
+
+What the page receives when line 1 lands. Not the event: the whole `roster` view, recomputed, with
+the seq it is current as of. The client replaces its copy if `seq` is higher than what it holds:
+
+```json
+{"type": "member_projection", "data": {"slug": "default", "key": "roster", "seq": 1,
+  "value": {"name": "default", "starred": true, "workspace": "default", "kiro_agent": "kirocrew"}}}
+```
+
+A guest, end to end. An app named `stats` declares in its manifest what it intends to do:
+
+```json
+"contributions": {"units": ["member"], "events": ["stats/*"], "projections": ["stats/*"]}
+```
+
+It catches up, then streams; it appends under its own name; it publishes a whole view with the
+seq it folded up to. Each call is refused with a machine-readable code if the declaration does
+not cover it:
+
+```text
+GET  /api/eventlog/member/default/events?after=1&limit=500      -> {"events": [...], "lastSeq": 7}
+WS   -> {"type": "eventlog_subscribe", "data": {"kind": "member", "id": "default"}}
+WS   <- {"type": "eventlog_subscribed", "data": {"kind": "member", "id": "default", "lastSeq": 7}}
+WS   <- {"type": "eventlog_event", "data": {"kind": "member", "id": "default",
+           "event": {"type": "slot/opened", "seq": 8, "time": 1788999000000, "data": {"slot_key": "chat-7"}}}}
+POST /api/eventlog/member/default/events
+       {"type": "stats/computed", "data": {"opens": 3}}                  -> 201 (seq 9)
+POST /api/eventlog/member/default/events
+       {"type": "member/config", "data": {...}}                          -> 403 event_type_not_owned
+POST /api/eventlog/member/default/projections/stats%2Fopens
+       {"value": {"opens": 3}, "seq": 9, "stateVersion": 1}              -> 204, pushed to every dashboard
+```
+
+The reference client that does exactly this is `test/contrib_protocol_demo.py`; stopping it, appending
+two events from elsewhere, and restarting it is the gap-rule test: it resumes from `?after=9`.
+
+Hosting a foreign plugin, concretely. The plugin we host is a session-statistics projection from the
+studied runtime. Its whole dependency on its home is two services it asks for by name,
+`invariants` and `sessionProjections`, and one npm package. The adapter is a Node process that:
+
+1. boots the runtime's own kernel from a read-only checkout, in source form (Node's module hooks
+   resolve the workspace package names to their source files and strip the types on load), so the
+   plugin's diff against upstream is empty by construction;
+2. hands the plugin a context whose `sessionProjections.register()` is a shim: it subscribes to the
+   member's ledger through the protocol above, maps each of our events onto the event names the
+   plugin's `apply` was written for, runs `apply`, and publishes `view()` under the adapter's own key
+   with the plugin's `stateVersion`;
+3. obeys the contiguity rule: a seq that is not exactly one past the folded position drops the fold
+   and re-reads.
+
+The result is one row in the member's `projections.values`, `<adapter>/sessionStats`, next to the
+four built-in keys, rendered in the drawer as a card titled by the plugin and badged with the
+adapter's name. The plugin never learns it left home.
+
+One honest note on that card: with only the `member` kind, the plugin sees slot spans and message
+markers, not the turn and model-timing events it was written to fold. The numbers it shows are
+real folds of a thin input. The `session` kind is what makes them meaningful.
+
+## 8. What an adapter can host, and what it cannot
+
+The studied runtime ships 226 packages and calls each one a plugin, because its own kernel, server,
+storage, shell, sandbox and browser client are all packages too. Sorting them by the services each
+one asks for gives an honest picture of what "host their plugins" can mean:
+
+| Kind of package | Roughly | Hostable? |
+|---|---|---|
+| Projection units: read session events, publish a view (statistics, title, todo list, plan state, permission state, goal board) | 6 | Yes. One runs today; the others need the `session` kind for real input |
+| Jobs, schedules, slash commands | 6 | Yes, with shims to the job runner, cron and command bar that are not written yet |
+| Self-contained tools (web fetch, todo, session query) | 5 | Yes, as MCP tools through a shim that is not written yet |
+| Telemetry exporters over session events | 2 | Yes, once the `session` kind exists |
+| Agent loop internals: the loop, compaction, retries, checkpoints, prompt assembly, tool timeouts | 15 | No. The loop is the agent runtime's, not the gateway's; we could not host it without becoming that runtime |
+| Model adapters, token meters, search backends bound to a model | 10 | No. Model access belongs to the agent runtime |
+| Execution environment: filesystem, shell, sandbox, terminals, subprocess, code runtimes, LSP | 45 | No. The agent runtime already owns one; a second nobody uses is a liability |
+| Subagent drivers, agent teams, workflow engines | 20 | No. We have our own spawn and workflow surfaces; these drive the other loop |
+| Storage, persistence, query backends, credentials, settings | 20 | No. Infrastructure of that runtime |
+| Host, server, CLI, SDK, type generators | 25 | No. That runtime itself |
+| Browser client and its UI packages | 50 | No. A React client tree for a different shell; our surface is the declared card |
+
+About twenty packages are plugins in the sense this document means: something a third party wrote to
+add a capability, that reads facts and produces a view, a job, a command or a tool. Those are the
+target. The other two hundred are the runtime, split into packages by its architecture, and the
+right answer to them is not an adapter but the seams we already have: the agent runtime over its
+protocol, tools over MCP, skills and servers by conversion.
+
+## 9. What exists today and what does not
 
 Built and running: one ledger per crew, the ten rules, four built-in projections, whole-value push
 ([`member-event-log.md`](../system-specs/modules/member-event-log.md)); guests (read, namespaced
