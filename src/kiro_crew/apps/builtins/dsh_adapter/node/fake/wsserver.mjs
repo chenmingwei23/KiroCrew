@@ -133,6 +133,7 @@ export function attachWebSocketServer(server, onConnection) {
 
     const connection = {
       url: request.url ?? '',
+      origin: typeof request.headers.origin === 'string' ? request.headers.origin : '',
       send(text) {
         if (open && !socket.destroyed) socket.write(encodeTextFrame(text))
       },

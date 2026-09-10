@@ -11,15 +11,16 @@
  * | variable                    | meaning                                              |
  * | --------------------------- | ---------------------------------------------------- |
  * | `PORT`                      | health server port (the platform assigns it)         |
+ * | `KIROCREW_APP_NAME`         | the app name the gateway knows (the platform sets it) |
+ * | `KIROCREW_PROXY_SECRET`     | the app's own secret (the platform sets it)          |
  * | `DSH_ADAPTER_CHECKOUT`      | absolute path to the read-only plugin checkout       |
- * | `DSH_ADAPTER_GATEWAY`       | gateway origin; defaults to loopback on `KIROCREW_PORT` |
- * | `DSH_ADAPTER_TOKEN`         | the app bearer token (§2)                            |
+ * | `DSH_ADAPTER_GATEWAY`       | gateway origin                                        |
+ * | `DSH_ADAPTER_TOKEN`         | a token to use instead of exchanging the secret      |
  * | `DSH_ADAPTER_UNITS`         | comma-separated unit ids; omit to discover members   |
  *
- * Without a token the process still starts and still serves health, reporting
- * `contributing: false` and why. That is deliberate: the platform hands an app
- * backend no outbound credential today, so a hard exit would turn a known
- * platform gap into a crash-looping app.
+ * With anything missing the process still starts and still serves health,
+ * reporting `contributing: false` and why. A hard exit would turn a
+ * configuration gap into a crash-looping app.
  *
  * @module dsh_adapter/server
  */
@@ -27,7 +28,7 @@
 import { createServer } from 'node:http'
 import process from 'node:process'
 import { startHost } from './lib/host.mjs'
-import { ContractClient } from './lib/contract.mjs'
+import { ContractClient, ContractError, exchangeToken } from './lib/contract.mjs'
 import { UnitDriver } from './lib/unit.mjs'
 
 /** The app's own name; §2 requires every declared pattern to start with it. */
@@ -42,23 +43,19 @@ export const UNIT_KIND = 'member'
 /**
  * Render schema per plugin key (§7).
  *
- * Every label says what the number means FOR A MEMBER and names the plugin's
- * own field, because the mapping gives those fields a member's meaning: a
- * "step" is a slot span, not a model step. Naming both keeps the card readable
- * without misreporting what was folded. The three fields a member's log cannot
- * feed are left off the card rather than shown as a permanent zero.
+ * The shape is the host's, not ours: `kind` picks one of five body shapes and
+ * `path` is a list of dotted selectors, which for `keyvalue` names the fields to
+ * show AND supplies their labels. So a label cannot carry a gloss — it is the
+ * selector. The five fields listed are the ones a member's log can honestly
+ * feed; `toolMs`, `decodeMs` and `decodeTokens` are left off rather than shown
+ * as a permanent zero, and the title names the plugin so its own field names
+ * read as its own.
  */
 export const RENDER_SCHEMAS = Object.freeze({
   sessionStats: {
-    title: 'Session stats',
     kind: 'keyvalue',
-    fields: [
-      { title: 'Slots driven (turns)', path: 'turns' },
-      { title: 'Slot spans (steps)', path: 'steps' },
-      { title: 'Slot wall time ms (llmMs)', path: 'llmMs' },
-      { title: 'Time to first message ms (ttftMs)', path: 'ttftMs' },
-      { title: 'Spans with a message (ttftSteps)', path: 'ttftSteps' },
-    ],
+    title: 'session-stats (hosted plugin)',
+    path: ['turns', 'steps', 'llmMs', 'ttftMs', 'ttftSteps'],
   },
 })
 
@@ -77,18 +74,69 @@ function log(message, detail = {}) {
 /**
  * Read configuration from the environment.
  *
+ * `secret` comes from the platform itself: a backend is handed its own app
+ * secret as `KIROCREW_PROXY_SECRET`, which is the same value the token exchange
+ * validates — so an app can authenticate outbound with nothing configured. A
+ * `DSH_ADAPTER_TOKEN` is still honoured for a run against a standalone contract
+ * server that mints no tokens.
+ *
  * @param {Record<string, string | undefined>} [env] - the environment; defaults to the process env.
- * @returns {{port: number, checkout: string, gateway: string, token: string, units: string[]}} the configuration.
+ * @returns {{port: number, checkout: string, gateway: string, token: string, secret: string,
+ *   appName: string, units: string[]}} the configuration.
  */
 export function readConfig(env = process.env) {
-  const gatewayPort = env.DSH_ADAPTER_GATEWAY ? '' : (env.KIROCREW_PORT ?? '5476')
   return {
     port: Number(env.PORT ?? '0'),
     checkout: env.DSH_ADAPTER_CHECKOUT ?? '',
-    gateway: env.DSH_ADAPTER_GATEWAY ?? `http://127.0.0.1:${gatewayPort}`,
+    gateway: env.DSH_ADAPTER_GATEWAY ?? '',
     token: env.DSH_ADAPTER_TOKEN ?? '',
+    secret: env.KIROCREW_PROXY_SECRET ?? '',
+    appName: env.KIROCREW_APP_NAME ?? APP_NAME,
     units: (env.DSH_ADAPTER_UNITS ?? '').split(',').map(part => part.trim()).filter(Boolean),
   }
+}
+
+/**
+ * The app-scoped token to call the gateway with.
+ *
+ * A configured token wins, so a standalone contract server needs no exchange.
+ * Otherwise the platform-supplied secret is exchanged for one, RETRYING while
+ * the gateway refuses to connect: at boot the platform starts an app backend
+ * before its own HTTP listener is up, so a single attempt loses that race and
+ * the app would sit there not contributing until someone restarted it. A refusal
+ * that is not a connection failure -- a wrong secret -- is final and returns at
+ * once rather than being retried for a minute.
+ *
+ * @param {{gateway: string, token: string, secret: string, appName: string}} config - the configuration.
+ * @param {object} [options] - retry options.
+ * @param {number} [options.attempts] - how many times to try connecting.
+ * @param {number} [options.delayMs] - wait between attempts.
+ * @returns {Promise<{token: string, reason: string}>} the token, or the reason there is none.
+ */
+export async function resolveToken(config, { attempts = 20, delayMs = 3000 } = {}) {
+  if (config.token) return { token: config.token, reason: '' }
+  if (!config.secret) {
+    return { token: '', reason: 'no app secret in the environment and no DSH_ADAPTER_TOKEN configured' }
+  }
+  let last = ''
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const token = await exchangeToken({
+        baseUrl: config.gateway, appName: config.appName, secret: config.secret,
+      })
+      return { token, reason: '' }
+    } catch (error) {
+      last = String(error)
+      // A ContractError carries a status, so the gateway answered and the
+      // refusal is about the secret, not the connection.
+      if (error instanceof ContractError) return { token: '', reason: `app token exchange refused: ${last}` }
+      if (attempt < attempts) {
+        log('gateway not reachable yet, retrying token exchange', { attempt, of: attempts })
+        await new Promise(resolve => setTimeout(resolve, delayMs))
+      }
+    }
+  }
+  return { token: '', reason: `app token exchange failed after ${attempts} attempts: ${last}` }
 }
 
 /**
@@ -105,7 +153,7 @@ export function readConfig(env = process.env) {
 export async function resolveUnits(client, configured) {
   if (configured.length > 0) return configured
   try {
-    const response = await fetch(`${client.baseUrl}/api/members`, { headers: client.headers() })
+    const response = await fetch(client.url('/api/members'), { headers: client.headers() })
     if (!response.ok) {
       log('member discovery refused', { status: response.status })
       return []
@@ -174,13 +222,19 @@ export async function main({ env = process.env } = {}) {
   state.keys = host.keys.map(key => `${APP_NAME}/${key}`)
   log('plugin mounted', { plugin: host.plugin, keys: host.keys, stateVersions: host.stateVersions })
 
-  if (!config.token) {
-    state.reason = 'no app token: the platform passes an app backend no outbound credential'
+  if (!config.gateway) {
+    state.reason = 'DSH_ADAPTER_GATEWAY is not set, so there is no gateway to contribute to'
+    log('not contributing', { reason: state.reason })
+    return { state, stop }
+  }
+  const { token, reason } = await resolveToken(config)
+  if (!token) {
+    state.reason = reason
     log('not contributing', { reason: state.reason })
     return { state, stop }
   }
 
-  const client = new ContractClient({ baseUrl: config.gateway, token: config.token })
+  const client = new ContractClient({ baseUrl: config.gateway, token })
   const units = await resolveUnits(client, config.units)
   if (units.length === 0) {
     state.reason = 'no units to drive'

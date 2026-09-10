@@ -16,14 +16,16 @@ does not explicitly pass through::
     {
       "checkout": "/abs/path/to/the/plugin/checkout",
       "gateway":  "http://127.0.0.1:5476",
-      "token":    "<app bearer token>",
       "units":    ["kiro", "review-agent"]
     }
 
-``token`` is in that file because nothing hands an app backend an outbound
-credential today; see the app README. Absent any of it the adapter still starts
-and still reports health, saying what is missing -- a backend that exits instead
-would be restarted forever over a configuration gap.
+No credential belongs in that file: the platform already hands a backend its own
+app secret as ``KIROCREW_PROXY_SECRET``, and the adapter exchanges that at
+``POST /api/apps/<name>/token`` for the app-scoped token it calls with. A
+``token`` key is still honoured for a run against a standalone contract server
+that mints none. Absent any of it the adapter still starts and still reports
+health, saying what is missing -- a backend that exited instead would be
+restarted forever over a configuration gap.
 """
 from __future__ import annotations
 

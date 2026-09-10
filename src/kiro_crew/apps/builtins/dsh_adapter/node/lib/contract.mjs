@@ -9,11 +9,21 @@
  * Uses the global `fetch` and `WebSocket` Node ships, so the adapter's only
  * npm dependency is the one the hosted plugin itself declares.
  *
- * Authentication is a bearer token, per §2. Nothing in the gateway hands an app
- * backend such a token today — the backend environment carries a proxy secret
- * for verifying INBOUND forwarded requests and nothing for calling out — so the
- * token arrives by configuration and the caller decides what to do when it is
- * absent.
+ * Three things about how the gateway reads a credential, each of which is a
+ * silent 403 if you get it wrong:
+ *
+ * - The app token rides the QUERY STRING (`?token=…`) on every request. The auth
+ *   middleware reads `?token=` or its own session cookie and ignores
+ *   `Authorization`, and a contributor has no cookie.
+ * - The WebSocket is `/api/ws?token=…` and its handshake must carry an `Origin`
+ *   equal to the gateway's own origin.
+ * - The token is obtained by exchanging the app's secret at
+ *   `POST /api/apps/{app}/token` with an `X-App-Secret` header. The platform
+ *   already hands a backend that secret, so an app can authenticate itself
+ *   without any configured credential — see {@link exchangeToken}.
+ *
+ * A projection key contains a slash, so it is percent-encoded whole
+ * (`encodeURIComponent`), never left to split into two path segments.
  *
  * @module dsh_adapter/contract
  */
@@ -62,13 +72,42 @@ async function readBody(response) {
 }
 
 /**
+ * Exchange an app's secret for an app-scoped token.
+ *
+ * The platform passes a backend its own secret (as `KIROCREW_PROXY_SECRET`), so
+ * this is how an app authenticates outbound without a configured credential. The
+ * returned token carries the app identity the gateway checks every declaration
+ * against, and it expires — a 403 on a later call means exchange again.
+ *
+ * @param {object} options - exchange options.
+ * @param {string} options.baseUrl - gateway origin.
+ * @param {string} options.appName - the app's name, as the gateway knows it.
+ * @param {string} options.secret - the app's own secret.
+ * @param {typeof fetch} [options.fetchImpl] - override for tests.
+ * @returns {Promise<string>} the app-scoped token.
+ */
+export async function exchangeToken({ baseUrl, appName, secret, fetchImpl }) {
+  const call = fetchImpl ?? globalThis.fetch
+  const url = `${baseUrl.replace(/\/+$/, '')}/api/apps/${encodeURIComponent(appName)}/token`
+  const response = await call(url, {
+    method: 'POST',
+    headers: { 'x-app-secret': secret, 'content-type': 'application/json' },
+    body: '',
+  })
+  const body = await readBody(response)
+  const token = body?.token ?? body?.access_token ?? ''
+  if (!token) throw new ContractError(response.status, 'no_token', 'token exchange returned no token')
+  return token
+}
+
+/**
  * A contribution-protocol client bound to one gateway and one app token.
  */
 export class ContractClient {
   /**
    * @param {object} options - client options.
    * @param {string} options.baseUrl - gateway origin, e.g. `http://127.0.0.1:5476`.
-   * @param {string} options.token - the app's bearer token (§2).
+   * @param {string} options.token - the app-scoped token (§2).
    * @param {typeof fetch} [options.fetchImpl] - override for tests.
    * @param {typeof WebSocket} [options.socketImpl] - override for tests.
    */
@@ -80,12 +119,41 @@ export class ContractClient {
   }
 
   /**
-   * Authorization header for every call.
+   * Headers for every call.
+   *
+   * The token is NOT here: the auth middleware reads it from the query string,
+   * so a header would be ignored and the request refused `Token required`.
    *
    * @returns {Record<string, string>} the headers.
    */
   headers() {
-    return { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }
+    return { 'content-type': 'application/json' }
+  }
+
+  /**
+   * A gateway URL carrying the app token the way the gateway reads it.
+   *
+   * @param {string} path - the API path, already percent-encoded.
+   * @param {string} [query] - extra query parameters, without a leading `?`.
+   * @returns {string} the full URL.
+   */
+  url(path, query = '') {
+    const separator = query ? '&' : ''
+    return `${this.baseUrl}${path}?${query}${separator}token=${encodeURIComponent(this.token)}`
+  }
+
+  /**
+   * The path of one unit's projection key, percent-encoded whole.
+   *
+   * @param {string} kind - the unit kind.
+   * @param {string} id - the unit id.
+   * @param {string} key - the projection key, which contains a slash.
+   * @param {string} [suffix] - an extra path segment, e.g. `/schema`.
+   * @returns {string} the path.
+   */
+  projectionPath(kind, id, key, suffix = '') {
+    return `/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`
+      + `/projections/${encodeURIComponent(key)}${suffix}`
   }
 
   /**
@@ -99,8 +167,8 @@ export class ContractClient {
    */
   async readEvents(kind, id, after, limit = MAX_LIMIT) {
     const query = new URLSearchParams({ after: String(after), limit: String(Math.min(limit, MAX_LIMIT)) })
-    const url = `${this.baseUrl}/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/events?${query}`
-    const response = await this.fetchImpl(url, { headers: this.headers() })
+    const path = `/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/events`
+    const response = await this.fetchImpl(this.url(path, query.toString()), { headers: this.headers() })
     return await readBody(response)
   }
 
@@ -137,8 +205,8 @@ export class ContractClient {
    * @returns {Promise<object>} the stored envelope, with the gateway's `seq` and `time`.
    */
   async appendEvent(kind, id, type, data) {
-    const url = `${this.baseUrl}/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/events`
-    const response = await this.fetchImpl(url, {
+    const path = `/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/events`
+    const response = await this.fetchImpl(this.url(path), {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({ type, data }),
@@ -161,9 +229,7 @@ export class ContractClient {
    * @returns {Promise<{published: boolean, code: string}>} whether the row moved, and the code when it did not.
    */
   async publishProjection(kind, id, key, value, seq, stateVersion) {
-    const url = `${this.baseUrl}/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`
-      + `/projections/${encodeURIComponent(key)}`
-    const response = await this.fetchImpl(url, {
+    const response = await this.fetchImpl(this.url(this.projectionPath(kind, id, key)), {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({ value, seq, stateVersion }),
@@ -189,9 +255,7 @@ export class ContractClient {
    * @returns {Promise<{published: boolean, status: number}>} whether the gateway accepted it.
    */
   async publishSchema(kind, id, key, schema) {
-    const url = `${this.baseUrl}/api/eventlog/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`
-      + `/projections/${encodeURIComponent(key)}/schema`
-    const response = await this.fetchImpl(url, {
+    const response = await this.fetchImpl(this.url(this.projectionPath(kind, id, key, '/schema')), {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(schema),
@@ -217,8 +281,12 @@ export class ContractClient {
    * @returns {{close: () => void}} a handle that unsubscribes and closes.
    */
   subscribe({ kind, id, onSubscribed, onEvent, onClosed }) {
-    const wsUrl = `${this.baseUrl.replace(/^http/, 'ws')}/api/apps/ws?token=${encodeURIComponent(this.token)}`
-    const socket = new this.socketImpl(wsUrl)
+    const origin = new URL(this.baseUrl).origin
+    const wsUrl = `${this.baseUrl.replace(/^http/, 'ws')}/api/ws?token=${encodeURIComponent(this.token)}`
+    // The handshake must carry an Origin equal to the gateway's own; without it
+    // the upgrade is refused. `headers` is Node's own extension to the
+    // WebSocket constructor -- the standard second argument is protocols only.
+    const socket = new this.socketImpl(wsUrl, { headers: { origin } })
     let closed = false
 
     socket.addEventListener('open', () => {

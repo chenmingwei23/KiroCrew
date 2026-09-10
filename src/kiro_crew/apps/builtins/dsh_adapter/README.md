@@ -50,9 +50,13 @@ So for a member: `turns` is distinct slots driven, `steps` is fully observed
 slot spans, `llmMs` is total wall time holding a slot open, and `ttftMs` is time
 from opening a slot to its first message. `toolMs`, `decodeMs` and
 `decodeTokens` stay `0` — a member's log carries no tool pairs and no token
-usage, and the adapter does not invent either. The render schema published under
-§7 labels every field with both meanings, and leaves the three unfeedable ones
-off the card rather than showing a permanent zero.
+usage, and the adapter does not invent either.
+
+The §7 render schema shows only the five fields a member's log can feed, leaving
+the other three off the card rather than displaying a permanent zero. It cannot
+gloss them: for a `keyvalue` body the host uses each `path` selector AS the label,
+so the card shows the plugin's own field names. The card's title names the plugin
+for that reason, and this table is where the member meaning is written down.
 
 Two limits, both deliberate:
 
@@ -83,18 +87,31 @@ sandbox inside it.
 {
   "checkout": "/abs/path/to/the/plugin/checkout",
   "gateway": "http://127.0.0.1:5476",
-  "token": "<app bearer token>",
   "units": ["kiro"]
 }
 ```
 
 A file rather than the environment, because `minimal_env()` strips anything the
-platform does not explicitly pass to a backend. `token` is here because nothing
-hands an app backend an outbound credential today; §2 assumes one exists.
-`units` is optional — omitted, the adapter asks the dashboard for the member
-list, because §3 addresses a unit by id and offers no way to enumerate units.
+platform does not explicitly pass to a backend.
 
-With any of it missing the adapter still starts and still serves health,
+No credential belongs in that file. The platform already hands a backend its own
+app secret as `KIROCREW_PROXY_SECRET`, and the adapter exchanges that at
+`POST /api/apps/dsh-adapter/token` for the app-scoped token it calls with. The
+exchange retries while the gateway refuses to connect, because the platform
+starts an app backend before its own listener is up and a single attempt loses
+that race; a refused secret is final and reported at once. A `token` key is still
+honoured for a run against a standalone contract server that mints none.
+
+Two things about how the gateway reads that token, each a flat 403 if you get it
+wrong: it rides the QUERY STRING (`?token=…`, never `Authorization`), and the
+event stream is `/api/ws?token=…` whose handshake must carry an `Origin` equal to
+the gateway's own.
+
+`units` is required in practice: an app token is scoped to `/api/eventlog/`, so
+the adapter cannot read the dashboard's member list, and §3 addresses a unit by
+id with no way to enumerate units.
+
+With anything missing the adapter still starts and still serves health,
 reporting `contributing: false` and the reason. A backend that exited instead
 would be restarted forever over a configuration gap.
 
@@ -107,16 +124,20 @@ how many refolds a gap forced, and how many publishes the gateway took.
 cd node && npm install && npm test
 ```
 
-36 tests, no network beyond loopback. `test/driver.test.mjs` runs against
+48 tests, no network beyond loopback. `test/driver.test.mjs` runs against
 `fake/gateway.mjs`, which serves §3–§7 over a real loopback HTTP server and
 enforces the refusals the real gateway will: an event type or key outside the
 declared patterns, a built-in key, an ungranted unit kind, an equal or lower
-`seq`.
+`seq`, a wrong app secret, and a token presented as a header instead of a query
+parameter.
 
-Two things are worth knowing about the suite. `test/fold.test.mjs` checks the
+Three things are worth knowing about the suite. `test/fold.test.mjs` checks the
 hosted fold against the same plugin definition run in a plain `init`/`apply`/`view`
-loop, which is what catches the adapter changing the plugin's answer. And the §3
-event frames arrive through an injected socket rather than a real WebSocket:
-Node ships a WebSocket client but no server, and the point of the fake is to be
-able to **drop** a frame on purpose — a gap the adapter folds across is a view
-that stays wrong with no error anywhere.
+loop, which is what catches the adapter changing the plugin's answer.
+`test/auth.test.mjs` pins the two credential rules above, because a client that
+gets either wrong looks correctly written and is refused everywhere. And the §3
+event frames in the driver suite arrive through an injected socket rather than a
+real WebSocket: the point of the fake is to be able to **drop** a frame on
+purpose, since a gap the adapter folds across is a view that stays wrong with no
+error anywhere. `test/wire.test.mjs` covers the real socket separately, so the
+handshake is not first exercised in a pod.

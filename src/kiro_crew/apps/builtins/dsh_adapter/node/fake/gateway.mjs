@@ -91,8 +91,9 @@ export class FakeGateway {
    * @param {string} [options.token] - the bearer token it accepts.
    * @param {object} [options.contributions] - the app's declared `contributions` block.
    */
-  constructor({ token = 'test-token', contributions = {} } = {}) {
+  constructor({ token = 'test-token', secret = 'test-secret', contributions = {} } = {}) {
     this.token = token
+    this.secret = secret
     this.contributions = {
       events: contributions.events ?? [],
       projections: contributions.projections ?? [],
@@ -140,8 +141,12 @@ export class FakeGateway {
    * @returns {void}
    */
   acceptWire(connection) {
-    const query = new URL(connection.url, 'http://127.0.0.1').searchParams
-    if (query.get('token') !== this.token) {
+    const url = new URL(connection.url, 'http://127.0.0.1')
+    // The real handshake is `/api/ws?token=…` and needs an Origin equal to the
+    // gateway's own; refusing anything else here keeps a client that only works
+    // against the fake from looking correct.
+    if (url.pathname !== '/api/ws' || url.searchParams.get('token') !== this.token
+      || !connection.origin) {
       connection.close()
       return
     }
@@ -226,13 +231,17 @@ export class FakeGateway {
   }
 
   /**
-   * Whether a request carries the app's bearer token.
+   * Whether a request carries the app token where the gateway reads it.
    *
-   * @param {import('node:http').IncomingMessage} request - the request.
+   * The query string, not a header: the real auth middleware takes `?token=` or
+   * its own session cookie and ignores `Authorization`, so a fake that accepted
+   * a bearer header would pass a client the real gateway refuses.
+   *
+   * @param {URL} url - the request URL.
    * @returns {boolean} true when authorized.
    */
-  authorized(request) {
-    return request.headers.authorization === `Bearer ${this.token}`
+  authorized(url) {
+    return url.searchParams.get('token') === this.token
   }
 
   /**
@@ -254,9 +263,18 @@ export class FakeGateway {
       response.writeHead(status, { 'content-type': 'application/json' })
       response.end(text)
     }
-    if (!this.authorized(request)) return send(401, { code: 'unauthorized', error: 'bad token' })
 
     const parts = url.pathname.split('/').filter(Boolean)
+    // The secret exchange is the ONE route reached without a token (§2): it is
+    // how a contributor gets one.
+    if (parts[0] === 'api' && parts[1] === 'apps' && parts[3] === 'token' && request.method === 'POST') {
+      if (request.headers['x-app-secret'] !== this.secret) {
+        return send(403, { code: 'invalid_secret', error: 'invalid secret' })
+      }
+      return send(200, { token: this.token })
+    }
+    if (!this.authorized(url)) return send(401, { code: 'unauthorized', error: 'Token required' })
+
     // api eventlog {kind} {id} events | projections {key} [schema]
     if (parts[0] !== 'api' || parts[1] !== 'eventlog' || parts.length < 5) {
       return send(404, { code: 'not_found', error: url.pathname })
