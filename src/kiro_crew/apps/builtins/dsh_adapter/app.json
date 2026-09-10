@@ -1,0 +1,52 @@
+{
+  "name": "dsh-adapter",
+  "version": "0.1.0",
+  "displayName": "Harness Plugin Adapter",
+  "description": "Runs an unmodified DeepSeek Harness plugin in its own process and contributes the plugin's projected view to a member, through the contribution protocol.",
+  "author": "kirocrew",
+  "license": "MIT",
+  "tags": [
+    "adapter",
+    "eventlog",
+    "projections",
+    "members"
+  ],
+  "defaultEnabled": false,
+  "minKiroCrewVersion": "0.1.0",
+  "contributions": {
+    "events": [
+      "dsh-adapter/*"
+    ],
+    "projections": [
+      "dsh-adapter/*"
+    ],
+    "units": [
+      "member"
+    ]
+  },
+  "permissions": {
+    "storage": true
+  },
+  "backend": {
+    "entryPoint": "kiro_crew.apps.builtins.dsh_adapter.server",
+    "port": "auto",
+    "healthCheck": "/health"
+  },
+  "requirements": {
+    "commands": [
+      "node"
+    ]
+  },
+  "platform": {
+    "os": [
+      "macos",
+      "linux"
+    ]
+  },
+  "useCases": [
+    "Show a foreign plugin's projected view on a member's card without porting the plugin or running its code inside the gateway."
+  ],
+  "configuration": [
+    "Write data/config.json in the app directory with checkout (the plugin checkout path), gateway, token, and optionally units."
+  ]
+}

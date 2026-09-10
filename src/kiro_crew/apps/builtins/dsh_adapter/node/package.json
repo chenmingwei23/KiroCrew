@@ -1,0 +1,17 @@
+{
+  "name": "kirocrew-dsh-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Adapter process that hosts an unmodified DeepSeek Harness plugin and publishes its projection through the contribution protocol.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec test/*.test.mjs"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}
