@@ -103,26 +103,12 @@ _MANIFEST_KNOWN_KEYS = frozenset(
     }
 )
 
-# Identity fields read off the source manifest's ``interface`` block that have
-# no field on an installed app's manifest. They are carried as provenance so the
-# information is not lost, and reported as carried-not-rendered so nobody reads
-# their presence as support. Both spellings of the URL keys are accepted: real
-# packages use the uppercase form and the format documents the other as an alias.
-_CARRIED_INTERFACE_KEYS = (
-    "composerIcon",
-    "logo",
-    "logoDark",
-    "screenshots",
-    "brandColor",
-    "defaultPrompt",
-    "category",
-    "capabilities",
-    "websiteUrl",
-    "websiteURL",
-    "privacyPolicyUrl",
-    "privacyPolicyURL",
-    "termsOfServiceUrl",
-    "termsOfServiceURL",
+# Interface keys this converter CONSUMES into a target field. Every other key in
+# the block is carried as provenance -- a wholesale remainder rather than an
+# allowlist, because an allowlist silently drops the next presentation field the
+# source format adds (and it already spells some links two ways).
+_CONSUMED_INTERFACE_KEYS = frozenset(
+    {"displayName", "shortDescription", "longDescription", "developerName"}
 )
 
 # Top-level source fields with real information and no field on an installed
@@ -475,6 +461,38 @@ def _convert_skills(root: Path, declared: object, out_dir: Path, report: ImportR
     return emitted
 
 
+def _package_relative_fields(config: dict[str, Any]) -> list[str]:
+    """Fields in a server config that name a path inside the source package.
+
+    The source format resolves a server's ``command``, ``args`` and ``cwd`` against
+    the package root. Conversion does not preserve that root, and the program a
+    server points at is not a DECLARED resource, so it is not copied either --
+    emitting such a server would register one that cannot start. Detection is
+    deliberately narrow (``.``, ``..`` and an explicit ``./`` or ``../`` prefix,
+    plus any non-absolute ``cwd``) so a bare command name, a flag and a package
+    specifier are never mistaken for a path.
+    """
+
+    def relative(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        return text in (".", "..") or text.startswith("./") or text.startswith("../")
+
+    found: list[str] = []
+    if relative(config.get("command")):
+        found.append("command")
+    args = config.get("args")
+    if isinstance(args, list):
+        for index, arg in enumerate(args):
+            if relative(arg):
+                found.append(f"args[{index}]")
+    cwd = config.get("cwd")
+    if isinstance(cwd, str) and cwd.strip() and not Path(cwd).is_absolute():
+        found.append("cwd")
+    return found
+
+
 def _convert_mcp_servers(root: Path, declared: object, report: ImportReport) -> dict[str, Any]:
     if declared is None:
         return {}
@@ -501,6 +519,21 @@ def _convert_mcp_servers(root: Path, declared: object, report: ImportReport) -> 
             continue
         if not isinstance(config, dict):
             report.warnings.append(f"mcpServers[{name}] is not an object; dropped")
+            continue
+        relative_fields = _package_relative_fields(config)
+        if relative_fields:
+            report.unmapped.append(
+                UnmappedKind(
+                    kind=f"mcpServers[{name}]",
+                    bucket="d",
+                    reason=(
+                        "the server resolves its program against the source package "
+                        "root, which conversion does not preserve, and that program is "
+                        "not a declared resource so it is not copied"
+                    ),
+                    detail=f"package-relative: {', '.join(relative_fields)}",
+                )
+            )
             continue
         cleaned[name] = config
     if cleaned:
@@ -537,7 +570,11 @@ def _report_hooks(root: Path, declared: object, report: ImportReport) -> None:
     for document in documents:
         events = document.get("hooks")
         if not isinstance(events, dict):
-            report.warnings.append("hooks document has no 'hooks' object; ignored")
+            # An EMPTY declaration is a real published shape (`"hooks": {}`): the
+            # package reserves the kind and declares no event. That is not a
+            # malformed document and must not read as one.
+            if document:
+                report.warnings.append("hooks document has no 'hooks' object; ignored")
             continue
         for event, groups in events.items():
             count = len(groups) if isinstance(groups, list) else 1
@@ -552,6 +589,8 @@ def _report_hooks(root: Path, declared: object, report: ImportReport) -> None:
         detail_parts.append(f"same-meaning agent events: {named}")
     if no_counterpart:
         detail_parts.append(f"no counterpart: {', '.join(sorted(no_counterpart))}")
+    if not detail_parts:
+        detail_parts.append("declared with no events")
     report.unmapped.append(
         UnmappedKind(
             kind="hooks",
@@ -593,8 +632,9 @@ def _carried_fields(
     dropped.
     """
     carried: dict[str, Any] = {}
-    for key in _CARRIED_INTERFACE_KEYS:
-        value = interface.get(key)
+    for key, value in interface.items():
+        if key in _CONSUMED_INTERFACE_KEYS:
+            continue
         if value or value == 0:
             carried[key] = value
     for key in _CARRIED_MANIFEST_KEYS:

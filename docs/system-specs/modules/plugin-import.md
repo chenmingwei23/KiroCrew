@@ -97,6 +97,29 @@ The emitted manifest is validated with `AppManifest.validate` before it is
 written. A conversion that would emit an invalid manifest raises
 `emitted_manifest_invalid` and writes nothing.
 
+### 3.1 A server whose program lives in the package is refused
+
+The source format resolves a server's `command`, `args` and `cwd` against the
+package root. Conversion does not preserve that root, and the program a server
+points at is not a DECLARED resource, so it is not copied either. Emitting such a
+server would register one that cannot start -- and a stdio server that fails to
+launch takes its whole tool set with it, silently, on an app that installed clean.
+
+So a server config carrying a package-relative path is refused as a unit and
+reported, naming the fields:
+
+```
+mcpServers[acme] [d] the server resolves its program against the source package
+  root, which conversion does not preserve, and that program is not a declared
+  resource so it is not copied -- package-relative: args[0], cwd
+```
+
+Detection is narrow on purpose -- `.`, `..`, an explicit `./` or `../` prefix, and
+any non-absolute `cwd` -- so a bare command name (`npx`), a flag (`-y`) and a
+package specifier (`some-mcp@latest`) are never mistaken for a path. One refused
+server does not take its siblings with it: a map with a bare-command server and a
+package-relative one emits the first and reports the second.
+
 ## 4. The two safety properties
 
 **No foreign code runs.** Conversion opens JSON files and copies bytes. Nothing
@@ -153,25 +176,31 @@ every local install does -- `kirocrew app enable <name>` is the separate step.
 
 ## 8. What it was measured against
 
-The 180 packages published in the public plugin directory at
-`github.com/openai/plugins`, converted in one pass:
+The plugin directory published at `github.com/openai/plugins`, tree `d416fd5`,
+converted in one pass:
 
 | | |
 |---|---|
-| packages | 180 |
-| converted | 180 |
+| packages | 62 |
+| converted | 62 |
 | refused | 0 |
 | emitted an invalid manifest | 0 |
-| skills copied | 577 |
-| MCP servers mapped | 8 |
-| connector declarations reported unmapped | 154 |
-| presentation and link fields carried | 180 |
+| skills copied | 501 |
+| MCP servers mapped | 4 |
+| MCP servers refused as package-relative | 4 |
+| connector declarations reported unmapped | 36 |
+| presentation and link blocks carried | 62 |
+| hook declarations reported | 1 |
 | warnings | 0 |
 
-Zero warnings across 180 real manifests is the number that matters: every field
+Zero warnings across 62 real manifests is the number that matters: every field
 every published package declares is either mapped to an extension point or
 reported as unmapped with a reason. Nothing in that corpus was dropped silently.
 
-None of the 180 declares `hooks`, so the hook gap the mapping doc names is not
-exercised by this corpus; it is exercised by the tests, which cover both the
-same-meaning events and the ones with no counterpart.
+Exactly half the MCP servers in the corpus are package-relative and therefore
+refused, which is why §3.1 exists: the shape is not an edge case.
+
+Three of those packages were then converted, installed and enabled in an isolated
+pod, chosen to cover the three outcomes: one whose bare-command server registered
+into the agent config as `<app>:<server>` alongside 9 skills, one whose 14 skills
+mapped while its package-relative server was refused, and one that declares hooks.

@@ -85,7 +85,7 @@ under the package root. In-process extensions are Rust contributor traits collec
 | Their kind | Bucket | Target and mechanism |
 |---|---|---|
 | `skills` (path or list; a dir per skill holding `SKILL.md`) | (a)+(c) | `skills`. Pure converter. |
-| `mcpServers` (path to an MCP config file, or inline object) | (a)+(c) | `mcpServers`. Pure converter. |
+| `mcpServers` (path to an MCP config file, or inline object) | (a)+(c) | `mcpServers`. Pure converter -- for a server whose command is a bare name or an absolute path. A server whose `command`, `args` or `cwd` is package-relative is REFUSED: conversion does not preserve the package root, and the program is not a declared resource so it is not copied. Half the servers in the published corpus are that shape. |
 | `interface.displayName`, `.shortDescription`, `.developerName` | (c) | `displayName`, `description`, `author`. Pure converter. |
 | `interface` icons, `logo`, `screenshots`, `defaultPrompt`, `brandColor` | (c) partial | No installed-app manifest field. Carried in `extra` as provenance; nothing renders them. |
 | `keywords` | (c) | `tags`. Pure converter. |
@@ -217,15 +217,31 @@ process to supervise. The hermes adapter is the cheapest runtime adapter of the 
 (same language, four-method `ctx`), and it is the right second proof; it is not this
 one, because its value depends on Diff D2, which is not decided yet.
 
-It was measured against the 180 packages published in the public plugin directory at
-`github.com/openai/plugins`: all 180 converted, none was refused, none emitted an
-invalid app manifest, 577 skills and 8 MCP servers reached an extension point, 154
-connector declarations and 180 presentation blocks were reported unmapped, and there
-were zero warnings -- meaning no field any published manifest declares was dropped
-without being named. What that corpus does NOT exercise is the hook gap: not one of
-the 180 declares `hooks`, which is its own evidence about where these packages
-currently carry their value, and the reason D1 and D2 are proposals rather than
-blockers for this converter.
+It was measured against the plugin directory published at `github.com/openai/plugins`
+(tree `d416fd5`): all 62 packages converted, none was refused, none emitted an invalid
+app manifest, 501 skills and 4 MCP servers reached an extension point, 4 further MCP
+servers were refused as package-relative, 36 connector declarations and 62 presentation
+blocks were reported unmapped, and there were zero warnings -- meaning no field any
+published manifest declares was dropped without being named.
+
+Three of those packages were then converted, installed and enabled in an isolated pod,
+picked to cover the three outcomes end to end: one whose bare-command server registered
+into the agent config as `<app>:<server>` (the [app-kit-platform.md](app-kit-platform.md)
+§1 path) beside 9 skills; one whose 14 skills mapped while its package-relative server
+was refused; and the one package in the corpus that declares `hooks`, reported as
+declared-with-no-events.
+
+Two platform findings came out of that run, neither a converter question:
+
+- An app MCP server with an `http` url is not registered at all when the app has no
+  live backend port (`_register_mcp_servers` skips and scrubs it, `_live_port_for`
+  returns `None`). The fail-safe exists for a url pointing at the app's OWN backend,
+  whose illustrative port would otherwise be a dead address that breaks every session
+  -- but it also drops an EXTERNAL endpoint that has no relationship to any backend
+  port. A converted package whose server is a hosted `https` endpoint therefore
+  installs clean with its tools missing, and the only trace is one INFO line.
+- The dashboard app card reads `mcpServers` from the MANIFEST, so it shows a server
+  the agent config does not carry. The two surfaces disagree by construction.
 
 ## 6. Proposed diffs to the contract
 
@@ -280,6 +296,14 @@ installed from a local directory is recorded with origin `registry`, because
 dashboard renders that as "Origin: registry" for a directory that came off disk, so any
 grading built on `origin` today would grade a local import as a registry install. That
 is a pre-existing defect, not a protocol question, and it belongs in its own change.
+
+It also collides with an existing rule, so it is the weakest of the seven as written:
+[app-kit-platform.md](app-kit-platform.md) §0 states that behaviour hangs off
+`resources` and `lifecycle`, **never** off `origin`, which is why `origin` drives
+display and re-install lookups rather than branching. Either the diff carries a fourth
+axis for contribution authority, or it grades on something §0 already sanctions. The
+underlying need stands -- a directory off disk and a signed registry app should not
+publish into a unit on identical terms -- but "grade on origin" is not the shape.
 
 Convergent, no diff needed: section 5's `seq` plus `409 stale_seq` is the same rule as
 grok-build's monotonic queue `version`, and section 5's "the gateway never executes

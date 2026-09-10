@@ -268,6 +268,74 @@ class TestMcpServers:
         assert "mcpServers" not in manifest
         assert any("missing" in w for w in report.warnings)
 
+    def test_a_server_whose_program_lives_in_the_package_is_refused(self, tmp_path):
+        """The real shape: command node, args ./mcp/server.mjs, cwd "." """
+        root = _package(tmp_path, mcpServers="./.mcp.json")
+        _write_json(
+            root / ".mcp.json",
+            {
+                "mcpServers": {
+                    "local-server": {
+                        "command": "node",
+                        "args": ["./mcp/server.mjs", "--stdio"],
+                        "cwd": ".",
+                    }
+                }
+            },
+        )
+
+        report = convert_plugin_package(root, tmp_path / "out")
+
+        manifest = json.loads((tmp_path / "out" / "app.json").read_text(encoding="utf-8"))
+        assert "mcpServers" not in manifest
+        refused = [u for u in report.unmapped if u.kind == "mcpServers[local-server]"]
+        assert len(refused) == 1
+        assert refused[0].bucket == "d"
+        assert refused[0].detail == "package-relative: args[0], cwd"
+
+    def test_a_bare_command_server_is_kept_verbatim(self, tmp_path):
+        """A bare command with flags and a package specifier is not a path."""
+        server = {
+            "command": "npx",
+            "args": ["-y", "some-mcp@latest", "mcp"],
+            "env": {"SOME_FLAG": "a,b"},
+        }
+        root = _package(tmp_path, mcpServers="./.mcp.json")
+        _write_json(root / ".mcp.json", {"mcpServers": {"bare": server}})
+
+        report = convert_plugin_package(root, tmp_path / "out")
+
+        manifest = json.loads((tmp_path / "out" / "app.json").read_text(encoding="utf-8"))
+        assert manifest["mcpServers"] == {"bare": server}
+        assert not [u for u in report.unmapped if u.kind.startswith("mcpServers")]
+
+    def test_one_refused_server_does_not_take_the_others_with_it(self, tmp_path):
+        root = _package(tmp_path, mcpServers="./.mcp.json")
+        _write_json(
+            root / ".mcp.json",
+            {
+                "mcpServers": {
+                    "keep": {"command": "npx", "args": ["-y", "x"]},
+                    "drop": {"command": "./bin/serve"},
+                }
+            },
+        )
+
+        report = convert_plugin_package(root, tmp_path / "out")
+
+        manifest = json.loads((tmp_path / "out" / "app.json").read_text(encoding="utf-8"))
+        assert list(manifest["mcpServers"]) == ["keep"]
+        assert [u.detail for u in report.unmapped if u.kind == "mcpServers[drop]"] == [
+            "package-relative: command"
+        ]
+
+    def test_an_absolute_cwd_is_not_package_relative(self, tmp_path):
+        root = _package(tmp_path, mcpServers={"abs": {"command": "serve", "cwd": "/opt/app"}})
+        report = convert_plugin_package(root, tmp_path / "out")
+        manifest = json.loads((tmp_path / "out" / "app.json").read_text(encoding="utf-8"))
+        assert list(manifest["mcpServers"]) == ["abs"]
+        assert not [u for u in report.unmapped if u.kind.startswith("mcpServers")]
+
 
 # ---------------------------------------------------------------------------
 # Kinds with no target
@@ -314,6 +382,16 @@ class TestUnmappedKinds:
         convert_plugin_package(root, tmp_path / "out")
 
         assert not sentinel.exists()
+
+    def test_an_empty_hooks_declaration_reads_as_declared_with_no_events(self, tmp_path):
+        """A package may reserve the kind and declare nothing. Not a malformed document."""
+        root = _package(tmp_path, hooks={})
+        report = convert_plugin_package(root, tmp_path / "out")
+
+        hooks = [u for u in report.unmapped if u.kind == "hooks"]
+        assert len(hooks) == 1
+        assert hooks[0].detail == "declared with no events"
+        assert not [w for w in report.warnings if "hooks" in w]
 
     def test_connector_directories_are_reported(self, tmp_path):
         root = _package(tmp_path, apps="./apps")
