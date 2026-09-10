@@ -22,6 +22,7 @@ agent loads only the one it needs.
 | [session.md](session.md) | Sessions, slots, session keys, the warm pool, and PID tracking. |
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
+| [contribution-protocol.md](contribution-protocol.md) | Draft contract for out-of-process contributors: read a unit's log, append namespaced events, publish projected views; adapters for foreign plugin runtimes build on it. |
 | [member-event-log.md](member-event-log.md) | Per-member append-only event log, its four projections, the whole-value push frames, and load-time closers behind the Members page. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
 | [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
