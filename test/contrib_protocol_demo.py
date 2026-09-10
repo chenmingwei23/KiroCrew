@@ -14,8 +14,11 @@ What it does, in the order the protocol prescribes:
 3. subscribes over the WebSocket and folds the ``eventlog_event`` stream,
    checking ``seq == last + 1`` and re-reading on a gap -- never folding across
    one;
-4. appends ``demo/ping`` events;
-5. publishes the folded ``demo/count`` view plus its render schema.
+4. appends ``<app>/ping`` events;
+5. publishes the folded ``<app>/count`` view plus its render schema.
+
+Every type and key it writes is prefixed with the app's own name, which is the
+protocol's §2 rule: a contributor may only name its own namespace.
 
 Usage::
 
@@ -48,7 +51,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +78,18 @@ class Gateway:
         return cls(base, app, token)
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        return {"Content-Type": "application/json"}
+
+    def _url(self, path: str, query: str = "") -> str:
+        """A URL carrying the app token the way the gateway reads it.
+
+        The dashboard's auth middleware takes the token from ``?token=`` or from
+        its session cookie -- NOT from an ``Authorization`` header -- so a
+        contributor appends it to the query string. The token is app-scoped, so it
+        grants only what the app's manifest declares.
+        """
+        sep = "&" if query else ""
+        return f"{self.base}{path}?{query}{sep}token={self.token}"
 
     @staticmethod
     def _request(url: str, *, method: str, headers: dict[str, str], payload: bytes | None):
@@ -101,21 +115,23 @@ class Gateway:
             return out
 
     def get_events(self, kind: str, unit: str, after: int, limit: int = 200) -> dict:
-        url = f"{self.base}/api/eventlog/{kind}/{unit}/events?after={after}&limit={limit}"
+        url = self._url(f"/api/eventlog/{kind}/{unit}/events", f"after={after}&limit={limit}")
         return self._request(url, method="GET", headers=self._headers(), payload=None)
 
     def append(self, kind: str, unit: str, type_: str, data: dict) -> dict:
-        url = f"{self.base}/api/eventlog/{kind}/{unit}/events"
+        url = self._url(f"/api/eventlog/{kind}/{unit}/events")
         payload = json.dumps({"type": type_, "data": data}).encode()
         return self._request(url, method="POST", headers=self._headers(), payload=payload)
 
     def publish(self, kind: str, unit: str, key: str, value, seq: int, state_version: int) -> dict:
-        url = f"{self.base}/api/eventlog/{kind}/{unit}/projections/{key}"
+        url = self._url(f"/api/eventlog/{kind}/{unit}/projections/{quote(key, safe='')}")
         payload = json.dumps({"value": value, "seq": seq, "stateVersion": state_version}).encode()
         return self._request(url, method="POST", headers=self._headers(), payload=payload)
 
     def put_schema(self, kind: str, unit: str, key: str, schema: dict) -> dict:
-        url = f"{self.base}/api/eventlog/{kind}/{unit}/projections/{key}/schema"
+        url = self._url(
+            f"/api/eventlog/{kind}/{unit}/projections/{quote(key, safe='')}/schema"
+        )
         return self._request(
             url, method="POST", headers=self._headers(), payload=json.dumps(schema).encode()
         )
@@ -139,13 +155,14 @@ class WebSocket:
             raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(secrets.token_bytes(16)).decode()
         handshake = (
-            f"GET /api/ws HTTP/1.1\r\n"
+            # The token rides the query string: the auth middleware reads
+            # ``?token=`` or its own cookie, and a contributor has no cookie.
+            f"GET /api/ws?token={token} HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
             f"Sec-WebSocket-Version: 13\r\n"
-            f"Authorization: Bearer {token}\r\n"
             # The gateway refuses a cross-origin upgrade, so present its own.
             f"Origin: {url.scheme}://{host}:{port}\r\n"
             f"\r\n"
@@ -234,9 +251,9 @@ class WebSocket:
 STATE_VERSION = 1
 
 
-def fold(state: dict, event: dict) -> dict:
-    """Count ``demo/ping`` events. The gateway never runs this."""
-    if event.get("type") == "demo/ping":
+def fold(state: dict, event: dict, ping_type: str) -> dict:
+    """Count this app's ping events. The gateway never runs this."""
+    if event.get("type") == ping_type:
         state = dict(state)
         state["pings"] = state.get("pings", 0) + 1
         state["last"] = event.get("data", {}).get("note", "")
@@ -259,7 +276,7 @@ def main() -> int:
         default="",
         help="path to the app's .app_secret (default ~/.kiro/crew/apps/<app>/.app_secret)",
     )
-    ap.add_argument("--pings", type=int, default=3, help="how many demo/ping events to append")
+    ap.add_argument("--pings", type=int, default=3, help="how many <app>/ping events to append")
     ap.add_argument("--state", default="", help="where to persist the folded seq between runs")
     ap.add_argument("--no-subscribe", action="store_true", help="skip the WebSocket half")
     args = ap.parse_args()
@@ -278,6 +295,8 @@ def main() -> int:
         secret = path.read_text(encoding="utf-8").strip()
 
     gw = Gateway.connect(args.base, args.app, secret)
+    ping_type = f"{args.app}/ping"
+    count_key = f"{args.app}/count"
     print(f"[1/6] token exchanged for app {args.app!r}")
 
     # Resume from the seq this contributor last folded, if it has one.
@@ -307,7 +326,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 3
-            state = fold(state, event)
+            state = fold(state, event, ping_type)
             folded_seq = event["seq"]
             caught_up += 1
         if len(events) < 200:
@@ -339,13 +358,13 @@ def main() -> int:
 
     # ---- append (§4) ------------------------------------------------------
     for i in range(args.pings):
-        res = gw.append(args.kind, args.slug, "demo/ping", {"note": f"ping {i + 1}"})
+        res = gw.append(args.kind, args.slug, ping_type, {"note": f"ping {i + 1}"})
         if res.get("_status") != 201:
             print(f"FAIL: append: {res}", file=sys.stderr)
             if ws:
                 ws.close()
             return 5
-    print(f"[4/6] appended {args.pings} demo/ping event(s)")
+    print(f"[4/6] appended {args.pings} {ping_type} event(s)")
 
     # ---- fold the stream, checking contiguity (§3) -------------------------
     if ws is not None:
@@ -364,11 +383,11 @@ def main() -> int:
                 print(f"      gap at seq {event['seq']} (folded {folded_seq}); re-reading")
                 page = gw.get_events(args.kind, args.slug, folded_seq)
                 for e in page.get("events", []):
-                    state = fold(state, e)
+                    state = fold(state, e, ping_type)
                     folded_seq = e["seq"]
                 streamed = args.pings
                 break
-            state = fold(state, event)
+            state = fold(state, event, ping_type)
             folded_seq = event["seq"]
             streamed += 1
         ws.send_json({"type": "eventlog_unsubscribe", "data": {"kind": args.kind, "id": args.slug}})
@@ -377,7 +396,7 @@ def main() -> int:
     else:
         page = gw.get_events(args.kind, args.slug, folded_seq)
         for e in page.get("events", []):
-            state = fold(state, e)
+            state = fold(state, e, ping_type)
             folded_seq = e["seq"]
         print(f"[5/6] folded by catch-up; at seq {folded_seq}")
 
@@ -385,19 +404,19 @@ def main() -> int:
     schema = gw.put_schema(
         args.kind,
         args.slug,
-        f"{args.app}/count",
+        count_key,
         {"kind": "keyvalue", "title": "Demo contributor", "path": ["pings", "last"]},
     )
     if schema.get("_status") != 204:
         print(f"FAIL: schema publish: {schema}", file=sys.stderr)
         return 7
     published = gw.publish(
-        args.kind, args.slug, f"{args.app}/count", view(state), folded_seq, STATE_VERSION
+        args.kind, args.slug, count_key, view(state), folded_seq, STATE_VERSION
     )
     if published.get("_status") != 204:
         print(f"FAIL: publish: {published}", file=sys.stderr)
         return 7
-    print(f"[6/6] published {args.app}/count = {view(state)} at seq {folded_seq}")
+    print(f"[6/6] published {count_key} = {view(state)} at seq {folded_seq}")
 
     if state_path:
         state_path.parent.mkdir(parents=True, exist_ok=True)
