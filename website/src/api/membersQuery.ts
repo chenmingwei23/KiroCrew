@@ -40,7 +40,17 @@ export const membersRosterQuery = {
   select: (rows: MemberRosterRow[]): MemberRosterRow[] => {
     for (const row of rows) {
       if (row.projections) {
-        memberProjectionStore.seed(row.slug, row.projections.values, row.projections.asOfSeq)
+        // `seqs` / `schemas` are present only for CONTRIBUTED rows: such a row's
+        // seq is the contributor's own fold position rather than this response's
+        // asOfSeq, and seeding it at asOfSeq would make higher-seq-wins drop the
+        // contributor's next live push.
+        memberProjectionStore.seed(
+          row.slug,
+          row.projections.values,
+          row.projections.asOfSeq,
+          row.projections.seqs,
+          row.projections.schemas,
+        )
       }
     }
     return rows

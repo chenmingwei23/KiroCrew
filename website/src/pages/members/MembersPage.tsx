@@ -82,8 +82,9 @@ import { compareText } from '../../i18n/format'
 import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
 import { lastActivityEpoch } from '../chat/sessionOrder'
 import { activityDayLabel, floorCountText, groupActivityDays, projectLabel } from './activityDays'
+import { ContributedViews } from './ContributedViewCard'
 import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
-import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
+import { useMemberProjection, useMemberContributedViews, useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView, ActivityView, WakeView } from '../../state/memberProjectionTypes'
 
 /** The crew manager surface — the ONLY write path for member configuration.
@@ -1143,6 +1144,10 @@ export default function MembersPage() {
   // the loading/error three-state the drawer keeps. When no projection is held
   // (an older gateway), fall back to the query's own entries.
   const activityView = useMemberProjection<ActivityView>(activeSlug, 'activity')
+  // Contributed `<app>/<key>` views for the open member. Nothing to fetch: they
+  // arrive in the same roster baseline and the same member_projection frames as
+  // the built-in keys, which is the whole point of §5 reusing that frame.
+  const contributedViews = useMemberContributedViews(activeSlug)
   const activeEntries = useMemo(
     () => (activityView?.recent as MemberActivityEntry[] | undefined) ?? activityQuery.data?.entries ?? [],
     [activityView, activityQuery.data],
@@ -2297,6 +2302,13 @@ export default function MembersPage() {
               )}
             </div>
           )}
+          {/* Contributed views: any `<app>/<key>` projection an app published on
+              this member's log (contribution protocol §7). Rendered generically
+              from the value plus an optional declarative schema -- no app code
+              runs here -- and placed after the host's own blocks so a
+              contribution adds to the drawer rather than displacing it. Absent
+              entirely when no app has published for this member. */}
+          <ContributedViews views={contributedViews} />
           <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5 flex items-center">
             <span className="flex-1">{t('pages.membersPage.wake_sources')}</span>
             {/* Read-only view; managing schedules stays on the Schedule page

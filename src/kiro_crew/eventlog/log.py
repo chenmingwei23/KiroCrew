@@ -22,10 +22,10 @@ import time
 from pathlib import Path
 
 from kiro_crew.eventlog.types import (
-    ALL_EVENT_TYPES,
     HEADER_TYPE,
     HEADER_VERSION,
     Event,
+    is_known_event_type,
 )
 
 
@@ -246,7 +246,7 @@ class MemberLog:
     # ---- append -----------------------------------------------------------
     def append(self, type: str, data: dict) -> Event:
         """Append one event, fsync, and return it. Rolls back on any error."""
-        if type not in ALL_EVENT_TYPES:
+        if not is_known_event_type(type):
             raise ValueError(f"unknown event type {type!r}")
         # Validate serialisability before touching the file.
         try:
@@ -304,6 +304,22 @@ class MemberLog:
             if limit is not None and limit >= 0:
                 return newest_first[:limit]
             return newest_first
+
+    def events_after(self, after: int, limit: int) -> list[Event]:
+        """Oldest-first page of events with ``seq > after``, at most *limit*.
+
+        The catch-up read of the contribution protocol's §3: a consumer that
+        folded up to ``after`` asks for what came next, in the order it must fold
+        it. Distinct from :meth:`history`, which pages BACKWARDS for a timeline
+        view -- folding a newest-first page would apply a later event before an
+        earlier one.
+        """
+        with self._lock:
+            self._ensure_loaded()
+            out = [e for e in self.events if e["seq"] > after]
+            if limit is not None and limit >= 0:
+                return out[:limit]
+            return out
 
     def last_seq(self) -> int:
         with self._lock:

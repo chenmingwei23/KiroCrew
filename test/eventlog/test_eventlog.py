@@ -56,8 +56,15 @@ def test_append_assigns_seq_and_fsyncs(tmp_path):
 def test_append_rejects_unknown_type_and_unserializable(tmp_path):
     log = _log(tmp_path)
     log.create("Alice")
+    # A type in a RESERVED namespace that is not in the vocabulary is a typo'd
+    # built-in, not a contribution: a contributor's type is `<app>/<name>` with a
+    # namespace the built-ins do not own (see types.is_contributed_event_type),
+    # and an app cannot be named `member`.
     with pytest.raises(ValueError):
-        log.append("bogus/type", {})
+        log.append("member/bogus", {})
+    # No namespace at all is refused on either rule.
+    with pytest.raises(ValueError):
+        log.append("bogus", {})
     with pytest.raises(ValueError):
         log.append(types.MEMBER_MESSAGE, {"x": {1, 2, 3}})  # set not JSON
     # File unchanged by the rejected writes (still just the header).
