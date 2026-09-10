@@ -20,6 +20,7 @@ import { api } from '../api/client'
 import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import type { ProjectionSchema } from '../state/memberProjectionTypes'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import { slotChangeUrls } from '../utils/pullRequestLinks'
@@ -1376,9 +1377,14 @@ export function useWebSocket() {
             // Apply only a well-formed frame: the store's higher-seq-wins drops
             // a stale or replayed seq, but a missing slug/key/seq is a malformed
             // frame that must not touch the store at all.
-            const pf = (data ?? {}) as { slug?: unknown; key?: unknown; seq?: unknown; value?: unknown }
+            const pf = (data ?? {}) as { slug?: unknown; key?: unknown; seq?: unknown; value?: unknown; schema?: unknown }
             if (typeof pf.slug === 'string' && pf.slug && typeof pf.key === 'string' && pf.key && typeof pf.seq === 'number') {
-              memberProjectionStore.apply(pf.slug, pf.key, pf.value, pf.seq)
+              // `schema` rides a CONTRIBUTED row's frame and declares how to
+              // render it (contribution protocol §7). Absent on every built-in
+              // key and on a contributor's later folds, where the store keeps
+              // the rendering the key already has.
+              const schema = pf.schema && typeof pf.schema === 'object' ? (pf.schema as ProjectionSchema) : undefined
+              memberProjectionStore.apply(pf.slug, pf.key, pf.value, pf.seq, schema)
             }
             break
           }

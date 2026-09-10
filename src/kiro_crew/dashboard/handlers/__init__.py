@@ -229,6 +229,13 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
 )
+# ── Contribution protocol event log (handlers/eventlog.py) ──
+from kiro_crew.dashboard.handlers.eventlog import (  # noqa: E402, F401
+    api_eventlog_events_get,
+    api_eventlog_events_post,
+    api_eventlog_projection_put,
+    api_eventlog_projection_schema_put,
+)
 from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
     api_mcp_apps_call,
 )

@@ -8,7 +8,13 @@
 import { useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { memberProjectionStore, type ProjectionFace } from './memberProjectionStore'
-import type { ActivityView, DrivingView, RosterView, WakeView } from './memberProjectionTypes'
+import type {
+  ActivityView,
+  ContributedView,
+  DrivingView,
+  RosterView,
+  WakeView,
+} from './memberProjectionTypes'
 
 /** A face that is always empty and holds no listeners, for a null slug. */
 const EMPTY_FACE: ProjectionFace = {
@@ -50,6 +56,34 @@ export function useMemberProjections(slug: string | null | undefined): MemberPro
     wake: useMemberProjection<WakeView>(slug, 'wake'),
     driving: useMemberProjection<DrivingView>(slug, 'driving'),
   }
+}
+
+/** Nothing held, for a null slug — a module constant so the memo below is stable. */
+const NO_CONTRIBUTED: ContributedView[] = []
+
+/**
+ * Every contributed `<app>/<key>` view held for a member, sorted by key.
+ *
+ * Subscribes to the slug's KEY SET rather than to each key, so a card appearing
+ * for the first time re-renders the list. Value changes to a card already in the
+ * list arrive through the same subscription: the store bumps the keyset version
+ * only on a set change, but the list is rebuilt from the store on every bump AND
+ * on any re-render of the consumer, and each card reads its own value through
+ * `useMemberProjection` so a pushed value moves that card alone.
+ */
+export function useMemberContributedViews(
+  slug: string | null | undefined,
+): readonly ContributedView[] {
+  const face = useMemo<ProjectionFace>(
+    () => (slug ? memberProjectionStore.contributedFace(slug) : EMPTY_FACE),
+    [slug],
+  )
+  const version = useSyncExternalStore(face.subscribe, face.getSnapshot, face.getSnapshot)
+  return useMemo(
+    () => (slug ? memberProjectionStore.contributedViews(slug) : NO_CONTRIBUTED),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [slug, version],
+  )
 }
 
 /**

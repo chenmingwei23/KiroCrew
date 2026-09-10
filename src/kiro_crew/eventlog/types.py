@@ -57,6 +57,36 @@ ALL_EVENT_TYPES = frozenset({
     ACTIVITY_RECORD, SLOT_OPENED, SLOT_CLOSED, PATROL_STARTED, PATROL_STOPPED,
 })
 
+#: Namespaces the built-in vocabulary owns. A contributor's event type is
+#: ``<app>/<name>`` (contribution protocol §2), and an app cannot be named for
+#: one of these, so a type in a reserved namespace that is not in
+#: :data:`ALL_EVENT_TYPES` is a typo'd built-in rather than a contribution --
+#: and a typo must be refused, not written as a foreign event nothing folds.
+RESERVED_EVENT_NAMESPACES = frozenset({"member", "activity", "slot", "patrol"})
+
+
+def is_contributed_event_type(type_: str) -> bool:
+    """Whether *type_* is a well-formed contributor event type.
+
+    Syntax only: ``<namespace>/<name>`` with a namespace the built-in vocabulary
+    does not own. WHETHER a given app may append it is authority, decided at the
+    HTTP boundary against that app's declared ``contributions.events`` -- the log
+    is not the place to answer it, and a log written by the gateway on behalf of
+    an app that has since been uninstalled must still load.
+    """
+    if not isinstance(type_, str) or type_.count("/") != 1:
+        return False
+    namespace, name = type_.split("/", 1)
+    if not namespace or not name:
+        return False
+    return namespace not in RESERVED_EVENT_NAMESPACES
+
+
+def is_known_event_type(type_: str) -> bool:
+    """Whether the log accepts *type_* at all: built-in or contributed."""
+    return type_ in ALL_EVENT_TYPES or is_contributed_event_type(type_)
+
+
 # ---- projection keys -----------------------------------------------------
 
 PROJ_ROSTER = "roster"      # MemberRosterRow minus ``running``
