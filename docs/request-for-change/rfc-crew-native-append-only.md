@@ -126,7 +126,7 @@ The ledger still belongs to the crew. The guest signs its lines.
 Now the hard question. A conductor crew runs five worker crews. The conductor needs to know what its
 workers did; the workers need to know what they were told. If the tree "shares one ledger", two
 things go wrong at once. Any crew that ever connects to another joins its ledger for good, so every
-tree eventually becomes one tree, and one global ledger is exactly the design we chose not to copy.
+tree eventually becomes one tree, which is one global ledger by another route.
 And permission collapses to per-line access control on a shared stream, which nobody gets right.
 
 The answer is to keep three things separate that the question runs together:
@@ -253,8 +253,9 @@ POST /api/eventlog/member/default/projections/stats%2Fopens
 The reference client that does exactly this is `test/contrib_protocol_demo.py`; stopping it, appending
 two events from elsewhere, and restarting it is the gap-rule test: it resumes from `?after=9`.
 
-Hosting a foreign plugin, concretely. The plugin we host is a session-statistics projection from the
-studied runtime. Its whole dependency on its home is two services it asks for by name,
+Hosting a foreign plugin, concretely. This was built and validated on a separate branch and is NOT part of
+the change this document rides in; it stays here as the worked example of what an adapter is. The plugin
+hosted was a session-statistics projection from the studied runtime. Its whole dependency on its home is two services it asks for by name,
 `invariants` and `sessionProjections`, and one npm package. The adapter is a Node process that:
 
 1. boots the runtime's own kernel from a read-only checkout, in source form (Node's module hooks
@@ -306,12 +307,13 @@ protocol, tools over MCP, skills and servers by conversion.
 Built and running: one ledger per crew, the ten rules, four built-in projections, whole-value push
 ([`member-event-log.md`](../system-specs/modules/member-event-log.md)); guests (read, namespaced
 append, published views, teardown) under
-[`contribution-protocol.md`](../system-specs/modules/contribution-protocol.md); a hosted foreign
-plugin publishing a view; and a converter that installs configuration-only plugin bundles as apps
+[`contribution-protocol.md`](../system-specs/modules/contribution-protocol.md); and a converter that
+installs configuration-only plugin bundles as apps
 ([`plugin-import.md`](../system-specs/modules/plugin-import.md), with the mapping in
 [`harness-plugin-mapping.md`](../system-specs/modules/harness-plugin-mapping.md)).
 
-Not built: attach and dispatch events, grants derived from them, the multi-source tree view,
+Built elsewhere and withdrawn from this change: the adapter hosting a foreign projection plugin
+(section 7). Not built: attach and dispatch events, grants derived from them, the multi-source tree view,
 visibility classes and tombstones, and any ledger kind other than crew. The next kind is the
 session, whose events (turns, steps, model timing) are what most plugins actually want to fold. The
 one after is the app's own ledger, for apps whose facts are about themselves rather than about a
