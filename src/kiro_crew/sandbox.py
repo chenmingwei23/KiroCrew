@@ -282,6 +282,13 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # The conductor work ledger: a worker's full file toolset must not reach any
     # conductor's records except through the routes that check its binding.
     "work-ledger",
+    # Per-crew append-only ledgers. The design treats the ledger as the authority
+    # a conductor reads instead of re-deriving, so an in-sandbox process able to
+    # write here could forge an entry attributed to the gateway or rewrite the
+    # history it is reporting into. Nothing in-sandbox reads one: the store runs
+    # in the GATEWAY process, so HIDDEN rather than READONLY. Session ledgers need
+    # no entry, their root being the already-masked ``sessions`` leaf.
+    "crews",
     "cron-history",
     # The cron in-flight markers, masked rather than sealed read-only because
     # nothing in the sandbox reads one: they are written and cleared by the run

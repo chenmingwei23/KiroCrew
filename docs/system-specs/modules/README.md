@@ -14,7 +14,7 @@ agent loads only the one it needs.
 |---|---|
 | [acp-client.md](acp-client.md) | The ACP JSON-RPC client that drives `kiro-cli`: transport, framing, timeouts, and the backend seam. |
 | [providers.md](providers.md) | The `LLMProvider` interface, the `AcpProvider` the factory selects, and how a backend id is chosen. |
-| [agent-host-contract.md](agent-host-contract.md) | What an agent backend must supply besides speaking ACP: agent layout, session store, identity, sandbox, MCP delivery, billing, permission engine, auxiliary runtimes — kiro-cli, KAS and Claude Code side by side, with the new-provider checklist. |
+| [agent-host-contract.md](agent-host-contract.md) | What an agent backend must supply besides speaking ACP: agent layout, session store, identity, sandbox, MCP delivery, billing, permission engine, auxiliary runtimes -- kiro-cli, KAS and Claude Code side by side, with the new-provider checklist. |
 | [claude-code-provider.md](claude-code-provider.md) | Claude Code as a selectable ACP harness: the live spawn path, the two binaries it needs on the machine, and the MCP gap a Claude session still carries. |
 | [harness-parity.md](harness-parity.md) | The invariants keeping the Kiro harness first-class while other harnesses are adapted, and the test pinning each. |
 | [harness-onboarding.md](harness-onboarding.md) | The sequence a new ACP harness walks to land: vocabulary, capability decisions, spawn path, handshake, install probe, selectability, and what a live harness additionally touches. |
@@ -23,6 +23,7 @@ agent loads only the one it needs.
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
+| [ledger-core.md](ledger-core.md) | Append-only per-crew and per-session ledgers: the wire format, type ownership and guest namespacing, the torn-tail rule, and how the stream relates to `kiro_crew.events`. |
 | [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
 | [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
 | [session-control.md](session-control.md) | One chat session opening, stopping, and reading another. |

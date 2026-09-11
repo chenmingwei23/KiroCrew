@@ -337,6 +337,19 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
+    # Per-crew append-only ledgers (ledger/store.py). Not credentials, but the
+    # design's whole premise is that the ledger is the AUTHORITY and the context
+    # window only a cache: a conductor reads a crew's history as fact instead of
+    # re-deriving it. An agent's auto-approved file tools reaching this subtree
+    # would let it forge an entry attributed to the gateway, or rewrite the
+    # history it is supposed to be reporting into, which is the one thing an
+    # append-only record exists to prevent. The write-side rules (type ownership,
+    # guest namespacing, seq under the lock) live in the library, so they bind
+    # only callers who go through it; this entry is what keeps a file tool from
+    # going around it. Session ledgers get the same protection from the sandbox's
+    # existing ``sessions`` deny, which their root reuses. The store opens these
+    # paths directly rather than through this gate, so nothing breaks.
+    "crews",
     # The optional Playwright extension token. It removes the browser-side approval
     # click for an attach, so a process that could read it could attach to the
     # operator's logged-in browser without them seeing a prompt. The gateway hands
