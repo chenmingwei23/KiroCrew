@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import mcp_apps_render, model_registry, session_directive
+from kiro_crew import (
+    mcp_apps_render,
+    model_registry,
+    session_directive,
+    session_ledger_emit,
+)
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpError,
@@ -7260,6 +7265,19 @@ async def _run_chat(
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
         slot._acp_client = getattr(client, "client", None)
+        # Append-only session ledger (flag-gated, fail-soft). The id is read
+        # once here and reused at every emit site below, so a turn that never
+        # got a session id emits nothing rather than guessing one. ``owner`` is
+        # "default" because a crew-bound slot never reaches this local runner.
+        _ledger_sid = session_ledger_emit.session_id_of(client)
+        session_ledger_emit.on_session_opened(
+            _ledger_sid,
+            agent=slot.agent or "",
+            slot=slot.key,
+            model=slot.model or "",
+            cwd=slot.project or "",
+            resumed=bool(resumed),
+        )
         # This consumer implements the low-fidelity child downgrade (the
         # interactive card) — opt in so the handle-level fail-close gate
         # yields those events here instead of rejecting them itself.
@@ -8023,6 +8041,18 @@ async def _run_chat(
         _turn_cost_usd = 0.0
         _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
+        session_ledger_emit.on_turn_started(
+            _ledger_sid,
+            _turn_msg_boundary,
+            "autonudge"
+            if _directive_self_wake
+            else "cron"
+            if message.startswith(CRON_NOTIFY_PREFIX)
+            else "subagent"
+            if message.startswith(SUBAGENT_COMPLETION_PREFIXES)
+            else "user",
+            depth=_prompt_depth,
+        )
 
         # Lease-dispatch race gate: this session's semaphore lease
         # was taken by get_or_create above, but the provider turn only opens on
@@ -8199,6 +8229,14 @@ async def _run_chat(
                 _turn_thought = True
             elif event.kind == EVENT_TOOL_CALL:
                 _turn_tool_calls += 1
+                session_ledger_emit.on_tool_called(
+                    _ledger_sid,
+                    _turn_msg_boundary,
+                    name=event.tool_name or "",
+                    server=event.mcp_server_name or "",
+                    kind=event.tool_kind or "",
+                    call_id=event.tool_call_id or "",
+                )
                 # Flush pre-tool text silently (no broadcast) so it persists,
                 # but keep the streaming message in place for correct tool ordering.
                 _flush_text_stream()
@@ -8522,6 +8560,19 @@ async def _run_chat(
                 # redacted form, so the comparison must use the redacted form
                 # too — see the `_tool_meta` docstring for the convention.
                 _tcid = _redact_tool_field(event.tool_call_id) if event.tool_call_id else ""
+                # Only the terminal frame: a tool result can arrive more than
+                # once for one call, and the ledger records one completion.
+                # ``tool_final`` IS the completed status; ``stop_reason`` on this
+                # event describes the turn, not the tool, so it is not used here.
+                if event.tool_final:
+                    session_ledger_emit.on_tool_completed(
+                        _ledger_sid,
+                        _turn_msg_boundary,
+                        name=event.tool_name or "",
+                        server=event.mcp_server_name or "",
+                        status="refused" if event.refusal else "completed",
+                        call_id=event.tool_call_id or "",
+                    )
                 # MCP Apps (flag-independent on this side): if gatewayd spooled a
                 # UI payload it injected an opaque marker into the result text.
                 # Load it, push an mcp_app_render event to this slot, and strip
@@ -10702,6 +10753,20 @@ async def _run_chat(
                 #      joins. Attributing the sample to the slot would file every
                 #      linked Slack or Telegram turn under ``dashboard`` — the
                 #      same blind spot in a new place.
+                session_ledger_emit.on_turn_completed(
+                    _ledger_sid,
+                    _turn_msg_boundary,
+                    input_tokens=event.usage.input_tokens,
+                    output_tokens=event.usage.output_tokens,
+                    cache_read_tokens=event.usage.cache_read_tokens,
+                    cache_write_tokens=event.usage.cache_creation_tokens,
+                    credits=_turn_credits,
+                    duration_ms=_turn_elapsed_ms,
+                    stop_reason=event.stop_reason,
+                    model=_turn_model or _record_model,
+                    provider=_provider_name,
+                    depth=_prompt_depth,
+                )
                 _emit_turn_metric(
                     event.usage.duration_ms,
                     event.stop_reason,
@@ -12451,6 +12516,14 @@ async def _run_chat(
             and not _should_suppress_requeue(slot)
             and (_fb_candidate := await _fallback_swap_for_turn(slot, client)) is not None
         ):
+            # Append-only session ledger (flag-gated, fail-soft). Emitted HERE,
+            # in the branch body, so it runs after _fallback_swap_for_turn has
+            # released slot._model_pick_lock rather than while it is held. This
+            # is the one model decision a transcript cannot answer afterwards:
+            # the user picked the primary and the turn ran somewhere else.
+            session_ledger_emit.on_model_selected(
+                _ledger_sid, _fb_candidate, "fallback"
+            )
             # ── Throttle-exhaustion model fallback (agent.fallback_model) ──
             # The same-model budget above is spent and the error is still
             # transient (throttle/capacity). _fallback_swap_for_turn already

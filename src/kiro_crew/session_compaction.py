@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew import session_ledger_emit
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import END_REASON_RECYCLED, record_session_ended
 
@@ -550,6 +551,13 @@ class CompactionCoordinator:
             )
             return False
         self.state.pending_verdict.pop(key, None)
+        # Append-only session ledger (flag-gated, fail-soft). Emitted only once
+        # the after-reading is confirmed, so a deferred verdict records nothing.
+        session_ledger_emit.on_compaction_applied(
+            session_ledger_emit.session_id_of(provider),
+            pct_before=pct_before,
+            pct_after=pct_after,
+        )
         return self._owner._judge_compact_effect(key, pct_before, pct_after)
 
     def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> bool:

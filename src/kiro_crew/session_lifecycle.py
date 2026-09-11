@@ -20,6 +20,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew import session_ledger_emit
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
     END_REASON_DISCARDED,
@@ -398,6 +399,13 @@ class SessionLifecycleService:
                 # own suspension point, so that ordering still holds; only the
                 # crumb unlink is deferred to a worker.
                 await record_session_ended(key, end_reason=END_REASON_RESET)
+                # Append-only session ledger (flag-gated, fail-soft). Reset is
+                # the teardown that ends a ledger's life, since the successor
+                # cold-starts a new ACP session id.
+                session_ledger_emit.on_session_closed(
+                    session_ledger_emit.session_id_of(session.provider),
+                    END_REASON_RESET,
+                )
         if clear_conversation and session is not None:
             # The registry lock, not an absence of suspension points, is what makes
             # this safe: the end record above awaits, but it awaits while this
