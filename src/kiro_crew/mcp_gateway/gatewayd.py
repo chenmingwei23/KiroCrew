@@ -45,6 +45,7 @@ import signal
 import sys
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterator, NoReturn, Optional
 
@@ -93,10 +94,14 @@ from kiro_crew.mcp_gateway.rewriter import (
     records_dir,
     resolve_overlay_dir,
 )
-from kiro_crew.mcp_gateway.secret_uri import resolve_secret_uris
+from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX, resolve_secret_uris
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
 from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
+from kiro_crew.member_memory_auth import (
+    issue_member_session_proof,
+    protected_member_session_for_pid,
+)
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
@@ -105,7 +110,15 @@ from kiro_crew.platform_compat import get_process_start_id as _get_process_start
 from kiro_crew.platform_compat import pid_exists as _pid_exists
 from kiro_crew.platform_compat import proc_rss_bytes as _proc_rss_bytes
 from kiro_crew.platform_compat import process_start_time as _process_start_time
-from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, warm_backend
+from kiro_crew.sandbox import (
+    _PYTHON_ENV_PREFIXES,
+    CANONICAL_TEMP_KEYS,
+    classify_declared_temp_env,
+    declared_temp_refusal_reasons,
+    format_declared_temp_refusals,
+    warm_backend,
+)
+from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
 logger = logging.getLogger(__name__)
@@ -532,7 +545,7 @@ async def run_gatewayd(
             name="mcp-gateway-idle-sweeper",
         )
 
-        # Backend temp containment (#5064): reclaim per-process temp dirs
+        # Backend temp containment: reclaim per-process temp dirs
         # whose owner is dead AND whose content is idle (see backend_tmp --
         # deletion deliberately lives ONLY here, never on a shutdown path,
         # because a launcher's exit is not proof its process tree is gone).
@@ -1477,7 +1490,7 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
     """
     base = "KIROCREW_MCP_TARGET_" + pool_key.server_name.upper().replace("-", "_")
     # Accept the legacy MC_MCP_TARGET_ prefix for overlays/daemons written by
-    # older versions that haven't been regenerated (#928).
+    # older versions that haven't been regenerated.
     legacy_base = "MC_MCP_TARGET_" + pool_key.server_name.upper().replace("-", "_")
     # Prefer the args-disambiguated entry (written by
     # rewriter._collect_target_env) so two agents that share a server name but
@@ -1506,9 +1519,9 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
     # site can't drift from the kiro-cli/agent spawn path's scrub again.
     for key in _PYTHON_ENV_PREFIXES:
         env.pop(key, None)
-    # No KIROCREW_CHANNEL_ID is exported into the backend env. It used to be
-    # copied from PoolKey.channel_id, which only made sense while a backend was
-    # owned by one channel. A pooled backend serves several channels, so a
+    # No KIROCREW_CHANNEL_ID is exported into the backend env. Copying it from
+    # PoolKey.channel_id would only make sense while a backend was owned by one
+    # channel. A pooled backend serves several channels, so a
     # single channel baked into its environment at spawn would be actively
     # wrong — it would tell the server it belongs to whichever channel happened
     # to spawn it first. The channel is delivered PER CALL instead, in
@@ -1716,7 +1729,7 @@ class _StubConn:
         self.caller = caller
         self.pid_start_ids = pid_start_ids if pid_start_ids is not None else {}
         # Namespace separator for a connection whose session the gateway cannot
-        # name, forwarded to the backend on every request (#5322). GATEWAY-minted
+        # name, forwarded to the backend on every request. GATEWAY-minted
         # and never derived from the Register frame: ``stub_uuid`` arrives from
         # the stub, so a nonce derived from it would let one stub choose to share
         # an unnamed peer's per-tenant namespace. Independent of ``caller``,
@@ -2477,8 +2490,8 @@ async def _handle_connection(
         # filesystem gate below, which is a real check rather than a shrug: a
         # 0600 socket already prevents any other uid from connecting.
         #
-        # macOS used to take this branch. It was promoted into
-        # PEER_IDENTITY_SUPPORTED once the macOS CI job proved LOCAL_PEERCRED
+        # macOS does NOT take this branch: it is inside
+        # PEER_IDENTITY_SUPPORTED because the macOS CI job proves LOCAL_PEERCRED
         # returns MATCH on real hardware over an accepted socket, with that
         # canary enforced by node id so it cannot silently stop running.
         peer_result = socketsec.check_peer_is_self(writer)
@@ -2716,9 +2729,12 @@ async def _handle_connection(
     # index host pids) without the kernel positively attesting the peer uid.
     resolved_session_key = ""
     peer_host_pids: list[int] = []
+    # Capture independently of the claimed session. A nonempty register key is
+    # not evidence of member authority, and its ancestor_pids are untrusted.
+    peer_pid = socketsec.get_peer_pid(writer)
+    peer_uid_ok = socketsec.check_peer_is_self(writer)
+    member_peer_pid = peer_pid if peer_uid_ok is socketsec.PeerCredResult.MATCH else None
     if caller is None or not caller.session_key:
-        peer_pid = socketsec.get_peer_pid(writer)
-        peer_uid_ok = socketsec.check_peer_is_self(writer)
         if peer_pid is None or peer_uid_ok is not socketsec.PeerCredResult.MATCH:
             _audit_peer_identity_denied(
                 reason=(
@@ -3218,9 +3234,19 @@ async def _handle_connection(
                 captured_init = dict(msg)
 
             try:
-                await backend.forward_from_stub(
-                    stub_uuid, msg, caller=caller, tenant_nonce=conn.tenant_nonce
+                call_caller = await _caller_with_member_proof(
+                    caller, member_peer_pid, msg.get("method")
                 )
+                await backend.forward_from_stub(
+                    stub_uuid, msg, caller=call_caller, tenant_nonce=conn.tenant_nonce
+                )
+            except _MemberCallerRefused as exc:
+                # An incorrect/missing claimed session must not turn a member
+                # invocation into an unowned V1 tool call. Keep the connection
+                # available for a subsequent trusted claim repair, but execute
+                # none of this invocation in the shared backend.
+                await _write_json_line(writer, _jsonrpc_error(msg, str(exc)))
+                continue
             except BackendGone as exc:
                 # Transparent respawn: a shared backend dying must NOT brick
                 # this stub's transport (which would make kiro-cli mark the
@@ -3390,11 +3416,76 @@ async def _acquire_backend(
         # the flag check reads config and the sidecar read touches the
         # filesystem, either of which would stall gateway traffic and heartbeat
         # processing if done inline after a config invalidation.
-        declared = await asyncio.to_thread(
-            _declared_env_for_private_backend if exclusive_stub_uuid else _declared_env_to_forward,
-            pool_key,
+        declared = dict(
+            await asyncio.to_thread(
+                (
+                    _declared_env_for_private_backend
+                    if exclusive_stub_uuid
+                    else _declared_env_to_forward
+                ),
+                pool_key,
+            )
         )
+        accepted_temp_keys: tuple[str, ...] = ()
         if declared:
+            # A ``secret://`` temp has no path until resolution. Classifying
+            # the raw reference can both misjudge URI text as a local path and
+            # echo a hostile secret name into this warning. Keep its canonical
+            # key provisionally declared; ``spawn_backend`` classifies the
+            # resolved value and masks it through ``secret_env_keys``.
+            secret_temp_keys = {
+                key.upper()
+                for key, value in declared.items()
+                if key.upper() in CANONICAL_TEMP_KEYS and value.startswith(SECRET_URI_PREFIX)
+            }
+            checkable_declared = {
+                key: value
+                for key, value in declared.items()
+                if not (key.upper() in CANONICAL_TEMP_KEYS and value.startswith(SECRET_URI_PREFIX))
+            }
+            accepted_checked, refused, failure = await asyncio.to_thread(
+                classify_declared_temp_env,
+                checkable_declared,
+            )
+            accepted_set = set(accepted_checked) | secret_temp_keys
+            accepted_temp_keys = tuple(key for key in CANONICAL_TEMP_KEYS if key in accepted_set)
+            if refused:
+                accepted_temp_keys = ()
+                logger.warning(
+                    "MCP gateway backend [%s]: ignoring spec-declared %s — %s; "
+                    "spawning with the managed temp instead",
+                    pool_key.server_name,
+                    format_declared_temp_refusals(refused, redactor=redact),
+                    "; ".join(
+                        declared_temp_refusal_reasons(
+                            refused,
+                            failure,
+                            redactor=redact,
+                        )
+                    ),
+                )
+                declared = {
+                    key: value
+                    for key, value in declared.items()
+                    if key.upper() not in CANONICAL_TEMP_KEYS
+                }
+                spawn_env = {
+                    key: value
+                    for key, value in spawn_env.items()
+                    if key.upper() not in CANONICAL_TEMP_KEYS
+                }
+            elif accepted_temp_keys:
+                declared_temp_values = {
+                    key.upper(): value
+                    for key, value in declared.items()
+                    if key.upper() in accepted_temp_keys
+                }
+                declared = {
+                    key: value
+                    for key, value in declared.items()
+                    if key.upper() not in CANONICAL_TEMP_KEYS
+                }
+                declared.update(declared_temp_values)
             # Declared env wins over the daemon's inherited value: the
             # operator wrote it in the agent spec for this server. Safe to
             # let it win because every key here is in the PoolKey, so no
@@ -3422,17 +3513,11 @@ async def _acquire_backend(
             args=list(args),
             env=spawn_env,
             work_dir=work_dir,
-            # Containment yields ONLY to a spec-declared temp. ``spawn_env``
-            # also carries the daemon's ambient TMPDIR/TMP/TEMP (macOS and
-            # Windows always export one), so spawn_backend cannot infer
-            # declaration from env membership -- this closure is the one
-            # place that still knows the declared set. Key NAMES are passed
-            # (matched case-insensitively inside; Windows env keys are
-            # case-insensitive) so spawn_backend can also prune the ambient
-            # keys the operator did NOT declare.
-            declared_temp_keys=tuple(
-                key for key in declared if key.upper() in ("TMPDIR", "TMP", "TEMP")
-            ),
+            # Containment yields only to temp keys cleared by the shared rule.
+            # ``spawn_backend`` checks them again after secret resolution, so a
+            # path hidden behind ``secret://`` cannot bypass the runtime check.
+            declared_temp_keys=accepted_temp_keys,
+            secret_env_keys=tuple(_secret_keys),
         )
         # Security note: resolved secrets exist ONLY in the local spawn_env
         # dict passed to the child via Popen(env=...).  They are NEVER written
@@ -3871,6 +3956,51 @@ async def _drain_inbox_to_stub(
         raise
 
 
+class _MemberCallerRefused(RuntimeError):
+    """Protected peer identity cannot safely authorize this tool invocation."""
+
+
+async def _caller_with_member_proof(
+    caller: Optional[CallerContext], peer_pid: Optional[int], method: Any
+) -> Optional[CallerContext]:
+    """Delegate private-memory authority for this call, never for a connection.
+
+    Resolve the protected peer even when the client supplies no caller. Omitting
+    a key or claiming a global session must not downgrade a protected member to
+    V1 in a shared backend whose own process cannot identify the original peer.
+    No proof is kept on the connection or replayed during backend recovery.
+    """
+    proof = ""
+    if method in ("tools/call", "tools/list") and peer_pid is not None:
+        try:
+            protected = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), protected_member_session_for_pid, peer_pid
+            )
+        except Exception:
+            raise _MemberCallerRefused(
+                "Cannot verify the protected runtime identity. Reopen the member conversation and retry."
+            ) from None
+        if protected is not None and (
+            not protected or caller is None or caller.session_key != protected
+        ):
+            raise _MemberCallerRefused(
+                "The caller does not match its protected runtime identity. Reopen the member conversation and retry."
+            )
+        if caller is not None and caller.session_key:
+            try:
+                proof = await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(), issue_member_session_proof, caller.session_key, peer_pid
+                )
+            except Exception:
+                # Neither diagnostics nor tool results may expose token material.
+                logger.warning("member memory caller verification unavailable")
+            if protected is not None and not proof:
+                raise _MemberCallerRefused(
+                    "The protected runtime proof is unavailable. Reopen the member conversation and retry."
+                )
+    return replace(caller, member_memory_proof=proof) if caller is not None else None
+
+
 def _caller_from_register(register: dict[str, Any]) -> Optional[CallerContext]:
     """Build a :class:`CallerContext` from the stub's Register payload.
 
@@ -4042,9 +4172,9 @@ def _read_rss_kb() -> int:
 
     Delegates to :func:`platform_compat.proc_rss_bytes` — the one per-platform
     current-RSS reader — so this diagnostic cannot drift from the figure the
-    dashboard reports. The per-platform duplicate that used to live here read
+    dashboard reports. A separate per-platform reader here would reach for
     ``ru_maxrss`` on macOS, which is a high-water mark that never decreases, so
-    a spike the gateway had already released stayed in every later snapshot.
+    a spike the gateway had already released would stay in every later snapshot.
     """
     rss_bytes = _proc_rss_bytes()
     return rss_bytes // 1024 if rss_bytes > 0 else -1

@@ -66,6 +66,14 @@ def test_load_from_file(self, tmp_path, monkeypatch):
 ```
 
 ### Filesystem tests
+
+Member execution fixtures must provision their own V2 memory before resolving
+bindings. Use `provision_member_memory` inside the isolated test home; do not
+bypass ownership checks to exercise an unrelated model or scheduling assertion.
+Mocked conversation logs must return a concrete metadata dictionary and its
+readability status. Inject member persistence failures at `persist_member_config`
+or its config writer, so rollback tests reach the current publication path.
+
 Use `tmp_path` fixture:
 ```python
 def test_custom_work_dir(self, tmp_path):
@@ -109,6 +117,18 @@ monkeypatch.setattr("kiro_crew.dashboard.handlers._SHUTDOWN_TIMEOUT_SECS", 0.05)
 monkeypatch.setattr("kiro_crew.dashboard.handlers.sessions._SHUTDOWN_TIMEOUT_SECS", 0.05)
 ```
 
+Unit tests that exercise a caller's handling of a subprocess result stub its imported
+launch helper. For example, `cloud.aws.run_aws` tests stub `cloud.aws.popen_limited`;
+patching stdlib `Popen` underneath it still runs executable resolution and can fail
+before reaching the stub on a host without the AWS CLI. Keep the caller's action
+guards and result/interrupt assertions real; launcher enforcement belongs in the
+launcher's own tests.
+
+Config binding tests unrelated to memory provision real private stores for named
+members through `provision_member_memory`. Only the reserved `default` assistant
+can use V1. Workspace fallback and alias resolution assertions must not depend on
+an invalid member-to-global binding or disable private-file validation.
+
 ### Loop-wiring tests stub every dispatched operation
 
 A test that drives a periodic/maintenance loop (e.g. `SessionManager.
@@ -118,6 +138,52 @@ against the dev machine (process-table scans, `~/.kiro/crew` PID files), which
 violates the isolation rules below and costs seconds per test (an unstubbed
 `find_orphan_mcp_candidates` alone added ~9s to every `TestCleanupLoop`
 test). The sweep's own behavior belongs in its own module's tests.
+
+### Golden payload tests: the mechanism that makes "unchanged" checkable
+
+Some subsystems assemble one large output from many contributors. The first-turn
+context payload is the case that has one —
+[`test/test_memory_v1_golden.py`](../../../test/test_memory_v1_golden.py) pins the v1
+default memory path. Every contributor there already has behavioural tests, and none
+of them can see the property that matters when the subsystem is refactored: that the
+**whole assembled payload** is the same. A block can be added, reordered, doubled, or
+grown past its budget with every per-property test still green, which leaves "the
+default path is unchanged" an assertion nobody can check.
+
+A golden payload test closes that by pinning, in one place, what the assembled output
+IS: the SET of blocks, their ORDER, each one's character extent and the total, the
+recall order of rows inside each block, and the files the build touches. **It is
+re-run UNEDITED after every later change to the subsystem it covers. Needing to edit
+it is the definition of a regression** — the edit is the diff a reviewer reads, and
+its size is the change's real blast radius.
+
+Rules that decide whether one is worth having:
+
+- **The golden values live in the test file as explicit expected structures**, never
+  in a committed snapshot artifact. A `.txt` golden invites a blind `--update` that
+  re-baselines the regression instead of reporting it.
+- **Derive every budget from the production constant** (`context._resolve_caps`, the
+  module `_*_CAP` values), never a restated literal — a restated cap goes stale
+  silently and the test then pins a number the code no longer reads. Pair the extents
+  with an overflow case that lands exactly on the cap, so the extents stay tied to the
+  constant rather than to the size of the seed.
+- **Split what the golden covers from what it must not.** Content that changes for
+  reasons the golden does not cover — the shipped agent prompt, the real skill catalog
+  — gets a deterministic stand-in, and its presence on the real default path is
+  asserted separately. Otherwise every prompt reword edits the golden and the edit
+  stops meaning anything.
+- **Normalize only machine-specific absolute paths**, by exact-string substitution.
+  Extents are meaningless while a tmp dir's length is inside them, and a fuzzier
+  normalization would hide a content change.
+- **Pin the clock, and pin ages rather than timestamps** wherever production scores
+  against `now`. An absolute `created_at` behind an `exp(-rate * days_old)` decay term
+  drifts the ranking every day the suite runs.
+- **Make each ranked seed discriminating.** Write the most-relevant row FIRST, so the
+  ranked order is the reverse of the insertion order; a seed whose ranked order equals
+  its write order proves nothing about ranking.
+- **Mark the module `xdist_group`** when the subsystem holds module globals
+  (`context._memory_stores` / `_lesson_stores` behind `_stores_lock`), and reset those
+  globals through `monkeypatch`, never raw assignment.
 
 ## Which conftest you are standing on
 
@@ -212,6 +278,16 @@ the held slot descriptors are module state.
 `test/conftest.py` holds the rest: suite-specific isolation (Slack thread state, the
 model-window cache, the platform context, …) and the Windows collect-ignore list.
 
+Host-side `PodConfig` paths do not derive from `KIROCREW_HOME`. Tests that publish
+pod state must set `pod_root`, `pods_dir` and `artifacts_dir` under `tmp_path` on
+their configuration object. Keep the real publisher and reader so the fixture
+proves persistence without depending on an existing directory in the host home.
+
+Provider-stub tests of member routing may stub the host capability check at
+`member_memory_auth.private_memory_execution_supported`. They must retain actual
+member provisioning, ownership and store-binding checks. Tests of native Windows
+refusal or the OS sandbox boundary must use the real capability check instead.
+
 When you add isolation, put it in the rootdir conftest **only** if a test in any
 testpath could damage the host, poison a process global for every later test, or
 consume enough of a shared *resource* — memory, cores, disk — to take the machine down
@@ -225,6 +301,19 @@ failure it was written to prevent — a swapped, unresponsive machine — does n
 which testpath asked for the workers.
 
 ## Rules
+
+- **Host-floor patches use `_floor_monkeypatch`, never the test's shared
+  `monkeypatch`.** The rootdir fixtures keep path redirects, service guards,
+  download/telemetry switches and policy/preload scrubs on a private undo stack.
+  A test can override them with `monkeypatch`, and undoing that override restores
+  the floor without removing it. The public `monkeypatch` fixture depends on
+  `_floor_monkeypatch`, so its stack unwinds before the floor at teardown;
+  reversing that order can reinstall a stale per-test path or delete a restored
+  inherited environment value. Tests
+  should use `monkeypatch.context()` for a temporary override instead of calling
+  the shared fixture's `undo()`. The undo regression tests deliberately exercise
+  that misuse with inert sentinels and path/guard identity assertions, without
+  invoking an unprotected filesystem or process operation.
 
 - Tests MUST NOT spawn real kiro-cli processes
 - Tests MUST NOT depend on `~/.kiro/crew/` existing
@@ -558,6 +647,15 @@ which testpath asked for the workers.
   on `[` matched a *different* string for grouped vs ungrouped tests and for `-n0` vs
   `loadgroup` runs. Never add the `@group` suffix to an entry — it makes the line match
   in one invocation and silently miss in another.
+
+  **macOS uses the same list mechanism, not a second one.**
+  `test/macos-expected-failures.txt` is applied by the same rootdir
+  `_apply_tracked_gap_list` matcher, with the same plain-node-id spelling and the same
+  burn-down semantics: anything not on the list still fails the macOS shards. Prefer a
+  precise `skipif(sys.platform == "darwin", reason=...)` on the test when the reason is
+  a named capability difference; use the list when the gap is a real one to be fixed
+  later, with a `# TODO` reason line above the entry. `test/macos-collect-ignore.txt`
+  exists for the blunt case only — a file that cannot be *collected* on darwin.
 - Tests SHOULD be fast (< 1s each)
 - Async tests MUST use `@pytest.mark.asyncio` — and ONLY async tests. The mark on a
   plain `def` is accepted silently by pytest-asyncio strict mode and the test then
@@ -792,10 +890,151 @@ found these further classes. Each one passed on the host that wrote it.
   and still catch a pin that escapes to the real tree. Sixteen tests were red in every
   agent-driven run before this.
 
+The third full-run audit ran five backend and five frontend runs on a **macOS** host,
+from inside a Kiro Crew agent session, with the audit hook attributing every write,
+spawn, connect and kill to a test and a per-test census of duration, RSS, threads and
+descriptors. Both changes of venue mattered: the two earlier audits ran on Linux, and a
+suite that is clean there had 227 deterministic failures and four 120-second hangs on a
+Mac, plus host writes the Linux runs could not see. Zero backend flakes in 5 × 92k
+tests; the classes below are what the rest was made of.
+
+- **`monkeypatch.undo()` in a test body unwound the floor, and the order of the two
+  stacks was luck.** The same class the second pass closed with `_floor_monkeypatch`
+  (below); this pass caught `detect()` creating the real `~/.kiro/crew` through it and
+  added the missing half. Two independent `MonkeyPatch` stacks only nest correctly when
+  the floor's is set up BEFORE the test's `monkeypatch` and torn down AFTER it, and
+  autouse ordering across three conftests does not promise that. The rootdir conftest
+  therefore re-declares the `monkeypatch` fixture with `_floor_monkeypatch` as a
+  dependency, so the order is a dependency edge, not a convention.
+  `test_host_isolation_floor.py::TestTheDataHomeIsPinnedForEveryTestpath` pins both
+  halves: `undo()` in a test body leaves every pin in force, and the fixture in force is
+  the rootdir override. Never `undo()` a shared instance to lift one patch; use
+  `pytest.MonkeyPatch.context()`.
+- **A pin that lives in `test/conftest.py` is not a floor.** `KIROCREW_PROFILE=standalone`
+  was pinned there, so the ~108 modules under `src/kiro_crew/apps/builtins/*/tests/`
+  never saw it. A Kiro Crew agent session exports the enterprise `KIROCREW_PROFILE` to every
+  child it spawns; with no companion installed that profile FAILS CLOSED, and 150+
+  builtin-app tests were red (every governance-gated route 500, every gated
+  notification dropped) while `test/` was green. The pin is a rootdir autouse fixture
+  now (`_reset_platform_context`). The rule generalises: anything an operator's shell
+  can export that changes what production resolves is pinned at the ROOTDIR, and
+  `test_host_isolation_floor.py` asserts it for every testpath.
+- **A metric emitted at import builds the recorder from the operator's config.**
+  `ToolHookResult.allow()` as a module-level DEFAULT ARGUMENT ran during collection,
+  before any pin existed; the recorder's first build read the real `config.json`
+  (`telemetry.enabled: true`) and started a `PeriodicExportingMetricReader` bound to
+  the real `~/.kiro/crew/metrics`, which exported every minute for the life of each
+  xdist worker (four worker pids' shards in the operator's metrics dir per run). The
+  per-test exporter-leak guard cannot see it (the thread predates every test) and the
+  per-test env pin cannot reach it (already built). Two fixes: `pytest_configure` pins
+  `KIROCREW_TELEMETRY=0` for the whole PROCESS, so even an emitter nobody has named
+  yet builds a no-op recorder; and `pytest_make_collect_report` records every module
+  whose collection flipped `metrics.provider._ever_built` into
+  `IMPORT_TIME_METRIC_EMITTERS`, asserted empty by
+  `TestNoMetricIsEmittedAtImport`. Build such values inside the test or fixture.
+- **A maintenance-pool job resolved its path when it RAN.** `cleanup_stale_sandbox_profiles`
+  ran on the `mc-maint` executor and called `config_dir()` there; the test that queued
+  it had torn down its pin by the time the thread was scheduled, so the sweep `mkdir`ed
+  the operator's real `~/.kiro/crew` 60+ times per run and aimed its retired-snapshot
+  `rmtree` and legacy-residue marker at the same tree. Round one's breadcrumb rule,
+  one layer up: the caller resolves the home on ITS thread and hands it in
+  (`SessionManager._cleanup_deps` → `cleanup_stale_sandbox_profiles(data_home=...)`).
+  When a job goes onto a pool, ask what it resolves lazily; the answer must be "nothing".
+  The `mc-maint` pool is the gateway's own, so `_join_test_loop_executor` (which joins
+  the TEST LOOP's default executor at teardown) cannot reach it; the caller-resolves rule
+  is the fix there. The loop's executor is covered: a cache write-through in
+  `test_source_providers.py` scheduled a detached repo-visibility refresh whose
+  `to_thread` resolved the provider CLI through `workspace_root()`; the join drains it,
+  and the module also stubs the scheduler (a recorder, so the calls stay observable),
+  because no test there is about visibility and a side task that never starts has
+  nothing to drain.
+- **Dropping the override to test the DEFAULT home resolves, and creates, the real one.**
+  Five tests `delenv("KIROCREW_HOME")` (or `patch.dict(os.environ, {}, clear=True)`, or
+  ran a module-scoped fixture BEFORE the function-scoped floor) and let `config_dir()`
+  fall through to `~/.kiro/crew` plus the recovery breadcrumb beside it. A test of the
+  default path relocates the default too: `monkeypatch.setattr(paths,
+  "_resolve_default_home", lambda: tmp_path / "d")`, a fake `HOME` + `Path.home`, or
+  keep `KIROCREW_HOME` in the cleared environment. Ratcheted:
+  `pytest_runtest_teardown` reads `paths._resolved_home` BEFORE any fixture unwinds
+  (a test that patched the global itself would otherwise restore the evidence first)
+  and fails the test AFTER the floor has torn down, when it holds the operator's real
+  home (`_refuse_a_resolved_real_default_home`). Relocating only the RESOLVER is not
+  enough: `config_dir()`'s default path also writes `~/.kirocrew.breadcrumb` beside the
+  home, through `Path.home()`, so a tmp stand-in for `_resolve_default_home` alone
+  rewrote the operator's real breadcrumb to point at a pytest directory (six writes per
+  run, repaired only because the live gateway wrote it back). The floor wraps
+  `_write_recovery_breadcrumb` (`_breadcrumb_guard`): with `Path.home()` still the real
+  home it fails the test, with a faked home it delegates. So fake the host home (`HOME`
+  and `pathlib.Path.home`) and let every default derive from it. A module-, class- or
+  session-scoped fixture (`setUpClass` included) runs OUTSIDE the function-scoped floor
+  and pins what it resolves itself.
+- **Bytecode written into the checkout, closed as a class.** Fifteen `__pycache__/`
+  trees per run (`scripts/`, `packaging/signing/`, every skill's `scripts/`), each from
+  an import-by-path that round two had closed one site at a time with a scoped
+  `sys.dont_write_bytecode`. `pytest_configure` now sets `sys.pycache_prefix` (and
+  `PYTHONPYCACHEPREFIX` for children) to `~/.cache/kirocrew/pycache`: every import's
+  bytecode lands in a mirror tree under the cache root, still persistent across runs.
+  A test that wants a module's stale bytecode gone locates it with
+  `importlib.util.cache_from_source`, not by assuming a sibling `__pycache__/`.
+- **A PTY close that deadlocks on macOS: a hang is a lost run.** `_kill_session` closed
+  the PTY's controller descriptor first, to unblock the reader's `os.read()`. True on Linux
+  (the read returns EIO), false on macOS/BSD, where `close()` WAITS for the outstanding
+  read. With an interactive bash holding the terminal end, four terminal tests hit the 120 s
+  timeout on every run, each parking a pool thread forever. The process tree is now
+  hung up (SIGHUP: the signal a vanished terminal delivers, and the one an interactive
+  shell does not ignore) and terminated BEFORE the controller end is closed; the tests run in
+  under a second. A teardown that "unblocks" something by closing a descriptor has to be
+  true on every kernel the suite runs on.
+- **Linux-shaped tests on a Mac.** Ten distinct shapes, one rule: a test that asserts a
+  platform behaviour pins the platform it means, or gates on the SAME predicate
+  production gates on, never on `os.name == "nt"` alone. The frame recorder is
+  Linux-only (`_require_acl_inspectable`), so its 75 logic tests pin the gate open
+  (`IS_LINUX=True`, an `os.listxattr` that reports no ACLs) and only the two tests OF
+  the gate flip it; the unnamed-inode (`O_TMPFILE`) prompt tests skip on the production
+  capability flag `_UNNAMED_CREATE_SUPPORTED`; `/dev/fd/N` is a symlink Linux `realpath`
+  follows and a devfs node macOS leaves alone, so a consumer path is compared by
+  `open`+`fstat` identity; `unlink()` on a directory is `EISDIR` on Linux and `EPERM` on
+  macOS, so `_discard_untracked_files` recognises both; a simulated `O_BINARY` bit is
+  derived from the live `os.O_*` constants (`1 << 20` IS `O_DIRECTORY` on macOS, and
+  every open became a directory open); a `--copies` venv cannot relocate a
+  non-framework shared-lib CPython, so that test skips on `Py_ENABLE_SHARED` without
+  `PYTHONFRAMEWORK`; the darwin-only workspace binding adds a `pass_fds` entry, so the
+  test about the snapshot descriptor pins that seam to the no-descriptor shape;
+  `sys.platform` patched to `"darwin"` on a real Mac lets `get_process_start_id`
+  answer for the pid the test hoped was absent, so the start id is pinned; a
+  `Path.mkdir` stub (record, do nothing) left the pinned data home uncreated for the
+  macOS seatbelt priming that `lstat`s it, so it is a SPY that delegates; and a
+  workflow's `sed -e '1{...}' -e '1,8{...}'` relied on GNU opening a numeric range on
+  a later line (BSD only opens it on the exact one), so the two deletes share one
+  `1,8{}` block.
+- **Real network in a platform-specific test file.** `test_handlers_system_macos_paths.py`
+  reached `8.8.8.8:80` through `_local_ip()`; the Linux siblings had stubbed it in
+  round one, this file was never run there. Stub at the seam the code reads.
+- **A probe that depends on the venv's packaging, again.** `transcribe_unsupported`
+  folds in `_pip_install_channel_available()`, False in every uv-created venv; one
+  test had not pinned it. Same rule as round two: pin every probe the function reads.
+- **Frontend: a fetch chain `act` does not await, and a latch that lags its source.**
+  `AutoNudgePopover`'s watch list is `fetch` → `json()` → `setState`, three promise hops
+  after `await act(render)`, so the positive assertion flaked (1 in 5 runs) and every
+  "not listed" assertion in the block was vacuous (absent BEFORE the fetch resolves
+  whether or not the filter works). Render, wait for the mocked fetch to have been
+  CALLED, drain the chain, then assert (`renderPopoverSettled`). And `App`'s startup
+  video gate read a `startupInterruptionSeen` latch that an effect sets AFTER the commit
+  showing the changelog, while `changelogDecided` is set one microtask later on the
+  same fetch chain: when that microtask landed between the commit and its passive
+  effects, the gate opened beside the changelog (2 in 5 runs). The gate now reads the
+  live conditions in the same commit as well as the latch, the `onboardingOwed` shape.
+
 Two ways to see all of the above on your own machine: run a touched file under
 `trace_home.py`-style tracing (an `sys.addaudithook` that prints the stack of every
 write under the real home — the recipe is in "The measurement" above), and compare
 `systemctl --user list-units --all | grep -c kirocrew-agents` before and after a run.
+On macOS the manager to compare is `launchctl list`, and the metrics dir to watch is
+`ls -la ~/.kiro/crew/metrics`, where a shard named after a pytest worker's pid is the
+import-time-emission class above. A thread that exists at the FIRST test's setup with
+an exporter bound to the real home (`_prev` in an audit plugin's
+`pytest_runtest_protocol`) was started at collection, and the plugin above names the
+module in `IMPORT_TIME_METRIC_EMITTERS`.
 
 ### Coverage that only looks like coverage
 
@@ -870,8 +1109,8 @@ run, and each named a class the floor did not yet close.
 - **A collection-time probe reads the operator's config.** `test_app_backend.py`'s
   `_sandbox_can_spawn()` runs at import, before any per-test pin, and called
   `wrap_argv()` — which loads `KiroCrewConfig` from the REAL `~/.kiro/crew/config.json`.
-  A developer box that carries `sandbox_allow_unsandboxed_exec=true` (the only way Kiro Crew
-  runs on Windows) made the probe say "can spawn", and the three tests it gates then ran
+  A developer box that carries `sandbox_allow_unsandboxed_exec=true` (redundant on Windows
+  since the platform default already permits it, but common on a backend-less Linux box) made the probe say "can spawn", and the three tests it gates then ran
   under the fixture's default config and failed closed, while CI skipped them. A
   `skipif` helper must observe what the tests will observe: run it under an empty
   `KIROCREW_HOME`. The pattern to grep for is a module-level `def _can_*()` (or
@@ -1499,6 +1738,30 @@ The same applies to `Event.wait()`, `Queue.get()`, `Condition.wait()`, and a
 matters when the property is broken); make it generous and keep it well under
 `--timeout`, so the failure is a named assertion and not a dead worker.
 
+### The gateway harness runs on all three platforms
+
+`kiro_crew.testing.harness.spawn_feature_gateway` boots a real gateway subprocess
+on an isolated throwaway `KIROCREW_HOME`. Two of its internals are platform
+contracts rather than implementation taste, and both used to be POSIX-shaped:
+
+- The `KIROCREW_READY:` wait reads the child's stdout through ONE daemon reader
+  thread feeding a `queue.Queue`. It is not a selector, because
+  `selectors.DefaultSelector()` is select()-based on Windows and accepts sockets
+  only, so registering a subprocess pipe there raises. The queue's bounded `get`
+  keeps what the selector poll bought: the `KIROCREW_HARNESS_READY_TIMEOUT`
+  deadline (default 60s) is enforced even while the child is alive and silent,
+  and a child that exits during the wait fails IMMEDIATELY with its stderr tail
+  rather than waiting out the deadline.
+- Teardown routes through `platform_compat.kill_process_tree` on Windows and
+  `terminate_pgid` on POSIX. There is no `setsid` or `killpg` on Windows, and
+  `taskkill /F` gives the child no shutdown budget there.
+
+Because the harness spawns a real process per test, a module built on it runs
+with `-n0` and an explicit `--timeout` above the widest readiness window: under
+xdist a block would take the worker with it (flake class 6 above), and on Windows
+that aborts the run. `test/e2e/test_gateway_boot_matrix.py` is the reference
+shape; `docs/ci/e2e-gate.md` documents the job that runs it.
+
 ## Keeping the suite fast
 
 The suite is ~89.5k tests. At that count a per-test cost is multiplied by 89,500, so
@@ -1639,11 +1902,15 @@ git diff --stat "$f"                     # should show only what you had before
 
 ### Shard balance
 
-`ci.yml` splits the backend suite into 4 `pytest-split` groups. Splitting is balanced by
+`ci.yml` splits the backend suite into 4 `pytest-split` groups on Linux and Windows,
+and 3 on macOS. Splitting is balanced by
 recorded runtime **only when a `.test_durations` file is committed**; without one
 pytest-split falls back to an even split by test *count*. No such file is committed here:
 `test-durations.yml` would generate one weekly but has failed on a transient `git push`
-502 both times it ran, so it has never landed.
+502 both times it ran, so it has never landed. So every OS splits by count today, and
+there is no Linux-recorded duration file that could mis-balance the Windows or macOS
+shards. If one is ever committed, note that it is recorded on Linux: check the macOS
+shard spread afterwards rather than assuming it improved.
 
 **Measure a shard by running it, not by summing durations.** Each shard runs its own
 tests at `-n 4`, so per-test times from a `--store-durations` run include worker

@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import aiohttp
@@ -20,6 +21,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from kiro_crew import __version__ as _local_version
 from kiro_crew import dep_sync, shutdown_event
 from kiro_crew.changelog import Release, base_version, build_release_list, release_of_build
+from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -1414,7 +1416,9 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
     return rc == 0
 
 
-async def _restart_gateway(state: DashboardState) -> bool:
+async def _restart_gateway(
+    state: DashboardState, *, resolver: Callable[[], str] | None = None
+) -> bool:
     """Save state, close sessions, and exec the same Python process once.
 
     Restart is a process-wide transition.  Two callers must never both drain
@@ -1435,12 +1439,13 @@ async def _restart_gateway(state: DashboardState) -> bool:
         # other install shape the resolver answers ``sys.executable``.
         # Offloaded: the resolver walks the venv's sibling directory, which is
         # synchronous filesystem I/O this loop must not wait on.
-        # Imported here, not at module scope: this module loads on the gateway
-        # boot path, and the updater subsystems are needed only when an
-        # update/restart actually runs (no-new-work-on-gateway-boot-path).
-        from kiro_crew.platform.wheel_engine import respawn_executable
+        # Applying callers import the resolver before the install can replace
+        # their import tree. A plain restart has no apply, so load it here.
+        if resolver is None:
+            from kiro_crew.platform.wheel_engine import respawn_executable
 
-        exe = await asyncio.to_thread(respawn_executable)
+            resolver = respawn_executable
+        exe = await asyncio.to_thread(resolver)
         if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
             state.push_update_progress("error", "Cannot restart: invalid Python executable path")
             return False
@@ -1496,6 +1501,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
     # run the built-in mechanism their own policy excluded. A dashboard token
     # proves who the caller is, not that this host may update by git.
     from kiro_crew.platform.update_provider import apply_policy_update
+    from kiro_crew.platform.wheel_engine import respawn_executable
 
     applied = await apply_policy_update()
     if applied is not None:
@@ -1511,7 +1517,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
-        await _restart_gateway(state)
+        await _restart_gateway(state, resolver=respawn_executable)
         return web.json_response({"ok": True, "status": "updating"})
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
@@ -1645,18 +1651,90 @@ async def api_update_apply(request: web.Request) -> web.Response:
             status=409,
         )
 
+    # Pin the revision this update will apply. The guard above fetched and
+    # measured against `@{u}`, but a ref name is re-resolved by every later git
+    # command, so a remote that moves between here and the apply would let the
+    # floor check below judge one commit and the fast-forward land on another.
+    # An OID cannot move: it is what gets floor-checked AND what gets applied.
+    target_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "rev-parse",
+        "--verify",
+        "@{u}^{commit}",
+        cwd=proj,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        target_out, _ = await asyncio.wait_for(target_proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        try:
+            target_proc.kill()
+        except ProcessLookupError:
+            pass
+        await target_proc.communicate()
+        return web.json_response(
+            {"error": "Timed out resolving the upstream revision", "code": "git_read_failed"},
+            status=500,
+        )
+    target = (target_out or b"").strip().decode()
+    if target_proc.returncode != 0 or not target:
+        logger.warning("Update refused: could not resolve the tracked upstream in %s", proj)
+        return web.json_response(
+            {
+                "error": "Could not resolve the tracked upstream revision — check the tracked remote",
+                "code": "git_read_failed",
+            },
+            status=409,
+        )
+
+    # Interpreter floor, checked against the pinned revision before the tree
+    # moves to it. pip enforces the same floor during the reinstall, but by then
+    # the checkout has already advanced to code this venv can never import: the
+    # gateway keeps serving the old revision from memory while every lazy import
+    # reads the new files, and each later click repeats the pull and the
+    # refusal. Refusing here leaves the checkout where it was and names the
+    # remedy. Offloaded: it shells out to git and probes the interpreter.
+    try:
+        floor_breach = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            lambda: dep_sync.incoming_python_floor_breach(Path(proj), target, Path(sys.executable)),
+        )
+    except dep_sync.IncomingFloorUnreadable as exc:
+        # The pinned revision is real, but its floor could not be read. That is
+        # not "no floor": waving it through would land exactly the revision
+        # the gate exists to keep out, on the one path git happened to fail on.
+        logger.warning("Update refused: could not read the incoming interpreter floor (%s)", exc)
+        return web.json_response(
+            {
+                "error": "Could not read the incoming revision's interpreter requirement — "
+                "check the tracked remote",
+                "code": "git_read_failed",
+            },
+            status=409,
+        )
+    if floor_breach:
+        logger.warning("Update refused: %s", floor_breach)
+        return web.json_response(
+            {"error": f"Update refused: {floor_breach}", "code": "python_floor"},
+            status=409,
+        )
+
     async def _apply() -> None:
         try:
             state.push_update_progress("pulling", "Pulling latest changes…")
-            # --ff-only makes the non-fast-forward classes unreachable at the
-            # action primitive itself, not just at the precondition above: a
-            # remote that moves in the window between the guard's fetch and
-            # this pull fails the pull instead of minting an unrequested merge
-            # commit into the user's branch.
+            # Fast-forward to the PINNED commit, not `git pull`: a pull refetches
+            # and re-resolves the upstream, so a remote that moved after the
+            # floor check would land a revision nobody checked. --ff-only keeps
+            # the non-fast-forward classes unreachable at the action primitive
+            # itself, not just at the precondition above, so an upstream that
+            # was rewritten in the window fails the merge instead of minting an
+            # unrequested merge commit into the user's branch.
             pull = await asyncio.create_subprocess_exec(
                 "git",
-                "pull",
+                "merge",
                 "--ff-only",
+                target,
                 cwd=proj,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1669,10 +1747,19 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 except ProcessLookupError:
                     pass
                 await pull.communicate()
-                state.push_update_progress("error", "git pull timed out")
+                state.push_update_progress(
+                    "error", f"Fast-forward to {target[:12]} timed out (git merge --ff-only)"
+                )
                 return
             if pull.returncode != 0:
-                state.push_update_progress("error", "git pull failed")
+                # The detail is what the failure card shows and what its
+                # "Ask the agent" hand-off sends along, so it names the
+                # command that ran and the revision it targeted.
+                state.push_update_progress(
+                    "error",
+                    f"Fast-forward to {target[:12]} failed (git merge --ff-only) — "
+                    "the checkout may have moved; check `git status` in a terminal",
+                )
                 return
 
             # Rebuild the in-tree frontend and stage website/dist into the
@@ -1687,7 +1774,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
 
             # Restart: save history + clean up sessions then exec the same process.
             logger.info("Update complete — saving history and cleaning up before restart")
-            await _restart_gateway(state)
+            await _restart_gateway(state, resolver=respawn_executable)
         except Exception:
             logger.exception("Update failed")
             state.push_update_progress("failed", "Update failed — check logs")
@@ -1766,6 +1853,37 @@ _LOG_LEVELS = {
 }
 
 
+def apply_log_level(level_name: str, *, source: str) -> bool:
+    """Set the ``kiro_crew`` logger to *level_name*; False when the name is unknown.
+
+    The one place the runtime level changes, shared by the dashboard endpoint
+    and the ``agent.log_level`` config applier so a ``kirocrew config set`` or
+    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle.
+    """
+    name = str(level_name or "").upper()
+    if name not in _LOG_LEVELS:
+        return False
+    root = logging.getLogger("kiro_crew")
+    if root.level == _LOG_LEVELS[name]:
+        return True
+    root.setLevel(_LOG_LEVELS[name])
+    logger.info("Log level changed to %s via %s", name, source)
+    return True
+
+
+def apply_log_level_from_config(change: ConfigChange) -> None:
+    """Config applier for ``agent.log_level``: push the written level to the logger.
+
+    Registered by ``server.py`` at boot next to the other appliers that outlive
+    a request, so a write from any writer reaches the logger.
+    """
+    if not change.touched("agent.log_level"):
+        return
+    level = change.new.agent.log_level
+    if not apply_log_level(level, source="config"):
+        logger.warning("agent.log_level %r is not a level name; runtime level unchanged", level)
+
+
 async def api_log_level(request: web.Request) -> web.Response:
     """POST /api/logs/level — change the kiro_crew logger level at runtime.
 
@@ -1776,11 +1894,8 @@ async def api_log_level(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
     level_name = body.get("level", "").upper()
-    if level_name not in _LOG_LEVELS:
+    if not apply_log_level(level_name, source="dashboard"):
         return web.json_response({"error": f"invalid level: {level_name}"}, status=400)
-    root = logging.getLogger("kiro_crew")
-    root.setLevel(_LOG_LEVELS[level_name])
-    logger.info("Log level changed to %s via dashboard", level_name)
 
     # Persist to config so the level survives restarts: a DELTA read-modify-
     # write of the one key this endpoint owns, inside a single sidecar-flock
@@ -2395,7 +2510,9 @@ async def api_update_arm_status(request: web.Request) -> web.Response:
     """GET /api/update/arm — the armed request, SPA-safe projection."""
     from kiro_crew.platform import update_stepup
 
-    pending = await asyncio.to_thread(update_stepup.read_pending)
+    # clear_expired=True: this runs inside the gateway, where the expiry
+    # cleanup is serialized against arm under the module mutex.
+    pending = await asyncio.to_thread(lambda: update_stepup.read_pending(clear_expired=True))
     if pending is None:
         return web.json_response({"armed": False})
     return web.json_response(update_stepup.public_view(pending))
@@ -2429,7 +2546,11 @@ async def api_update_approve(request: web.Request) -> web.Response:
     from kiro_crew.platform import update_stepup
     from kiro_crew.platform.update_layout import cdn_bases as _cdn
     from kiro_crew.platform.update_layout import cdn_bases_are_safe as _cdn_safe
-    from kiro_crew.platform.wheel_engine import WheelUpdateError, apply_wheel_update
+    from kiro_crew.platform.wheel_engine import (
+        WheelUpdateError,
+        apply_wheel_update,
+        respawn_executable,
+    )
 
     # A policy-defined command provider OWNS updates on this host, and its
     # commands never read the built-in mechanism this endpoint drives. Checked
@@ -2557,7 +2678,7 @@ async def api_update_approve(request: web.Request) -> web.Response:
             return
         logger.info("In-app wheel update to v%s promoted; restarting", pending.version)
         await _audit("success", resources=f"v{pending.version} promoted")
-        await _restart_gateway(state)
+        await _restart_gateway(state, resolver=respawn_executable)
 
     task = asyncio.create_task(_apply())
     state._background_tasks.add(task)

@@ -189,6 +189,7 @@ The monitor payload contains at least:
 ```text
 kind, version, target, objective
 last_observation, last_fingerprint, last_observed_at
+last_observation_status, last_observation_reason_code
 config_generation, last_wake_fingerprint, wake_in_flight
 wake_delivery, completion_evidence_deadline
 wake_count, agent_turns, input_tokens, output_tokens
@@ -222,6 +223,15 @@ It reads the minimum remote state necessary to classify the pull request:
 - review decision and unresolved blocking review state;
 - mergeability when the provider supplies it;
 - provider error category.
+
+The durable `last_observation` is the canonical provider-fact snapshot, not the
+typed classification record. For GitHub it contains only the monitor kind,
+normalized target, pull-request state, draft flag, head revision, mergeability,
+review decision, blocking-review state, review-thread completeness and unresolved
+count, plus the failed/passed/pending/unknown check-name buckets. The latest typed
+status, reason code, and sanitized summary live in adjacent dedicated fields. A
+provider error advances those typed fields while retaining the last good canonical
+facts and fingerprint.
 
 The probe returns a canonical observation rather than raw provider output. A
 stable serialization is hashed to form the fingerprint. Volatile values such as
@@ -302,7 +312,8 @@ Probe execution never enters the owning chat session. `WAKE_ACTIONABLE` requests
 one normal turn on the existing session. The monitor marks that fingerprint as
 in-flight before dispatch so another timer cannot enqueue a duplicate.
 Probe decisions are staged and fsynced before changing the live record or timer,
-so persistence failure cannot leave an actionable claim only in memory. The
+and pre-probe budget stops persist their terminal replacement before disarming
+the live record, so persistence failure cannot diverge memory from restart state. The
 claim is revalidated both before transport handoff and at each surface's final,
 yield-free turn-start boundary. Dashboard performs that final check in its runner
 after pre-turn setup, then crosses SessionManager's synchronous shutdown gate
@@ -365,7 +376,8 @@ policy removes them. An outcome records:
 - success, blocked, budget, user stop, session close, or target unavailable;
 - stable machine-readable reason code;
 - concise human-readable detail;
-- last observation and fingerprint;
+- last canonical observation and fingerprint, plus its dedicated typed status,
+  reason code, and sanitized summary;
 - probe count, wake count, completed agent turns, and token totals;
 - created, last-observed, and stopped timestamps.
 
@@ -390,6 +402,8 @@ For a structured monitor it shows target, objective, next probe, bounds, latest
 classification, usage, and terminal reason. Terminal records are read-only; the
 user explicitly restarts a monitor rather than reviving it through a generic Save
 action. The create form uses the same safe defaults and bounds as the MCP tool.
+Cold REST hydration never replaces a newer live record while its refetch is in
+flight or after that refetch fails.
 
 Legacy “Set a goal” remains available during rollout with an explicit legacy
 label. Browser creation is create-only at the durable service boundary, so a
@@ -577,7 +591,8 @@ Primary areas:
 
 - replace the pull-request babysit recipe with `monitor_watch` instructions;
 - remove the prompt-owned sidecar progress protocol;
-- retain legacy guidance only for unsupported targets, clearly marked as costly;
+- retain costly legacy guidance for unsupported targets and objectives whose
+  required evidence the typed provider does not observe;
 - add product documentation and migration notes;
 - evaluate legacy goal-loop deprecation from collected metrics.
 
@@ -592,8 +607,8 @@ Exit criteria:
 - The supported pull-request path contains no repeated polling turns.
 - Completion is controller-owned rather than dependent on the model remembering to
   stop itself.
-- Legacy prompt loops remain functional for unsupported use cases until a separate
-  removal decision is approved.
+- Legacy prompt loops remain functional for unsupported targets and unobserved
+  evidence until a separate removal decision is approved.
 
 ## Backward compatibility and rollout
 
@@ -624,7 +639,9 @@ Exit criteria:
 - Provider output passes through existing secret redaction before persistence,
   logging, or delivery.
 - Canonical observations use an allowlist of small fields. Raw logs, diffs, review
-  bodies, and comments are not persisted by default.
+  bodies, and comments are not persisted by default. The public projection rebuilds
+  the canonical snapshot from exact root and check-bucket allowlists; unknown
+  persisted keys remain internal and cannot cross into browser or agent inspection.
 - Error reasons exposed to the agent or UI use stable codes and sanitized detail.
 - Background action turns retain existing governance and approval behavior. A
   monitor does not grant new tool authority.

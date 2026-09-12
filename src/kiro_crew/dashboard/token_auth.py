@@ -1685,7 +1685,7 @@ async def _verify_unix_peer(
             error=_reason,
         )
         _log_auth(request, "internal", "denied", _reason)
-        return _deny(request, "Forbidden")
+        return _deny(request, "Forbidden", "unix_peer_unverified")
     peer_pid = get_peer_pid(sock)
     if peer_pid is None:
         return None
@@ -1720,7 +1720,7 @@ async def _verify_unix_peer(
             "denied",
             f"peer identity mismatch (peer_pid={peer_pid})",
         )
-        return _deny(request, "Forbidden")
+        return _deny(request, "Forbidden", "peer_session_mismatch")
     # Positive kernel attestation. Debug-level on purpose — this fires on
     # every internal call from a claimed session; the SEL trail records the
     # deny arm, which is the permission decision that changes anything.
@@ -2341,6 +2341,12 @@ def token_auth_middleware(
                     # loopback caller (kiro-cli / MCP) authenticated" from "no
                     # auth ran at all".
                     request["internal_auth"] = True
+                    if path == "/api/chat" or path.startswith("/api/chat/"):
+                        from kiro_crew.dashboard.handlers._shared import private_chat_route_refusal
+
+                        memory_refusal = await private_chat_route_refusal(request)
+                        if memory_refusal is not None:
+                            return memory_refusal
                     # Derive the app identity ONCE, here, so every ownership
                     # check downstream sees it. The secret proves
                     # the call came from inside, not who made it, so identity

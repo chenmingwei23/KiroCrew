@@ -3,7 +3,7 @@
 Covers what this channel gained: the commands a user can now reach from chat, the
 outbound image upload, the reasoning post, the stall marks on the live bubble, the
 reaction allow-list, the durable getUpdates cursor — and, first, the credential
-that Telegram's own markdown→HTML conversion used to REASSEMBLE after the
+that Telegram's own markdown→HTML conversion can REASSEMBLE after the
 byte-level redactor had already looked at it.
 
 The doubles come from ``test_telegram`` so there is one FakeClient, not two that
@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from test_telegram import FakeClient, _dispatcher, _dm
+from test_telegram import FakeClient, _dispatcher, _dm, _prime_live
 
 from conftest import host_abs
 from kiro_crew.messaging.outbound_files import OutboundFile
@@ -50,6 +50,20 @@ _AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
 #: ``ntpath.isabs("/tmp")`` is False, so the POSIX literal left uploads disabled
 #: on Windows and every "the picture must be uploaded" assertion failed there.
 _UPLOAD_ROOT = host_abs("tmp")
+
+
+@pytest.fixture(autouse=True)
+def _drop_live_config_snapshot():
+    """Leave no primed config snapshot behind for the next test.
+
+    ``_prime_live`` (and ``_dispatcher``, which calls it) publishes into the
+    process-global config watcher, so without this the last test to prime would
+    set the live config for every test after it in the same worker.
+    """
+    yield
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
 
 
 def _msg(text: str, *, user: int = 1, chat: int = 1) -> TelegramInboundMessage:
@@ -308,7 +322,7 @@ class TestOutboundImages:
 
     @pytest.mark.asyncio
     async def test_recovery_of_many_failed_uploads_drops_no_reference(self) -> None:
-        # One truncated bubble used to keep only what fit under the cap: with
+        # A truncated bubble must not keep only what fits under the cap: with
         # enough failed images, every reference past it vanished silently.
         renderer, client = _renderer()
         renderer.authorize_upload_root(_UPLOAD_ROOT)
@@ -1248,7 +1262,7 @@ class TestSessionsCommand:
 
         heading, markup = client.sent[-1]
         labels = [row[0]["text"] for row in markup["inline_keyboard"]]
-        assert "Dashboard session search" in heading
+        assert "Session search" in heading
         assert any("General Q&A" in label for label in labels)
         assert all("Other session" not in label for label in labels)
 
@@ -1261,7 +1275,7 @@ class TestSessionsCommand:
 
         await dispatcher.handle_message(_msg("/session"))
 
-        assert client.sent[-1][0] == "No recent dashboard sessions."
+        assert client.sent[-1][0] == "No recent sessions."
 
     @pytest.mark.asyncio
     async def test_search_failure_is_audited_and_fails_closed(
@@ -2569,7 +2583,7 @@ class TestForumActivation:
 
 
 class TestSplitterConvergence:
-    """Telegram's splitter no longer fabricates fence delimiters.
+    """Telegram's splitter does not fabricate fence delimiters.
 
     The channel-local predecessor rebalanced by counting backticks
     (``ch.count("```") % 2``), which is not the fence grammar. On a
@@ -2694,11 +2708,13 @@ class TestVoiceOut:
         # every conversation the operator has not overridden.
         d, _, _ = _dispatcher({1})
         d.cfg.telegram.voice_replies = True
+        _prime_live(d.cfg)
         assert d._voice_enabled(("direct", "1")) is True
 
     def test_an_explicit_off_beats_a_configured_on(self) -> None:
         d, _, _ = _dispatcher({1})
         d.cfg.telegram.voice_replies = True
+        _prime_live(d.cfg)
         d._voice_pref[("direct", "1")] = False
         assert d._voice_enabled(("direct", "1")) is False
 
@@ -3059,7 +3075,7 @@ class TestARestrictedSessionUploadsNothing:
     async def test_a_channel_without_privacy_modes_is_unaffected(self) -> None:
         """Discord has no `/temporary`, so nothing can mark its keys.
 
-        Pinned because this rung used to answer False unconditionally: the change
+        This rung must not answer False unconditionally: the change
         must be invisible to a channel that offers no modes, or it would read as a
         behaviour change to every other channel's uploads.
         """
@@ -3127,6 +3143,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
     async def test_a_queued_modifier_rides_along_and_applies_on_drain(self) -> None:
         d, client, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
         self._busy(d)
 
         await d.handle_message(_dm("/temporary summarise this"))
@@ -3214,6 +3231,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
 
         d, _, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
         key = d._session_key(("direct", "7"))
         self._busy(d)
         steered: list[str] = []
@@ -3237,6 +3255,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
 
         d, _, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
         key = d._session_key(("direct", "7"))
         self._busy(d)
         sessions._gp = SimpleNamespace(
@@ -3801,6 +3820,7 @@ class TestRotationChokepoint:
 
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         d._conv.maybe_rotate(route, time.time() - 3600, idle_minutes=1, daily_reset_hour=-1)
         logged: list[Any] = []
@@ -3832,6 +3852,7 @@ class TestRotationChokepoint:
         # has to be safe to call more than once for one inbound message.
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         first = d._rotated_session_key(route)
         assert d._rotated_session_key(route) == first
@@ -3842,7 +3863,7 @@ class TestAlbumMergePreservesIdentity:
 
     An album is the head message with more photos and a joined caption, so those two
     are the only things the merge decides. Everything else is identity and has to
-    survive verbatim. The merge used to enumerate fields, which meant any field added
+    survive verbatim. The merge must not enumerate fields, or any field added
     to ``TelegramInbound`` was silently dropped: ``reply_to_user_id`` went missing
     that way, and a reply-to-the-bot album in a mention-mode forum Topic was then
     discarded by the activation gate with no trace.
@@ -4263,6 +4284,7 @@ class TestDurableWritesUseTheRotatedKey:
     async def test_title_renames_the_session_the_next_message_will_use(self) -> None:
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         d._conv.maybe_rotate(route, time.time() - 3600, idle_minutes=1, daily_reset_hour=-1)
         titled: list[tuple[str, str]] = []

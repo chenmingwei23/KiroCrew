@@ -133,6 +133,125 @@ import pytest
 # through monkeypatch.
 os.environ.pop("KIROCREW_ACP_RECORD_FRAMES", None)
 
+# ── The data-home floor, installed at IMPORT time ────────────────────────────
+#
+# Every per-test redirect of ``KIROCREW_HOME`` is a value laid over whatever the
+# process started with, so the danger is never a wrong value -- it is the ABSENCE
+# of one. ``config.paths._valid_override_home`` reads the variable and, finding it
+# unset, falls through to ``_default_home()``: the operator's real ``~/.kiro/crew``.
+# Anything that can return the variable to "unset" mid-session therefore aims the
+# whole suite at live data, and a single ``monkeypatch.undo()`` on the shared
+# function-scoped instance does exactly that -- it reverts every patch on that
+# stack, including a redirect some fixture installed. One such undo truncated an
+# operator's real 36 MB ``memory.db`` to 29 bytes, with no backup.
+#
+# Setting the variable HERE, before pytest imports a fixture or a test module,
+# removes "unset" from the set of reachable states: an undo restores the value the
+# process started with, which is now this scratch directory rather than nothing.
+# That closes the entire class at the process level, so it holds no matter which
+# fixture owns a redirect, whether that fixture used a private ``MonkeyPatch``, or
+# what a future test does to the shared one.
+#
+# An operator's own ``KIROCREW_HOME`` is honoured untouched: someone running the
+# suite against a deliberately chosen home keeps it, and only the unset case --
+# the one that resolves to live data -- is given a floor.
+# ``mkdtemp``, never ``mkdir(exist_ok=True)`` on a pid-derived name -- the same rule
+# :func:`_create_tmp_root` states and for the same reason: a pid-derived name is
+# PREDICTABLE, so another local account can pre-create it as a SYMLINK to a directory
+# it controls, and ``exist_ok=True`` succeeds against a symlink-to-directory. This
+# directory becomes the data home the whole session falls back to, so every secret,
+# token and ``memory.db`` the suite fabricates would land where that account chose.
+# ``mkdtemp`` creates with O_EXCL at mode 0700 and fails rather than adopting.
+# These literals are also the session guard's source of truth below. They must
+# exist before choosing the import-time floor so even an inherited temp root
+# inside live memory cannot influence that choice.
+_REAL_DATA_HOMES = (
+    pathlib.Path.home() / ".kiro" / "crew",
+    pathlib.Path.home() / ".kirocrew",
+)
+
+
+def _create_host_home_floor() -> pathlib.Path:
+    """Create the import-time floor without consulting temp environment vars."""
+    if os.name == "nt":
+        candidates = (
+            pathlib.Path.home() / "AppData" / "Local" / "Temp",
+            pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp",
+            pathlib.Path(os.environ.get("ProgramData", r"C:\ProgramData")),
+        )
+    else:
+        candidates = (pathlib.Path("/tmp"), pathlib.Path("/var/tmp"), pathlib.Path("/usr/tmp"))
+    for candidate in candidates:
+        try:
+            base = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        unsafe = False
+        for real in _REAL_DATA_HOMES:
+            try:
+                live = real.resolve()
+            except OSError:
+                live = real.absolute()
+            if base == live or live in base.parents or base in live.parents:
+                unsafe = True
+                break
+        if unsafe or not base.is_dir():
+            continue
+        try:
+            return pathlib.Path(tempfile.mkdtemp(dir=base, prefix="kirocrew-test-floor-"))
+        except OSError:
+            continue
+    raise RuntimeError("no writable system temp directory exists outside live Kiro Crew homes")
+
+
+_HOST_HOME_FLOOR: "pathlib.Path | None" = None
+if not os.environ.get("KIROCREW_HOME"):
+    _HOST_HOME_FLOOR = _create_host_home_floor()
+    os.environ["KIROCREW_HOME"] = str(_HOST_HOME_FLOOR)
+
+    @atexit.register
+    def _remove_host_home_floor() -> None:
+        """Remove the floor, so it does not accumulate or trip the residue reporter.
+
+        The suite's own temp-residue check reports anything that outlives a run, and
+        ``KIROCREW_TMP_RESIDUE_STRICT`` turns that report into a failure -- attributed
+        to whichever test happened to be last, not to this floor.
+        """
+        if _HOST_HOME_FLOOR is not None:
+            shutil.rmtree(_HOST_HOME_FLOOR, ignore_errors=True)
+
+
+def _refuse_a_real_data_home() -> None:
+    """Refuse to run at all if the session would resolve a real data home.
+
+    A second, independent barrier to the floor above, and the one that fails LOUD.
+    The floor prevents the accident; this catches the case where someone exports
+    ``KIROCREW_HOME`` to their real home by hand -- copying a command out of a
+    runbook, or reusing a shell that was pointed at live data -- which no amount of
+    per-test isolation can distinguish from a deliberate choice.
+
+    Called from ``pytest_configure`` rather than being a second hook of that name:
+    a module defines one, and a duplicate silently replaces the earlier definition
+    instead of running alongside it.
+    """
+    resolved = pathlib.Path(os.environ["KIROCREW_HOME"]).expanduser()
+    for real in _REAL_DATA_HOMES:
+        try:
+            here, live = resolved.resolve(), real.resolve()
+        except OSError:  # an unreadable component cannot be the live home
+            continue
+        # CONTAINMENT in both directions, not equality. A PARENT is the dangerous
+        # miss: ``~/.kiro`` is kiro-cli's own home and resolves the whole live tree
+        # underneath it, and ``~`` resolves everything. A CHILD is refused too, since
+        # the suite deletes directories it believes it created.
+        if here == live or live in here.parents or here in live.parents:
+            raise pytest.UsageError(
+                f"KIROCREW_HOME points at the live data home {real}. The suite writes, "
+                f"truncates and deletes under it, so running here destroys real memory, "
+                f"sessions and config. Unset KIROCREW_HOME or point it at a scratch dir."
+            )
+
+
 # ── Hypothesis example database (rootdir floor) ─────────────────────────────
 # ``test/conftest.py`` registers the "default"/"thorough" profiles but never sets
 # ``database=``, so hypothesis falls back to its own default: ``.hypothesis/examples``
@@ -214,6 +333,38 @@ def _redirect_hypothesis_database() -> None:
     _hyp_settings.load_profile(_hyp_settings._current_profile)
 
 
+def _redirect_bytecode_cache() -> None:
+    """Write every ``.pyc`` this run compiles under the per-user cache, not the checkout.
+
+    Importing a module writes its bytecode beside the source, and the suite imports
+    a lot that is not a package: ``scripts/*.py``, ``packaging/signing/*.py``, every
+    skill's ``scripts/`` helper, ``.github/scripts``, all loaded by path through
+    ``spec_from_file_location`` + ``exec_module``. Each such import left a
+    ``__pycache__/`` in the tree (fifteen of them per full run at the last count),
+    after two audits had closed individual sites with a scoped
+    ``sys.dont_write_bytecode`` (``test/skill_script_helpers.py`` is the helper for
+    that). A per-site opt-out is the "remember to" contract this file exists to
+    delete, so the class is closed here instead: ``sys.pycache_prefix`` sends the
+    bytecode of EVERY import to a mirror tree under the cache root, and the env var
+    does the same for every interpreter a test spawns. The cache still persists
+    across runs (it is keyed on the absolute source path), so warm imports stay
+    warm; only WHERE the files land changes. Same cache root, same fallback posture
+    and same tolerance of an unwritable root as the hypothesis redirect above.
+    Runs in ``pytest_configure``, before any test module or ``test/conftest.py`` is
+    imported, so the test tree's own bytecode moves too.
+    """
+    if os.environ.get("PYTHONDONTWRITEBYTECODE"):
+        return  # nothing is written anywhere; nothing to redirect
+    cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    candidate = os.path.join(cache_root, "kirocrew", "pycache")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+    except OSError:
+        return
+    sys.pycache_prefix = candidate
+    os.environ["PYTHONPYCACHEPREFIX"] = candidate
+
+
 def _root_can_create_real_symlink() -> bool:
     """Probe real-link capability for tests collected outside ``test/`` too.
 
@@ -259,7 +410,7 @@ _ROOT_HAS_REAL_SYMLINKS = _root_can_create_real_symlink()
 #: * ``sudo`` — a privilege prefix, not an action. Whether the spawn mutates
 #:   anything is decided by the command it wraps, and ``sudo systemctl restart``
 #:   is already caught on ``systemctl``.
-_SERVICE_MANAGERS = frozenset({"systemctl", "launchctl"})
+_SERVICE_MANAGERS = frozenset({"systemctl", "launchctl", "schtasks", "schtasks.exe"})
 
 #: Subcommands of the managers above that CHANGE host service state.
 #:
@@ -306,6 +457,13 @@ _MUTATING_VERBS = frozenset(
         "setenv",
         "unsetenv",
         "attach",
+        # schtasks (Windows Task Scheduler). Verbs are `/Create`-style switches
+        # and case-insensitive on the command line, so they are matched lowercased.
+        "/create",
+        "/delete",
+        "/run",
+        "/end",
+        "/change",
     }
 )
 
@@ -324,7 +482,38 @@ _ALWAYS_REFUSED = frozenset({"apparmor_parser"})
 #: service on whoever runs the suite. Same shape as ``_ALLOWED`` in
 #: ``test/test_spawn_preexec_guard.py``: an entry needs a comment saying why the
 #: host mutation is acceptable.
-_HOST_SERVICE_EXEC_ALLOWED_MODULES: frozenset[str] = frozenset()
+#:
+#: The two entries below are the real-service end-to-end suites, and they are the
+#: reason the guard also recognises the pod CLI (see ``_POD_MUTATING_VERBS``): a
+#: test that drives ``kirocrew pod up`` through a CHILD interpreter reaches
+#: ``systemctl start`` / ``launchctl bootstrap`` / ``schtasks /Create`` one
+#: process removed, where the in-process manager check cannot see it. Both
+#: suites self-skip unless an operator sets their own opt-in variable
+#: (``KIROCREW_E2E_SCENARIOS`` / ``KIROCREW_E2E_POD_WINDOWS``), run against a
+#: hermetic plane (their own root, env dir, port base and unit prefix), and tear
+#: down every pod, the plane root and the plane's template unit in ``finally``.
+_HOST_SERVICE_EXEC_ALLOWED_MODULES: frozenset[str] = frozenset(
+    {
+        # The pod scenario suite (nightly ``pod-scenarios``): boots one real pod
+        # per session on the ``kirocrew-e2e-pod`` plane and reclaims it.
+        "e2e.scenarios.test_cron_fire",
+        "e2e.scenarios.test_service_install_dry_run",
+        "e2e.scenarios.test_settings_save",
+        "e2e.scenarios.test_subagent_spawn",
+        "e2e.scenarios.test_wheel_install",
+        # The Windows pod boot canary: one real Task Scheduler task on a
+        # per-run plane, removed by ``pod down`` before the test returns.
+        "test_pod_windows_boot",
+    }
+)
+
+#: ``kirocrew pod`` verbs that create, start, stop or delete a host service
+#: definition (a systemd unit, a launchd agent, a Task Scheduler task). The pod
+#: CLI is how a test reaches a service manager without naming one, so a spawn of
+#: ``kirocrew pod <verb>`` or ``python -m kiro_crew pod <verb>`` is refused for
+#: every module not listed above. Read-only verbs (``ls``, ``status``, ``api``,
+#: ``logs``) stay allowed.
+_POD_MUTATING_VERBS = frozenset({"up", "down", "install", "prune", "restart"})
 
 
 def _tokens(argv: object, *, shell: bool = False) -> list[str]:
@@ -368,8 +557,35 @@ def _refusal_reason(argv: object, *, shell: bool = False) -> str | None:
         if name not in _SERVICE_MANAGERS:
             continue
         for candidate in tokens[index + 1 :]:
-            if _basename(candidate) in _MUTATING_VERBS:
+            # `schtasks` verbs are `/Create`-style switches: `_basename` would
+            # strip the slash, so the raw token is compared lowercased as well.
+            if _basename(candidate) in _MUTATING_VERBS or candidate.lower() in _MUTATING_VERBS:
                 return f"{name} {candidate!r} changes host service state"
+    pod_reason = _pod_cli_refusal(tokens)
+    if pod_reason:
+        return pod_reason
+    return None
+
+
+def _pod_cli_refusal(tokens: list[str]) -> str | None:
+    """Name the ``kirocrew pod`` mutation in *tokens*, or ``None``.
+
+    Matches the console script (``kirocrew``, ``kirocrew.exe``) and the module
+    form (``python -m kiro_crew``), then requires the literal ``pod`` subcommand
+    followed by a verb from :data:`_POD_MUTATING_VERBS`. Anything looser would
+    refuse a test that merely passes ``"pod"`` as an argument to something else.
+    """
+    for index, token in enumerate(tokens):
+        name = _basename(token)
+        if name in {"kirocrew", "kirocrew.exe"}:
+            rest = tokens[index + 1 :]
+        elif token == "-m" and index + 1 < len(tokens) and tokens[index + 1] == "kiro_crew":
+            rest = tokens[index + 2 :]
+        else:
+            continue
+        if len(rest) >= 2 and rest[0] == "pod" and rest[1] in _POD_MUTATING_VERBS:
+            return f"kirocrew pod {rest[1]!r} changes host service state"
+        return None
     return None
 
 
@@ -427,6 +643,25 @@ def _floor_monkeypatch():
         yield mp
     finally:
         mp.undo()
+
+
+@pytest.fixture
+def monkeypatch(_floor_monkeypatch):
+    """pytest's own ``monkeypatch``, re-declared to order it AFTER the floor.
+
+    Body-identical to ``_pytest.monkeypatch.monkeypatch``; the only change is the
+    dependency on ``_floor_monkeypatch``, which is what GUARANTEES the order the
+    docstring above relies on: the floor is set up before the test's ``monkeypatch``
+    and torn down after it, whatever autouse fixture in whatever conftest happens to
+    request ``monkeypatch`` first. A test's ``setenv("KIROCREW_HOME", ...)`` therefore
+    records the pinned value, restores it on the test's undo, and the floor's undo then
+    restores the operator's. A test cannot tell the difference otherwise: same type,
+    same scope, same undo semantics for everything IT patched.
+    ``test_host_isolation_floor.py::TestTheDataHomeIsPinnedForEveryTestpath`` pins it.
+    """
+    mp = pytest.MonkeyPatch()
+    yield mp
+    mp.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -760,17 +995,13 @@ def _scrub_inherited_preload_env(_floor_monkeypatch):
     79-failure pattern this fixture exists to remove, as a wall of wrong refusal
     codes instead of one clear error.
 
-    The removals are recorded on the test's shared ``monkeypatch`` instance rather
-    than hand-rolled, and that is load-bearing, not convenience. Same-scope autouse
-    fixtures are ordered so that OTHER monkeypatch users run first (alphabetically in
-    practice), so a hand-rolled save/restore here tears down BEFORE monkeypatch's
-    undo -- and for a test that ``monkeypatch.setenv``-overrides the SAME key the
-    host inherited (recorded "was absent", because this scrub had removed it), the
-    undo then deletes the inherited value the hand-rolled restore had just put back,
-    leaking the removal out of the test. On one shared undo stack the nesting is
-    correct BY CONSTRUCTION: the test's later record is undone first (its delete
-    tolerates the key already being gone), then this fixture's ``delenv`` record
-    restores the inherited value. ``test_name_grant.py::TestInheritedHostEnvironment``
+    The removals use the private host-floor stack. A shared ``monkeypatch.undo()``
+    cannot restore an inherited preload during the test. The public ``monkeypatch``
+    fixture depends on ``_floor_monkeypatch``, so its stack unwinds first at teardown:
+    an override of the SAME inherited key first reverts to "absent", and only then
+    does this fixture's ``delenv`` record restore the inherited value. Reversing
+    those steps would delete the restored host value and leak the scrub into the
+    next test. ``test_name_grant.py::TestInheritedHostEnvironment``
     pins exactly that same-key case, and
     ``test_host_isolation_floor.py::TestInheritedShellEnvironmentIsScrubbed`` drives
     one real cycle of this fixture directly.
@@ -1042,10 +1273,76 @@ def _prefer_short_tmp_base() -> None:
         os.environ[name] = _SHORT_TMP_BASE
 
 
+#: Module nodeids whose COLLECTION built the process-global metrics recorder.
+#:
+#: Filled by :func:`pytest_make_collect_report`, asserted empty by
+#: ``test_host_isolation_floor.py::TestNoMetricIsEmittedAtImport``. A metric emitted
+#: while a test module is being imported (a default argument evaluated at
+#: definition time, a module constant built through a factory that counts itself)
+#: runs ``get_recorder()`` before any test's pins exist. The recorder's first build
+#: reads the OPERATOR's real config; with ``telemetry.enabled`` there, it starts a
+#: ``PeriodicExportingMetricReader`` whose exporter is bound to the real
+#: ``~/.kiro/crew/metrics`` and which exports every minute for the life of the xdist
+#: worker. The per-test exporter-leak guard cannot see it (the thread predates every
+#: test), and the per-test ``KIROCREW_TELEMETRY=0`` pin cannot reach it (it is already
+#: built). The third full-run audit found four worker pids writing the operator's
+#: metrics dir on every run from exactly one such default argument.
+IMPORT_TIME_METRIC_EMITTERS: list[str] = []
+
+
+def _metrics_provider_module():
+    return sys.modules.get("kiro_crew.metrics.provider")
+
+
+def _pin_telemetry_off_for_the_process() -> None:
+    """``KIROCREW_TELEMETRY=0`` from process start, not just from each test's setup.
+
+    The per-test pin (``_no_model_download``) covers the test body; this covers the
+    stretch BEFORE the first test (conftest imports and the collection of every
+    module), which is where an import-time metric emission builds the recorder. With
+    the env pin in force the build is a no-op recorder that reads no config and starts
+    no thread, so even an emitter this guard has not yet named cannot reach the host.
+    Tests that exercise telemetry delete the variable themselves, as they already did.
+    """
+    os.environ["KIROCREW_TELEMETRY"] = "0"
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    """Name the module whose import built the metrics recorder, and undo it.
+
+    The detection is ``metrics.provider._ever_built`` flipping across one module's
+    collection: the flag is set by every build, including the no-op one the env pin
+    above turns it into, so an emitter is caught whether or not it reached the host.
+    ``reset_for_testing()`` then drops what was built (stopping an exporter thread if
+    one exists), so the next module starts clean and the attribution stays per-module.
+    Recorded per worker under xdist: every worker collects the whole tree.
+    """
+    provider = _metrics_provider_module()
+    built_before = bool(provider is not None and getattr(provider, "_ever_built", False))
+    yield
+    if not isinstance(collector, pytest.Module):
+        return
+    provider = _metrics_provider_module()
+    if provider is None or not getattr(provider, "_ever_built", False):
+        return
+    if built_before:
+        # Built before this module was reached, by a conftest import. Named as such
+        # rather than blamed on whichever module happened to be first.
+        IMPORT_TIME_METRIC_EMITTERS.append(f"conftest import (before {collector.nodeid})")
+    else:
+        IMPORT_TIME_METRIC_EMITTERS.append(collector.nodeid)
+    with contextlib.suppress(Exception):
+        provider.reset_for_testing()
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Record the working directory pytest started in, before any test can move it."""
+    _refuse_a_real_data_home()
+    _pin_telemetry_off_for_the_process()
     _prefer_short_tmp_base()
     _redirect_hypothesis_database()
+    _redirect_bytecode_cache()
     global _SESSION_CWD
     try:
         _SESSION_CWD = os.getcwd()
@@ -1288,9 +1585,18 @@ def _join_test_loop_executor(item) -> None:
         return
 
 
-@pytest.hookimpl(tryfirst=True)
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
     """Put the process working directory back, BEFORE any fixture teardown runs.
+
+    A ``tryfirst`` HOOKWRAPPER: everything before the ``yield`` runs before any other
+    teardown impl (so before any fixture unwinds), and the one thing after it (the
+    verdict of ``_refuse_a_resolved_real_default_home``) runs after every fixture has
+    been torn down. That split is load-bearing: the check must READ its evidence before
+    the test's ``monkeypatch`` restores the global, but it must RAISE only once the
+    floor has unwound, because an exception raised before the default teardown impl
+    skips fixture finalization for the whole item and leaves every pin in place for
+    the rest of the worker (1,245 downstream errors when it was first tried).
 
     The CWD is per-PROCESS, so under xdist one test's ``os.chdir`` silently becomes every
     later test's starting directory on that worker. That was survivable while the
@@ -1324,6 +1630,16 @@ def pytest_runtest_teardown(item, nextitem):
     """
     _join_install_receipt_workers()
     _join_test_loop_executor(item)
+    resolved_real_home = (
+        _resolved_real_default_home() if item.stash.get(_HOME_PIN_ARMED, False) else None
+    )
+    _restore_session_cwd()
+    yield
+    if resolved_real_home is not None:
+        _refuse_a_resolved_real_default_home(resolved_real_home)
+
+
+def _restore_session_cwd() -> None:
     if _SESSION_CWD is None:  # pragma: no cover - configure always runs first
         return
     try:
@@ -1722,8 +2038,35 @@ def pytest_runtest_setup(item):
 # ── tracked Windows gaps apply to every testpath ──────────────────────
 
 
+#: Ceiling on a test node id. pytest exports the running item's node id as the
+#: ``PYTEST_CURRENT_TEST`` environment variable on every setup/call/teardown, and
+#: Windows caps one environment variable at 32767 characters -- ``os.environ``
+#: raises ``ValueError`` above that, so the item ERRORS at setup on Windows while
+#: passing everywhere else. A parametrized case whose value is a large payload (a
+#: 700 KB base64 audio blob, once) is how that happens; every report line for the
+#: item then carries the blob too, and the Windows shard ran to its 40-minute cap
+#: with its log dropped. The margin below the OS limit leaves room for pytest's
+#: `` (setup)`` suffix and an xdist group tag. Collection fails with the offending
+#: id named, which is the message the shard log never got to show.
+MAX_NODEID_CHARS = 30000
+
+
+def _refuse_oversized_nodeids(items) -> None:
+    oversized = [item for item in items if len(item.nodeid) > MAX_NODEID_CHARS]
+    if not oversized:
+        return
+    worst = max(oversized, key=lambda item: len(item.nodeid))
+    raise pytest.UsageError(
+        f"{len(oversized)} test node id(s) exceed {MAX_NODEID_CHARS} characters "
+        f"(longest: {len(worst.nodeid)}, {worst.nodeid[:160]!r}...). Windows caps an "
+        "environment variable at 32767 characters and pytest exports the node id as "
+        "PYTEST_CURRENT_TEST, so these error at setup there. Give the parametrize "
+        "an explicit ids= list instead of letting the payload become the id."
+    )
+
+
 def pytest_collection_modifyitems(config, items):
-    """Apply exact capability skips, then Windows' tracked known-gap skips.
+    """Apply exact capability skips, then the tracked known-gap skips for this OS.
 
     Real-symlink tests are listed individually rather than intercepting
     ``os.symlink`` globally.  A global interception also catches production
@@ -1731,22 +2074,25 @@ def pytest_collection_modifyitems(config, items):
     a junction, silently dropping the Windows behavior those tests exist to
     cover.  Exact collection markers leave every non-link path untouched.
 
-    The list lives in ``test/windows-expected-failures.txt`` -- one unparametrized node
-    id per line, captured from the first Windows CI runs. It is a burn-down backlog:
-    fixed tests get their line deleted, and anything NOT on the list still fails the
-    job, so the Windows line holds for the tests that pass today.
+    The lists live in ``test/windows-expected-failures.txt`` and
+    ``test/macos-expected-failures.txt`` -- one unparametrized node id per line,
+    captured from the first CI runs on that OS. Each is a burn-down backlog: fixed
+    tests get their line deleted, and anything NOT on the list still fails the
+    job, so the line holds for the tests that pass today. Both go through the same
+    ``_apply_tracked_gap_list`` matcher; do not add a third mechanism.
 
-    Lives HERE rather than in ``test/conftest.py`` because the list already names node
+    Lives HERE rather than in ``test/conftest.py`` because the lists already name node
     ids under ``src/kiro_crew/apps/builtins/auto_improvement/tests/``, and a hook rooted
     at ``test/`` is never registered when only in-package tests are collected -- which is
     exactly what CI's reduced-scope Windows job does when a diff touches no path under
     ``test/``. Those entries are also absent from ``BACKEND_DESELECTS``, so they were
     collected unskipped and the shard went red for a gap that was already tracked.
 
-    The list file itself stays under ``test/``, read by path from here. Node ids are
+    The list files themselves stay under ``test/``, read by path from here. Node ids are
     always spelled with ``/`` even on Windows, so the in-package entries need no
     translation.
     """
+    _refuse_oversized_nodeids(items)
     if not _ROOT_HAS_REAL_SYMLINKS:
         listfile = _REPO_ROOT / "test" / "requires-real-symlinks.txt"
         try:
@@ -1765,24 +2111,93 @@ def pytest_collection_modifyitems(config, items):
             if _base_nodeid(item.nodeid) in requires_real_symlink:
                 item.add_marker(marker)
 
-    if not platform_compat_or_none() or not platform_compat_or_none().IS_WINDOWS:
+    pc = platform_compat_or_none()
+    if pc is None:
         return
-    listfile = _REPO_ROOT / "test" / "windows-expected-failures.txt"
+    if pc.IS_WINDOWS:
+        _apply_tracked_gap_list(items, "windows-expected-failures.txt", "Windows")
+    elif pc.IS_MACOS:
+        _apply_tracked_gap_list(items, "macos-expected-failures.txt", "macOS")
+
+
+def _apply_tracked_gap_list(items, listname: str, platform_label: str) -> None:
+    """Mark every collected item named in ``test/<listname>`` as a STRICT xfail.
+
+    ONE mechanism serves both OS gap lists. macOS reuses it rather than growing a
+    second matcher, so the node-id spelling rule (``_base_nodeid``: no ``[params]``,
+    no ``@group``) and the burn-down semantics -- anything NOT listed still fails
+    the job -- are identical on both platforms by construction.
+
+    **``xfail(strict=True)``, not ``skip``, because these files call themselves a
+    burn-down backlog and say "fix the test and DELETE the line".** A skip does not
+    execute the test, so nothing can ever report that a gap CLOSED: the list could
+    only ever grow, and 241 node ids were retired rather than tracked. Under a
+    strict xfail a listed test that still fails is green (the gap is known), and one
+    that starts PASSING fails the job with XPASS -- which is precisely the signal
+    that the line should be deleted, delivered by the same run that earned it.
+
+    Safe for the entries whose failure is intended platform behaviour rather than a
+    gap: those still FAIL on the platform they are listed for, so they xfail green
+    exactly as before. They only never burn down, which is an honesty problem with
+    the list's framing (see the frame-recorder group in
+    ``macos-expected-failures.txt``) and not a mis-fire of this mechanism.
+
+    **A listed test that HANGS must not be in this list, and the platform is why.**
+    Executing rather than skipping costs CI minutes, which is fine; what is not
+    fine is a hang. On Windows there is no ``SIGALRM``, so pytest-timeout cannot
+    interrupt the test -- it kills the process, which is why the Windows shards pass
+    ``--max-worker-restart=0``. MEASURED: one listed entry
+    (``test_config_loader.py::TestAgentWorkspaceBindingsProperties::test_workspace_path_resolution``)
+    hangs on a native Windows host, and running the list killed the session at 22%
+    with no summary line printed at all. A hanging test therefore cannot be tracked
+    here; it needs an explicit ``skipif`` at the test, with the reason, so nothing
+    about it is silent.
+
+    **An entry MAY name one parametrization, and that is what makes strict xfail
+    expressible at all.** Stripping ``[params]`` from every entry (see
+    :func:`_base_nodeid` for why the strip exists) means one line covers every
+    parametrization of a test -- which is right when they all fail, and impossible
+    when they do not: ``test_seed_audit_uses_rail_tag_not_raw_path`` has two params
+    that fail on Windows and one that passes, so a single base entry would either
+    un-track the two or red the job forever on the one. So a line WITHOUT ``[`` is
+    matched against the param-stripped id, exactly as before, and a line WITH ``[``
+    is matched against the id with its params intact. The ``@group`` suffix is
+    stripped on both sides either way, because that one is an xdist artifact rather
+    than part of the test's identity.
+    """
+    listfile = _REPO_ROOT / "test" / listname
     try:
         text = listfile.read_text(encoding="utf-8")
     except OSError:  # pragma: no cover - list file absent in a partial checkout
         return
-    expected = {
-        _base_nodeid(ln.strip())
-        for ln in text.splitlines()
-        if ln.strip() and not ln.startswith("#")
-    }
-    marker = pytest.mark.skip(
-        reason="known Windows gap -- tracked in test/windows-expected-failures.txt"
+    entries = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    expected_base = {_base_nodeid(e) for e in entries if "[" not in e}
+    expected_exact = {_ungrouped_nodeid(e) for e in entries if "[" in e}
+    if not expected_base and not expected_exact:
+        return
+    marker = pytest.mark.xfail(
+        reason=f"known {platform_label} gap -- tracked in test/{listname}; "
+        "delete the line when it starts passing",
+        strict=True,
     )
     for item in items:
-        if _base_nodeid(item.nodeid) in expected:
+        if (
+            _base_nodeid(item.nodeid) in expected_base
+            or _ungrouped_nodeid(item.nodeid) in expected_exact
+        ):
             item.add_marker(marker)
+
+
+def _ungrouped_nodeid(nodeid: str) -> str:
+    """A node id with only the xdist ``@group`` suffix removed, params kept.
+
+    The counterpart to :func:`_base_nodeid` for a gap-list entry that names ONE
+    parametrization. ``@group`` still has to go -- it is added by
+    ``--dist loadgroup`` and absent under ``-n0``, so leaving it in would make the
+    same entry match in one invocation and not the other -- but ``[params]`` is part
+    of what the entry is identifying and stays.
+    """
+    return nodeid.split("@")[0]
 
 
 def _base_nodeid(nodeid: str) -> str:
@@ -2197,9 +2612,28 @@ def _isolation_dirs(_isolation_root):
 _isolation_dirs.seq = 0  # type: ignore[attr-defined]
 
 
+#: Set on an item by ``_isolate_kirocrew_home`` once its pins are in force. The
+#: teardown check reads it: a test skipped at setup (a ``skipif`` marker) never ran
+#: the floor, so ``paths._resolved_home`` still holds whatever collection resolved
+#: (the operator's real home, legitimately) and must not be blamed for it.
+_HOME_PIN_ARMED = pytest.StashKey[bool]()
+
+
 @pytest.fixture(autouse=True)
-def _isolate_kirocrew_home(_isolation_dirs, _floor_monkeypatch):
+def _isolate_kirocrew_home(request, _isolation_dirs, _floor_monkeypatch):
     """Pin ``KIROCREW_HOME`` and ``KIROCREW_WORKSPACE`` to per-test tmp dirs, for EVERY testpath.
+
+    The pin is applied through a PRIVATE ``pytest.MonkeyPatch`` instance, not the
+    shared function-scoped ``monkeypatch`` fixture. The shared instance is one undo
+    stack for every fixture and helper the test touched, so a test helper that calls
+    ``monkeypatch.undo()`` to revert its own patch also reverts THIS pin -- and every
+    path the test resolves afterwards lands in the operator's live ``~/.kiro/crew``.
+    That is not hypothetical: a memory-store test did exactly that and then wrote
+    ``b"this is not a sqlite database"`` over an operator's real 36 MB ``memory.db``,
+    which had no backup. With its own instance the pin can only be undone by this
+    fixture's teardown. The public ``monkeypatch`` fixture depends on
+    ``_floor_monkeypatch``, so the test's overrides unwind before the floor and a
+    later shared undo cannot reinstall a stale per-test home.
 
     This lives at the rootdir rather than in ``test/conftest.py`` because the leak it
     closes is worst in the testpaths that conftest does not reach. The ~108 test
@@ -2295,6 +2729,96 @@ def _isolate_kirocrew_home(_isolation_dirs, _floor_monkeypatch):
     paths = sys.modules.get("kiro_crew.config.paths")
     if paths is not None:
         monkeypatch.setattr(paths, "_resolved_home", None, raising=False)
+        monkeypatch.setattr(
+            paths,
+            "_write_recovery_breadcrumb",
+            _breadcrumb_guard(paths._write_recovery_breadcrumb),
+            raising=False,
+        )
+    request.node.stash[_HOME_PIN_ARMED] = True
+
+
+def _breadcrumb_guard(real):
+    """Refuse the recovery breadcrumb while ``Path.home()`` is the operator's.
+
+    ``config_dir()`` on its DEFAULT path writes ``~/.kirocrew.breadcrumb`` (outside
+    ``~/.kiro`` on purpose) naming the home it resolved. A test that relocates the
+    default with ``paths._resolve_default_home = lambda: tmp_path / ...`` and nothing
+    else therefore rewrites the operator's real breadcrumb to point at a pytest tmp
+    dir: the third audit found six such writes per run, each repaired only because
+    the live gateway rewrote the file later. The teardown check cannot see this one
+    (``_resolved_home`` holds the tmp stand-in), so the guard sits on the writer:
+    with ``Path.home()`` still the real home it FAILS the test naming the fix; with
+    a faked home (``monkeypatch.setattr(Path, "home", ...)``) it delegates, so the
+    tests OF the breadcrumb keep exercising the real writer against their fake home.
+    """
+
+    def _guarded(data_home):
+        try:
+            home_is_real = pathlib.Path.home().resolve() == _REAL_USER_HOME.resolve()
+        except OSError:  # pragma: no cover - a faked home that does not exist
+            home_is_real = False
+        if home_is_real:
+            raise AssertionError(
+                "this test would write the operator's real ~/.kirocrew.breadcrumb "
+                f"(pointing it at {data_home}): the default-home path was taken with "
+                "Path.home() still the real home. Relocate the WHOLE default, not just the "
+                "resolver: monkeypatch HOME and pathlib.Path.home to a dir under tmp_path, "
+                "or stub paths._write_recovery_breadcrumb when the breadcrumb is not what "
+                "the test is about; see conftest._breadcrumb_guard."
+            )
+        return real(data_home)
+
+    return _guarded
+
+
+def _is_the_operators_default_home(path) -> bool:
+    """Whether *path* is the real ``~/.kiro/crew`` (not a tmp stand-in for it)."""
+    try:
+        return pathlib.Path(path).resolve() == (_REAL_USER_HOME / ".kiro" / "crew").resolve()
+    except OSError:
+        return False
+
+
+def _resolved_real_default_home():
+    """The operator's real home if ``paths._resolved_home`` holds it right now, else None."""
+    paths = sys.modules.get("kiro_crew.config.paths")
+    resolved = getattr(paths, "_resolved_home", None) if paths is not None else None
+    if resolved is not None and _is_the_operators_default_home(resolved):
+        return resolved
+    return None
+
+
+def _refuse_a_resolved_real_default_home(resolved) -> None:
+    """Fail the test that let ``config_dir()`` fall through to the operator's home.
+
+    ``paths._resolved_home`` is only ever written by ``_resolve_default_home()``, i.e.
+    by a ``config_dir()`` / ``data_home()`` call made with NO override in force. So a
+    value equal to the operator's real ``~/.kiro/crew`` at teardown means the test
+    dropped the pin (``monkeypatch.delenv("KIROCREW_HOME")``) to exercise the default
+    path and let production resolve, and CREATE, the real data home, plus the
+    recovery breadcrumb beside it. Five tests did in the third full-run audit; each
+    passed. A test of the default path relocates the default too
+    (``monkeypatch.setattr(paths, "_resolve_default_home", lambda: tmp_path / "d")``,
+    or ``_resolved_home`` itself); ``test_lazy_data_home_paths.py`` is the shape.
+
+    The evidence is read by ``pytest_runtest_teardown`` BEFORE the test's own
+    ``monkeypatch`` unwinds (a test that set ``_resolved_home = None`` through
+    monkeypatch and then resolved the real home would otherwise have it restored to
+    ``None`` before any fixture could look), and the failure is raised AFTER every
+    fixture has been torn down, so the floor's pins are always restored. One attribute
+    read and one path comparison per test, so it costs nothing on the ~92k tests that
+    never touch the global.
+    """
+    raise AssertionError(
+        "this test resolved the operator's REAL default data home "
+        f"({resolved}): it dropped the KIROCREW_HOME pin and let config_dir() / "
+        "data_home() fall through to ~/.kiro/crew, which CREATES that directory. "
+        "A test of the default path pins the default too: "
+        "monkeypatch.setattr(kiro_crew.config.paths, '_resolve_default_home', "
+        "lambda: tmp_path / 'default'); see test_lazy_data_home_paths.py and "
+        "conftest._refuse_a_resolved_real_default_home."
+    )
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -2932,6 +3456,43 @@ def _no_central_policy_fetch(_floor_monkeypatch):
         # next test a different way.
         with contextlib.suppress(Exception):
             module.reset_process_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_platform_context(_floor_monkeypatch):
+    """Clear the process-global PlatformContext between tests, and pin the profile.
+
+    A test that composes a non-default context (e.g. an enterprise-overlay probe)
+    must not leak it into the next test.  ``current_context()`` lazily rebuilds
+    the standalone default on next access.
+
+    Also pins ``KIROCREW_PROFILE=standalone`` so the profile a test boots under
+    comes from the test, never from the operator's shell: a dev box with a real
+    SSO-marker directory, or a shell whose parent process exported
+    ``KIROCREW_PROFILE`` set to the enterprise profile (a Kiro Crew agent session
+    does exactly that for every child it spawns), would otherwise make
+    ``boot_platform`` resolve the enterprise profile and fail CLOSED (no companion installed) for every test
+    that drives ``run_gateway`` / boot / the governance hook.  A test that wants
+    the enterprise profile overrides this env via its own ``monkeypatch.setenv`` (it
+    runs after this autouse fixture), or composes the context directly via
+    ``set_context`` without booting.
+
+    Lives HERE, at the rootdir, for the same reason ``_isolate_kirocrew_home`` does:
+    the ~108 test modules under ``src/kiro_crew/apps/builtins/*/tests/`` never see
+    ``test/conftest.py``.  With the pin only there, an inherited
+    ``KIROCREW_PROFILE=enterprise`` reddens 150+ builtin-app tests (every governance-gated
+    route answers 500, every gated notification is dropped) while ``test/`` stays
+    green.
+    """
+    from kiro_crew.platform.bootstrap import _reset_boot_state
+    from kiro_crew.platform.context import reset_context
+
+    _floor_monkeypatch.setenv("KIROCREW_PROFILE", "standalone")
+    reset_context()
+    _reset_boot_state()
+    yield
+    reset_context()
+    _reset_boot_state()
 
 
 @pytest.fixture(autouse=True)

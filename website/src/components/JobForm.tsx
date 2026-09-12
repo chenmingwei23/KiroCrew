@@ -59,7 +59,7 @@ export function jobKindOf(job?: CronJob): JobKind {
 function parseJobDefaults(job?: CronJob) {
   if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, minimalContext: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
   const isInterval = !!(job.every_secs || (job.schedule || '').match(/^every\s+\d+/))
-  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([sh])/); if (!m) return 3600; return m[2] === 'h' ? parseInt(m[1]) * 3600 : parseInt(m[1]) })()
+  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([smh])/); if (!m) return 3600; return parseInt(m[1]) * (m[2] === 'h' ? 3600 : m[2] === 'm' ? 60 : 1) })()
   // Largest unit that divides `secs` EVENLY, not the largest unit that is merely
   // <= `secs`. The magnitude test sent 5400s to 'hours', where Math.round(1.5) is
   // 2, and buildBody re-serialises `intVal * 3600` — so opening a 90-minute job
@@ -113,6 +113,7 @@ function buildBody(
   tz: string,
   setError: (e: string) => void,
   isEdit = false,
+  prefill?: CronPrefill,
 ): Record<string, string | number | boolean> | null {
   const isLlmless = f.jobKind === 'script' || f.jobKind === 'command'
   // Script/command crons have no agent message — only the agent/message kind
@@ -152,6 +153,16 @@ function buildBody(
     body.cron = expr
     body.timezone = tz
   }
+  // Provenance stamp, create-only: the template this job was seeded from, plus
+  // the template's prompt AS IT WAS when picked (the snapshot the Schedule page
+  // compares against the template's current prompt to detect a template change,
+  // independent of any edit the user makes to the Message field below). The
+  // PATCH endpoint does not accept either (provenance is fixed at creation), so
+  // they are never sent on edit.
+  if (!isEdit && prefill?.sourcePreset) {
+    body.source_preset = prefill.sourcePreset
+    body.source_template_prompt = prefill.sourceTemplatePrompt ?? ''
+  }
   return body
 }
 
@@ -174,6 +185,9 @@ interface Props {
    *  that embed the form inside a single crew's own surface, where offering a
    *  crew picker would just be a way to file the job in the wrong place. */
   lockedAgent?: string
+  /** Durable member identity, distinct from its provider template. */
+  memberId?: string
+  providerAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
   layout?: 'vertical' | 'horizontal'
@@ -192,9 +206,11 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, memberId, providerAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
   // "" and undefined both mean unlocked, so render and submit share one truth.
-  const locked = lockedAgent || undefined
+  const boundMember = job?.member_id || memberId
+  const privateMember = !!boundMember && boundMember !== 'default'
+  const locked = boundMember || lockedAgent || undefined
   const defaults = parseJobDefaults(job)
   // In create mode (no job), a preset can seed the prompt + schedule fields.
   // Edit mode always reflects the job as-stored and ignores any prefill.
@@ -292,7 +308,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   // Recomputed as the prompt is typed, which is why it is a local regex pass
   // and not a round trip. Reads minimalContext too, so the hint stops once the
   // reader has acted on it.
-  const advice = useMemo(() => adviseCronMode(msg, minimalContext), [msg, minimalContext])
+  const advice = useMemo(() => privateMember ? 'none' : adviseCronMode(msg, minimalContext), [msg, minimalContext, privateMember])
 
   /** Model-override rows as the two parallel arrays `SimpleSelect` takes.
    *
@@ -311,8 +327,12 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const submit = async () => {
     setError(''); setSaving(true)
     const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, minimalContext, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
-    const body = buildBody(f, tz, setError, !!job)
+    const body = buildBody(f, tz, setError, !!job, job ? undefined : prefill)
     if (!body) { setSaving(false); return }
+    if (boundMember && !isLlmless) {
+      body.member_id = boundMember
+      body.agent = providerAgent || job?.agent || ''
+    }
     try {
       const res = job
         ? await api.updateCron(job.id, body)
@@ -531,7 +551,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             )}
             <SettingsToggle
               label={i18nT('components.jobForm.minimal_context')}
-              description={i18nT('components.jobForm.minimal_context_description')}
+              description={i18nT(privateMember ? 'components.jobForm.private_minimal_context_description' : 'components.jobForm.minimal_context_description')}
               checked={minimalContext}
               onChange={setMinimalContext}
             />

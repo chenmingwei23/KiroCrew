@@ -90,6 +90,13 @@ class TestSecurityConductorInstaller:
             assert role in prompt, role
         assert "prepare-pr" in prompt  # the fixer's own procedure
 
+    def test_prompt_closes_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
+        """Four child roles reach a terminal verdict and the loop is stopped for each
+        one; without the verb in the tool line the finished session stays open and the
+        operator cleans up by hand."""
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        assert "`session_close` (close a child once its item is terminal)" in prompt
+
     def test_prompt_delegates_scope_and_acceptance_to_scripts(self, tmp_path, monkeypatch):
         """Both decisions this agent must NOT make by judgment: whether a target
         is in scope, and whether a finding is real. Each names the script whose
@@ -225,8 +232,8 @@ class TestSecurityConductorInstaller:
         assert data["mcpServers"]["kirocrew-dashboard"]["args"] == ["mcp-dashboard"]
 
     def test_the_work_server_is_not_mounted(self, tmp_path, monkeypatch):
-        """The work-ledger flow belongs to ``kirocrew-ledger-conductor``, and no
-        shipped conductor mounts it. This agent's children report through the
+        """The work-ledger flow belongs to ``kirocrew-conductor``, and no other
+        conductor mounts it. This agent's children report through the
         ``security-conductor`` skill's ledger scripts, not the work ledger, so the
         mount would grant a flow whose procedure this conductor does not run."""
         data = self._install(tmp_path, monkeypatch)

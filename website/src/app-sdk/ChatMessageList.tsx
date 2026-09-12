@@ -1,13 +1,25 @@
 /**
- * ChatMessageList — shared message rendering for ChatPage and ChatEmbed.
+ * ChatMessageList — shared message rendering for every chat surface but the
+ * main page: the split/DM pane, the side panel, and the app-SDK embed.
  *
  * Renders messages with the same turn grouping, collapsible tool groups,
  * and component hierarchy as ChatPage. No Redux, no React Router.
  *
- * ChatPage wraps this in Virtuoso for virtualized scrolling.
- * ChatEmbed wraps this in a simple scrollable div.
+ * Two mounting modes, chosen by the `transcript` prop:
+ * - With `transcript`, the list OWNS its scroller: rows go through
+ *   `VirtualTranscript` (chat-core P5-e), so only the viewport window is in the
+ *   DOM and stick-to-bottom follow, row identity, and the earlier-history bar
+ *   come with it. This is what the dashboard hosts mount.
+ * - Without it, the list is a bare fragment of rows inside a scroller the
+ *   host supplies — the original SDK shape, kept for embeds that own their
+ *   own scroll container.
+ * ChatPage keeps its inline virtualizer wiring for now (P5-f).
  */
-import React, { useMemo, useCallback, useLayoutEffect, memo } from 'react'
+import React, { useMemo, useCallback, useLayoutEffect, memo, forwardRef } from 'react'
+import VirtualTranscript, {
+  type TranscriptEarlierPaging,
+  type VirtualTranscriptHandle,
+} from '../chat-core/transcript/VirtualTranscript'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
@@ -50,6 +62,12 @@ export interface ChatMessageListProps {
    *  (#5400, #5434). */
   canTrust?: boolean
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Selection actions offered on assistant text, next to Copy. Host
+   *  capabilities, not list behaviour: Quote needs the host's composer, Ask
+   *  needs a Side Chat surface the host can bring on screen. Either absent
+   *  hides its action (see chat-core/composer/selectionActions). */
+  onQuote?: (text: string, rect: DOMRect) => void
+  onAsk?: (text: string) => void
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
@@ -87,7 +105,35 @@ export interface ChatMessageListProps {
    *  consumer needs exactly this, and the ts-vs-index rule lives here once
    *  instead of in every host. */
   hiddenRow?: { ts?: string | null; index: number }
+  /** Mount the rows inside the list's own virtualized scroller. Supplying it
+   *  is what makes this component the scroll container: the host drops its
+   *  `overflow-y-auto` div and its follow hook, and reaches the scroller
+   *  through `ref` (a `VirtualTranscriptHandle`) or `transcript.scrollerRef`.
+   *  Without it the component has no scroller, so `ref` stays null. */
+  transcript?: TranscriptMount
 }
+
+/** The host-side wiring of a virtualized mount — everything about the scroller
+ *  that is not "which rows": identity for the height/anchor caches, what is
+ *  live, what sits above and below the rows, and how earlier history loads. */
+export interface TranscriptMount {
+  /** Partitions the persisted height cache and scroll anchor; prefix per host. */
+  sessionId: string
+  /** Share the scroll container with a host hook (usePinnedPrompt). */
+  scrollerRef?: React.MutableRefObject<HTMLDivElement | null>
+  onScroll?: () => void
+  onAtBottomChange?: (atBottom: boolean) => void
+  scrollerStyle?: React.CSSProperties
+  aboveRows?: React.ReactNode
+  belowRows?: React.ReactNode
+  earlier?: TranscriptEarlierPaging
+  /** Pin to the bottom on appends. Default true. */
+  followOutput?: boolean
+  /** Where the list opens with no saved anchor. Default 'bottom'. */
+  initialPlacement?: 'top' | 'bottom'
+}
+
+export type { TranscriptEarlierPaging, VirtualTranscriptHandle }
 
 // ── Stable helpers (outside component) ──
 
@@ -97,7 +143,7 @@ function msgKey(m: ChatMessage, i: number): string {
 
 // ── Main component ──
 
-const ChatMessageList = memo(function ChatMessageList({
+const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageListProps>(function ChatMessageList({
   messages,
   running,
   contentWidth = '900px',
@@ -105,15 +151,19 @@ const ChatMessageList = memo(function ChatMessageList({
   onApproveBatch,
   canTrust,
   onFileOpen,
+  onQuote,
+  onAsk,
   renderTool,
   hideCardOwnedOAuth = false,
   renderers,
   onDisplayItems,
   hiddenRow,
-}: ChatMessageListProps) {
+  transcript,
+}: ChatMessageListProps, ref) {
   // Row indexing is inferred from the props that consume it, not a separate
   // flag: a host that reads indices supplies onDisplayItems (and hides through
-  // hiddenRow); one that supplies neither gets the unwrapped DOM.
+  // hiddenRow); one that supplies neither gets the unwrapped DOM. A virtualized
+  // mount always indexes: its measured wrapper is the indexed block.
   const indexRows = onDisplayItems != null || hiddenRow != null
 
   // Phase 1: Build raw items — skip permissions, group thinking
@@ -216,6 +266,8 @@ const ChatMessageList = memo(function ChatMessageList({
       running,
       key,
       onFileOpen,
+      onQuote,
+      onAsk,
       hideCardOwnedOAuth,
       autoDeniedIds,
       renderTool,
@@ -223,7 +275,7 @@ const ChatMessageList = memo(function ChatMessageList({
       row,
     }
     return entry.render(m, ctx)
-  }, [messages, running, contentWidth, onFileOpen, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
+  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
 
 
   // Render a TurnItem (single or group)
@@ -235,6 +287,14 @@ const ChatMessageList = memo(function ChatMessageList({
     const nonPerm = item.msgs.filter(m => m.role !== 'permission')
     const perms = item.msgs.filter(m => m.role === 'permission')
     const unresolvedPerms = perms.filter(m => !m.meta?.resolved)
+    // A group of only RESOLVED permissions has nothing to show: its pill would
+    // claim "0 tool calls" over an empty expansion (permission rows render
+    // null), which after a stop cancels a call sits right under the turn
+    // summary's own count — two disagreeing counts for one stopped call
+    // (#9556). ChatPage's renderTurnItem already skips all-permission groups;
+    // this host keeps a group with a PENDING permission because, with no
+    // pinned ApprovalBar in the embed, the group IS the approval surface.
+    if (nonPerm.length === 0 && unresolvedPerms.length === 0) return null
     const lastPerm = unresolvedPerms[unresolvedPerms.length - 1]
 
     const handleApprove = onApprove && lastPerm?.meta?.approval_id
@@ -310,11 +370,60 @@ const ChatMessageList = memo(function ChatMessageList({
   // Layout effect, not passive: see `onDisplayItems`.
   useLayoutEffect(() => { onDisplayItems?.(displayItems) }, [displayItems, onDisplayItems])
 
+  // The row's content alone: the virtualized mount supplies the measured,
+  // indexed wrapper, so the fragment path's wrapper must not stack under it.
+  const renderRowContent = useCallback((item: DisplayItem, i: number) => (
+    item.kind === 'turn'
+      ? <TurnBlock turn={item} renderItem={renderItem} />
+      : renderItem(item, i)
+  ), [renderItem])
+  const isRowHidden = useCallback((item: DisplayItem, i: number) => (
+    hiddenRow != null && (hiddenRow.ts != null
+      ? (item.kind === 'single' && item.msg.ts === hiddenRow.ts)
+      : hiddenRow.index === i)
+  ), [hiddenRow])
+
+  // The row whose tail message is streaming (only ever the last one): its
+  // growth applies to the offset math immediately instead of through the
+  // debounced sync. Gated on the streaming ROLE, not the run flag — a tool
+  // phase or an auto-height widget in the last row must keep the debounce.
+  const streamingIndex = useMemo(() => {
+    const last = displayItems[displayItems.length - 1]
+    if (!last) return undefined
+    const tailOf = (t: TurnItem): ChatMessage | undefined =>
+      t.kind === 'single' ? t.msg : t.msgs[t.msgs.length - 1]
+    const tail = last.kind === 'turn' ? (last.items.length ? tailOf(last.items[last.items.length - 1]) : undefined) : tailOf(last)
+    return tail?.role === 'streaming' ? displayItems.length - 1 : undefined
+  }, [displayItems])
+
+  if (transcript) {
+    return (
+      <VirtualTranscript
+        ref={ref}
+        items={displayItems}
+        renderRow={renderRowContent}
+        sessionId={transcript.sessionId}
+        running={running}
+        streamingIndex={streamingIndex}
+        followOutput={transcript.followOutput}
+        initialPlacement={transcript.initialPlacement}
+        scrollerRef={transcript.scrollerRef}
+        onScroll={transcript.onScroll}
+        onAtBottomChange={transcript.onAtBottomChange}
+        scrollerStyle={transcript.scrollerStyle}
+        aboveRows={transcript.aboveRows}
+        belowRows={transcript.belowRows}
+        earlier={transcript.earlier}
+        isRowHidden={hiddenRow != null ? isRowHidden : undefined}
+      />
+    )
+  }
+
   return (
     <>
       {displayItems.map(renderDisplayItem)}
     </>
   )
-})
+}))
 
 export default ChatMessageList

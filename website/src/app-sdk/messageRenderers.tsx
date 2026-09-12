@@ -32,6 +32,7 @@ import NudgeCard from '../pages/chat/NudgeCard'
 import NoticeCard from '../pages/chat/NoticeCard'
 import { SystemNoticeRow, isSystemNoticeRow } from '../pages/chat/CompactionCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
+import { resolveTransientNotice } from '../pages/chat/transientNotice'
 import StopEventCard from '../pages/chat/StopEventCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { REASONING_ROLES } from '../pages/chat/groupDisplayItems'
@@ -55,6 +56,10 @@ export interface MessageRenderContext {
   /** Stable React key the list computed for this row. */
   key: string
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Selection actions the host offers on assistant text (see
+   *  chat-core/composer/selectionActions). Absent = Copy only. */
+  onQuote?: (text: string, rect: DOMRect) => void
+  onAsk?: (text: string) => void
   /** Drop mcp_oauth banners a Connections card already owns. */
   hideCardOwnedOAuth: boolean
   /** tool_call_ids whose call a policy or hook blocked. */
@@ -84,7 +89,7 @@ export interface MessageRenderer {
  * IDENTICALLY to the main chat's. `fmtMessageTime` elides the year only when it
  * is safe, so a message from a previous year is never dated to the current one.
  */
-function formatTs(ts?: string): string | undefined {
+export function formatTs(ts?: string): string | undefined {
   if (!ts) return undefined
   return fmtMessageTime(ts) || undefined
 }
@@ -416,6 +421,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
             showFooter={showFooter}
             slotRunning={ctx.running}
             onFileOpen={ctx.onFileOpen}
+            onQuote={ctx.onQuote}
+            onAsk={ctx.onAsk}
             variants={m.variants}
             variantIdx={m.variant_idx}
             turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
@@ -469,7 +476,15 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // The shared ErrorCard, deliberately without `onContinue`: omitting the
     // handler selects its settled (non-continuable) shape, and the app-sdk
     // surface has no turn to resume, so it must never grow the affordance.
-    render: (m, ctx) => ctx.row(<ErrorCard content={m.content} />),
+    // Same transient-notice split as transcriptRenderers: a pending gateway
+    // retry is a soft localized NoticeCard, not a red error.
+    render: (m, ctx) => {
+      const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+      if (transient?.card === 'notice') {
+        return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
+      }
+      return ctx.row(<ErrorCard content={transient ? transient.text : m.content} meta={m.meta} />)
+    },
   },
   {
     id: 'notice',

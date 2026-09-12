@@ -5,9 +5,9 @@ and the child-environment key set — for every ``gh``-spawning surface: the
 dashboard's PR sidebar (``dashboard/handlers/source_providers.py``), Issue
 Radar (``apps/builtins/issue_radar/backend/github_client.py``), and Code
 Review Sage (``apps/builtins/code_review_sage/sage_lib/discovery.py`` /
-``pipeline.py``). Each previously carried its own copy of the hardened-runner
-pattern, so a hardening fix had to land in three places and a missed copy
-silently kept the weaker guard.
+``pipeline.py``). Without one home each carries its own copy of the
+hardened-runner pattern, so a hardening fix has to land in three places and a
+missed copy silently keeps the weaker guard.
 
 Spawning is shared for the sync app-side callers only: Issue Radar and Sage
 route every spawn through :func:`run_gh` below, while the sidebar keeps its
@@ -312,18 +312,31 @@ def validate_provider_executable(candidate: str) -> str:
     AWS/Slack/gateway secrets), and every spawn is SEL-audited — containment
     and audit carry the trust boundary instead of binary provenance.
 
-    A gateway running as **root** is refused outright, in both modes: every
-    process it spawns (including the agent's own shell) would be root too, which
-    makes the ownership and agent-tree checks vacuous.
+    A gateway running as **root** on POSIX is refused outright, in both modes.
+    The reason is the sandbox boundary, not root itself: the agent's children
+    run under :mod:`kiro_crew.sandbox`, which bind-masks the credential homes
+    (``~/.config/gh`` among them) but leaves the rest of the filesystem
+    writable, while a provider child runs UNSANDBOXED with those credentials.
+    A root agent can therefore overwrite a root-owned ``/usr/bin/gh`` and have
+    the next Issue Radar call execute it with the credentials the sandbox hid
+    from it — and this walk cannot tell that write from the operator's install,
+    because both are root. Refusing the root gateway is what keeps the mask a
+    boundary. Where there is no such boundary the refusal protects nothing:
+
+    On **Windows** the same two questions are answered from the object's ACL
+    rather than from ``st_uid`` and the mode bits, which carry no information
+    there (see :mod:`kiro_crew.windows_acl`). An **elevated** token (the
+    built-in ``Administrator`` account, which is always elevated, or any "Run as
+    administrator" launch) is NOT a refusal reason: Windows has no OS sandbox in
+    this codebase, so the agent's shell already holds the gateway's full token
+    and the provider's credentials with it — refusing the gateway there would
+    remove the feature without removing any exposure. Which account runs the
+    gateway is Windows' decision; the ACL walk runs unchanged, keyed on the
+    gateway user's SID, which an elevated token still carries.
 
     Set ``KIROCREW_PROVIDER_BIN_STRICT=1`` on shared or multi-tenant hosts to
     restore the previous rule: canonical, symlink-free, root-owned and
     unwritable by the gateway user through every parent.
-
-    On **Windows** the same two questions are answered from the object's ACL
-    rather than from ``st_uid`` and the mode bits, which carry no information
-    there (see :mod:`kiro_crew.windows_acl`). An **elevated** gateway is refused
-    for the same reason a root one is: its children would be elevated too.
     """
     if not os.path.isabs(candidate):
         raise ValueError("path must be absolute")
@@ -332,15 +345,9 @@ def validate_provider_executable(candidate: str) -> str:
     uid = -1
     me_sid = ""
     if windows:
-        # Both of these live in platform_compat because it already owns "read
-        # this process's own access token" for the codebase. Both are tri-state
-        # and BOTH non-True answers refuse: an unreadable token is not a
-        # not-elevated token, and an unverifiable SID is not a trusted one.
-        elevated = platform_compat.is_token_elevated()
-        if elevated is None:
-            raise ValueError("provider execution is disabled: the gateway token is unreadable")
-        if elevated:
-            raise ValueError("provider execution is disabled for an elevated gateway")
+        # Lives in platform_compat because it already owns "read this process's
+        # own access token" for the codebase. Tri-state, and the non-True
+        # answer refuses: an unverifiable SID is not a trusted one.
         me_sid = platform_compat.current_user_sid() or ""
         if not me_sid:
             raise ValueError("provider execution is disabled: the gateway user's SID is unverifiable")
@@ -441,8 +448,8 @@ def provider_executable_candidates(executable: str) -> tuple[str, ...]:
     Resolution inside a directory is delegated to :func:`shutil.which`, which
     applies whatever the platform defines as "runnable there": ``PATHEXT`` on
     Windows, so a bare ``gh`` matches ``gh.exe``, and ``X_OK`` on POSIX. Joining
-    the bare name by hand is why this scan previously found nothing at all on
-    Windows.
+    the bare name by hand is why this scan must not do so: on Windows it would
+    find nothing at all.
 
     A hit is then required to actually LIE INSIDE the directory that was asked
     for, because on Windows ``which`` does not only search ``path``::
@@ -710,8 +717,8 @@ def run_gh(
     keeps its own error taxonomy, and a non-zero exit is returned as-is for
     the caller to classify.
 
-    NOT sandbox-routed today: these sync callers historically spawned bare and
-    this refactor is behavior-preserving. Strict-mode sandboxing would hide
+    NOT sandbox-routed today: these sync callers spawn bare.
+    Strict-mode sandboxing would hide
     ``~/.config/gh`` + the keychain and break auth, though the sidebar's async
     path shows standard-mode routing is compatible — adopting it here is a
     follow-up, not a constraint. The trusted-binary requirement, minimal env,

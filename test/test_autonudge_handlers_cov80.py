@@ -24,7 +24,12 @@ from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.dashboard.handlers import autonudge as h
-from kiro_crew.monitoring.models import MonitorOutcome, MonitorState, monitor_state_public_dict
+from kiro_crew.monitoring.models import (
+    MonitorObservationStatus,
+    MonitorOutcome,
+    MonitorState,
+    monitor_state_public_dict,
+)
 
 
 class _FakeSvc:
@@ -130,6 +135,8 @@ async def test_session_monitor_read_requires_and_uses_authenticated_binding(
     loop = _monitor_loop(slot_key="chat-1-111")
     assert loop.monitor is not None
     loop.monitor.wake_count = 3
+    loop.monitor.last_observation_status = MonitorObservationStatus.PENDING
+    loop.monitor.last_observation_reason_code = "checks_pending"
     _svc(monkeypatch, _FakeSvc([loop]))
 
     cookie_only = await h.api_session_monitor_get(
@@ -155,6 +162,9 @@ async def test_session_monitor_read_requires_and_uses_authenticated_binding(
     assert payload["monitor_id"] == loop.id
     assert payload["monitor"]["target"] == "https://github.com/acme/widgets/pull/7"
     assert payload["monitor"]["wake_count"] == 3
+    assert payload["monitor"]["last_observation_status"] == "pending"
+    assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
+    assert "last_observation_summary" not in payload["monitor"]
 
 
 @pytest.mark.asyncio
@@ -698,6 +708,8 @@ async def test_structured_legacy_row_carries_exactly_the_entitled_keys(
         "approval_stalled",
         "next_due_ts",
         "self_armed",
+        "terminal_notification_outcome",
+        "terminal_notification_stopped_at",
         # Mapped from the monitor's own accounting, not withheld -- withholding
         # them handed the component a default whose label reads "0 = infinity".
         "max_cycles",
@@ -1184,7 +1196,7 @@ async def test_delete_of_an_unknown_loop_is_audited_as_a_noop(
     assert kwargs["session_key"] == ""
 
 
-# --- #9194: an armed auto-nudge loop must read as armed, distinct from none ---
+# --- An armed auto-nudge loop must read as armed, distinct from none ---
 
 
 def _authed_session_monitor_request() -> web.Request:
@@ -1202,7 +1214,7 @@ async def test_session_monitor_read_reports_no_loop_as_not_armed(
 ) -> None:
     """A session with NOTHING armed reads as not armed.
 
-    This is the negative case #9194 turns on: a loop that did not arm must be
+    This is the negative case: a loop that did not arm must be
     distinguishable from one that did. Here no loop exists at all.
     """
     _svc(monkeypatch, _FakeSvc([]))
@@ -1219,8 +1231,8 @@ async def test_session_monitor_read_reports_armed_autonudge_loop(
 ) -> None:
     """A plain auto-nudge loop reads as armed via ``autonudge_loop``.
 
-    Previously this collapsed to ``monitor: None`` — identical to the no-loop
-    case above — which is the observability gap the issue reports.
+    A plain loop must not collapse to ``monitor: None`` — that would be identical
+    to the no-loop case above, the observability gap this pins.
     """
     loop = _loop(slot_key="chat-1-111")
     loop.cycle_count = 4

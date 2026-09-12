@@ -30,6 +30,9 @@ on:
       - Design Review
       - UX Review
       - First Principles Review
+      # Blocking and fail-closed: a script-confirmed newly-refused operation reds
+      # it, and so does a run that measured nothing.
+      - Security Scope Review
       - CodeQL
       # Stage-2 fork AI reviewers. They run from the default branch via
       # `workflow_run` (on CI's completion), so their own completion must
@@ -40,6 +43,7 @@ on:
       - Fork Design Review
       - Fork UX Review
       - Fork First Principles Review
+      - Fork Security Scope Review
       # Without these two, a finished scan never re-triggers readiness and the
       # lane sits at "(not started)" with no event able to clear it.
       - Internal Content Scan Gate
@@ -590,6 +594,7 @@ jobs:
               "checkrun:Design Review|Design Review|design-pr-|fast-gate.yml"
               "checkrun:UX Review|UX Review|ux-pr-|fast-gate.yml"
               "checkrun:First Principles Review|First Principles Review|first-principles-pr-|fast-gate.yml"
+              "checkrun:Security Scope Review|Security Scope Review|scope-pr-|fast-gate.yml"
             )
           else
             if [ "$stacked" = "true" ]; then
@@ -609,6 +614,7 @@ jobs:
               "design-review.yml|Design Review"
               "ux-review.yml|UX Review"
               "first-principles-review.yml|First Principles Review"
+              "security-scope-review.yml|Security Scope Review"
             )
           fi
           passed=()
@@ -779,6 +785,16 @@ jobs:
                 else
                   pending+=("$label (not started)")
                 fi
+              # Security Scope Review is deliberately NOT in the branch above.
+              # That branch exists for lanes that resolve NEUTRAL when the run
+              # itself errored, so a `failure` there can only be a judged-wrong
+              # verdict. This lane fails CLOSED instead: an unreadable report, a
+              # missing head marker and a stage that never ran all red it, and
+              # each of those means the tightening went unmeasured. Relabeling
+              # its failure as "(BLOCK)" would claim a verdict was reached, and
+              # moving it out of `failed[]` would let an unmeasured tightening
+              # merge. The default branch below already attributes it as a plain
+              # blocker, which is true of both of its failing causes.
               elif [ "$fail" -gt 0 ]; then
                 failed+=("$label (failure)")
               elif [ "$pass" -gt 0 ]; then
@@ -852,7 +868,49 @@ jobs:
             else
               if [ "$file" = "dynamic/github-code-scanning/codeql" ]; then
                 case "$conclusion" in
-                  success|skipped) passed+=("$label") ;;
+                  success)
+                    # A successful managed workflow says the language analyses
+                    # ran. It does NOT say their security results passed: GitHub
+                    # publishes that verdict as a separate exact-SHA check-run
+                    # owned by github-advanced-security. Requiring only the
+                    # workflow conclusion let a revision with high alerts pass
+                    # this repository's sole required aggregate.
+                    codeql_checks="$(gh_retry gh api --method GET \
+                      "repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL&per_page=100")" || {
+                      rc=$?
+                      if [ "$rc" -eq 22 ]; then exit 1; fi
+                      transport_failed=true
+                      break
+                    }
+                    # Bind by app as well as name and SHA. Another app is free
+                    # to publish a check called CodeQL; it must not answer for
+                    # GitHub's security result. Check-run ids are monotonic, so
+                    # an updated result supersedes an earlier interim row.
+                    codeql_check="$(jq -c '
+                      [.check_runs[]?
+                       | select((.app.slug // "") == "github-advanced-security")]
+                      | max_by(.id) // empty
+                    ' <<<"$codeql_checks")"
+                    if [ -z "$codeql_check" ]; then
+                      pending+=("$label (results not reported)")
+                      continue
+                    fi
+                    codeql_status="$(jq -r '.status // ""' <<<"$codeql_check")"
+                    codeql_conclusion="$(jq -r '.conclusion // ""' <<<"$codeql_check")"
+                    if [ "$codeql_status" != "completed" ]; then
+                      pending+=("$label (results $codeql_status)")
+                    else
+                      case "$codeql_conclusion" in
+                        success) passed+=("$label") ;;
+                        # Default setup publishes an interim neutral result while
+                        # one or more configured languages have not reported.
+                        # It is absence of a final result, not a clean verdict.
+                        neutral|"") pending+=("$label (results pending)") ;;
+                        *) failed+=("$label ($codeql_conclusion)") ;;
+                      esac
+                    fi
+                    ;;
+                  skipped) passed+=("$label") ;;
                   *) failed+=("$label ($conclusion)") ;;
                 esac
               elif [ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] || [ "$label" = "First Principles Review" ]; then
@@ -873,6 +931,11 @@ jobs:
                   success|neutral|skipped) passed+=("$label") ;;
                   *) failed+=("$label (BLOCK)") ;;
                 esac
+              # Security Scope Review is deliberately absent here too, for the
+              # same reason as in the fork reader above: it is fail-closed, so a
+              # `failure` conclusion covers both a confirmed regression and a run
+              # that measured nothing, and only the default branch's plain
+              # "(failure)" attribution is true of both.
               else
                 case "$conclusion" in
                   success|neutral) passed+=("$label") ;;
@@ -1001,7 +1064,7 @@ jobs:
 
           # (The long-term "Arbiter — judge from comments" gate was retired: its
           # one-way-door / long-term-reversibility lens now lives in Design
-          # Review. Readiness no longer waits on any API-owned external check.)
+          # Review. Readiness no longer waits on that retired Arbiter check.)
 
           # Disposition-rule enforcement (issue #6658). A violation is a
           # condition waiting cannot fix -- only the author editing or deleting

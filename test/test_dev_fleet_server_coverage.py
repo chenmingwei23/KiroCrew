@@ -11,6 +11,7 @@ loader's ``config_dir`` is patched, so nothing touches the real one.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import sys
@@ -1098,7 +1099,7 @@ async def test_disk_fresh_result_served_without_rescan(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_disk_six_sequential_polls_run_one_aggregation(monkeypatch):
-    """Regression for #8787: an open dashboard polling /disk must not re-scan.
+    """An open dashboard polling /disk must not re-scan.
 
     Six sequential endpoint reads on main ran three full aggregations because
     the done branch reset the state machine to idle on every snapshot. With
@@ -1351,7 +1352,7 @@ async def test_rebase_locked_refuses_dirty_worktree(monkeypatch):
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "scratch.log\0", "")))
     res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False
-    # The message no longer equals the bare legacy string: it now appends a
+    # The message does not equal the bare legacy string: it appends a
     # dirt-detail tail. The legacy prefix is preserved for clients keying on it.
     assert res["error"].startswith("worktree has uncommitted changes")
     assert "uncommitted changes" in res["error"]
@@ -1966,7 +1967,7 @@ async def test_json_body_empty_request_is_empty_dict():
 @pytest.mark.asyncio
 async def test_json_body_unknown_charset_is_400_not_500():
     # An unknown ``charset=`` codec makes aiohttp's decode step raise LookupError,
-    # not JSONDecodeError. The catch was ValueError-only, so this used to escape as
+    # not JSONDecodeError. A ValueError-only catch would let this escape as
     # a 500; it is a client-input mistake and must answer 400. Guards the widened
     # (LookupError, RecursionError, ValueError) catch against a regression.
     body, err = await http_api._json_body(
@@ -3302,7 +3303,7 @@ async def test_prune_run_handler_guards_protected_worktree_in_discard_paths(monk
 @pytest.mark.asyncio
 async def test_prune_run_discard_only_name_reaches_remove_and_skips_recheck(monkeypatch):
     """A name present ONLY in discard_untracked_paths is now RE-CHECKED via
-    _prunable (force's blanket bypass is no longer inherited), but a refusal
+    _prunable (force's blanket bypass is not inherited), but a refusal
     whose code is in _DISCARD_OVERRIDABLE_CODES is overridden, so it still
     reaches _worktree_remove with the caller's consented path list."""
     prunable_calls: list[str] = []
@@ -3357,7 +3358,7 @@ async def test_prune_run_discard_only_name_reaches_remove_and_skips_recheck(monk
 
 @pytest.mark.asyncio
 async def test_discard_rel_paths_scoped_to_approved_paths(monkeypatch):
-    """CHANGE 1: the discard is no longer a blanket sweep. `_discard_untracked_files`
+    """The discard is not a blanket sweep. `_discard_untracked_files`
     is handed EXACTLY the enumerated untracked paths, and a path that was never
     enumerated (never approved) is never handed to it."""
     discarded: list[tuple] = []
@@ -3575,7 +3576,7 @@ async def test_discard_refused_when_submitted_omits_a_file_now_on_disk():
 
 @pytest.mark.asyncio
 async def test_discard_refused_when_submitted_names_a_file_no_longer_there():
-    """CONSENT MISMATCH (reverse): the caller names a file that is no longer on
+    """CONSENT MISMATCH (reverse): the caller names a file that is not on
     disk. The submitted set differs from the fresh set, so the discard is
     refused with the same message; nothing is cleaned or removed."""
     cleaned = {"ran": False}
@@ -3594,7 +3595,7 @@ async def test_discard_refused_when_submitted_names_a_file_no_longer_there():
 
     async def run_cmd(cmd, timeout=None, **kw):
         if "ls-files" in cmd:
-            # only note.txt survives; gone.txt the caller listed is no longer here
+            # only note.txt survives; gone.txt the caller listed is not here
             return (0, "note.txt\0", "")
         if "worktree" in cmd and "remove" in cmd:
             ran_remove["v"] = True  # pragma: no cover - must not run
@@ -3990,6 +3991,67 @@ def test_discard_untracked_files_type_change_refuses_and_keeps_unapproved(tmp_pa
 
 
 @requires_fd_safe_discard
+def test_discard_untracked_files_type_change_is_named_on_an_eperm_platform(tmp_path, monkeypatch):
+    """The SAME type change, arriving as the errno darwin uses.
+
+    `unlink(2)` on a directory is EISDIR on Linux and EPERM on darwin, so the
+    branch above is unreachable there and the refusal the user reads was a bare
+    "operation not permitted" naming nothing. Injecting EPERM runs the darwin
+    shape here, so the message stays pinned on every runner rather than only on
+    the one that happens to be macOS.
+    """
+    _need_unsymlinked_tmp(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    victim = scratch / "not-approved.txt"
+    victim.write_text("keep me")
+
+    real_unlink = os.unlink
+
+    def _eperm_on_a_directory(name, *a, **kw):
+        try:
+            return real_unlink(name, *a, **kw)
+        except IsADirectoryError:
+            raise PermissionError(errno.EPERM, "Operation not permitted") from None
+
+    # The helper's own capability gate reads `os.unlink in os.supports_dir_fd`, so
+    # the replacement has to be declared dir_fd-capable or the whole discard is
+    # refused as unsupported before any unlink happens.
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {_eperm_on_a_directory})
+    monkeypatch.setattr(os, "unlink", _eperm_on_a_directory)
+    reason = repository._discard_untracked_files(str(tmp_path), ["scratch"])
+    monkeypatch.setattr(os, "unlink", real_unlink)
+
+    assert reason is not None
+    assert "scratch" in reason
+    assert "directory" in reason.lower()
+    assert victim.read_text() == "keep me"
+
+
+@requires_fd_safe_discard
+def test_discard_untracked_files_keeps_a_real_permission_refusal_verbatim(tmp_path, monkeypatch):
+    """A genuine EPERM on a FILE is not relabelled as a type change.
+
+    The stat that confirms the type change is what keeps these two apart, so an
+    unwritable directory still reports the permission problem it has.
+    """
+    _need_unsymlinked_tmp(tmp_path)
+    (tmp_path / "scratch").write_text("approved")
+
+    def _always_eperm(name, *a, **kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {_always_eperm})
+    monkeypatch.setattr(os, "unlink", _always_eperm)
+    reason = repository._discard_untracked_files(str(tmp_path), ["scratch"])
+
+    assert reason is not None
+    assert "scratch" in reason
+    assert "directory" not in reason.lower()
+    assert "not permitted" in reason.lower()
+
+
+@requires_fd_safe_discard
 def test_discard_untracked_files_deletes_files_but_leaves_emptied_dir(tmp_path):
     """Approved files, including a nested `sub/harness.py`, are deleted; the
     now-empty `sub/` directory is deliberately left behind (git does not track
@@ -4032,7 +4094,7 @@ def test_discard_untracked_files_refuses_escapes_and_deletes_nothing(tmp_path):
 
 @requires_fd_safe_discard
 def test_discard_untracked_files_missing_path_is_idempotent(tmp_path):
-    """A path that no longer exists returns None (idempotent) so a retry after a
+    """A path that does not exist returns None (idempotent) so a retry after a
     partially-completed discard is not an error."""
     _need_unsymlinked_tmp(tmp_path)
     assert not (tmp_path / "gone.txt").exists()

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 from aiohttp import web
 
 from kiro_crew.acp.types import STOP_REASON_CANCELLED
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, fsync_dir
 from kiro_crew.config.loader import (
     DASHBOARD_PORT,
     _raw_config,
@@ -56,7 +56,12 @@ from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.websocket_hub import WebSocketHub
 from kiro_crew.deny_guidance import remediation_for
-from kiro_crew.history import latest_transcript_ts, mint_row_mid, monotonic_transcript_ts
+from kiro_crew.history import (
+    latest_transcript_ts,
+    mint_row_mid,
+    monotonic_transcript_ts,
+    transcript_sort_key,
+)
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import (
@@ -2071,8 +2076,13 @@ def is_stop_event_row(m: dict) -> bool:
     """
     if m.get("kind") == "stop_event":
         return True
+    # A truthy non-dict `meta` (a corrupt or foreign transcript row) is data,
+    # not a match: `.get` on it would raise into every caller — including the
+    # disk-tail preview walk, which already tolerates unparseable lines,
+    # non-dict rows, and the non-string `cls` refused below. Same guard, same
+    # sibling field.
     meta = m.get("meta") or {}
-    if meta.get("kind") == "stop_event":
+    if isinstance(meta, dict) and meta.get("kind") == "stop_event":
         return True
     # Live window: the discriminator is still JSON inside `cls`. Prefilter on
     # the literal before parsing — this runs from `to_dict()` on the
@@ -2098,9 +2108,16 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     ASSISTANT's but an error row follows it (the turn streamed partway then died,
     which is otherwise shape-identical to a clean completion).
 
-    One shape is explicitly excluded: a trailing ``stop_event``. The user pressing
-    Stop is a deliberate ending, not an interruption, and stopping before the
-    reply emitted any text produces the same ``[user, ...]`` tail as a crash.
+    Two shapes are explicitly excluded. A trailing ``stop_event``: the user
+    pressing Stop is a deliberate ending, not an interruption, and stopping
+    before the reply emitted any text produces the same ``[user, ...]`` tail as
+    a crash. And a ``/compact`` request answered by its compaction notice (the
+    assistant row ``chat_utils._append_compaction_notice`` tags
+    ``meta.kind="compaction"``): the slash command IS the whole request and the
+    notice IS its result, so nothing is missing. The discriminator is
+    deliberately BOTH halves -- the tag alone cannot decide, because an
+    automatic compaction can write the same tagged row inside an ordinary turn
+    whose real reply never arrived, and that tail is a genuine interruption.
 
     Selects the wording injected for the model (``_MANUAL_RESUME_MSG`` vs
     ``_MANUAL_CONTINUE_MSG``), gates whether the composer offers the Resume
@@ -2121,6 +2138,7 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     distinction would buy a branch and nothing else.
     """
     saw_trailing_error = False
+    saw_compaction_result = False
     for m in reversed(messages):
         role = m.get("role")
         meta = m.get("meta") or {}
@@ -2134,9 +2152,37 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         if is_stop_event_row(m):
             return False
         if is_system_notice(role, meta):
+            # Remember a compaction RESULT row on the newest turn. Skipping the
+            # row is still right in general (an auto-compaction notice inside
+            # an ordinary turn is not that turn's reply), but when the user row
+            # this scan lands on IS the ``/compact`` request, this row is that
+            # request's whole result -- see the user branch below. The recycle
+            # and stuck-turn notices borrow ``kind="compaction"`` for the
+            # follow-up scan's skip and mark themselves with ``meta["notice"]``;
+            # they report no compaction, so they must not complete one.
+            if (
+                isinstance(meta, dict)
+                and meta.get("kind") == "compaction"
+                and not meta.get("notice")
+            ):
+                saw_compaction_result = True
             continue
         if role in ("user", "assistant") and m.get("content"):
-            return True if role == "user" else saw_trailing_error
+            if role != "user":
+                return saw_trailing_error
+            # A ``/compact`` answered by its compaction notice is a FINISHED
+            # turn -- unless an error row trails the notice, which is the same
+            # evidence the plain-assistant branch honors. Matched on the first
+            # whitespace token, the same rule the runner uses for
+            # ``user_requested_compaction``.
+            content = m.get("content")
+            if (
+                saw_compaction_result
+                and isinstance(content, str)
+                and content.split()[:1] == ["/compact"]
+            ):
+                return saw_trailing_error
+            return True
         if role == "error":
             saw_trailing_error = True
     return False
@@ -2357,13 +2403,20 @@ def append_and_surface(
     return msg
 
 
-#: Roles whose LIVE append starts the slot's next turn, and so consumes the answer
-#: channel an unanswered stateless question card was waiting on. Mirrors the
-#: frontend's ``QUESTION_RETIRING_ROLES``: the two must agree, or a session reports
-#: needs_input with no card on screen (client retired, server did not) or renders a
-#: card whose answer channel is already gone (server retired, client did not).
-#: Widening coverage is a data edit here.
-_QUESTION_RETIRING_ROLES = frozenset({"user", "nudge"})
+#: Roles whose LIVE append IS the next message an unanswered stateless question
+#: card was waiting on, and so retires it. Only ``user`` qualifies: the card's
+#: answer arrives as the user's next message, so only the human can spend it.
+#: ``nudge`` deliberately does NOT: an auto-nudge cycle wakes the SAME agent in
+#: the SAME conversation, so the answer channel survives it, and retiring there
+#: destroys both the card and the record a reload rehydrates from while the
+#: question is still open. A card whose question is genuinely dead is retired by
+#: its own Dismiss control, which clears this record through
+#: ``/api/ask-question/dismiss``.
+#: Mirrors the frontend's ``QUESTION_RETIRING_ROLES``: the two must agree, or a
+#: session reports needs_input with no card on screen (client retired, server did
+#: not) or renders a card whose answer channel is already gone (server retired,
+#: client did not). Widening coverage is a data edit here.
+_QUESTION_RETIRING_ROLES = frozenset({"user"})
 #: Roles that carry an inbound PROMPT -- the rows that ask this session to do
 #: something, as opposed to the rows produced while it works. ``user`` is a human
 #: send from any surface; ``inject`` is automation delivering a cron notification
@@ -2898,6 +2951,8 @@ DENY_CAUSE_INVALID_NAME = "invalid_name"
 DENY_CAUSE_HOOK_ERROR = "hook_error"
 DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
 DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
+DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
+DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
 
 #: cause → (clause completing "The tool call you just made …", what to do next).
 _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
@@ -2935,6 +2990,22 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "it. Do not immediately reissue the same call: the person who did not "
         "answer is still away, and re-prompting re-arms the same wait for the "
         "same silence.",
+    ),
+    DENY_CAUSE_APPROVAL_NO_BUDGET: (
+        "was auto-declined because the turn had no budget left to host its approval prompt",
+        "the prompt was never shown, so the action itself was never judged — do "
+        "not abandon it or route around it on this evidence. State the "
+        "permission you need and why, then continue with what you can do "
+        "without it. Do not immediately reissue the same call: this turn cannot "
+        "host an approval wait, so the identical call would be declined the "
+        "same way.",
+    ),
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE: (
+        "was auto-declined because its approval prompt could not be delivered "
+        "to the operator's channel",
+        "delivery failed, so the action itself was never judged — do not "
+        "abandon it or route around it on this evidence. State the permission "
+        "you need and why, then continue with what you can do without it.",
     ),
 }
 
@@ -3185,6 +3256,119 @@ def _normalize_slot_key(name: str) -> str:
     return _SLOT_KEY_FILENAME_UNSAFE_RE.sub("_", _ascii_slot_key(name))
 
 
+# Tag revisions are totally ordered across gateway restarts. Each process claims
+# an EPOCH once at startup (``ensure_tags_revision_epoch``, run off the event
+# loop from ``DashboardState.load_tags``): ``max(persisted counter + 1, current
+# clock in microseconds)``, persisted atomically to the data home. Paired with a
+# strictly increasing in-process sequence, a revision minted by a later process
+# always sorts after every revision of an earlier one, so a slow reply from the
+# pre-restart process can never masquerade as newer. The persisted counter keeps
+# the order monotonic across a backward clock step; the clock floor keeps a
+# writable restart above everything minted before it. A process whose claim
+# cannot be persisted mints OPAQUE revisions instead: an ordering that was never
+# made durable is never asserted, and clients fall back to equality + lineage.
+_TAGS_REVISION_EPOCH_FILE = "tags_revision_epoch"
+_TAGS_REVISION_EPOCH: int | None = None
+_TAGS_REVISION_SEQ_LOCK = threading.Lock()
+_TAGS_REVISION_SEQ = 0
+
+
+def _claim_tags_revision_epoch() -> int | None:
+    """Claim, persist and return this process's epoch, or None if it could not
+    be persisted.
+
+    The claim is ``max(previous + 1, now_microseconds)``: never below the
+    persisted counter (so a backward clock step cannot regress the order) and
+    never below the current clock (so a writable restart sorts above anything
+    minted before it). If the claim cannot be persisted, no epoch is returned
+    and ``mint_tags_revision`` falls back to OPAQUE revisions: an ordering
+    that was never made durable must not be asserted, because the next restart
+    cannot know about it and a backward clock step could then produce a lower
+    orderable epoch that clients would reject. Opaque revisions keep the
+    equality/lineage behaviour that fixes the reported flicker; only the
+    cross-restart ordering refinement is given up, on a home that cannot
+    persist anything anyway.
+    """
+    path = config_dir() / _TAGS_REVISION_EPOCH_FILE
+    previous = 0
+    try:
+        previous = int(path.read_text(encoding="utf-8").strip() or "0")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        # An unreadable or malformed counter is NOT "no counter": the real value
+        # may be higher than anything the clock would now yield, so re-seeding
+        # from the clock could persist a LOWER epoch than clients already hold.
+        # Refuse to assert an order this process cannot prove.
+        logger.warning(
+            "tags revision epoch file unreadable; minting opaque (unordered) revisions",
+            exc_info=True,
+        )
+        return None
+    claimed = max(previous + 1, time.time_ns() // 1000)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The anti-regression guarantee rests on the persisted counter surviving
+        # a crash: without the data AND the directory entry on disk, a power
+        # loss inside the flush window followed by a backward clock step would
+        # re-claim an epoch that connected clients already hold.
+        atomic_write(path, f"{claimed}\n", fsync=True)
+        fsync_dir(path.parent)
+    except OSError:
+        logger.warning(
+            "tags revision epoch not persisted; minting opaque (unordered) revisions",
+            exc_info=True,
+        )
+        return None
+    return claimed
+
+
+# Sentinel stored in _TAGS_REVISION_EPOCH once a claim failed, so the disk is not
+# retried on every mint; the process stays on opaque revisions until restart.
+_TAGS_REVISION_EPOCH_UNPERSISTED = -1
+
+
+def ensure_tags_revision_epoch() -> int | None:
+    """Claim this process's epoch now (idempotent); None when unpersisted.
+
+    Called from startup code that already runs off the event loop
+    (``DashboardState.load_tags`` via ``asyncio.to_thread``) so the one disk
+    read/write the claim performs never happens inside a request handler;
+    ``mint_tags_revision`` keeps a lazy claim only as a fallback for callers
+    that construct slots without a full startup (tests, tools).
+    """
+    global _TAGS_REVISION_EPOCH
+    with _TAGS_REVISION_SEQ_LOCK:
+        if _TAGS_REVISION_EPOCH is None:
+            claimed = _claim_tags_revision_epoch()
+            _TAGS_REVISION_EPOCH = _TAGS_REVISION_EPOCH_UNPERSISTED if claimed is None else claimed
+        epoch = _TAGS_REVISION_EPOCH
+    return None if epoch == _TAGS_REVISION_EPOCH_UNPERSISTED else epoch
+
+
+def mint_tags_revision() -> str:
+    """Return a new tag revision: ``<16-digit epoch>.<20-digit sequence>-<8 hex>``.
+
+    Zero-padded epoch then sequence sort lexically and numerically alike, so a
+    client compares two revisions for staleness by string order alone: a later
+    gateway process (higher epoch) always wins over an earlier one, and within a
+    process the sequence orders commits. The random suffix keeps revisions
+    unique even if two processes ever claimed the same epoch. When no epoch
+    could be persisted (unwritable data home) an opaque ``uuid4`` hex is
+    returned instead, which clients treat with equality + lineage only.
+    """
+    global _TAGS_REVISION_SEQ
+    epoch = ensure_tags_revision_epoch()
+    if epoch is None:
+        # No durable epoch: an opaque revision. Clients treat it with the
+        # equality/lineage rules (no ordering is asserted).
+        return uuid.uuid4().hex
+    with _TAGS_REVISION_SEQ_LOCK:
+        _TAGS_REVISION_SEQ += 1
+        seq = _TAGS_REVISION_SEQ
+    return f"{epoch:016d}.{seq:020d}-{uuid.uuid4().hex[:8]}"
+
+
 class SlotOrigin:
     """Slot creation origin — who initiated the slot.
 
@@ -3220,6 +3404,7 @@ class _ChatSlot:
 
     __slots__ = (
         "_buffers",
+        "_decision_dismissed_ts",
         "_projection",
         "_queue_repository",
         "_source_links_cache",
@@ -3235,6 +3420,8 @@ class _ChatSlot:
         "autocompact_pct",
         "mode",
         "workspace",
+        "memory_store",
+        "_memory_assignment_from_history",
         "project",
         "created_at",
         "messages",
@@ -3303,6 +3490,7 @@ class _ChatSlot:
         "_folder_suggested",
         "pinned",
         "tags",
+        "tags_revision",
         "_pending_subagent_failures",
         "_pending_synthesis",
         "_synthesis_inflight",
@@ -3429,6 +3617,15 @@ class _ChatSlot:
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
+        # The crew's memory silo, or "" for the global store. Held on the slot
+        # rather than re-resolved per save because it is SLOT-OWNED metadata:
+        # absence retracts it, so a save that could not name it would drop the
+        # binding and silently return that session to the global store.
+        self.memory_store: str = ""
+        # Transcript fields can restore display state, never a new private
+        # assignment. Only a protected binding or an explicit owner pick clears
+        # that admission boundary; this marker is not persisted in the transcript.
+        self._memory_assignment_from_history = False
         self.project: str = ""
         # Remote-execution binding. ``executor`` is "local" for every ordinary
         # slot; "remote" means the turn is dispatched over an instance tunnel to
@@ -3607,8 +3804,12 @@ class _ChatSlot:
         # stop. Holds an id rather than a bool so the marker cannot leak onto a
         # later card: a boolean left set would make the NEXT card's cooperative
         # ack defer to a hard callback that never fires, stranding it at
-        # "stopping". Every card has a fresh uuid, so a stale id simply stops
-        # matching and no card-open path has to remember to clear it.
+        # "stopping". A later press usually mints a fresh uuid, so a stale id
+        # stops matching on its own — with ONE exception: a press that finds a
+        # same-turn orphan RE-ARMS that card under its existing id
+        # (chat_handlers._open_stop_event_card), so that path clears
+        # this marker explicitly, and per-attempt identity for the resolver
+        # callbacks is carried by `_stop_generation` above, not by the card id.
         self._stop_escalated_card_id: str | None = None
         # Set by api_chat_slot_project; consumed in _run_chat instead of
         # inline because the endpoint can be reached from inside the kiro-cli
@@ -3677,6 +3878,10 @@ class _ChatSlot:
         self._folder_suggested: bool = False
         self.pinned: bool = False  # pinned to top of sidebar
         self.tags: list[str] = []  # assigned tag ids (see DashboardState._tags)
+        # Change identity for tag snapshots. Orderable (see mint_tags_revision):
+        # equality identifies a specific frame, and the sequence prefix lets a
+        # client classify an unseen older snapshot as stale rather than newer.
+        self.tags_revision: str = mint_tags_revision()
         self._pending_subagent_failures: list[str] = []
         # Fix 2 (B1): armed by gateway when the LAST sub-agent of a fan-out
         # completes; consumed once by chat_runner's drain/idle branch to fire a
@@ -4102,6 +4307,29 @@ class _ChatSlot:
         # "the agent is done and asked you something", and which entries a user
         # message may retire.
         self._question_pending: dict[str, dict] = {}
+        # Dismiss tombstone for the projection's buried-decision scan
+        # (slot_projection.py): the ``ts`` of the one options-bearing assistant
+        # row whose ``pending_decision`` the user explicitly waved away. The
+        # projection re-derives from the transcript on every push, so dismissal
+        # cannot be a state delete — there is no state to delete — it has to name
+        # the message it silences. A LATER options turn has a different ts and
+        # surfaces normally. In-memory like ``_question_pending``: after a
+        # restart the card may reappear, which errs on the side of re-asking.
+        self._decision_dismissed_ts: str = ""
+
+    def bump_tags_revision(self) -> str:
+        """Rotate and return the revision for the current tag list.
+
+        Totally ordered, not merely opaque: ``mint_tags_revision`` pairs a
+        persisted per-process epoch with a strictly increasing sequence, so a
+        client can tell an older snapshot it has never seen (a delayed HTTP
+        fetch landing after a newer WebSocket frame, or a slow reply from the
+        pre-restart process) from a genuinely newer commit by string order
+        alone. No wall-clock value participates after the first epoch is
+        seeded, so a clock step cannot make revisions regress.
+        """
+        self.tags_revision = mint_tags_revision()
+        return self.tags_revision
 
     @property
     def _dirty(self) -> bool:
@@ -4263,12 +4491,12 @@ class _ChatSlot:
         meta: dict | None = None,
         mint_mid: bool = True,
     ) -> dict[str, Any]:
-        # A LIVE turn-consuming row retires every unanswered STATELESS question:
-        # the card's own submit path sends one, and anything else that starts the
-        # slot's next turn consumes the answer channel the card was waiting on.
+        # A LIVE user row retires every unanswered STATELESS question: that row
+        # IS the next message the card's answer was contracted to arrive as.
         # Retiring here rather than at the composer covers every entrance —
-        # queued dispatch, an auto-nudge cycle, a channel row relayed from Slack —
-        # instead of the one send site that happens to be in front of the user.
+        # queued dispatch, a channel row relayed from Slack — instead of the one
+        # send site that happens to be in front of the user. An auto-nudge cycle
+        # is NOT one of them: see ``_QUESTION_RETIRING_ROLES``.
         #
         # The role set mirrors the frontend's `QUESTION_RETIRING_ROLES`, which
         # drops the card on the same frames. They must agree: a role the client
@@ -4920,6 +5148,12 @@ class DashboardState:
     # assign a fresh set(), so mutation only ever touches an instance attribute.
     unrestored_slot_keys: "frozenset[str] | set[str]" = frozenset()
     crew: Any = None  # Crew Mode control plane (set by gateway; None = unavailable)
+    # Gateway-owned restore/open task. The class default keeps lightweight
+    # ``__new__`` fixtures on the already-ready baseline; a real gateway
+    # publishes its task immediately before READY so chat admission can wait
+    # without mistaking a transient preparation fence for a failed turn.
+    memory_startup_task: "asyncio.Task[None] | None" = None
+    resume_channel_agents: "Callable[[], None] | None" = None
 
     def __init__(
         self,
@@ -4941,17 +5175,20 @@ class DashboardState:
         self.start_time = start_time
         # Published only at the final boot-to-ready boundary in server.py.
         # The socket binds earlier, so /api/ready can truthfully return 503
-        # while session restoration, channel relaunch, and tunnel setup finish.
+        # while session restoration and tunnel setup finish. The gateway may
+        # defer restored channel agents until its memory task completes.
         self.ready: bool = False
+        self.memory_startup_task: "asyncio.Task[None] | None" = None
         # Wired by server.py after the gateway-owned prerequisite service is
         # constructed. The central chat runner reads this latch so every turn
         # entry path is protected, including task/workflow continuations.
         self.kiro_prerequisite_service: Any = None
         self.subagents = subagents
-        # Crew Mode control plane; attached by the gateway after
-        # SubagentManager construction (None = crew mode unavailable).
-        self.crew: Any = None
         self.channel_manager: Any = None  # lazy-init in server.py
+        # A gateway launch defers legacy channel-agent relaunch until memory
+        # preparation settles. Standalone dashboard callers keep the immediate
+        # start behavior and leave this callback unset.
+        self.resume_channel_agents: "Callable[[], None] | None" = None
         self.tunnel_manager: Any = None  # lazy-init in server.py (TunnelManager)
         self.instances_manager: Any = None  # lazy-init in server.py (SshTunnelManager)
         self.instances_registry: Any = None  # lazy-init in server.py (InstancesRegistry)
@@ -5582,8 +5819,15 @@ class DashboardState:
             try:
                 # Tag kind="compaction" so the dashboard's follow-up [OPTIONS:]
                 # backward scan skips this proactive system notice, matching the
-                # auto-compact notice invariant.
-                slot.append("assistant", message, "msg msg-a", meta={"kind": "compaction"})
+                # auto-compact notice invariant. `notice` marks it as borrowing
+                # the tag: it reports no compaction, so `is_turn_interrupted`
+                # must not read it as a `/compact` request's result.
+                slot.append(
+                    "assistant",
+                    message,
+                    "msg msg-a",
+                    meta={"kind": "compaction", "notice": "session_recycled"},
+                )
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Failed to append recycle notice to slot %s", slot_key
@@ -5627,7 +5871,15 @@ class DashboardState:
                 # kind="compaction" for the same reason as the recycle notice: it
                 # keeps the dashboard's follow-up [OPTIONS:] backward scan from
                 # treating a proactive system notice as the turn's own output.
-                slot.append("assistant", message, "msg msg-a", meta={"kind": "compaction"})
+                # `notice` marks the borrowed tag: a stuck turn is the OPPOSITE
+                # of a completed one, so `is_turn_interrupted` must not read
+                # this row as a `/compact` request's result.
+                slot.append(
+                    "assistant",
+                    message,
+                    "msg msg-a",
+                    meta={"kind": "compaction", "notice": "stuck_turn"},
+                )
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Failed to append stuck-turn notice to slot %s", slot_key
@@ -5675,17 +5927,22 @@ class DashboardState:
         _BUNDLE_ID_CACHE["v"] = (key, digest)
         return digest
 
-    def _count_lessons(self) -> int:
-        """Count lessons from JSONL store + vector store (if enabled)."""
-        count = len(self.lessons.load_all())
-        if self.context_builder:
-            vs = self.context_builder.memory.vector_store
-            if vs:
-                # COUNT(*) — not get_lessons() — so the status paths that poll
-                # this per client do not materialize the whole lesson corpus
-                # just to len() it.
-                count += vs.count_lessons()
-        return count
+    def _count_lessons(self) -> int | None:
+        """Count available Global lessons without blocking the recovery dashboard."""
+        from kiro_crew.memory_startup import MemoryStartupUnavailable
+
+        try:
+            count = len(self.lessons.load_all())
+            if self.context_builder:
+                vs = self.context_builder.memory.vector_store
+                if vs:
+                    # COUNT(*) keeps status polling from materializing lessons.
+                    count += vs.count_lessons()
+            return count
+        except MemoryStartupUnavailable:
+            # The selected store's Recovery view supplies the diagnostic. Keep
+            # the dashboard shell usable and do not misreport unavailable as 0.
+            return None
 
     def status_snapshot(
         self,
@@ -6162,6 +6419,46 @@ class DashboardState:
     def _broadcast_question_retired(self, slot_key: str, card_ids: list[str]) -> None:
         """Tell owner clients that question cards are no longer actionable."""
         _questions_for(self).broadcast_retired(self, slot_key, card_ids)
+
+    def dismiss_pending_decision(self, slot_key: str, ts: str) -> bool:
+        """Silence one buried [OPTIONS:] decision without answering it.
+
+        ``ts`` names the options-bearing assistant row (the ``pending_decision``
+        payload carries it), not the slot: the decision can be superseded by a
+        newer options turn before the dismissal lands, and a slot-wide clear
+        would silence THAT one unseen. The projection re-derives on every push,
+        so this only records the tombstone and pushes; there is no record to
+        delete. The tombstone is monotonic under ``transcript_sort_key``
+        ordering (transcripts can mix naive and offset-aware rows): a dismiss
+        naming an OLDER ts than the recorded one is a delayed request about a
+        superseded decision and is refused rather than letting it un-silence
+        the newer dismissal. Returns False for an unknown slot, a blank ts, or
+        a stale ts so the route can 404 instead of acknowledging a no-op.
+        """
+        slot = self._slots.get(slot_key)
+        if slot is None or not ts:
+            return False
+        current = getattr(slot, "_decision_dismissed_ts", "") or ""
+        if current:
+            # Out-of-order dismiss: a delayed request naming a superseded
+            # decision must not overwrite the tombstone of the newer one that
+            # was dismissed after it. Ordered by transcript_sort_key, not
+            # string compare -- transcripts can mix naive rows (older builds)
+            # with offset-aware ones, and on a non-UTC host string order is
+            # not row order for that pair (see history.transcript_sort_key).
+            # Only refuse when BOTH sides parse (bucket 0): an unparseable
+            # value carries no order, and refusing against one would let a
+            # single bad ts brick every later dismissal. Either way the named
+            # decision is already superseded -- 404 tells the client its
+            # card was stale, which is already that caller's
+            # take-the-card-away exit.
+            key_new = transcript_sort_key(ts)
+            key_cur = transcript_sort_key(current)
+            if key_new[0] == 0 and key_cur[0] == 0 and key_new < key_cur:
+                return False
+        slot._decision_dismissed_ts = ts
+        _questions_for(self).push_slots(self)
+        return True
 
     def _push_slots(self) -> None:
         """Push question status without failing the question lifecycle."""
@@ -7021,7 +7318,7 @@ class DashboardState:
         )
 
     async def remove_chat_pins_for_slots(self, slot_keys: set[str]) -> int:
-        """Remove pins when their persisted history sessions are permanently deleted."""
+        """Explicitly remove pins for the supplied dashboard slot keys."""
         keys = {key for key in slot_keys if key}
         if not keys:
             return 0
@@ -7098,6 +7395,10 @@ class DashboardState:
         across restarts), and a parse failure is left untouched (so a
         transient I/O error never silently overwrites saved data).
         """
+        # Claim this process's tag-revision epoch here: load_tags runs off the
+        # event loop at startup (asyncio.to_thread) and before any slot is
+        # restored, so the claim's disk read/write never lands on the loop.
+        ensure_tags_revision_epoch()
         tags_path = config_dir() / self._TAGS_FILE
         file_existed = tags_path.exists()
         try:
