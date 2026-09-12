@@ -676,6 +676,13 @@
       "description": "Display time on each message"
     },
     {
+      "id": "chat.side-by-side-diffs",
+      "label": "Side-by-side diffs",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.side-by-side-diffs",
+      "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere."
+    },
+    {
       "id": "chat.simplified-tool-call-names",
       "label": "Simplified Tool Call Names",
       "tab": "chat",
