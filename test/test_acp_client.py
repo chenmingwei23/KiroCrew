@@ -1,6 +1,7 @@
 """Tests for ACP client."""
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -7231,19 +7232,37 @@ class TestExtractToolCallUpdate:
         assert event.tool_output == "real output"
         assert "exitCode" not in event.tool_output
 
-    def test_empty_items_envelope_still_returns_none(self):
-        """The gate is the ABSENCE of ``items``, so kiro-cli's space is unchanged."""
+    def test_outputless_terminal_updates_return_status_only_results(self):
         client = self._client()
-        for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
-            msg = self._make_msg(
-                {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tc-empty",
-                    "status": "completed",
-                    "rawOutput": shape,
-                }
-            )
-            assert client._extract_tool_call_update(msg) is None, shape
+        for status in ("completed", "failed"):
+            for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
+                msg = self._make_msg(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-empty",
+                        "status": status,
+                        "rawOutput": shape,
+                    }
+                )
+                event = client._extract_tool_call_update(msg)
+                assert (
+                    event is not None
+                ), f"terminal status {status} was discarded without a result event"
+                assert event.tool_status == status
+                assert event.tool_final is (status == "completed")
+                assert event.tool_output == "", "a status-only result invented tool output"
+
+    def test_outputless_nonterminal_update_returns_none(self):
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-empty",
+                "status": "in_progress",
+                "rawOutput": {"items": []},
+            }
+        )
+        assert client._extract_tool_call_update(msg) is None
 
     def test_credential_straddling_the_bound_is_still_redacted(self):
         """The 8000-char bound must be applied AFTER redaction, not before.
@@ -7279,6 +7298,32 @@ class TestExtractToolCallUpdate:
         assert event is not None
         assert secret not in event.tool_output
         assert len(event.tool_output) <= 8000
+
+    def test_long_output_metadata_covers_full_redacted_text(self):
+        output = "A" * 8000 + "é-tail"
+        full_redacted = acp_client.redact_text(output)
+        full_bytes = full_redacted.encode("utf-8", "replace")
+        prefix_bytes = full_redacted[:8000].encode("utf-8", "replace")
+
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-long",
+                "status": "completed",
+                "rawOutput": {"items": [{"Text": output}]},
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.tool_output == full_redacted[:8000]
+        assert event.tool_output_bytes == len(
+            full_bytes
+        ), f"parser recorded {event.tool_output_bytes} bytes from truncated output"
+        assert event.tool_output_bytes != len(prefix_bytes)
+        assert (
+            event.tool_output_digest == hashlib.sha256(full_bytes).hexdigest()
+        ), "parser digested truncated display prefix instead of full redacted output"
 
     def test_raw_output_json_fallback(self):
         client = self._client()
