@@ -146,6 +146,7 @@ from kiro_crew.acp.types import (
     OUTCOME_SELECTED,
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
+    TERMINAL_TOOL_STATUSES,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_CONFIG_OPTION,
@@ -11276,10 +11277,11 @@ class AcpClient:
              follow-up text.
           2. A `status: completed` update with `rawOutput.items[].Json.stdout`
              for shell-style tools.
-        Both carry the same `toolCallId`; we yield an EVENT_TOOL_RESULT on
-        whichever provides output. Hooking these gives the inline pill its real
-        output the moment the tool finishes, instead of waiting for the kiro-cli
-        JSONL flush at the next tool_call boundary or message end.
+        Both carry the same `toolCallId`; we yield an EVENT_TOOL_RESULT when an
+        update provides output or a terminal status. A status-only event carries
+        no output. Hooking these gives the inline pill its real output the moment
+        the tool finishes, instead of waiting for the kiro-cli JSONL flush at the
+        next tool_call boundary or message end.
         """
         params = msg.params or {}
         update = params.get("update", {})
@@ -11288,11 +11290,9 @@ class AcpClient:
         tool_use_id = update.get("toolCallId", "")
         if not tool_use_id:
             return None
-        # Stamped before the output parsing below, which returns None for an
-        # output-less update: a tool that completes with no output is still a
-        # completed round-trip and must not be dropped from the histogram. A
-        # non-terminal status is a no-op, so a mid-stream update leaves the clock
-        # running for the real completion.
+        # A terminal status is useful even when output parsing finds no text: it
+        # closes the observed round-trip without claiming a result body. A
+        # non-terminal status leaves the clock running for the real completion.
         record_tool_call_finished(
             tool_use_id,
             status=update.get("status"),
@@ -11347,9 +11347,17 @@ class AcpClient:
                 if raw_output and "items" not in raw_output:
                     output_parts.append(json.dumps(raw_output, default=str))
 
+        tool_status = str(update.get("status") or "")
         if not output_parts:
-            log_unrenderable_content(logger, tool_use_id, content)
-            return None
+            if tool_status not in TERMINAL_TOOL_STATUSES:
+                log_unrenderable_content(logger, tool_use_id, content)
+                return None
+            return AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id=tool_use_id,
+                tool_final=tool_status == "completed",
+                tool_status=tool_status,
+            )
 
         final_output = "\n".join(output_parts)
         # Redact the WHOLE join, then bound -- never the reverse. Bounding first
@@ -11358,12 +11366,19 @@ class AcpClient:
         # slice keeps "://user:password" and drops the "@" the prefilter needs,
         # so the password reaches the dashboard in clear text. Same ordering as
         # `_dispatch._build_tool_result_event` and as `_compaction_detail` below.
-        final_output = redact_text(final_output)[:8000]
+        _redacted = redact_text(final_output)
+        _redacted_bytes = _redacted.encode("utf-8", "replace")
+        tool_output_digest = hashlib.sha256(_redacted_bytes).hexdigest()
+        tool_output_bytes = len(_redacted_bytes)
+        final_output = _redacted[:8000]
         return AcpEvent(
             kind=EVENT_TOOL_RESULT,
             tool_call_id=tool_use_id,
             tool_output=final_output,
+            tool_output_digest=tool_output_digest,
+            tool_output_bytes=tool_output_bytes,
             tool_final=update.get("status") == "completed",
+            tool_status=str(update.get("status") or ""),
         )
 
     def _extract_tool_call_refinement(self, msg: JsonRpcMessage) -> AcpEvent | None:
