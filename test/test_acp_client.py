@@ -7231,19 +7231,37 @@ class TestExtractToolCallUpdate:
         assert event.tool_output == "real output"
         assert "exitCode" not in event.tool_output
 
-    def test_empty_items_envelope_still_returns_none(self):
-        """The gate is the ABSENCE of ``items``, so kiro-cli's space is unchanged."""
+    def test_outputless_terminal_updates_return_status_only_results(self):
         client = self._client()
-        for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
-            msg = self._make_msg(
-                {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tc-empty",
-                    "status": "completed",
-                    "rawOutput": shape,
-                }
-            )
-            assert client._extract_tool_call_update(msg) is None, shape
+        for status in ("completed", "failed"):
+            for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
+                msg = self._make_msg(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-empty",
+                        "status": status,
+                        "rawOutput": shape,
+                    }
+                )
+                event = client._extract_tool_call_update(msg)
+                assert (
+                    event is not None
+                ), f"terminal status {status} was discarded without a result event"
+                assert event.tool_status == status
+                assert event.tool_final is (status == "completed")
+                assert event.tool_output == "", "a status-only result invented tool output"
+
+    def test_outputless_nonterminal_update_returns_none(self):
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-empty",
+                "status": "in_progress",
+                "rawOutput": {"items": []},
+            }
+        )
+        assert client._extract_tool_call_update(msg) is None
 
     def test_credential_straddling_the_bound_is_still_redacted(self):
         """The 8000-char bound must be applied AFTER redaction, not before.

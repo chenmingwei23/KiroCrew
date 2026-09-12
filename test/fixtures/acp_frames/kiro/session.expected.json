@@ -117,7 +117,8 @@
         "kind": "tool_result",
         "tool_call_id": "toolu_bdrk_01K2gMtk8bxngM8Cw1FAFNTV",
         "tool_final": true,
-        "tool_output": "hello-from-corpus\n"
+        "tool_output": "hello-from-corpus\n",
+        "tool_status": "completed"
       },
       {
         "is_shell": true,

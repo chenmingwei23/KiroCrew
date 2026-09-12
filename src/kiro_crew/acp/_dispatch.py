@@ -47,6 +47,7 @@ from kiro_crew.acp.types import (
     OPTION_ALLOW_ALWAYS,
     OPTION_ALLOW_ONCE,
     STOP_REASON_CONTENT_FILTERED_WIRE,
+    TERMINAL_TOOL_STATUSES,
     TODO_TASKS_MAX,
     TODO_TEXT_MAX,
     TOOL_PURPOSE_KEYS,
@@ -1692,14 +1693,16 @@ def log_unrenderable_content(log: logging.Logger, tool_use_id: Any, content: Any
 
 
 def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> AcpEvent | None:
-    """Build an ``EVENT_TOOL_RESULT`` from a ``tool_call_update`` carrying output.
+    """Build an ``EVENT_TOOL_RESULT`` from output or a terminal tool status.
 
     Three output shapes: ``content[].content.text`` blocks (stream mid-turn),
     ``rawOutput.items[]`` (``Text`` / ``Json.stdout``) on ``status=completed``,
     and -- since ``rawOutput`` is unstructured passthrough rather than a
-    contract -- any other non-empty ``rawOutput`` object, serialised. Returns
-    None when the update carries no output at all (refinement-only updates are
-    handled by :func:`_build_tool_refinement_event`).
+    contract -- any other non-empty ``rawOutput`` object, serialised. A terminal
+    update with no renderable output emits the observed status without inventing
+    output. Returns None when the update carries neither output nor terminal
+    status (refinement-only updates are handled by
+    :func:`_build_tool_refinement_event`).
 
     ``cache_scope`` is the emitting session's origin scope, forwarded only so the
     duration histogram closes the same registry entry its start opened.
@@ -1707,10 +1710,9 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
     tool_use_id = update.get("toolCallId", "")
     if not tool_use_id:
         return None
-    # Before the output parsing below, which returns None for an output-less
-    # update: a tool that completed with no output is still a completed
-    # round-trip. A non-terminal status is a no-op here, so a mid-stream update
-    # leaves the clock running for the real completion.
+    # A terminal status is useful even when output parsing finds no text: it
+    # closes the observed round-trip without claiming a result body. A
+    # non-terminal status leaves the clock running for the real completion.
     record_tool_call_finished(tool_use_id, status=update.get("status"), scope=cache_scope)
     # Parts are collected RAW and redaction runs once over their JOIN, before
     # the single 8000-char bound. Both orderings matter: bounding first can
@@ -1771,9 +1773,17 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
             # winning over the raw envelope.
             if raw_output and "items" not in raw_output:
                 output_parts.append(_dumps_degraded(raw_output, default=str))
+    tool_status = str(update.get("status") or "")
     if not output_parts:
-        log_unrenderable_content(logger, tool_use_id, content)
-        return None
+        if tool_status not in TERMINAL_TOOL_STATUSES:
+            log_unrenderable_content(logger, tool_use_id, content)
+            return None
+        return AcpEvent(
+            kind=EVENT_TOOL_RESULT,
+            tool_call_id=tool_use_id,
+            tool_final=tool_status == "completed",
+            tool_status=tool_status,
+        )
     joined = "\n".join(output_parts)
     _redacted = _redact(joined)
     final_output = _redacted[: session_directive.MAX_TOOL_RESULT_CHARS]
@@ -1799,6 +1809,7 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
         tool_call_id=tool_use_id,
         tool_output=final_output,
         tool_final=update.get("status") == "completed",
+        tool_status=str(update.get("status") or ""),
     )
 
 

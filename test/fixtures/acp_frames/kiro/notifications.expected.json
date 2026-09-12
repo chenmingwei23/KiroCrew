@@ -106,7 +106,8 @@
         "kind": "tool_result",
         "tool_call_id": "kiro-tool-0002",
         "tool_final": true,
-        "tool_output": "{\"content\": \"the deploy key is [REDACTED: credential]\"}"
+        "tool_output": "{\"content\": \"the deploy key is [REDACTED: credential]\"}",
+        "tool_status": "completed"
       }
     ],
     "frame": "session/update",

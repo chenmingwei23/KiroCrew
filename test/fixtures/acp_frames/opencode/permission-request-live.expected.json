@@ -104,7 +104,8 @@
       {
         "kind": "tool_result",
         "tool_call_id": "call_hixtdbkj",
-        "tool_output": "kirocrew-op encode-live\n"
+        "tool_output": "kirocrew-op encode-live\n",
+        "tool_status": "in_progress"
       },
       {
         "is_shell": true,
@@ -130,7 +131,8 @@
         "kind": "tool_result",
         "tool_call_id": "call_hixtdbkj",
         "tool_final": true,
-        "tool_output": "kirocrew-op encode-live\n"
+        "tool_output": "kirocrew-op encode-live\n",
+        "tool_status": "completed"
       },
       {
         "is_shell": true,
