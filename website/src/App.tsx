@@ -2613,6 +2613,14 @@ export default function App() {
   // separate strip inset to relay to Electron — positionTrafficLights centers on
   // the header height directly. Remote panes get their own inset via `macInset`.
   const macInset = isMacElectron && !macFullscreen
+  // Windows / frameless-Linux paint their caption controls at the top-RIGHT, so
+  // an embedded pane inside them needs a right inset instead. The local window
+  // gets this from `.win-electron` / `.linux-electron`, but a preload-less pane
+  // iframe cannot see Electron, so relay it down the host model. Not
+  // fullscreen-gated: unlike the macOS traffic lights, the Windows overlay and
+  // the injected Linux cluster stay painted in fullscreen.
+  const winInset = isWinElectron
+  const linuxInset = isLinuxFramelessElectron
   const { data: sysMetrics, isError: sysMetricsError, dataUpdatedAt: sysMetricsUpdatedAt } = useQuery({ queryKey: ['system-metrics'], queryFn: () => api.system().then((d): SysMetricsFrame => ({ memUsed: d.mem_used_gb, memTotal: d.mem_total_gb, cpuPct: d.cpu_pct, diskTotal: d.disk_total_gb, diskFree: d.disk_free_gb, posture: d.resource_posture as 'ample' | 'tight' | 'critical' | 'unknown' | undefined, availableGb: d.resource_available_gb as number | undefined, subagentCap: d.subagent_cap as number | undefined })), refetchInterval: metricsOpen || metricsPopoverOpen ? 30_000 : 60_000, enabled: true })
   // Tick every 10s while widget is open so `sysMetricsStale` re-evaluates even when the query stops refetching (backgrounded tab, network drop).
   const [, setStaleTick] = useState(0)
@@ -4546,7 +4554,7 @@ export default function App() {
       </div>{/* /Local pane */}
       {/* Remote instance panes — embedded dashboards kept warm (mounted, hidden)
           so switching is instant; the active instance fills the pane. */}
-      <InstancesViewport macInset={macInset} />
+      <InstancesViewport macInset={macInset} winInset={winInset} linuxInset={linuxInset} />
       {/* macOS focus mode: window-drag strips for the LOCAL header, placed to be
           structurally identical to the pane strips that provably work — the
           .host-drag-strip mechanism, in the same top-level container, OUTSIDE

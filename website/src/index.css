@@ -2088,6 +2088,16 @@ body.mc-focus-mode .linux-electron .focus-caption-reserve{padding-right:112px}
    of the parent window's native traffic lights.
    Keep 84px in sync with TRAFFIC_LIGHT_INSET_PX in src/lib/electron.ts. */
 .embedded-mac-inset header.topbar-glass{padding-left:84px}
+/* The Windows and frameless-Linux counterparts: those parents paint their
+   caption controls (min/max/close) at the pane's TOP-RIGHT, not top-left, so an
+   embedded pane inside them must inset its header's RIGHT side or the bell and
+   its unread badge render under the native close button and cannot be clicked.
+   Same widths as the top-level `.win-electron` / `.linux-electron`
+   rules above -- keep 142px / 112px in sync with WIN_CAPTION_OVERLAY_WIDTH /
+   LINUX_CAPTION_CONTROLS_WIDTH in src/lib/electron.ts. macOS insets LEFT because
+   its traffic lights sit top-left; there is no right-side reserve to duplicate. */
+.embedded-win-inset header.topbar-glass{padding-right:142px}
+.embedded-linux-inset header.topbar-glass{padding-right:112px}
 /* The injected #electron-drag-bar (electron/main.js) marks the top 42px as a
    window drag region and only exempts native controls (button/a/input/
    [role="button"]/[tabindex]). The side panel's tab strip lives in that zone

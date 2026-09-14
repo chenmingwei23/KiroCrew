@@ -20,6 +20,8 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   activeId: 'cd-1',
   self: null,
   macInset: false,
+  winInset: false,
+  linuxInset: false,
   electron: true,
   pinnedCrews: [],
   stableOrder: false,
@@ -32,6 +34,8 @@ beforeEach(() => {
 })
 afterEach(() => {
   document.documentElement.classList.remove('embedded-mac-inset')
+  document.documentElement.classList.remove('embedded-win-inset')
+  document.documentElement.classList.remove('embedded-linux-inset')
 })
 
 describe('EmbeddedInstanceTabBar (option B)', () => {
@@ -217,6 +221,75 @@ describe('EmbeddedHostBridge (option B relay)', () => {
     expect(store.getState().instances.host?.macInset).toBe(true)
     expect(store.getState().instances.host?.stableOrder).toBe(true)
     expect(document.documentElement.classList.contains('embedded-mac-inset')).toBe(true)
+  })
+
+  // A Windows parent paints its native close button at the pane's
+  // TOP-RIGHT, so the relayed winInset must toggle the RIGHT-side reserve
+  // (.embedded-win-inset) and NOT the macOS left inset -- otherwise the bell
+  // renders under the close button and is unclickable. Drives the same bridge
+  // path the app drives (a relayed mc-host-model), so it pins the whole relay,
+  // not just the CSS. The equivalent Linux-frameless case rides linuxInset.
+  it('toggles the right-side caption inset for a Windows parent, not the mac left inset', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ winInset: true }) },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.winInset).toBe(true))
+    const root = document.documentElement.classList
+    expect(root.contains('embedded-win-inset')).toBe(true)
+    expect(root.contains('embedded-mac-inset')).toBe(false)
+    expect(root.contains('embedded-linux-inset')).toBe(false)
+  })
+
+  it('toggles the right-side caption inset for a frameless-Linux parent', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ linuxInset: true }) },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.linuxInset).toBe(true))
+    const root = document.documentElement.classList
+    expect(root.contains('embedded-linux-inset')).toBe(true)
+    expect(root.contains('embedded-win-inset')).toBe(false)
+    expect(root.contains('embedded-mac-inset')).toBe(false)
+  })
+
+  // An older host that never relays the new fields must leave every inset off
+  // (absence coerces to false), matching a host that reserves nothing.
+  it('leaves all insets off when the host omits them (older host)', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          // A pre-relay payload: no macInset / winInset / linuxInset fields.
+          data: { type: 'mc-host-model', tabs: [], activeId: null },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host).not.toBeNull())
+    const root = document.documentElement.classList
+    expect(root.contains('embedded-mac-inset')).toBe(false)
+    expect(root.contains('embedded-win-inset')).toBe(false)
+    expect(root.contains('embedded-linux-inset')).toBe(false)
   })
 
   it('ignores messages that are not from the direct parent', async () => {

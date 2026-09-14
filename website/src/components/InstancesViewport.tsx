@@ -104,7 +104,7 @@ function ttlToSeconds(ttl: string): number {
   return m[2] === 'h' ? n * 3600 : n * 60
 }
 
-export default function InstancesViewport({ macInset = false }: { macInset?: boolean } = {}) {
+export default function InstancesViewport({ macInset = false, winInset = false, linuxInset = false }: { macInset?: boolean; winInset?: boolean; linuxInset?: boolean } = {}) {
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
   const warm = useAppSelector(s => s.instances.warm)
@@ -827,7 +827,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           }
         : null
       return {
-        type: 'mc-host-model', v: 1, tabs, activeId, self, macInset, focusMode,
+        type: 'mc-host-model', v: 1, tabs, activeId, self, macInset, winInset, linuxInset, focusMode,
         electron: isElectron,
         // Array, not the Set itself: structured clone rejects a Set across this
         // boundary in some engines and the receiver validates element-wise anyway.
@@ -835,7 +835,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         stableOrder,
       }
     },
-    [instancesQuery.data, warm, unread, activeId, macInset, focusMode, pinnedCrews, stableOrder],
+    [instancesQuery.data, warm, unread, activeId, macInset, winInset, linuxInset, focusMode, pinnedCrews, stableOrder],
   )
 
   // Post the model into one embedded pane, addressed to its exact loopback
@@ -892,7 +892,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // to a loopback frame.
   useEffect(() => {
     for (const id of Object.keys(warm)) postModelTo(id)
-  }, [warm, activeId, unread, macInset, instancesQuery.data, postModelTo, pinnedCrews, stableOrder])
+  }, [warm, activeId, unread, macInset, winInset, linuxInset, instancesQuery.data, postModelTo, pinnedCrews, stableOrder])
 
   // Keep warm iframes mounted across Local<->remote switches (hide-not-unmount).
   // Also render when the active tab is a remote instance with no warm iframe

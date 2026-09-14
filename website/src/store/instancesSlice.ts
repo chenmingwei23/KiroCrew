@@ -55,6 +55,18 @@ export interface HostModel {
   /** True when the parent is a macOS Electron window not in fullscreen, so the
    *  embedded header must inset its content clear of the native traffic lights. */
   macInset: boolean
+  /** True when the parent is a Windows Electron window, whose titleBarOverlay
+   *  paints the native min/max/close buttons over the pane's TOP-RIGHT -- so the
+   *  embedded header must inset its RIGHT side or the bell renders under the
+   *  close button and is unclickable. The top-level window applies this
+   *  itself via `.win-electron`, but the pane is a preload-less iframe that
+   *  cannot see Electron, so the parent must relay it. */
+  winInset: boolean
+  /** True when the parent is a FRAMELESS Linux Electron window, whose injected
+   *  caption cluster sits at the pane's top-right -- same right-inset need as
+   *  `winInset`, at the Linux control width. A framed Linux window keeps native
+   *  decorations and reserves nothing, so this stays false there. */
+  linuxInset: boolean
   /** The parent window's focus mode, relayed so the pane hides its own chrome to
    *  match instead of landing fully-framed inside a focused window. `null` means
    *  the host SENT NO OPINION — an older host whose model predates the field —

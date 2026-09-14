@@ -23,6 +23,8 @@ import { isEmbeddedPane } from '../lib/embedded'
 import { setFocusModeEnabled } from '../hooks/useFocusMode'
 
 const MAC_INSET_CLASS = 'embedded-mac-inset'
+const WIN_INSET_CLASS = 'embedded-win-inset'
+const LINUX_INSET_CLASS = 'embedded-linux-inset'
 
 // Backoff (ms) between re-announcements of `mc-embedded-ready`, applied AFTER
 // the initial announce. The handshake is: child posts `mc-embedded-ready`, the
@@ -69,6 +71,10 @@ function parseHostModel(data: unknown): HostModel | null {
     activeId: typeof d.activeId === 'string' ? d.activeId : null,
     self,
     macInset: !!d.macInset,
+    // Plain booleans like `macInset`: absence coerces to `false`, which is the
+    // correct "no reserve" default for an older host that never relayed them.
+    winInset: !!d.winInset,
+    linuxInset: !!d.linuxInset,
     // Tri-state on purpose: `false` and "the host never sent the field" must
     // not collapse. An older host omits it AND ignores the pane's echoed
     // `mc-set-focus-mode`, so coercing absence to `false` would revert a
@@ -146,6 +152,8 @@ export default function EmbeddedHostBridge() {
       if (!model) return
       dispatch(setHostModel(model))
       document.documentElement.classList.toggle(MAC_INSET_CLASS, model.macInset)
+      document.documentElement.classList.toggle(WIN_INSET_CLASS, model.winInset)
+      document.documentElement.classList.toggle(LINUX_INSET_CLASS, model.linuxInset)
       // Adopt the host window's focus mode. `echo: false` because this IS the
       // relayed value — sending it back up is what would make the two frames
       // ping-pong. A toggle the user drives inside this pane still echoes.
@@ -171,6 +179,8 @@ export default function EmbeddedHostBridge() {
       window.removeEventListener('message', onMessage)
       for (const t of retryTimers) window.clearTimeout(t)
       document.documentElement.classList.remove(MAC_INSET_CLASS)
+      document.documentElement.classList.remove(WIN_INSET_CLASS)
+      document.documentElement.classList.remove(LINUX_INSET_CLASS)
       setFocusModeEnabled(false, { echo: false })
       dispatch(setHostModel(null))
     }

@@ -13,6 +13,8 @@ function model(over: Partial<HostModel> = {}): HostModel {
     activeId: null,
     self: null,
     macInset: false,
+    winInset: false,
+    linuxInset: false,
     electron: true,
     pinnedCrews: [],
     stableOrder: false,
