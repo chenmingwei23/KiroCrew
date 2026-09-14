@@ -31,7 +31,15 @@ import aiohttp
 from aiohttp import web
 
 from kiro_crew import github_runner, platform_compat
-from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_env_file_credential
+from kiro_crew.config.loader import (
+    CRED_JIRA_API_TOKEN,
+    KiroCrewConfig,
+    config_dir,
+    jira_global_token_applicable,
+    jira_host_token_name,
+    normalize_jira_host,
+    read_env_file_credential,
+)
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 
 # Validation policy, well-known install dirs, and the strict-mode toggle are
@@ -46,6 +54,7 @@ from kiro_crew.github_runner import (
 )
 from kiro_crew.github_runner import STRICT_PROVIDER_BIN_ENV as _STRICT_PROVIDER_BIN_ENV
 from kiro_crew.github_runner import (
+    gitlab_ambient_token_allowed,
     provider_executable_candidates,
 )
 from kiro_crew.github_runner import strict_provider_bins as _strict_provider_bins
@@ -129,10 +138,6 @@ _DIRECT_FETCH_WAIT_SECS = 20.0
 # pull-request figures. TTL and entry count are shared with the PR cache.
 _ISSUE_CACHE_MAX_BYTES = 16 * 1024 * 1024
 _ISSUE_FETCH_RESERVATION_BYTES = 16 * 1024 * 1024
-_PROVIDER_EXECUTABLE_OVERRIDES = {
-    "gh": github_runner.GH_BIN_ENV,
-    "glab": "KIROCREW_GLAB_BIN",
-}
 # Provider commands are absolute. Keep PATH deterministic only for trusted
 # system helpers a provider may invoke; never inherit a workspace-controlled
 # PATH or search it for gh/glab.
@@ -309,7 +314,7 @@ def _resolve_provider_executable(executable: str) -> str:
     """Resolve gh/glab: explicit override, well-known install dirs, then PATH."""
     if executable not in _PROVIDER_EXECUTABLE_CANDIDATES:
         raise SourceProviderError("unsupported provider command")
-    override_name = _PROVIDER_EXECUTABLE_OVERRIDES[executable]
+    override_name = github_runner.PROVIDER_CLI_OVERRIDE_ENV[executable]
     override = os.environ.get(override_name)
     if override is not None:
         try:
@@ -1621,7 +1626,7 @@ async def _run_provider(
         raise
 
     allowed_env_keys = _PROVIDER_BASE_ENV_KEYS | _PROVIDER_AUTH_ENV_KEYS[executable]
-    if executable == "glab" and gitlab_host != "gitlab.com":
+    if executable == "glab" and not gitlab_ambient_token_allowed(gitlab_host):
         # GITLAB_TOKEN is a single ambient credential with no host binding, so
         # forwarding it while GITLAB_HOST points at a self-managed instance would
         # send a gitlab.com PAT (and every permission it carries) to that server.
@@ -3232,17 +3237,14 @@ def _get_jira_auth(host: str) -> tuple[str, str] | None:
         creds = cfg.load_credentials()
     except Exception as exc:
         raise ValueError(f"jira_config_error: Could not load Jira configuration: {exc}") from exc
-    normalized = host.lower().removesuffix(":443")
+    normalized = normalize_jira_host(host)
     for entry in entries:
-        entry_host = entry.host.strip().lower().removesuffix(":443")
+        entry_host = normalize_jira_host(entry.host)
         if entry_host == normalized:
-            # Per-host token: JIRA_TOKEN_<host_key> takes precedence.
-            # Global JIRA_API_TOKEN fallback is only permitted when a single
-            # host is configured — prevents cross-host credential leakage.
-            # Injective host-to-key: hex-encode the normalized host to avoid
-            # collisions (e.g. jira-a.x.com vs jira.a-x.com).
-            host_key = entry_host.encode().hex().upper()
-            per_host_name = f"JIRA_TOKEN_{host_key}"
+            # Per-host token takes precedence. The shared helper owns the
+            # collision-free normalization and hex transform used by every
+            # producer/consumer of this key.
+            per_host_name = jira_host_token_name(entry_host)
             # Resolution order: the encrypted vault first (the successor store,
             # populated by `kirocrew secrets import`), then the legacy .env /
             # environment value so existing installs keep working unchanged.
@@ -3277,7 +3279,7 @@ def _get_jira_auth(host: str) -> tuple[str, str] | None:
             # as authoritative). `read_env_file_credential` blocks on I/O but
             # `_get_jira_auth` is called via `asyncio.to_thread` so that is safe.
             token = _resolve_jira_token_from_vault(per_host_name)
-            if not token and len(entries) == 1:
+            if not token and jira_global_token_applicable(entries):
                 # A `secret://` value is a vault REFERENCE, not a raw token.
                 # After `secrets import --apply` the `.env` line becomes
                 # `JIRA_API_TOKEN=secret://JIRA_API_TOKEN`, and `load_credentials`
@@ -3298,11 +3300,11 @@ def _get_jira_auth(host: str) -> tuple[str, str] | None:
                     # narrows str | None -> str for the type checker.
                     token = _env_global_override or ""
                 else:
-                    token = _resolve_jira_token_from_vault("JIRA_API_TOKEN")
+                    token = _resolve_jira_token_from_vault(CRED_JIRA_API_TOKEN)
             if not token:
                 _c = creds.get(per_host_name, "")
                 token = _c if not _is_secret_ref(_c) else ""
-            if not token and len(entries) == 1:
+            if not token and jira_global_token_applicable(entries):
                 _c = creds.get("JIRA_API_TOKEN", "")
                 token = _c if not _is_secret_ref(_c) else ""
             if not token:
@@ -4384,11 +4386,11 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
     # the event loop. Same discipline as _load_source_link_settings in this file.
     auth_pair = await asyncio.to_thread(_get_jira_auth, ref.host)
     if auth_pair is None:
-        host_key = ref.host.lower().removesuffix(":443").encode().hex().upper()
+        per_host_name = jira_host_token_name(ref.host)
         raise ValueError(
             "jira_no_credentials: No Jira credentials configured for "
             f"{ref.host}. Add a jira_auth entry to config.json and set "
-            f"JIRA_API_TOKEN (or JIRA_TOKEN_{host_key} for multi-host) "
+            f"JIRA_API_TOKEN (or {per_host_name} for multi-host) "
             "in your .env file."
         )
     email, token = auth_pair

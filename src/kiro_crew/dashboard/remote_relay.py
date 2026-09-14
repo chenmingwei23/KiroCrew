@@ -63,7 +63,7 @@ from aiohttp import web
 import kiro_crew
 from kiro_crew.apps.version import parse_version
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import _redact_deep
+from kiro_crew.dashboard.chat_utils import _redact_deep, chunk_generation
 from kiro_crew.dashboard.remote_mirror import MIRROR_CLS_PREFIX
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -337,19 +337,22 @@ def _replay_mirrored_frame(
 
 
 class _ChunkSequencer:
-    """Local ``seq`` numbers for relayed chunks.
+    """Local ``seq`` numbers for relayed chunks, drawn from the slot's counter.
 
     The peer's own sequence is not reusable: it counts that peer's turn, while
-    the local frontend orders chunks within the LOCAL slot and a second relayed
-    turn would restart the peer's count mid-conversation.
+    the local frontend orders chunks within the LOCAL slot. The numbers come
+    from ``_ChatSlot._chunk_seq`` -- the same counter a local turn continues --
+    so a relayed turn is numbered above every earlier turn of this slot, local
+    or relayed, and a client's replay floor orders it without seeing the
+    boundary.
     """
 
-    def __init__(self) -> None:
-        self._seq = 0
+    def __init__(self, slot: Any) -> None:
+        self._slot = slot
 
     def next(self) -> int:
-        self._seq += 1
-        return self._seq
+        self._slot._chunk_seq += 1
+        return int(self._slot._chunk_seq)
 
 
 def _apply_row(
@@ -393,9 +396,16 @@ def _apply_row(
         meta = None
 
     if role == "chunk":
-        slot.append("chunk", content, "chunk")
+        seq = sequencer.next()
+        # Same seq and generation on the window row as on the wire frame, so a
+        # mid-stream slot snapshot tells the client how far the stream it holds
+        # has advanced and which process numbered it (chunk_generation).
+        row = slot.append("chunk", content, "chunk")
+        row["seq"] = seq
+        row["gen"] = chunk_generation()
         state.broadcast_ws(
-            "chat_chunk", {"slot": slot.key, "content": content, "seq": sequencer.next()}
+            "chat_chunk",
+            {"slot": slot.key, "content": content, "seq": seq, "gen": chunk_generation()},
         )
         return
     if role == "thinking":
@@ -501,7 +511,12 @@ def remote_bound_refusal(slot: "_ChatSlot") -> "web.Response | None":
 
 
 async def create_peer_slot(
-    state: "DashboardState", instance_id: str, *, agent: str = "", model: str = ""
+    state: "DashboardState",
+    instance_id: str,
+    *,
+    agent: str = "",
+    model: str = "",
+    memory_mode: str = "persistent",
 ) -> str:
     """Create the slot on *instance_id* that will execute a local session's turns.
 
@@ -515,11 +530,13 @@ async def create_peer_slot(
     this machine's default agent names a crew from this machine's roster: sending
     it would either fail there or bind a different crew than the name implies,
     where an omission lets the peer apply its own default — which is the point of
-    the session running on it.
+    the session running on it. ``memory_mode`` is different: it is the user's
+    privacy boundary and always rides the create, so local and remote execution
+    cannot disagree about whether memory may be read or written.
     """
     mgr = await _require_manager(state)
     await ensure_version_parity(mgr, instance_id)
-    create_body: dict[str, str] = {}
+    create_body: dict[str, str] = {"memory_mode": memory_mode}
     if agent:
         create_body["agent"] = agent
     if model:
@@ -733,7 +750,7 @@ async def relay_remote_turn(
     rather than half-built. Until then, run peer-bound sessions on a crew whose
     approval policy does not stop for the tools you expect to use.
     """
-    sequencer = _ChunkSequencer()
+    sequencer = _ChunkSequencer(slot)
     # Mark the turn in-flight and persist that BEFORE any streaming, so a gateway
     # crash mid-turn is detectable on reload. The relay task dies with the
     # gateway while the peer keeps running, and its tail is never mirrored here —

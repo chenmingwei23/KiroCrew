@@ -120,6 +120,15 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def defer_replay_sid_promotion(self) -> bool:
+        """Whether replay settlement must precede publishing a fresh native SID.
+
+        The safe default is False: adapters added later publish their own session
+        identity normally unless they explicitly adopt the deferred-SID contract.
+        """
+        return False
+
+    @property
     def is_claude_backend(self) -> bool:
         """True when this provider drives claude-agent-acp."""
         return False
@@ -371,8 +380,8 @@ class LLMProvider(ABC):
 
         The manual entry points gate on this so an unsupported backend gets an
         immediate, user-visible refusal instead of a prompt whose
-        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``
-        (#7800). Default ``None`` — a provider that has not positively named an
+        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``.
+        Default ``None`` — a provider that has not positively named an
         unsupported backend passes through, because it handles ``/compact`` on
         its own terms. Declared here with a safe default rather than probed off
         the instance (harness-parity H14); the ACP implementations answer from

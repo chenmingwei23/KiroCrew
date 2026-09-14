@@ -47,6 +47,7 @@ import {
   PREVIEW_CREW,
   PREVIEW_FLAG_EVENT,
   PREVIEW_FLAG_PREFIX,
+  PREVIEW_INSTANCE_SESSIONS,
   PREVIEW_REMOTE_CREW_CHAT,
   PREVIEW_WEBHOOKS,
   readPreviewFlag,
@@ -123,7 +124,7 @@ describe('preview flag storage', () => {
   it('keeps every flag under the shared prefix', () => {
     // Cross-tab listeners match on the prefix rather than a list of known flags,
     // so a flag named outside it would silently stop updating other tabs.
-    for (const flag of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+    for (const flag of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_INSTANCE_SESSIONS]) {
       expect(flag.startsWith(PREVIEW_FLAG_PREFIX)).toBe(true)
     }
   })
@@ -374,16 +375,16 @@ describe('Settings > Developer > Feature Previews', () => {
     // One card per feature: crew's own toggle, not a row folded into the
     // webhooks card. Anchored (`^…$`) because the label's words also appear in
     // this card's description and in the "Chat on a crew" card next to it. The
-    // label names BOTH doors the flag holds so it stops sharing a bare "Crew"
+    // label names the page the flag holds so it stops sharing a bare "Crew"
     // with that neighbour, which a newcomer could not tell apart.
     renderTab()
-    expect(screen.getByRole('switch', { name: /^crew members and crew mode$/i }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: /^crew members$/i }).getAttribute('aria-checked')).toBe('false')
   })
 
   it('persists the crew opt-in under its own key, leaving webhooks alone', async () => {
     renderTab()
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew members and crew mode$/i }).click()
+      screen.getByRole('switch', { name: /^crew members$/i }).click()
     })
     expect(localStorage.getItem(PREVIEW_CREW)).toBe('1')
     // Two flags, two keys: a shared write would release both features at once.
@@ -410,7 +411,7 @@ describe('Settings > Developer > Feature Previews', () => {
       Array.from(container.querySelectorAll('button:not([data-testid="feature-preview-intro-button"])'))
     expect(realButtons()).toHaveLength(0)
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew members and crew mode$/i }).click()
+      screen.getByRole('switch', { name: /^crew members$/i }).click()
     })
     expect(realButtons()).toHaveLength(0)
     // The webhooks card still HAS its link, so this is an asymmetry on purpose
@@ -442,12 +443,34 @@ describe('Settings > Developer > Feature Previews', () => {
     const anchor = anchors[0]
     expect(anchor.contains(screen.getByRole('heading', { name: /feature previews/i }))).toBe(true)
     for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
-    expect(screen.getAllByRole('switch')).toHaveLength(3)
+    // Four, not three: the count is here so a card added outside the anchor
+    // fails rather than silently escaping the ring.
+    expect(screen.getAllByRole('switch')).toHaveLength(4)
+  })
+
+  it('carries a remote-instance-sessions card that starts off and writes only its own key', async () => {
+    // The toggle IS this preview's whole affordance — it has no page of its own,
+    // so nothing else on the page would reveal a card that failed to render or
+    // an onChange wired to the wrong constant. Four flags now share one section,
+    // and a shared write would release every unfinished surface at once, so the
+    // sibling assertions are the point rather than padding.
+    //
+    // `/^remote instance sessions$/i` anchored: the card's description also says
+    // "Sessions list", and the accessible name is the label alone.
+    renderTab()
+    const toggle = () => screen.getByRole('switch', { name: /^remote instance sessions$/i })
+    expect(toggle().getAttribute('aria-checked')).toBe('false')
+    await act(async () => { toggle().click() })
+    expect(localStorage.getItem(PREVIEW_INSTANCE_SESSIONS)).toBe('1')
+    expect(toggle().getAttribute('aria-checked')).toBe('true')
+    for (const other of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+      expect(localStorage.getItem(other)).not.toBe('1')
+    }
   })
 
   it('is gone from the Developer page rail', () => {
     // Pin the removal, not just the addition: a tab left behind would offer the
-    // same three switches from two places, and the two would drift.
+    // same four switches from two places, and the two would drift.
     render(<MemoryRouter initialEntries={['/developer?tab=config']}><DeveloperPage /></MemoryRouter>)
     expect(screen.getByTestId('kirocrew-cfg')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /feature previews/i })).toBeNull()

@@ -286,13 +286,13 @@ _OAUTH_AUTHORIZATION_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
         ("mcp.auth.mail.superhuman.com", "/oauth2/authorize"),
         ("mcp.linear.app", "/authorize"),
         # Miro's authorization_endpoint per its RFC 8414 metadata at
-        # https://mcp.miro.com/.well-known/oauth-authorization-server. Not a
+        # https://mcp.miro.com/.well-known/oauth-authorization-server. Also a
         # Connections registry entry; without this pair the fail-closed banner
         # blocks every attempt to connect the Miro remote MCP server.
         ("mcp.miro.com", "/authorize"),
         ("mcp.notion.com", "/authorize"),
         ("vercel.com", "/oauth/authorize"),
-        # Industry-baseline batch 1 (registry entries, all launch-gated). Each
+        # Industry-baseline batches (registry entries, all launch-gated). Each
         # pair is the ``authorization_endpoint`` from the issuer's RFC 8414
         # document, the issuer itself reached via RFC 9728 discovery from the
         # registry ``mcp_url`` by the L0 probe. The kiro-cli-minted
@@ -300,16 +300,28 @@ _OAUTH_AUTHORIZATION_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
         # manual launch-gate check.
         ("airtable.com", "/oauth2/v1/authorize"),
         ("api.supabase.com", "/v1/oauth/authorize"),
+        ("auth.prisma.io", "/authorize"),
+        ("bindings.mcp.cloudflare.com", "/oauth/authorize"),
+        ("huggingface.co", "/oauth/authorize"),
+        ("mcp.amplitude.com", "/authorize"),
         ("mcp.canva.com", "/authorize"),
+        ("mcp.neon.tech", "/api/authorize"),
         ("mcp.paypal.com", "/authorize"),
+        ("mcp.postman.com", "/authorize"),
         ("mcp.sentry.dev", "/oauth/authorize"),
+        ("mcp.squareup.com", "/authorize"),
+        ("mcp.webflow.com", "/oauth/authorize"),
+        ("mcp.zapier.com", "/oauth/authorize"),
+        ("netlify-mcp.netlify.app", "/oauth-server/auth"),
         ("www.dropbox.com", "/oauth2/authorize"),
-        # Figma's MCP authorization server (issuer api.figma.com) advertises a
-        # consent page on www.figma.com, so the registry issuer host and the
-        # consent host differ; both are listed -- the banner gate keys on the
-        # consent URL while the registry test keys on the issuer host.
-        ("api.figma.com", "/oauth/mcp"),
+        # Two issuers advertise a consent page on a different host than the
+        # issuer itself: Figma's MCP authorization server (issuer api.figma.com)
+        # sends the user to www.figma.com, Mixpanel's (issuer
+        # mcp.mixpanel.com/mcp) to mixpanel.com. Only the consent host is
+        # listed, because the banner gate keys on the URL the browser opens;
+        # the registry test maps issuer host to consent host for these two.
         ("www.figma.com", "/oauth/mcp"),
+        ("mixpanel.com", "/oauth/authorize"),
     }
 )
 
@@ -981,8 +993,8 @@ def _exfil_url_warning(
 
     if heuristic_query:
         # NO per-shape waiver on this gate, deliberately, and the same reasoning
-        # forbids adding one. Two were tried for the prefilled GitHub issue link of
-        # #7820 — one keyed to the validated SHAPE, one additionally pinned to this
+        # forbids adding one. Two were tried for the prefilled GitHub issue link —
+        # one keyed to the validated SHAPE, one additionally pinned to this
         # project's own tracker — and both are exfiltration primitives, because what
         # reaches this function is MODEL-AUTHORED text:
         #
@@ -1003,9 +1015,9 @@ def _exfil_url_warning(
         # bounded variant for paths that DO get relayed through prose.
         #
         # To make a long legitimate URL render, narrow or replace this heuristic for
-        # EVERY host on its own merits (#7820 also reports monitorportal.amazon.com)
-        # — do not reintroduce a per-shape escape hatch. Pinned by
-        # test_redaction_mirror_parity.py::TestPrefilledIssueCarveOutParity.
+        # EVERY host on its own merits (more than one host is reported this way)
+        # — do not reintroduce a per-shape escape hatch. Pinned
+        # by test_redaction_mirror_parity.py::TestPrefilledIssueCarveOutParity.
         if len(heuristic_query) >= _EXFIL_QUERY_MIN_LEN:
             trace("exfil_query_length")
             return (
@@ -1051,7 +1063,7 @@ def scan_exfiltration_urls(text: str) -> list[str]:
 #: a PREFIX constant and deliberately NOT a member of
 #: :data:`kiro_crew.security.redaction.CREDENTIAL_REDACTION_TAGS` (see that
 #: tuple's docstring). A consumer that must detect this rewriter's
-#: substitutions (the dashboard chat notice, issue #8132) prefix-counts THIS
+#: substitutions (the dashboard chat notice) prefix-counts THIS
 #: constant; the substitution below is built from it so the two can never
 #: drift.
 EXFILTRATION_REDACTION_TAG_PREFIX = "[REDACTED: suspicious URL to "

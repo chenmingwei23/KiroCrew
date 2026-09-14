@@ -69,6 +69,24 @@ from kiro_crew.validation import (
 
 logger = logging.getLogger(__name__)
 
+#: The generation every chat_chunk of this process carries (see chunk_generation).
+_CHUNK_GENERATION: str = uuid.uuid4().hex[:8]
+
+
+def chunk_generation() -> str:
+    """The ``gen`` stamped on every chat_chunk frame and window row this process
+    emits: one random value per gateway process.
+
+    Chunk ``seq`` numbers are a per-slot counter that continues across turns,
+    so a client's replay floor -- the newest seq its transcript holds -- orders
+    every later chunk above it. The counter lives in memory and restarts with
+    the gateway, so a floor from before a restart could sit above the new
+    process's early seqs; the client compares ``gen`` first and replaces its
+    floor when the generation changes, instead of dropping those chunks as
+    replays. Not a secret and not an identity: it only says "same process".
+    """
+    return _CHUNK_GENERATION
+
 
 async def run_config_write(fn, /, *args, **kwargs):
     """Run a blocking ``config.json`` writer under BOTH config locks.
@@ -742,7 +760,7 @@ def effective_session_key(slot: _ChatSlot) -> str:
 
 
 def subagents_attached(
-    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+    state: DashboardState, slot: _ChatSlot | None, session_key: str, operation: str
 ) -> bool:
     """Whether sub-agent children are attached to *session_key*.
 
@@ -750,6 +768,10 @@ def subagents_attached(
     would discard a child's work. Every such caller shares THIS predicate: a
     second copy is how the probes diverge, and both callers must fail toward
     keeping a child's work.
+
+    *slot* may be ``None`` when no tab displays the session: the in-flight
+    delivery probe then reads as 0 (``getattr`` on ``None`` returns its
+    default) and the two registry probes still decide.
 
     Three probes, none optional:
 
@@ -781,6 +803,24 @@ def subagents_attached(
             queued = 1
     inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
     return bool(running is None or running or queued or inflight)
+
+
+def wire_session_subagent_probe(state: DashboardState) -> None:
+    """Hand ``SessionManager`` the sub-agent probe its RSS ceiling consults.
+
+    The manager cannot see the dashboard's sub-agent registry or slots, so the
+    predicate is built here, over :func:`subagents_attached`, and installed via
+    ``set_subagent_probe``. The slot is resolved through
+    :func:`dashboard_slot_key` (the same mapping the recycle notice uses); a
+    session with no open tab passes ``None``, which the predicate accepts.
+    """
+
+    def _probe(session_key: str) -> bool:
+        slot_key = dashboard_slot_key(session_key)
+        slot = state.get_slot(slot_key) if slot_key else None
+        return subagents_attached(state, slot, session_key, "rss_recycle")
+
+    state.sessions.set_subagent_probe(_probe)
 
 
 def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
@@ -1778,6 +1818,27 @@ _NEGATED_PROMISE_RE = re.compile(
 # keeps the reject-bias but only where the promise can actually be.
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?\n]+")
 
+# A status update can be accurate while a turn is streaming and become false as
+# soon as that turn returns control. This detector is deliberately notice-only:
+# unlike the promise-only recovery above, it may run after tools with side
+# effects, so its caller must never replay the turn automatically. Requiring a
+# first-person claim at the start of a sentence excludes third-person status
+# reports such as "the subagent is still working" or "the monitor will continue"
+# that really can outlive this turn. A first-person claim that the main agent is
+# running or checking one remains foreground work and is intentionally matched.
+_UNFINISHED_PROGRESS_RE = re.compile(
+    r"(?:^|[.!?\n]\s*)(?P<claim>(?:next[,:]?\s+)?"
+    r"(?:"
+    r"(?:i(?:'|’)?m|i\s+am)\s+(?:still\s+)?"
+    r"(?:continuing\s+(?:with|to)|proceeding\s+(?:with|to)|working\s+(?:on|through)"
+    r"|running\b|checking\b|validating\b|testing\b|building\b|reviewing\b"
+    r"|preparing\b|investigating\b)"
+    r"|i(?:'|’)?ll\s+(?:keep|continue)\s+"
+    r"(?:working|running|checking|validating|testing|building|reviewing|preparing|investigating)\b"
+    r"))",
+    re.IGNORECASE,
+)
+
 
 def _terminal_sentence(text: str) -> str:
     """Return the last sentence of ``text`` — the span the terminal promise gate
@@ -1785,6 +1846,25 @@ def _terminal_sentence(text: str) -> str:
     multi-sentence closer cannot veto a promise that sits only at the end."""
     parts = [p.strip() for p in _SENTENCE_BOUNDARY_RE.split(text) if p.strip()]
     return parts[-1] if parts else text
+
+
+def has_unfinished_progress_claim(final_segment_text: str) -> bool:
+    """Return whether a completed turn's final sentence says foreground work continues.
+
+    The caller supplies only text emitted after the last tool boundary. A match
+    is diagnostic, not permission to re-run anything: earlier tools may already
+    have produced side effects. Only the terminal sentence can describe work as
+    still running when control returns; an earlier progress update followed by a
+    completed-status sentence is not an unfinished claim. A colon followed by
+    content is likewise a lead-in fulfilled by the same response.
+    """
+    text = (final_segment_text or "").strip()
+    terminal = _terminal_sentence(text)
+    match = _UNFINISHED_PROGRESS_RE.search(terminal)
+    if match is None:
+        return False
+    claim = terminal[match.start("claim") :]
+    return not bool(re.search(r":\s*\S", claim))
 
 
 def is_promise_only_terminal(final_segment_text: str) -> bool:
@@ -2555,6 +2635,46 @@ SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
 #: been queued, so the frontend can tell a pending retry from a terminal failure.
 TRANSIENT_RETRY_KIND = "transient_retry"
 
+#: ``meta["notice"]`` on the three `error` rows the transient-5xx ladder appends
+#: (chat_runner ``acp_error_is_transient`` branches). The row's CONTENT is the
+#: English fallback below, read verbatim by non-dashboard consumers (channel
+#: mirrors, SSE, an older frontend); the dashboard ignores it and renders
+#: localized copy keyed on this token instead
+#: (``website/src/pages/chat/transientNotice.ts``). A structured token rather
+#: than prose-matching so the wording can change on either side without the
+#: other silently falling back to raw English -- the drift class
+#: ``test_recovery_marker_parity.py`` exists for. Both sides are still
+#: hand-synced (no shared schema), so ``test_transient_notice_parity.py`` pins
+#: these values against the frontend table.
+TRANSIENT_NOTICE_META_KEY = "notice"
+TRANSIENT_NOTICE_RETRYING = "transient_retrying"
+TRANSIENT_NOTICE_RESUMING = "transient_resuming"
+TRANSIENT_NOTICE_GIVE_UP = "transient_give_up"
+
+#: English fallback text for the rows above. Plain language on purpose: the
+#: failure is an upstream model-backend 5xx the gateway is already retrying
+#: against, and neither "backend" nor "hiccup" tells a reader that.
+TRANSIENT_RETRYING_TEXT = "⟳ Connection unstable — retrying…"
+TRANSIENT_RESUMING_TEXT = "⟳ Connection unstable — resuming…"
+TRANSIENT_GIVE_UP_TEXT = "⟳ Connection unstable — please try again."
+
+#: Row-level kind for the terminal `error` row a prompt-time MODEL ENTITLEMENT
+#: rejection produces ("Your account does not have access to model 'X'"), so
+#: the frontend can offer the fix (open the model picker / change the default
+#: under Settings -> Chat) instead of a Continue button that re-runs the same
+#: rejection. No recovery is queued for this kind: a retry cannot earn an
+#: entitlement.
+MODEL_UNENTITLED_KIND = "model_unentitled"
+
+#: Row-level kind for the terminal `error` row an ``AcpAuthRequired`` turn
+#: produces (the agent process reported it is not signed in). Like
+#: MODEL_UNENTITLED_KIND, no recovery is queued -- a retry hits the same wall --
+#: and the frontend uses the kind to offer the fix that does end it: a deep link
+#: to the dashboard's Kiro sign-in card (Developer > Agent Backend), where the
+#: user signs in to Kiro Crew's own identity again. The prose stays as the
+#: backend formatted it.
+AUTH_REQUIRED_KIND = "auth_required"
+
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix
 #: text will not have the kind tag and will correctly classify as plain input.
@@ -2734,7 +2854,17 @@ def _collapse_wire_rows(messages: list[dict]) -> list[dict]:
         # One join across the run, not a new string per delta: a long reply is
         # hundreds of deltas, and pairwise concatenation copies the text
         # accumulated so far every time, which is quadratic in the reply size.
-        return {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        merged = {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        # The fold stands for every delta in the run, so it carries the run's
+        # NEWEST seq: that is the floor a client seeds its replay guard from,
+        # and the first delta's seq would let every later one be applied twice.
+        # Older rows carry no seq (legacy window); then the fold carries none.
+        seqs = [m["seq"] for m in run if isinstance(m.get("seq"), int)]
+        if seqs:
+            merged["seq"] = max(seqs)
+        else:
+            merged.pop("seq", None)
+        return merged
 
     out: list[dict] = []
     run: list[dict] = []
@@ -2938,7 +3068,20 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
             if text:
                 text, _ = redact_exfiltration_urls(text)
                 text, _ = redact_credentials(text)
-                out.append({"role": "streaming", "content": text, "cls": "msg msg-a"})
+                row: dict[str, Any] = {"role": "streaming", "content": text, "cls": "msg msg-a"}
+                # The newest chunk seq folded into this row (see
+                # _collapse_wire_rows). The client seeds its replay guard from
+                # it, so a live frame that races this snapshot and carries a
+                # seq at or below it is dropped instead of appended twice.
+                # Omitted when the window rows carry none: a client treats a
+                # missing seq as "apply as before".
+                if isinstance(m.get("seq"), int):
+                    row["seq"] = m["seq"]
+                    # The process that numbered it, so a client can tell a
+                    # floor from before a gateway restart apart (chunk_generation).
+                    if isinstance(m.get("gen"), str):
+                        row["gen"] = m["gen"]
+                out.append(row)
             continue
         text = m.get("content", "")
         # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the

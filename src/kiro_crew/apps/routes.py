@@ -833,7 +833,7 @@ async def handle_update_app(request: web.Request) -> web.Response:
 
         # Stop the backend, then deregister old resources — same order as uninstall and
         # the disable rollback. Stopping pops the tracking record, so the health watch
-        # can no longer re-register the OLD manifest's MCP servers after the scrub
+        # cannot re-register the OLD manifest's MCP servers after the scrub
         # (see app-kit-platform §17).
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), stop_app_backend, name
@@ -2016,7 +2016,12 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
             "X-Accel-Buffering": "no",
         },
     )
-    await resp.prepare(request)
+    try:
+        await resp.prepare(request)
+    except (ConnectionResetError, ConnectionAbortedError):
+        # The client vanished between sending the request and the stream
+        # opening; nothing has been installed yet, so just hang up quietly.
+        return resp
 
     # Create a queue-backed log collector so install_from_registry streams
     # each log line as it's appended — zero changes to the install logic.
@@ -2040,6 +2045,20 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
                 payload += f"data: {line}\n"
             payload += "\n"
             await resp.write(payload.encode("utf-8"))
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    async def _finish_stream() -> None:
+        """Close the SSE stream, tolerating a client that already left.
+
+        A browser tab closed mid-install makes ``write_eof`` raise
+        ``ClientConnectionResetError`` ("Cannot write to closing
+        transport", a ``ConnectionResetError`` subclass), which would
+        otherwise escape the handler and be logged by aiohttp as an
+        unhandled server error for a routine client disconnect.
+        """
+        try:
+            await resp.write_eof()
         except (ConnectionResetError, ConnectionAbortedError):
             pass
 
@@ -2103,7 +2122,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
 
     if result.get("needsClientInstall"):
         await _send_sse("done", json.dumps(result))
-        await resp.write_eof()
+        await _finish_stream()
         return resp
 
     if not result.get("ok"):
@@ -2115,7 +2134,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
             error=result.get("error", ""),
         )
         await _send_sse("done", json.dumps(result))
-        await resp.write_eof()
+        await _finish_stream()
         return resp
 
     # Resource registration + backend start already ran inside the locked
@@ -2127,7 +2146,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
         resources=name,
     )
     await _send_sse("done", json.dumps(result))
-    await resp.write_eof()
+    await _finish_stream()
     return resp
 
 
@@ -2515,7 +2534,7 @@ async def handle_app_config(request: web.Request) -> web.Response:
 
 
 #: Ceiling on one UI-bundle file this route will serve. With streaming (see
-#: :func:`handle_app_ui_file`) the ceiling no longer bounds gateway memory —
+#: :func:`handle_app_ui_file`) the ceiling does not bound gateway memory —
 #: per-request memory is one :data:`_UI_STREAM_CHUNK` regardless of file size —
 #: it bounds the WORK one unauthenticated request can command (bytes read and
 #: sent per request; the route bypasses token auth). Measured reality: the
@@ -2555,7 +2574,7 @@ def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str
     ``"not_found"`` (-> 404). On the tuple path the CALLER owns closing the fd.
 
     Handing back the descriptor rather than a path is the security-relevant
-    part, and it is the same fix :func:`_read_declared_art` carries (#6794):
+    part, and it is the same fix :func:`_read_declared_art` carries:
     validating a path and then handing it to ``FileResponse`` opens it a SECOND
     time, so the app that owns this directory can swap a validated name for a
     symlink between the check and that open and have the gateway read the
@@ -2716,8 +2735,8 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
 
     Serves bytes STREAMED from a pinned descriptor (see :func:`_open_ui_file`)
     rather than handing a validated path to ``FileResponse``, which re-opens it
-    and re-introduces the check-then-reopen window #6794 closed on the art
-    route. Streaming rather than buffering is itself load-bearing: this route
+    and re-introduces the check-then-reopen window the art route also closes.
+    Streaming rather than buffering is itself load-bearing: this route
     is UNAUTHENTICATED (the ``/apps/{name}/ui/`` token-auth bypass), so a
     buffered body would let N outstanding requests each pin a whole file in
     gateway memory — with streaming, per-request memory is one chunk
@@ -2802,20 +2821,26 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
             # after the open must not stream past the length the client was told,
             # so the loop below caps at `remaining` as well as EOF.
             resp.content_length = st.st_size
-            await resp.prepare(request)
-            remaining = st.st_size
-            # The enclosing `_UI_STREAM_SEMAPHORE` scope (acquired before the
-            # open, released after the close) is what bounds this loop's
-            # `to_thread` hops on the shared default executor — no second
-            # acquisition here: a nested acquire under the same semaphore
-            # would deadlock once 8 holders each waited for a 9th permit.
-            while remaining > 0:
-                chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                await resp.write(chunk)
-            await resp.write_eof()
+            try:
+                await resp.prepare(request)
+                remaining = st.st_size
+                # The enclosing `_UI_STREAM_SEMAPHORE` scope (acquired before the
+                # open, released after the close) is what bounds this loop's
+                # `to_thread` hops on the shared default executor — no second
+                # acquisition here: a nested acquire under the same semaphore
+                # would deadlock once 8 holders each waited for a 9th permit.
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    await resp.write(chunk)
+                await resp.write_eof()
+            except (ConnectionResetError, ConnectionAbortedError):
+                # A tab can close at any response boundary. The descriptor is
+                # still closed by the shielded finally below; the disconnect is
+                # routine client behavior, not an application error.
+                pass
             return resp
         finally:
             # Off the loop: `os.close` is on the no-blocking-call-on-event-loop
@@ -3081,8 +3106,8 @@ async def _fetch_git_blob(
     second registry-row resolution would open without retaining credentials in
     the row itself.
 
-    ``owner_designated`` extends the same-repo credential carve-out (PR 918) to
-    this third clone chokepoint.  It is ``True`` only when the caller has
+    ``owner_designated`` extends the same-repo credential carve-out to this third
+    clone chokepoint.  It is ``True`` only when the caller has
     confirmed — via the merged :func:`_owner_designated_repo_target` predicate,
     evaluated against the SAME entry ``git_url`` was resolved from — that the
     entry's clone URL is byte-identical to the owner-typed
@@ -3329,7 +3354,7 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
     # repo's cache directory — a crafted ``ref`` would then yield a cache hit that
     # returns another repo's cached (possibly private) bytes without
     # authorization.  Reject any ``..`` segment or leading ``/`` in ``ref``
-    # BEFORE it is used to build or read the cache path, mirroring the
+    # BEFORE the cache path is built or read from it, mirroring the
     # ``file_path`` guard above, so a ``ref`` can only ever name a flat branch
     # subtree under its own ``repo_key``.
     if ".." in ref or ref.startswith("/"):
@@ -3415,7 +3440,7 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not cache_path.is_file():
-        # Same-repo credential carve-out (PR 918, extended to the blob chokepoint):
+        # Same-repo credential carve-out, extended to the blob chokepoint:
         # only when the entry's clone URL is byte-identical to the owner-typed
         # registry repo does the clone get owner credentials.  Reuse the merged
         # predicate verbatim — no host normalization, no index-supplied URL trust;
@@ -3741,10 +3766,16 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
                         if k.lower() not in _PROXY_HOP_HEADERS
                     },
                 )
-                await resp.prepare(request)
-                async for chunk in upstream.content.iter_any():
-                    await resp.write(chunk)
-                await resp.write_eof()
+                try:
+                    await resp.prepare(request)
+                    async for chunk in upstream.content.iter_any():
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                except (ConnectionResetError, ConnectionAbortedError):
+                    # The upstream request may finish after the browser has
+                    # already closed its side of the proxy stream. Do not turn
+                    # that routine client disconnect into a gateway traceback.
+                    pass
                 return resp
         finally:
             if owns_session:
@@ -3812,8 +3843,8 @@ async def handle_registries(request: web.Request) -> web.Response:
         # Edition-pinned registries are reported SEPARATELY and read-only. They
         # are not part of ``registries`` because PUT replaces that list verbatim:
         # a GET→edit→PUT round-trip would persist an edition default into the
-        # operator's config.json, where a later edition change could no longer
-        # move it. The client renders these as non-editable rows.
+        # operator's config.json, where a later edition change cannot move it.
+        # The client renders these as non-editable rows.
         pinned = [
             {
                 "name": r.name,

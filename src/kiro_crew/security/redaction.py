@@ -20,9 +20,14 @@ gate is a separate predicate so a refusal can name which one fired.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import math
+import posixpath
 import re
+import secrets
 from collections import Counter
+from collections.abc import Callable
 
 from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
 
@@ -180,24 +185,26 @@ _CREDENTIAL_PATTERNS = re.compile(
     # matched by the `{2,4}` quantifier below; the 2-segment link token has its
     # OWN separately bounded alternative.
     #
-    # The floor stays at 2: at 2 the two-segment dashboard token did not
-    # match here at all and fell through to the bare-secret entropy pass, whose run
-    # class `[A-Za-z0-9+/]` is STANDARD base64 and excludes base64url's `-`/`_`.
-    # That made redaction depend on which characters a random HMAC signature
-    # happened to contain. That rate is derivable, so it is stated as a closed form
-    # rather than as a sample. HMAC-SHA256 is 256 bits and base64url-unpadded gives
-    # 43 chars. The first 42 each carry a full 6 bits, so each is uniform over the
-    # 64-char alphabet, of which exactly 2 are `-`/`_`. The 43rd carries only the
-    # leftover 4 bits (256 - 42*6), and they land in the HIGH bits of its 6-bit
+    # The floor stays at 2 because the two-segment dashboard token is what a higher
+    # floor drops: it would not match here at all and would fall through to the
+    # bare-secret entropy pass, whose run class `[A-Za-z0-9+/]` is STANDARD base64
+    # and excludes base64url's `-`/`_`. That makes redaction depend on which
+    # characters a random HMAC signature happens to contain. That rate is derivable,
+    # so it is stated as a closed form rather than as a sample. HMAC-SHA256 is 256
+    # bits and base64url-unpadded gives 43 chars. The first 42 each carry a full 6
+    # bits, so each is uniform over the 64-char alphabet, of which exactly 2 are
+    # `-`/`_`. The 43rd carries only the leftover 4 bits (256 - 42*6), and they
+    # land in the HIGH bits of its 6-bit
     # group with the low 2 bits zero, so it spans exactly the 16 alphabet indices
     # divisible by 4 (`048AEIMQUYcgkosw`) and can never be `-`/`_`, which sit at
     # 62/63. Hence P(no `-`/`_`) = (62/64)^42 = 26.4%, verified by encoding all
     # 256 possible final digest bytes.
-    # So roughly a quarter of tokens had only the signature replaced (leaving the
-    # payload claims verbatim in a URL that still looked complete but no longer
-    # authenticated), and the other ~74% streamed out entirely unredacted. Matching the whole token here makes
-    # the outcome deterministic and replaces it as one unit. The 2-segment token gets
-    # its OWN alternative rather than relaxing the segment floor to `{1,4}`. Relaxing
+    # So roughly a quarter of tokens would have only the signature replaced (leaving
+    # the payload claims verbatim in a URL that still looks complete but is not
+    # authenticated), and the other ~74% would stream out entirely unredacted.
+    # Matching the whole token here makes the outcome deterministic and replaces it
+    # as one unit. The 2-segment token gets its OWN alternative rather than
+    # relaxing the segment floor to `{1,4}`. Relaxing
     # the floor over-redacts ordinary code and prose, because the pattern has no left
     # boundary and post-header segments allow an EMPTY match: `keyJson.get(raw)` then
     # redacts to `k[REDACTED…](raw)`, and a JWT quoted at the end of a sentence loses
@@ -422,7 +429,7 @@ _B64_CHUNK_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 # prose intact and stop a longer high-entropy blob from being split and missed),
 # then require the *specific 40-char secret shape* per token.
 #
-# NO LONGER CONSULTED BY `redact_credentials`. Pass 3 derives its runs from
+# NOT CONSULTED BY `redact_credentials`. Pass 3 derives its runs from
 # `_B64_CHUNK_RE` instead (`run = chunk.rstrip("=")`), because that one scan feeds
 # both pass 2 and pass 3 and the two patterns select identical spans. The only
 # remaining consumer here is `_text_contains_bare_secret`. That split is a
@@ -455,10 +462,23 @@ _SECRET_ENTROPY_MIN = 4.3
 # do not. NOTE: unlike a naive design we deliberately do NOT treat the presence
 # of '/' or '+' as a free pass to redact — 40-char mixed-case file paths contain
 # '/' yet are benign, so a '/' token must still clear both structural gates.
+# Neither gate can speak for a path LONGER than one window, though: its straddling
+# sub-windows are built from fragments of several components and clear both, which
+# is what `_SECRET_MAX_SLASHES` below is for.
 # Thresholds are chosen from measured distributions (see test_security.py) with a
 # wide margin toward NOT redacting.
 _SECRET_MAX_LOWER_RUN = 5
 _SECRET_MAX_VOWEL_RATIO = 0.30
+
+# Ceiling on the separators a window CUT OUT OF A LONGER RUN may hold, applied by
+# :func:`_contains_bare_secret`. A window straddling several path components is a
+# token nobody wrote, and it clears both gates above; its separator density is
+# what gives it away -- `/` is 1 base64 character in 64, so a real 40-char key
+# averages 0.6 of them, while a window spanning components carries one per
+# component. Measured on 200,000 uniformly random 40-char keys: this declines
+# 0.36% on its own, against 9.29% for the lowercase-run gate and 6.60% for the
+# vowel-ratio gate. Three is the knee: four leaves the reported paths redacted.
+_SECRET_MAX_SLASHES = 3
 
 # A token that base64-decodes to >=85% printable ASCII is encoded *text*, not a
 # random key (random 40-char keys decode to mostly non-printable bytes). Such a
@@ -750,6 +770,15 @@ def _contains_bare_secret(run: str) -> bool:
     lifted to run granularity so a misaligned window cannot defeat it. A genuine
     glued secret (``X`` + key, key + ``ABC``, key + ``X`` + key) does NOT decode
     cleanly as a whole run, so it still reaches the sliding window below.
+
+    SEPARATOR CEILING FOR A FRAGMENT. ``/`` is in the run alphabet, so a deep
+    absolute path is one run whose straddling sub-windows clear every per-window
+    gate. A key-shaped window carrying a path's separator density
+    (``_SECRET_MAX_SLASHES``) is declined, on two conditions that keep this a gate
+    rather than a hole: only when the run is LONGER than one whole key (a
+    40-char run IS the token somebody wrote, so a standalone key is never subject
+    to it), and only AFTER :func:`_looks_like_secret_key` has answered, so every
+    offset is still classified and a glued key is still found at its own offset.
     """
     if len(run) < _SECRET_KEY_LEN:
         return False
@@ -765,7 +794,8 @@ def _contains_bare_secret(run: str) -> bool:
     # and the pre-check would be pure duplicate work. This is what keeps the
     # slide affordable on long non-secret runs (hex digests, lowercase blobs),
     # which are the common shape in tool output.
-    if len(run) > _SECRET_KEY_LEN:
+    is_fragment = len(run) > _SECRET_KEY_LEN
+    if is_fragment:
         if not _has_all_three_char_classes(run):
             return False
         if _HEX_ONLY_RE.match(run):
@@ -773,8 +803,13 @@ def _contains_bare_secret(run: str) -> bool:
     if _decodes_to_printable_text(run):
         return False
     for start in range(len(run) - _SECRET_KEY_LEN + 1):
-        if _looks_like_secret_key(run[start : start + _SECRET_KEY_LEN]):
-            return True
+        window = run[start : start + _SECRET_KEY_LEN]
+        if not _looks_like_secret_key(window):
+            continue
+        if is_fragment and window.count("/") > _SECRET_MAX_SLASHES:
+            # Key-shaped, but a fragment carrying a path's separator density.
+            continue
+        return True
     return False
 
 
@@ -889,13 +924,13 @@ _REDACTED_ENCODED_CREDENTIAL_TAG = "[REDACTED: encoded credential]"
 #: :data:`kiro_crew.security.exfil.EXFILTRATION_REDACTION_TAG_PREFIX` (beside
 #: the rewriter itself), and a consumer that needs the full "was this text
 #: rewritten" answer must check that constant by prefix ALONGSIDE this tuple --
-#: the dashboard chat notice does exactly that (issues #6189 and #8132).
+#: the dashboard chat notice does exactly that.
 #:
-#: This tuple exists because the enumeration used to live at the call site, where
-#: it silently missed the encoded tag and under-reported redactions on the
+#: This tuple exists so the enumeration lives beside the tags instead of at the
+#: call site, where it silently misses a tag and under-reports redactions on the
 #: dashboard chat notice. Co-locating it means a NEW tag is added next to the list
 #: that must name it; ``test_every_redaction_tag_constant_is_registered`` fails if
-#: one is added without registering it, so the drift cannot recur silently.
+#: one is added without registering it, so the drift cannot happen silently.
 #:
 #: Invariant relied on by callers that SUM per-tag counts: no tag is a substring
 #: of another, so one substitution cannot be counted twice.
@@ -1026,3 +1061,116 @@ def redact_local_paths(text: str) -> tuple[str, list[str]]:
         return _LOCAL_PATH_PLACEHOLDER
 
     return _LOCAL_PATH_RE.sub(_sub, text), notes
+
+
+#: A random key generated once per gateway process and held only in memory: it
+#: is never persisted, logged or exposed. It keys the per-segment label below.
+_PATH_LABEL_KEY = secrets.token_bytes(32)
+
+#: Joins a redacted path segment to the label :func:`redact_path_segments`
+#: appends. Outside the credential alphabet, so the label can never be glued
+#: onto a neighbouring run and read as part of one; and not a path separator, so
+#: the segment count is kept.
+_PATH_SEGMENT_DISCRIMINATOR_SEP = "~"
+
+
+def _path_segment_label(segment: str) -> str:
+    """The opaque, process-stable label for a redacted path *segment*.
+
+    ``HMAC-SHA256(_PATH_LABEL_KEY, segment)``, truncated to 12 hex digits (48
+    bits). Equal segments carry equal labels for the life of this process, and
+    that equality is the point: the dashboard joins the project-tree response
+    with the git-status response by path, so the same original must label the
+    same way in both. Distinct segments carry distinct labels except with
+    negligible probability (48 bits over the handful of collisions one tree can
+    hold). The digest is KEYED: without the key nothing about the segment can be
+    checked against the label, so a low-entropy secret behind a redaction tag is
+    not exposed to an offline dictionary guess the way an unkeyed hash prefix
+    would be. The key is fresh per gateway process, so the label changes across
+    a restart; both responses of one join come from one process, so the join
+    holds.
+    """
+    return hmac.new(
+        _PATH_LABEL_KEY, segment.encode("utf-8", "surrogatepass"), hashlib.sha256
+    ).hexdigest()[:12]
+
+
+def redact_path_segments(path: str, redactor: Callable[[str], str] | None = None) -> str:
+    """Redact a ``/``-separated *path* segment by segment, labelling each
+    redacted segment so distinct originals stay distinct.
+
+    The whole-string redactors replace a matched token wherever it sits, so a
+    path whose filename is credential-shaped (``AKIA…_model.txt``) keeps its
+    directory prefix and its non-secret tail but not the token. Here each segment
+    is redacted on its own, so a credential-shaped segment is replaced by the tag
+    while every clean segment around it is kept verbatim. Every segment the
+    redactor changes is then suffixed with :data:`_PATH_SEGMENT_DISCRIMINATOR_SEP`
+    and :func:`_path_segment_label` of its ORIGINAL bytes -- not only on a
+    collision, because a single call cannot know what else the listing holds.
+
+    The label is the one shape that meets all five properties the listings need
+    at once:
+
+    1. Distinct inputs stay distinct: two different credential-shaped segments
+       collapse to the same tag but carry different labels, so a de-duplicating
+       listing keeps both.
+    2. No byte of the secret is in the output: the tag replaces the token whole
+       and the label is a digest, not a substring.
+    3. No UNKEYED digest of the secret: the label is an HMAC under a per-process
+       random key, so a reader cannot enumerate low-entropy candidates offline
+       and match them against the label.
+    4. No dependence on listing position or order: the label is a function of
+       the segment alone, so a sorted listing does not correlate the label with
+       the secret's lexicographic rank, and the same path labels the same way
+       whatever else is listed with it.
+    5. Stable across responses within one gateway process: the dashboard joins
+       the tree response with the git-status response by path, and a
+       per-response label breaks that join when only one of two colliding paths
+       appears in the status response. A keyed label is the same in every
+       response this process serves.
+
+    The key is regenerated when the gateway restarts, so labels differ across
+    restarts; both responses of one join come from the same process, so that
+    is fine.
+
+    *redactor* is the whole-string redactor to apply -- callers on an egress
+    surface pass the context-aware ``redact`` shim so a loaded companion's extra
+    patterns apply; the default is the credential pass alone. Whatever it is,
+    this function never emits LESS redaction than it would: the segment-wise
+    result is returned only when redacting each segment on its own removes
+    EXACTLY the bytes the whole-string pass removes (their unlabelled joins are
+    equal) and the labelled result is itself a fixed point of the redactor;
+    otherwise the whole-string result is returned unchanged. Equality with the
+    whole-string pass is the load-bearing check: a token that spans a separator
+    (a ``key=value`` whose value carries a ``/``) is matched by the whole pass
+    but only up to the separator by the segment pass, and the leftover tail is
+    not a match on its own, so a fixed-point check alone would let it through.
+    A path the redactor leaves alone is returned as is. Splits on
+    :data:`posixpath.sep` only, on every host: the project listings this serves
+    emit POSIX-relative paths, not native ones.
+    """
+    _redact: Callable[[str], str] = redactor or (lambda s: redact_credentials(s)[0])
+    whole = _redact(path)
+    if whole == path:
+        return path
+    segments = path.split(posixpath.sep)
+    outs = [_redact(segment) for segment in segments]
+    # Floor 1: segment-wise redaction must reproduce the whole-string result
+    # byte for byte before any label is added. Anything the whole pass removed
+    # that a single segment did not is a tail the caller must not see.
+    if posixpath.sep.join(outs) != whole:
+        return whole
+    labelled = [
+        (
+            out
+            if out == segment
+            else f"{out}{_PATH_SEGMENT_DISCRIMINATOR_SEP}{_path_segment_label(segment)}"
+        )
+        for segment, out in zip(segments, outs)
+    ]
+    candidate = posixpath.sep.join(labelled)
+    # Floor 2: the labelled result must itself be a fixed point of the redactor
+    # (a shape that only matches in context, or one the labels complete).
+    if _redact(candidate) != candidate:
+        return whole
+    return candidate

@@ -6,12 +6,15 @@ import asyncio
 import contextlib
 import datetime as _dt
 import errno
+import functools
 import hashlib
+import io
 import json
 import logging
 import mimetypes
 import ntpath
 import os
+import posixpath
 import re
 import stat as _stat_mod
 import subprocess
@@ -23,13 +26,13 @@ import uuid
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import BinaryIO, NamedTuple
+from typing import BinaryIO, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
-from kiro_crew import file_delivery_consent, pinned_fs, platform_compat
+from kiro_crew import executors, file_delivery_consent, pinned_fs, platform_compat
 from kiro_crew.atomic_write import (
     atomic_write,
     open_access_control_source,
@@ -39,12 +42,21 @@ from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     WorkspaceConfig,
+    WorkspaceDirUnusable,
     coerce_dict_section,
     config_dir,
     data_home,
+    materialize_workspace_dir,
     update_config_locked,
 )
+from kiro_crew.config.sections import (
+    LINK_PATTERN_PATTERN_MAX_LEN,
+    LINK_PATTERN_URL_MAX_LEN,
+    LINK_PATTERNS_MAX,
+    link_pattern_url_ok,
+)
 from kiro_crew.dashboard import part_stream, upload_destination
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     dashboard_slot_key,
     drained_to_thread,
@@ -52,8 +64,13 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
 from kiro_crew.dashboard.handlers._shared import _probe_persisted_session, read_bounded_json
+from kiro_crew.dashboard.handlers.messaging import _resolve_session_target
 from kiro_crew.dashboard.origin import is_direct_local_request
-from kiro_crew.dashboard.state import DashboardState, append_and_surface
+from kiro_crew.dashboard.state import (
+    VALID_MEMORY_MODES,
+    DashboardState,
+    append_and_surface,
+)
 from kiro_crew.doc_parser import extract_text
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -66,10 +83,12 @@ from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_path_segments,
 )
 from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
     FILE_READ_SCHEMA,
+    MODEL_ID_RE,
     ValidationError,
     validate_tool_args,
 )
@@ -93,8 +112,71 @@ mimetypes.add_type(
 
 _INLINE_DISPOSITION_PREFIXES = frozenset({"audio/", "video/", "image/", "application/pdf"})
 
+#: Session-key namespace of a sub-agent run. A sub-agent has no tab of its own, so
+#: its file card belongs to the PARENT's tab — the surface every other sub-agent
+#: output already routes to (``subagent_manager.monitoring``'s completion
+#: injection, ``chat_utils.subagent_event_slot``'s WS frames).
+_SUBAGENT_SESSION_PREFIX = "subagent:"
+
 
 logger = logging.getLogger(__name__)
+
+
+def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str:
+    """The parent session key of the sub-agent running under *session_key*, or ``""``.
+
+    Matches on BOTH spellings a run can be keyed by — its ``conversation_key`` (a
+    continuable run) and ``subagent:<id>`` — the same comparison
+    ``subagent_manager.continuation`` makes, because a continuable run's key is not
+    derivable from its id. Returns ``""`` when the manager is absent or the run is
+    unknown, so the caller SUPPRESSES the card rather than guessing a tab.
+    """
+    manager = getattr(state, "subagents", None)
+    if manager is None:
+        return ""
+    try:
+        # A PROPERTY, not a method (``subagent.py`` ``@property all_agents``).
+        # Calling it invoked the returned LIST, so every lookup raised TypeError,
+        # the except below swallowed it, and the card was suppressed for every
+        # sub-agent -- the routing this function exists to do never happened once.
+        agents = list(manager.all_agents)
+    except Exception:
+        logger.warning("outbox notify: sub-agent roster unavailable", exc_info=True)
+        return ""
+    matches = [
+        info
+        for info in agents
+        if (getattr(info, "conversation_key", "") or f"{_SUBAGENT_SESSION_PREFIX}{info.id}")
+        == session_key
+    ]
+    if not matches:
+        return ""
+    # More than one record can carry ONE key: a continuation is minted as a new run
+    # whose ``conversation_key`` is the original's ``subagent:<id>``, and the
+    # original (spawned with an empty conversation_key) resolves to that same
+    # string. Their parents differ whenever a DIFFERENT session continued the
+    # conversation -- so taking the first match routes the card to whichever chat
+    # happens to sit earlier in the roster, which is the PREVIOUS owner's tab.
+    #
+    # Newest ACTIVE run wins: a live run is the one the card belongs to, and among
+    # equals the most recently started. Ranked rather than filtered so a roster of
+    # only-finished records still answers with the latest instead of nothing.
+
+    def _rank(info: object) -> tuple[int, float]:
+        # Defensive reads: a stubbed manager can hand back non-bool/non-number here,
+        # and a comparison against those raises inside the sort rather than routing.
+        done = getattr(info, "done", False)
+        started = getattr(info, "started", 0.0)
+        return (
+            0 if (done is True) else 1,
+            float(started) if isinstance(started, (int, float)) else 0.0,
+        )
+
+    best = max(matches, key=_rank)
+    parent = getattr(best, "parent_session_key", "")
+    # isinstance, not truthiness: a stubbed manager can hand back a
+    # non-str here and dashboard_slot_key would treat it as a key.
+    return parent if isinstance(parent, str) else ""
 
 
 def _sel():
@@ -194,11 +276,42 @@ async def api_reveal_path(request: web.Request) -> web.Response:
     # refuses to start, and either way this degrades to the clipboard rather than
     # failing a click in the file viewer.
     if action == "open":
-        if not os.path.isfile(path):
+
+        def _stat_then_launch() -> tuple[bool, bool]:
+            """The regular-file check AND the launch, in one worker transaction.
+
+            Both belong off the loop: the stat is unbounded on a caller-supplied
+            path, and the launch spawns a process. They must not be SPLIT across
+            an ``await``, though. The launcher takes a path, not the descriptor
+            this stat looked at, so the two calls are a check-then-use pair; an
+            ``await`` between them is a scheduler yield inside that window, which
+            is long enough for the path to be replaced with a symlink the
+            sensitive-path gate above already refused. The launcher follows it and
+            opens the substituted target in the user's default application.
+
+            Keeping them in one transaction holds the window to what it is when
+            the two run back-to-back: no suspension point, and the GIL not
+            released between them. Closing it entirely needs a launcher that
+            takes a descriptor, which no platform's open-by-association verb
+            does, so this is the narrow form rather than the closed form.
+            """
+            if not os.path.isfile(path):
+                return (False, False)
+            return (True, platform_compat.open_with_default_app(path))
+
+        try:
+            is_regular_file, launched = await _run_path_probe(_stat_then_launch)
+        except _PathProbeBusy:
+            return _probe_busy_response(
+                resource=path, tool_name="reveal_path", session_key="api", source="api"
+            )
+        if not is_regular_file:
             return web.json_response({"error": "not a regular file"}, status=400)
-        copied = not platform_compat.open_with_default_app(path)
+        copied = not launched
     else:
-        copied = not platform_compat.reveal_in_file_manager(path)
+        # Off-loop: the reveal spawns a file-manager process. No stat pairs with
+        # it, so there is no check-then-use window to hold here.
+        copied = not await asyncio.to_thread(platform_compat.reveal_in_file_manager, path)
     _sel().log_tool_invocation(
         session_key="api", source="api", tool_name="reveal_path",
         outcome="success", resources=path, metadata={"action": action})
@@ -329,40 +442,98 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
             )
-    # Inject into the caller's chat slot so the card persists in the correct session
-    if state._slots:
-        # Prefer the caller's own slot via X-Session-Key header
-        session_key = request.headers.get("X-Session-Key", "").strip()
-        active = None
-        if session_key.startswith("cron:"):
-            # A cron slot is named cron-<id>, which is not the session key folded.
-            active = state.get_slot(f"cron-{session_key.removeprefix('cron:')}")
-        else:
-            # A channel-born conversation keeps its channel key (slack:<ts>)
-            # while its tab is open, so the slot name comes from the surface
-            # lookup — stripping a "dashboard:" prefix would miss it and drop the
-            # card into whichever tab happened to be active last.
-            slot_key = dashboard_slot_key(session_key)
-            if slot_key:
-                active = state.get_slot(slot_key)
-        # An explicitly header-targeted slot receives the file even when empty
-        header_targeted = active is not None
-        # Fallback: most recently active slot
-        if not active:
-            active = max(
-                state._slots.values(),
-                key=lambda s: s.messages[-1]["ts"] if s.messages else "",
-            )
-        if active and (active.messages or header_targeted):
-            # Route through the context-aware redact() so a loaded companion's
-            # extra credential regexes scrub the broadcast file JSON too — the
-            # same overlay-aware pass the filename/path/description gates use.
-            redacted_file_json = redact(json.dumps(file_data))
-            # append_and_surface = the same conditional-broadcast pattern this
-            # site pioneered, now also stamping ``ts`` + ``meta.mid`` on the
-            # reader-suppressed frame so a client seeing the row through two
-            # doors recognises it instead of rendering a duplicate card.
-            append_and_surface(state, active, "file", redacted_file_json)
+    # Inject the file card into the caller's chat slot so it persists in the
+    # correct session. This runs even when ``state._slots`` is empty: a headless
+    # script cron typically has no dashboard tab open at all, and its origin slot
+    # is rehydrated from history below — gating the whole block on
+    # ``if state._slots`` skipped exactly that case.
+    # Prefer the caller's own slot via X-Session-Key header
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    active = None
+    if session_key.startswith("cron:"):
+        # A cron slot is named cron-<job-id>, which is not the session key folded.
+        # Only the JOB ID: a cron turn's key can carry a further segment
+        # (`cron:<job>:<run>` for a per-run session, `cron:<job>:<agent>` for a
+        # multi-agent one), and folding the whole tail asks for a `cron-<job>:<run>`
+        # slot that never exists — so every suffixed turn missed its own open tab
+        # and fell through to origin resolution or suppression.
+        job_id = session_key.removeprefix("cron:").split(":", 1)[0]
+        active = state.get_slot(f"cron-{job_id}")
+        if active is None:
+            # A headless script cron has no live "cron-<id>" slot. Rather than
+            # leak the card into whichever tab happens to be focused, route it to
+            # the cron's ORIGIN dashboard session — the chat that created the cron
+            # — through the same resolver ``send_message(session="origin")`` uses,
+            # so both delivery paths agree on where a cron's output belongs.
+            origin_slot_key, _origin_job = _resolve_session_target(state, "origin", session_key)
+            if origin_slot_key:
+                # get_slot is the hot path (O(1)); on a miss the origin session
+                # exists on disk but has no tab open, so rehydrate it — with the
+                # transcript read off the loop, the shape the sibling origin path
+                # established, because a large store would otherwise stall the
+                # gateway. A truly-gone session (never persisted, deleted, or
+                # closed) returns None and falls through to suppression below; no
+                # phantom empty tab is ever created.
+                active = state.get_slot(origin_slot_key)
+                if active is None:
+                    active = await rehydrate_slot_from_history_async(state, origin_slot_key)
+    elif session_key.startswith(_SUBAGENT_SESSION_PREFIX):
+        # A sub-agent has no tab of its own, so route its card to the PARENT slot
+        # — the same destination its completion injection and its ``subagent_*`` WS
+        # frames already use. Only the dedicated-process arm arrives here: a
+        # shared-runtime sub-agent's MCP stub carries the parent's own key and is
+        # resolved by the branch below. An unknown run or a parent with no open tab
+        # yields "" and falls through to suppression — never into an unrelated
+        # conversation.
+        parent_key = _subagent_parent_session_key(state, session_key)
+        parent_slot_key = dashboard_slot_key(parent_key) if parent_key else ""
+        if parent_slot_key:
+            active = state.get_slot(parent_slot_key)
+    else:
+        # A channel-born conversation keeps its channel key (slack:<ts>)
+        # while its tab is open, so the slot name comes from the surface
+        # lookup — stripping a "dashboard:" prefix would miss it and drop the
+        # card into whichever tab happened to be active last.
+        slot_key = dashboard_slot_key(session_key)
+        if slot_key:
+            active = state.get_slot(slot_key)
+    # An explicitly header-targeted slot receives the file even when empty
+    header_targeted = active is not None
+    # Fallback: most recently active slot — ONLY for a legacy headerless caller,
+    # the best-effort case it was written for. A key that IS present but resolves
+    # to nothing names a session we could not reach (a cron with no originating
+    # chat, an unknown job, a sub-agent whose parent has no tab, a task-runner or
+    # webhook session that owns no chat, a closed tab); suppress the card rather
+    # than surface it in an unrelated conversation.
+    if not active and not session_key and state._slots:
+        active = max(
+            state._slots.values(),
+            key=lambda s: s.messages[-1]["ts"] if s.messages else "",
+        )
+    delivered = False
+    if active is not None and (active.messages or header_targeted):
+        delivered = True
+        # Route through the context-aware redact() so a loaded companion's
+        # extra credential regexes scrub the broadcast file JSON too — the
+        # same overlay-aware pass the filename/path/description gates use.
+        redacted_file_json = redact(json.dumps(file_data))
+        # append_and_surface = the same conditional-broadcast pattern this
+        # site pioneered, now also stamping ``ts`` + ``meta.mid`` on the
+        # reader-suppressed frame so a client seeing the row through two
+        # doors recognises it instead of rendering a duplicate card.
+        append_and_surface(state, active, "file", redacted_file_json)
+    else:
+        # Suppression is the RIGHT outcome — better nowhere than in an unrelated
+        # conversation — but it is silent, and a caller that reads `ok: true` has
+        # no way to tell a delivered card from a vanished one. So say so once, at
+        # the only point that knows both that a key was supplied and that it
+        # resolved to no destination. The key is logged because it is the whole
+        # diagnosis (which namespace, which id); the file is already named in the
+        # audit event below.
+        logger.info(
+            "outbox notify: no destination for session key %r; file card suppressed",
+            session_key or "<none>",
+        )
 
     _sel().log_tool_invocation(
         session_key="api",
@@ -370,7 +541,11 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         tool_name="file_send",
         tool_kind="notify",
         outcome="completed",
-        resources=f"filename={file_data['filename']}",
+        # `delivered` distinguishes the two outcomes this endpoint folds into one
+        # 200: the card reached a session, or it was suppressed for want of a
+        # destination. Carried here rather than as a separate SEL outcome so the
+        # existing "completed" consumers keep working.
+        resources=f"filename={file_data['filename']} delivered={int(delivered)}",
     )
     return web.json_response({"ok": True})
 
@@ -994,8 +1169,11 @@ _SEARCH_LIMIT_CEILING = 60
 _ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _ALLOWED_TEXT_EXT = {
     ".txt",
+    ".text",
+    ".xwiki",
     ".md",
     ".json",
+    ".jsonl",
     # Excalidraw scene JSON — the composer's sketch pad attaches one per
     # sketch, and the dashboard has a dedicated read-only renderer for it
     # (FileRenderers routes on this exact extension). Content-wise it is
@@ -1006,6 +1184,7 @@ _ALLOWED_TEXT_EXT = {
     ".yml",
     ".xml",
     ".csv",
+    ".tsv",
     ".log",
     ".py",
     ".js",
@@ -1175,6 +1354,67 @@ def _content_matches_ext(ext: str, data: bytes) -> bool:
     if prefixes is None:
         return True  # text / svg / unknown — nothing to enforce
     return any(data.startswith(p) for p in prefixes)
+
+
+#: Canonical upload extension per sniffed raster type: the suffix a mislabelled
+#: raster is stored under so every downstream consumer that infers the mime
+#: from the path (ACP image inlining, /api/file-raw) reads the true type.
+_RASTER_MIME_EXT: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+}
+#: ISO-BMFF brands of still-image containers (HEIF/HEIC/AVIF). An iPhone photo
+#: that reaches the browser as ``IMG_1234.jpeg`` is routinely one of these, and
+#: the generic "not really a .jpeg" sentence leaves the user guessing why.
+_HEIF_BRANDS = frozenset(
+    {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis"}
+)
+
+
+def _resolve_raster_ext(ext: str, data: bytes) -> str | None:
+    """The extension a raster upload declared as *ext* is stored under.
+
+    Returns *ext* when the leading bytes match it, the sniffed type's canonical
+    extension when they are a DIFFERENT accepted raster, and ``None`` when they
+    are no raster at all. The relabel exists because browsers keep the URL's
+    extension on "Save image as" while the body is whatever the server sent
+    (a ``.jpeg`` that is really WebP is the everyday case), and a photo is a
+    photo whichever suffix it wears. Security is unchanged: the bytes still
+    have to be a raster the allowlist accepts, so the CWE-434 property --
+    no HTML or script stored under an image extension -- holds; only the label
+    is corrected instead of refused.
+    """
+    expected = _RASTER_EXT_MIME.get(ext)
+    if expected is None:
+        return None
+    sniffed = sniff_raster_mime(data[:SNIFF_BYTES])
+    if sniffed is None:
+        return None
+    if sniffed == expected:
+        return ext
+    return _RASTER_MIME_EXT[sniffed]
+
+
+def _content_mismatch_message(ext: str, data: bytes) -> str:
+    """User-facing sentence for a content-signature refusal.
+
+    Names the remedy for the same reason the video branch does: telling the
+    user their file "does not match its type" says what is wrong without
+    saying what to do about it, and the fix (convert or re-export) is not
+    guessable from the sentence.
+    """
+    if ext in _RASTER_EXT_MIME:
+        accepted = ", ".join(sorted(_RASTER_EXT_MIME))
+        if data[4:8] == b"ftyp" and data[8:12] in _HEIF_BRANDS:
+            return (
+                f"This {ext} file is really a HEIC/AVIF photo — convert it to "
+                f"one of: {accepted} and upload again"
+            )
+        return f"This file is not really a {ext} image — re-export it as one of: {accepted}"
+    return f"File content does not match its type: {ext}"
 
 
 async def _stream_video_part(
@@ -1395,7 +1635,25 @@ async def api_upload_file(request: web.Request) -> web.Response:
             # Content-signature gate (CWE-434): verify magic bytes match the
             # claimed extension BEFORE writing, so an allowed extension can't
             # smuggle arbitrary/binary content (e.g. a .png that is really HTML).
-            if not _content_matches_ext(ext, bytes(data)):
+            # A raster whose bytes are a different ACCEPTED raster is relabelled
+            # rather than refused: the content passed the same allowlist, only
+            # the filename lied, and the stored suffix must tell the truth for
+            # everything downstream that infers the mime from the path.
+            if ext in _RASTER_EXT_MIME:
+                true_ext = _resolve_raster_ext(ext, bytes(data))
+                content_ok = true_ext is not None
+                if true_ext is not None and true_ext != ext:
+                    logger.info(
+                        "upload.file relabel: name=%s declared=%s stored=%s",
+                        safe_name,
+                        ext,
+                        true_ext,
+                    )
+                    ext = true_ext
+                    dest = dest.with_suffix(true_ext)
+            else:
+                content_ok = _content_matches_ext(ext, bytes(data))
+            if not content_ok:
                 await _cleanup()
                 _sel().log_api_access(
                     caller=caller,
@@ -1405,7 +1663,10 @@ async def api_upload_file(request: web.Request) -> web.Response:
                     resources=f"file:{fname} reason:content_signature_mismatch:{ext}",
                 )
                 return web.json_response(
-                    {"error": f"File content does not match its type: {ext}"},
+                    {
+                        "error": _content_mismatch_message(ext, bytes(data)),
+                        "code": "content_mismatch",
+                    },
                     status=400,
                 )
             try:
@@ -1607,8 +1868,11 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # Recursively copy source workspace data to the new directory
         src_path = data_home() / cfg.workspaces[copy_from].dir
         dst_path = data_home() / ws_dir
+        # Resolved once each; both checks below judge these same objects.
+        src_resolved = src_path.resolve()
+        dst_resolved = dst_path.resolve()
         # Guard against path traversal
-        if not dst_path.resolve().is_relative_to(data_home().resolve()):
+        if not dst_resolved.is_relative_to(data_home().resolve()):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1617,7 +1881,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                 resources=name,
             )
             return web.json_response({"error": "Invalid directory path"}, status=400)
-        if not src_path.resolve().is_relative_to(data_home().resolve()):
+        if not src_resolved.is_relative_to(data_home().resolve()):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1628,7 +1892,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             return web.json_response({"error": "Invalid source directory path"}, status=400)
         # Reject config root itself to avoid copying .env / config.json
         cfg_root = data_home().resolve()
-        if src_path.resolve() == cfg_root or dst_path.resolve() == cfg_root:
+        if src_resolved == cfg_root or dst_resolved == cfg_root:
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1649,18 +1913,22 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     # is_relative_to + is_sensitive_path guards below reject traversals before
     # the value is stored in config. CodeQL's taint tracker does not model the
     # containment guard as a barrier.
-    final_path = (  # lgtm[py/path-injection]
-        Path(ws_dir).expanduser().resolve() if _abs else data_home() / ws_dir
-    )
+    # Resolved exactly ONCE. Every check below judges this object and the create
+    # below receives this same object: a second resolve after the checks would
+    # follow a parent swapped for a link in between, and the pinned create can
+    # only refuse a swap that happens AFTER the path it is handed was resolved.
+    validated_dir = (  # lgtm[py/path-injection]
+        Path(ws_dir).expanduser() if _abs else data_home() / ws_dir
+    ).resolve()
 
     # Check for directory collision with existing workspaces (resolve both sides)
     existing_resolved = {_resolve_ws_dir(ws.dir) for ws in cfg.workspaces.values()}
-    if _resolve_ws_dir(ws_dir) in existing_resolved:
+    if validated_dir in existing_resolved:
         return web.json_response(
             {"error": f"Directory '{ws_dir}' is already used by another workspace"},
             status=409,
         )
-    if is_sensitive_path(str(final_path.resolve())):
+    if is_sensitive_path(str(validated_dir)):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1669,7 +1937,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if not _abs and not final_path.resolve().is_relative_to(data_home().resolve()):
+    if not _abs and not validated_dir.is_relative_to(data_home().resolve()):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1678,7 +1946,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if final_path.resolve() == data_home().resolve():
+    if validated_dir == data_home().resolve():
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1746,7 +2014,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             for ws in workspaces.values()
             if isinstance(ws, dict)
         }
-        if _resolve_ws_dir(ws_dir) in raw_dirs:
+        if validated_dir in raw_dirs:
             raise _WorkspaceConflict(
                 409,
                 f"Directory '{ws_dir}' is already used by another workspace",
@@ -1782,6 +2050,17 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                     "workspace_dir_occupied",
                 ) from exc
             install_state["installed"] = True
+        # A create with no copy source still needs its directory to EXIST: the
+        # config entry alone is a latent fleet-wide outage for private members
+        # (see materialize_workspace_dir). Created through the pinned parent,
+        # adopting a directory already there; a non-directory or a missing parent
+        # is refused. Deliberately NOT rolled back when the config write fails --
+        # a concurrent create can already have adopted and registered it.
+        else:
+            try:
+                materialize_workspace_dir(validated_dir, display=ws_dir)
+            except WorkspaceDirUnusable as exc:
+                raise _WorkspaceConflict(409, str(exc), exc.code) from exc
         workspaces[name] = asdict(WorkspaceConfig(dir=ws_dir))
         return doc
 
@@ -1803,13 +2082,22 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # Nothing to clean: the staged tree was consumed by the install.
         raise
     except BaseException:
-        # The worker itself failed (unreadable config, a failed atomic
-        # write): the workspace was NOT registered, so an installed tree is a
-        # phantom -- roll it back; an uninstalled staging tree is residue --
-        # drop it. Both off the loop. The rollback can only remove a tree
-        # this request created (see the install invariant above).
+        # The worker itself failed (unreadable config, a failed atomic write): the
+        # workspace was NOT registered. An installed tree is left in place, by the
+        # same rule as the plain-create directory: by the time this runs a
+        # concurrent create can have adopted the directory and registered it
+        # (EEXIST is accepted above), so deleting it is the unsafe option -- it
+        # would leave THAT workspace declared with no directory, the exact state
+        # the private-memory layout refuses on. A full copied tree with nothing
+        # pointing at it is indistinguishable from a leak, so say where it is.
+        # An uninstalled staging tree is residue nothing can have adopted; drop it
+        # off the loop.
         if install_state["installed"] and install_dst is not None:
-            await asyncio.to_thread(shutil.rmtree, install_dst, ignore_errors=True)
+            logger.warning(
+                "workspace create failed after its copied tree was installed; %s is "
+                "left in place and no workspace entry names it",
+                install_dst,
+            )
         elif staged_path is not None:
             await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
         raise
@@ -1903,17 +2191,35 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
             # the workspace from this handler's older view would undo it.
             raise _WorkspaceConflict(404, f"Workspace '{name}' not found", "workspace_not_found")
         if "dir" in body:
-            new_resolved = _resolve_ws_dir(body["dir"])
+            # `resolved` is the ONE path screened above (is_sensitive_path,
+            # containment, config root); re-resolving the string here would let a
+            # parent swapped for a link between the screen and this check pass a
+            # different directory. Only the OTHER entries resolve fresh -- they are
+            # the state re-decided inside the lock.
             others = {
                 _resolve_ws_dir(str(w.get("dir", "")))
                 for n2, w in workspaces.items()
                 if n2 != name and isinstance(w, dict)
             }
-            if new_resolved in others:
+            if resolved in others:
                 raise _WorkspaceConflict(
                     409,
                     f"Directory '{body['dir']}' is already used by another workspace",
                     "workspace_dir_in_use",
+                )
+            # Same materialize-or-refuse invariant the create path holds: the V2
+            # private-memory layout resolves EVERY declared workspace strictly, so
+            # rebinding to a path that is not a directory arms a refusal for every
+            # private member, including members bound to other workspaces. An
+            # update names a destination the owner already chose, so it refuses
+            # rather than creating one -- creating is the create path's job, and
+            # this transaction has no rollback for a directory it made.
+            if not resolved.is_dir():
+                raise _WorkspaceConflict(
+                    409,
+                    f"Directory '{body['dir']}' does not exist or is not a directory; "
+                    "create it first",
+                    "workspace_dir_unusable",
                 )
             ws["dir"] = body["dir"]
             return doc
@@ -2004,11 +2310,274 @@ async def api_workspaces_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+#: Every control character: C0, DEL, and the C1 block.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
 def _validate_dashboard_path(raw: str) -> str | None:
-    """Validate a file path through hooks.py enforcement layer."""
+    """Validate a file path through hooks.py enforcement layer.
+
+    Refuses a control character in the RAW path first. ``FILE_READ_SCHEMA``
+    declares that class but cannot enforce it: ``validate_tool_args`` matches the
+    *sanitized* copy of the value, from which ``strip_hidden_unicode`` has already
+    removed every control character but CR, LF and TAB, while the raw string is
+    what travels on. So the class is unobservable at the schema and has to be
+    refused here.
+
+    It is refused HERE rather than inside ``validate_file_path`` because that is a
+    shared chokepoint whose other callers deliberately handle such a name -- a
+    diagnostic that enumerates an agent-writeable directory reports on a
+    control-character-named file and escapes the name for display, and refusing it
+    there would suppress that report. The class is a property of what this
+    boundary accepts from a caller, not of what a path can be.
+
+    What it buys at this boundary: the raw path is recorded in the request's audit
+    entry and echoed in diagnostics, so CR or LF forges a line and ESC or an 8-bit
+    C1 (U+009B CSI, U+0085 NEL) is a terminal escape. No file a dashboard caller
+    means to open is named with one, so the refusal costs nothing legitimate --
+    unlike the punctuation an allowlist omits, which is the defect this gate's
+    denylist exists to stop causing.
+
+    Blocking: ``validate_file_path`` canonicalizes with ``realpath`` and, on
+    Windows, walks the path's ancestors with one ``lstat`` each. Callers reach it
+    through :func:`_probe_request_path` on a worker thread rather than calling it
+    from an ``async def`` body.
+    """
     from kiro_crew.hooks import validate_file_path  # noqa: F811
 
+    if _CONTROL_CHARS_RE.search(raw):
+        return None
     return validate_file_path(raw)
+
+
+_ProbeT = TypeVar("_ProbeT")
+
+#: How long a request waits for a free worker before it is refused with 503.
+#: Sized to absorb a burst of healthy probes (each takes milliseconds), not to
+#: outwait a dead mount; the same figure the sensitive-path resolver's own budget
+#: uses.
+_PATH_PROBE_ADMIT_TIMEOUT_SECS = 2.0
+#: Execution ceiling handed to ``run_in_cron_pool``, which requires one. It is
+#: deliberately NOT a request timeout: this change bounds how many probes can be
+#: wedged, not how long a client waits on one, and a shorter figure here would
+#: add a second refusal class this endpoint family does not yet define. Large
+#: enough that no healthy transfer under the module's own caps reaches it.
+_PATH_PROBE_EXEC_CEILING_SECS = 3600.0
+
+
+class _PathProbeBusy(Exception):
+    """No worker on the chosen pool freed up within the admission window."""
+
+
+async def _run_path_probe(
+    fn: Callable[..., _ProbeT], /, *args: object, transfer: bool = False
+) -> _ProbeT:
+    """Run a blocking request-path call on a dedicated bounded pool, or refuse.
+
+    The only sanctioned route for filesystem work on a caller-supplied path in
+    this module -- never ``asyncio.to_thread``. That is the loop's default
+    executor, shared by MCP, crons and the rest of the dashboard: a thread wedged
+    in an uninterruptible ``stat`` on a dead mount never returns, so a caller
+    repeatedly naming one would retire a shared worker per request until every
+    unrelated ``to_thread`` user queued behind them. On its own pool the same
+    caller exhausts that pool and nothing else.
+
+    ``transfer`` picks the pool. Probes -- validation and stats, milliseconds
+    when healthy -- go to :func:`executors.path_probe_executor`; calls that hold
+    a worker for the length of a bounded transfer (the open-and-check envelope's
+    full read, the search walk, the browse listings, the document parses) go to
+    :func:`executors.path_transfer_executor`, so a burst of large downloads
+    cannot starve validation behind them.
+
+    Admission and the refusal are :func:`executors.run_in_cron_pool`'s: it
+    submits, waits at most ``_PATH_PROBE_ADMIT_TIMEOUT_SECS`` for a worker to
+    CLAIM the call, and if none does it cancels the still-queued call and raises
+    ``CronQueueTimeout`` -- which becomes :class:`_PathProbeBusy` here and a 503
+    at every endpoint via :func:`_probe_busy_response`. A call a worker claims at
+    the deadline is not refused: it is running, and a thread cannot be taken
+    back. Capacity accounting is the pool's own worker count, so a client that
+    gives up on a wedged call cannot make the pool believe a slot is free while
+    the thread is still parked; nothing here has to track that.
+    """
+    pool = (
+        executors.path_transfer_executor() if transfer else executors.path_probe_executor()
+    )
+    try:
+        return await executors.run_in_cron_pool(
+            fn,
+            *args,
+            timeout=_PATH_PROBE_EXEC_CEILING_SECS,
+            queue_timeout=_PATH_PROBE_ADMIT_TIMEOUT_SECS,
+            executor=pool,
+        )
+    except executors.CronQueueTimeout:
+        raise _PathProbeBusy() from None
+
+
+def _probe_busy_response(
+    *,
+    resource: str,
+    tool_name: str = "",
+    operation: str = "",
+    caller: str = "dashboard",
+    session_key: str = "dashboard",
+    source: str = "",
+) -> web.Response:
+    """The one answer for a refused probe: 503, coded, audited.
+
+    Pass ``tool_name`` for endpoints that audit through ``log_tool_invocation``
+    and ``operation`` for those that use ``log_api_access``, matching whichever
+    the endpoint's other outcomes already use. One ``json_response`` site, so the
+    error-code contract counts every adopter as one.
+    """
+    if tool_name:
+        _sel().log_tool_invocation(
+            session_key=session_key, source=source, tool_name=tool_name,
+            outcome="failure", error="path_probe_busy", resources=resource,
+        )
+    else:
+        _sel().log_api_access(
+            caller=caller, operation=operation, outcome="failure",
+            resources=resource, error="path_probe_busy",
+        )
+    return web.json_response(
+        {"error": "file system probe capacity exhausted; retry shortly", "code": "path_probe_busy"},
+        status=503,
+    )
+
+
+class _PathProbe(NamedTuple):
+    """What one off-loop filesystem probe of a request path found.
+
+    ``path`` is the validated canonical path, or ``""`` when validation refused
+    it -- which the endpoint answers as "invalid or forbidden path", exactly as
+    a ``None`` from :func:`_validate_dashboard_path` did. ``is_file`` and
+    ``is_dir`` are the stat answers for that path, both ``False`` on a refusal so
+    a caller that only reads them still takes its not-found branch.
+    """
+
+    path: str
+    is_file: bool
+    is_dir: bool
+
+
+def _probe_request_path(raw: str) -> _PathProbe:
+    """Validate and stat a request path -- ONE blocking hop, off the loop.
+
+    Groups the filesystem syscalls an endpoint needs before it can answer:
+    ``validate_file_path``'s ``realpath`` plus linked-ancestor walk, and the
+    ``isfile`` / ``isdir`` probe. One helper means one pool hop per request, and
+    it means these cannot be reintroduced on the event loop a call at a time.
+
+    Blocking by design, and unboundedly so: a path whose mount is unresponsive
+    (a disconnected network share, a wedged FUSE filesystem) makes ``realpath``
+    and ``stat`` block for however long the kernel takes, and those syscalls are
+    uninterruptible. Run on the event loop, ONE such request stalls every
+    endpoint in the process -- dashboard, tunnel, MCP and crons alike -- and a
+    stall outlasting ``dashboard.loop_stall_exit_after_secs`` makes the loop
+    watchdog kill the gateway. Which mount the path lands on is the caller's
+    choice, not this process's.
+
+    A ``ValueError`` from a malformed path (an embedded NUL makes ``realpath``
+    raise) is deliberately NOT caught: it propagates exactly as it did when this
+    ran inline, so no caller's answer for that input changes here.
+
+    This probe is a verdict, not a handle. A caller that goes on to OPEN the path
+    must not re-derive the descriptor from this answer in a second hop -- see
+    :func:`_read_request_path` for why.
+
+    Always reached through :func:`_run_path_probe`, never ``asyncio.to_thread``:
+    a thread wedged in an uninterruptible ``stat`` never returns, so a caller
+    repeatedly naming one dead mount would otherwise retire a default-executor
+    worker per request until the rest of the gateway starves behind them. The
+    dedicated pool caps the wedged threads and then refuses with 503, and no other
+    ``to_thread`` user ever queues behind a probe.
+    """
+    path = _validate_dashboard_path(raw)
+    if not path:
+        return _PathProbe("", False, False)
+    return _PathProbe(path, os.path.isfile(path), os.path.isdir(path))
+
+
+#: How much of a file /api/file-read returns, in CHARACTERS -- the unit matters,
+#: because the decode is a text wrapper over a byte descriptor and a byte count
+#: here would mis-set ``X-Truncated`` on multi-byte content.
+_FILE_READ_CAP = 512_000
+
+
+class _TextRead(NamedTuple):
+    """The outcome of one :func:`_read_request_path` transaction.
+
+    ``kind`` is the verdict the endpoint maps onto its status and audit outcome:
+    ``invalid`` (validation refused), ``dir`` / ``missing`` (nothing to read),
+    ``file`` (``content`` is the capped text) or ``read_failed``. ``path`` is the
+    validated path, or ``""`` for ``invalid`` -- the raw input is the caller's to
+    log, as before.
+    """
+
+    kind: str
+    path: str
+    content: str
+
+
+def _read_request_path(raw: str, read_cap: int) -> _TextRead:
+    """Validate, no-follow open and read a request path in ONE transaction.
+
+    Blocking; callers run it on a worker thread. It exists because validating in
+    one hop and opening in another is a symlink TOCTOU: between the two, the
+    validated name can be replaced with a link into a location the validator
+    would have refused, and a bare ``open`` then follows it. Whether the hops are
+    two ``await``s or two statements, only ONE transaction closes that window.
+
+    The transaction is :func:`_open_checked_file` -- the module's own
+    open-and-check prefix, shared with file-raw, file-download, file-stream and
+    file-sheet -- not a copy of it. That is the point: a later hardening fix to
+    the prefix reaches this endpoint too, which a hand-rolled second copy would
+    silently miss. Its ``is_sensitive_path`` rung is a re-check rather than a new
+    gate here, because ``validate_file_path`` already applies that predicate; its
+    ``except ValueError`` fold (an embedded NUL) is the prefix's decision for
+    every adopter, and this endpoint now inherits it instead of answering that
+    input differently from its four siblings.
+
+    What stays endpoint POLICY, per the prefix's own contract: the ``isdir``
+    probe, because a READ distinguishes a directory from a missing path in its
+    404 (it runs inside the transaction for the same reason the open does), and
+    the text decode -- a ``TextIOWrapper`` over the checked descriptor, so
+    ``read_cap`` still counts CHARACTERS. Counting bytes instead would mis-set
+    ``X-Truncated`` on multi-byte content.
+
+    Pass ``read_cap`` 0 for the verdict only: HEAD answers from the stat and must
+    open nothing.
+    """
+    if read_cap <= 0:
+        probe = _probe_request_path(raw)
+        if not probe.path:
+            return _TextRead("invalid", "", "")
+        if probe.is_file:
+            return _TextRead("file", probe.path, "")
+        return _TextRead("dir" if probe.is_dir else "missing", probe.path, "")
+    # log_open_failure=False: this endpoint's own handler logs the one traceback
+    # for a failed read, so the prefix must not write a second.
+    checked = _open_checked_file(raw, tool_name="file_read", log_open_failure=False)
+    if isinstance(checked, _OpenDenied):
+        if checked.code == "not_found":
+            # The prefix answers "not a regular file"; which kind it is belongs
+            # to this endpoint, and the probe stays inside the transaction.
+            return _TextRead(
+                "dir" if os.path.isdir(checked.path) else "missing", checked.path, ""
+            )
+        if checked.code in ("invalid_path", "sensitive_path"):
+            return _TextRead("invalid", "", "")
+        # symlink_refused (the final component became a link inside this
+        # transaction), read_failed, file_too_large: the read did not happen.
+        return _TextRead("read_failed", checked.path, "")
+    try:
+        with io.TextIOWrapper(checked.file, encoding="utf-8", errors="replace") as text:
+            return _TextRead("file", checked.path, text.read(read_cap))
+    except OSError:
+        with contextlib.suppress(Exception):
+            checked.file.close()
+        return _TextRead("read_failed", checked.path, "")
 
 
 async def api_file_watch(request: web.Request) -> web.StreamResponse:
@@ -2023,14 +2592,20 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    path = _validate_dashboard_path(raw_path)
+    # Off-loop: validation and the stat are filesystem syscalls that must not
+    # run on the event loop (see _probe_request_path).
+    try:
+        probe = await _run_path_probe(_probe_request_path, raw_path)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw_path, tool_name="file_watch")
+    path = probe.path
     if not path:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_watch", outcome="denied", resources=raw_path
         )
         return web.json_response({"error": "invalid or forbidden path"}, status=400)
 
-    if not os.path.isfile(path):
+    if not probe.is_file:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_watch", outcome="not_found", resources=path
         )
@@ -2039,6 +2614,13 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
     _sel().log_tool_invocation(
         session_key="dashboard", tool_name="file_watch", outcome="success", resources=path
     )
+
+    # Taken BEFORE the stream is prepared: a refused probe here is still an
+    # ordinary JSON answer, whereas once headers are out only the stream exists.
+    try:
+        resolved_at_start = await _run_path_probe(os.path.realpath, path)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=path, tool_name="file_watch")
 
     resp = web.StreamResponse()
     resp.content_type = "text/event-stream"
@@ -2050,7 +2632,6 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
     read_cap = 512_000
     last_mtime: float = 0.0
     last_content = ""
-    resolved_at_start = await asyncio.to_thread(os.path.realpath, path)
 
     def _read_file(p: str, cap: int) -> str:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -2058,16 +2639,26 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
 
     try:
         while not (request.transport is None or request.transport.is_closing()):
+            # Each poll tick is a probe on the watched path. A refused tick is
+            # skipped, not fatal: the stream is already open, the pool is busy
+            # rather than the file gone, and the next tick tries again.
             try:
-                stat = await asyncio.to_thread(os.stat, path)
+                stat = await _run_path_probe(os.stat, path)
                 mtime = stat.st_mtime
-            except FileNotFoundError:
+            except (FileNotFoundError, _PathProbeBusy):
                 await asyncio.sleep(poll_interval)
                 continue
 
             if mtime != last_mtime:
                 last_mtime = mtime
-                current_resolved = await asyncio.to_thread(os.path.realpath, path)
+                try:
+                    current_resolved = await _run_path_probe(os.path.realpath, path)
+                except _PathProbeBusy:
+                    # Do not read: the symlink re-check is what guards the read,
+                    # and an unchecked read is the thing it exists to prevent.
+                    last_mtime = 0.0
+                    await asyncio.sleep(poll_interval)
+                    continue
                 if current_resolved != resolved_at_start:
                     logger.warning(
                         "file-watch: symlink changed after validation: %s -> %s",
@@ -2114,9 +2705,14 @@ async def api_file_read(request: web.Request) -> web.Response:
     )
 
     raw_path = request.query.get("path", "")
-    # Resolve relative paths against project dir when resolve=1
+    # Resolve relative paths against project dir when resolve=1. Off-loop: the
+    # resolution is a pair of realpath calls, and the schema check below needs
+    # the resolved string, so it cannot be folded into the probe.
     if request.query.get("resolve") == "1":
-        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        try:
+            raw_path, _resolve_err = await _run_path_probe(_resolve_project_relative, raw_path)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=raw_path, tool_name="file_read")
         if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"},
@@ -2139,8 +2735,23 @@ async def api_file_read(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    path = _validate_dashboard_path(raw_path)
-    if not path:
+    read_cap = _FILE_READ_CAP
+    # ONE off-loop transaction: validation, the stats, the no-follow open and the
+    # capped read. Off-loop because each of those blocks for as long as the mount
+    # takes; ONE because splitting the open from the validation is a symlink
+    # TOCTOU (see _read_request_path). HEAD passes cap 0 -- it answers from the
+    # stat and opens nothing.
+    try:
+        outcome = await _run_path_probe(
+            _read_request_path,
+            raw_path,
+            0 if request.method == "HEAD" else read_cap + 1,
+            transfer=request.method != "HEAD",
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw_path, tool_name="file_read")
+    path = outcome.path
+    if outcome.kind == "invalid":
         _sel().log_tool_invocation(
             session_key="dashboard",
             tool_name="file_read",
@@ -2148,7 +2759,7 @@ async def api_file_read(request: web.Request) -> web.Response:
             resources=raw_path,
         )
         return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    if not os.path.isfile(path):
+    if outcome.kind in ("dir", "missing"):
         # Both a directory and a missing path are 404 for a READ — there is no
         # file content to return either way — but the caller needs to tell them
         # apart. The dashboard renders a markdown path chip as a folder
@@ -2156,10 +2767,11 @@ async def api_file_read(request: web.Request) -> web.Response:
         # entirely when the path is not on disk; without this header both look
         # like "file not found", which is actively wrong for a directory.
         #
-        # Sitting ahead of the HEAD branch below, one probe covers GET and HEAD.
-        # `path` is already realpath-canonical and denylist-checked here, so
-        # isdir() discloses nothing that the status code did not already.
-        is_dir = os.path.isdir(path)
+        # Reached for GET and HEAD alike: the transaction above stats before it
+        # opens, so both methods answer from the same verdict. `path` is already
+        # realpath-canonical and denylist-checked, so naming the kind discloses
+        # nothing the status code did not already.
+        is_dir = outcome.kind == "dir"
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="not_found", resources=path
         )
@@ -2174,9 +2786,9 @@ async def api_file_read(request: web.Request) -> web.Response:
         )
         return web.Response(status=200, headers={"X-Path-Kind": "file"})
     try:
-        read_cap = 512_000
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(read_cap + 1)
+        if outcome.kind == "read_failed":
+            raise OSError(f"file_read could not read {path}")
+        content = outcome.content
         truncated = len(content) > read_cap
         content = content[:read_cap]
         content = redact(content)
@@ -2470,9 +3082,13 @@ async def api_file_download(request: web.Request) -> web.Response:
     # ``_validate_dashboard_path`` (legitimate circular-import workaround,
     # listed as an exception in the top-level-imports rule).
     raw_path = request.query.get("path", "")
-    # Resolve relative paths against project dir when resolve=1 (mirrors api_file_read)
+    # Resolve relative paths against project dir when resolve=1 (mirrors
+    # api_file_read). Off-loop: the resolution is a pair of realpath calls.
     if request.query.get("resolve") == "1":
-        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        try:
+            raw_path, _resolve_err = await _run_path_probe(_resolve_project_relative, raw_path)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=raw_path, tool_name="file_download")
         if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"}, status=400,
@@ -2495,9 +3111,15 @@ async def api_file_download(request: web.Request) -> web.Response:
     # serves attachment + nosniff rather than choosing a content type. Offloaded
     # to a worker thread: the envelope is synchronous file I/O (realpath, open,
     # fstat, full read up to the cap) and must not block the event loop.
-    opened = await asyncio.to_thread(
-        _open_checked, raw_path, tool_name="file_download", max_bytes=_MAX_UPLOAD_BYTES,
-    )
+    try:
+        opened = await _run_path_probe(
+            functools.partial(
+                _open_checked, raw_path, tool_name="file_download", max_bytes=_MAX_UPLOAD_BYTES
+            ),
+            transfer=True,
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw_path, tool_name="file_download")
     if isinstance(opened, _OpenRefusal):
         return opened.response
     path, data = opened.path, opened.data
@@ -2615,8 +3237,12 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
     # shared helper (same as api_file_read / api_file_download / file-raw):
     # it passes Windows-absolute/UNC shapes through to the validator, whose
     # network-path gate runs BEFORE realpath — never re-implement this inline.
+    # Off-loop: the resolution is a pair of realpath calls.
     if request.query.get("resolve") == "1":
-        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        try:
+            raw_path, _resolve_err = await _run_path_probe(_resolve_project_relative, raw_path)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=raw_path, tool_name="file_office_preview")
         if _resolve_err == "cannot_resolve":
             _log("denied", request.query.get("path", ""), "cannot_resolve")
             return web.json_response(
@@ -2711,7 +3337,7 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
         }
 
     try:
-        result = await asyncio.to_thread(_open_and_extract)
+        result = await _run_path_probe(_open_and_extract, transfer=True)
     except asyncio.CancelledError:
         # Gateway shutdown / client disconnect while the worker thread is
         # parsing: the access attempt already happened, so record it before
@@ -2721,6 +3347,8 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
         # lifetime.
         _log("cancelled", res_path)
         raise
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=res_path, tool_name="file_office_preview")
     except _PreviewUnsupported:
         # 415 (not 400) so the frontend can distinguish "unsupported format,
         # keep showing the download card" from "invalid input, something's
@@ -2792,12 +3420,18 @@ async def api_file_raw(request: web.Request) -> web.Response:
     # shared with api_file_download so a hardening change lands on both.
     # Offloaded to a worker thread: the envelope is synchronous file I/O and
     # must not block the event loop (same shape as api_file_stream's _open_media).
-    opened = await asyncio.to_thread(
-        _open_checked,
-        request.query.get("path", ""),
-        tool_name="file_raw",
-        max_bytes=_MAX_UPLOAD_BYTES,
-    )
+    try:
+        opened = await _run_path_probe(
+            functools.partial(
+                _open_checked,
+                request.query.get("path", ""),
+                tool_name="file_raw",
+                max_bytes=_MAX_UPLOAD_BYTES,
+            ),
+            transfer=True,
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=request.query.get("path", ""), tool_name="file_raw")
     if isinstance(opened, _OpenRefusal):
         return opened.response
     path, data = opened.path, opened.data
@@ -2879,6 +3513,26 @@ def _resolve_project_relative(raw: str) -> tuple[str, str | None]:
     if not (candidate == resolved_proj or candidate.startswith(resolved_proj + os.sep)):
         return "", "outside_project"
     return candidate, None
+
+
+def _resolve_search_root(raw: str) -> tuple[str, bool]:
+    """Canonicalize a caller-supplied search root; say whether it is a directory.
+
+    Blocking (``realpath`` then ``isdir``) -- callers run it on a worker thread.
+    An empty *raw* means "the caller named no root", which the browse endpoints
+    answer with ``$HOME``; the search endpoint never passes one.
+    """
+    root = os.path.realpath(os.path.expanduser(raw or "~"))
+    return root, os.path.isdir(root)
+
+
+def _resolve_diff_path(raw: str) -> tuple[str, bool]:
+    """Canonicalize a diff target; say whether it is a regular file.
+
+    Blocking (``realpath`` then ``isfile``) -- callers run it on a worker thread.
+    """
+    path = os.path.realpath(os.path.expanduser(raw))
+    return path, os.path.isfile(path)
 
 
 # Container signature -> Content-Type. Sniffed from the file's first bytes so
@@ -3026,7 +3680,10 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
             return ("refused", "read_failed", validated)
         return ("ok", fobj, size, content_type, validated)
 
-    result = await asyncio.to_thread(_open_media, raw_path)
+    try:
+        result = await _run_path_probe(_open_media, raw_path)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw_path, tool_name="file_stream")
     if result[0] == "refused":
         _, code, res = result
         if code == "not_found":
@@ -3254,7 +3911,13 @@ async def api_file_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    path = _validate_dashboard_path(body.get("path", ""))
+    # Off-loop: validation and the stat are filesystem syscalls that must not
+    # run on the event loop (see _probe_request_path).
+    try:
+        probe = await _run_path_probe(_probe_request_path, body.get("path", ""))
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=body.get("path", ""), tool_name="file_write")
+    path = probe.path
     if not path:
         _sel().log_tool_invocation(
             session_key="dashboard",
@@ -3263,7 +3926,7 @@ async def api_file_write(request: web.Request) -> web.Response:
             resources=body.get("path", ""),
         )
         return web.json_response({"error": "invalid or forbidden path"}, status=400)
-    if not os.path.isfile(path):
+    if not probe.is_file:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_write", outcome="not_found", resources=path
         )
@@ -3389,11 +4052,18 @@ async def api_file_search(request: web.Request) -> web.Response:
     ws_name = request.query.get("workspace", "")
     search_roots: list[str] = []
     if project:
-        project = os.path.realpath(os.path.expanduser(project))
+        # Off-loop: realpath on a caller-supplied root, then its isdir probe.
+        # ``?project=`` names any path on the host, so an unresponsive mount
+        # would stall the loop here, before the already-offloaded walk is
+        # reached.
+        try:
+            project, project_is_dir = await _run_path_probe(_resolve_search_root, project)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=project, operation="file_search", caller=caller)
         if is_sensitive_path(project):
             _sel().log_api_access(caller=caller, operation="file_search", outcome="denied", resources=project, error="sensitive path")
             return web.json_response({"error": "Access denied"}, status=403)
-        if os.path.isdir(project):
+        if project_is_dir:
             search_roots.append(project)
         else:
             return web.json_response(
@@ -3402,7 +4072,11 @@ async def api_file_search(request: web.Request) -> web.Response:
     elif ws_name:
         from kiro_crew.config.loader import workspace_dir_for  # noqa: F811
         ws_path = str(workspace_dir_for(ws_name))
-        if os.path.isdir(ws_path):
+        try:
+            ws_is_dir = await _run_path_probe(os.path.isdir, ws_path)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=ws_path, operation="file_search", caller=caller)
+        if ws_is_dir:
             search_roots.append(ws_path)
 
     scoped = bool(search_roots)
@@ -3420,10 +4094,20 @@ async def api_file_search(request: web.Request) -> web.Response:
         # ask for it explicitly with ?project=$HOME, which is scoped and
         # searched in full.
         proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if proj and os.path.isdir(proj):
-            search_roots.append(proj)
         mc_workspace = str(data_home() / "workspace")
-        if os.path.isdir(mc_workspace):
+
+        def _probe_fallback_roots() -> tuple[bool, bool]:
+            return bool(proj) and os.path.isdir(proj), os.path.isdir(mc_workspace)
+
+        # Off-loop: two isdir probes on operator-configured paths, either of
+        # which may sit on a network mount.
+        try:
+            proj_is_dir, workspace_is_dir = await _run_path_probe(_probe_fallback_roots)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=proj, operation="file_search", caller=caller)
+        if proj_is_dir:
+            search_roots.append(proj)
+        if workspace_is_dir:
             search_roots.append(mc_workspace)
 
     # Filter out sensitive roots
@@ -3554,7 +4238,15 @@ async def api_file_search(request: web.Request) -> web.Response:
                     break
         return found["file"] + found["dir"]
 
-    results = await asyncio.to_thread(_walk_file_search)
+    # The walk is filesystem work on a caller-supplied root, so it takes a
+    # probe slot too: a walk into a dead mount would otherwise pin a
+    # default-executor worker exactly as an unbounded stat does.
+    try:
+        results = await _run_path_probe(_walk_file_search, transfer=True)
+    except _PathProbeBusy:
+        return _probe_busy_response(
+            resource=f"q={query}", operation="file_search", caller=caller
+        )
 
     # Sort by score descending, files before dirs on a tie, then shorter name, then recency
     now = time.time()
@@ -3578,8 +4270,14 @@ async def api_file_diff(request: web.Request) -> web.Response:
     if not raw_path:
         _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources="empty_path")
         return web.json_response({"diff": "", "original": ""})
-    raw_path = os.path.realpath(os.path.expanduser(raw_path))
-    if not os.path.isfile(raw_path):
+    # Off-loop: realpath then the isfile probe, on a caller-supplied path.
+    try:
+        raw_path, path_is_file = await _run_path_probe(_resolve_diff_path, raw_path)
+    except _PathProbeBusy:
+        return _probe_busy_response(
+            resource=raw_path, operation="file_diff", caller=request.get("user", "dashboard")
+        )
+    if not path_is_file:
         _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}", error="not_found")
         return web.json_response({"diff": "", "original": ""})
     if is_sensitive_path(raw_path):
@@ -3724,14 +4422,23 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
     caller = request.get("user", "dashboard")
     raw = request.query.get("path", "").strip()
-    base = os.path.realpath(os.path.expanduser(raw)) if raw else os.path.realpath(os.path.expanduser("~"))
-    if not os.path.isdir(base):
+    # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
+    # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
+    # resolves on its own bounded pool, so it cannot wedge the loop.
+    try:
+        base, base_is_dir = await _run_path_probe(_resolve_search_root, raw)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw, operation="browse_dirs", caller=caller)
+    if not base_is_dir:
         return web.json_response({"error": "Not a directory", "path": base}, status=400)
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="denied", resources=base, error="sensitive path")
         return web.json_response({"error": "Access denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim"}
-    dirs = await asyncio.to_thread(_browse_dirs_sync, base, skip)
+    try:
+        dirs = await _run_path_probe(_browse_dirs_sync, base, skip, transfer=True)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=base, operation="browse_dirs", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources=base)
     return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs})
 
@@ -3984,14 +4691,23 @@ async def api_browse_files(request: web.Request) -> web.Response:
     """
     caller = request.get("user", "dashboard")
     raw = request.query.get("path", "").strip()
-    base = os.path.realpath(os.path.expanduser(raw)) if raw else os.path.realpath(os.path.expanduser("~"))
-    if not os.path.isdir(base):
+    # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
+    # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
+    # resolves on its own bounded pool, so it cannot wedge the loop.
+    try:
+        base, base_is_dir = await _run_path_probe(_resolve_search_root, raw)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw, operation="browse_files", caller=caller)
+    if not base_is_dir:
         return web.json_response({"error": "Not a directory", "path": base}, status=400)
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_files", outcome="denied", resources=base, error="sensitive path")
         return web.json_response({"error": "Access denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim", "build", "dist", ".next"}
-    dirs, files = await asyncio.to_thread(_browse_files_sync, base, skip)
+    try:
+        dirs, files = await _run_path_probe(_browse_files_sync, base, skip, transfer=True)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=base, operation="browse_files", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_files", outcome="allowed", resources=base)
     return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs, "files": files})
 
@@ -4045,7 +4761,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             )
             return body_err
         assert body is not None  # read_bounded_json returns (dict, None) on success
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "default_memory_mode", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "link_patterns", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links", "model_picker_hidden_models_add", "model_picker_hidden_models_remove"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -4053,7 +4769,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # PUT body. Drop them here instead of listing them in _allowed -- they
         # stay unwritable, but a round-tripped read-only field must not 400 an
         # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled"}
+        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "model_picker_hidden_models", "model_picker_configured"}
         body = {
             k: v
             for k, v in body.items()
@@ -4066,6 +4782,59 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             )
             return web.json_response({"error": f"Unknown fields: {unknown}"}, status=400)
         updates: dict[str, object] = {}
+        hidden_model_add: list[str] | None = None
+        hidden_model_remove: list[str] | None = None
+
+        def _validated_hidden_model_list(field: str) -> tuple[list[str] | None, web.Response | None]:
+            val = body[field]
+            if not isinstance(val, list) or len(val) > 128:
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return None, web.json_response(
+                    {
+                        "error": f"{field} must be an array of at most 128 model IDs",
+                        "code": "invalid_model_picker_hidden_models",
+                    },
+                    status=400,
+                )
+            hidden_models: list[str] = []
+            seen_models: set[str] = set()
+            for raw_model in val:
+                if not isinstance(raw_model, str):
+                    _sel().log_tool_invocation(
+                        session_key="dashboard",
+                        tool_name="dashboard_config_write",
+                        outcome="failure",
+                    )
+                    return None, web.json_response(
+                        {
+                            "error": f"{field} entries must be strings",
+                            "code": "invalid_model_picker_hidden_models",
+                        },
+                        status=400,
+                    )
+                model = raw_model.strip()
+                if not model or model == "auto":
+                    continue
+                if not MODEL_ID_RE.fullmatch(model):
+                    _sel().log_tool_invocation(
+                        session_key="dashboard",
+                        tool_name="dashboard_config_write",
+                        outcome="failure",
+                    )
+                    return None, web.json_response(
+                        {
+                            "error": f"{field} contains an invalid model ID",
+                            "code": "invalid_model_picker_hidden_models",
+                        },
+                        status=400,
+                    )
+                if model not in seen_models:
+                    seen_models.add(model)
+                    hidden_models.append(model)
+            return hidden_models, None
+
         if "restore_sessions" in body:
             val = body["restore_sessions"]
             if not isinstance(val, bool):
@@ -4098,6 +4867,23 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     {"error": "merge_queued_messages must be a boolean"}, status=400
                 )
             updates["merge_queued_messages"] = val
+        if "default_memory_mode" in body:
+            val = body["default_memory_mode"]
+            if val not in VALID_MEMORY_MODES:
+                _sel().log_tool_invocation(
+                    session_key="dashboard",
+                    tool_name="dashboard_config_write",
+                    outcome="failure",
+                )
+                return web.json_response(
+                    {
+                        "error": "default_memory_mode must be 'persistent', "
+                        "'incognito' or 'temporary'",
+                        "code": "invalid_default_memory_mode",
+                    },
+                    status=400,
+                )
+            updates["default_memory_mode"] = val
         if "widget_density" in body:
             val = body["widget_density"]
             if val not in ("more", "less"):
@@ -4108,6 +4894,64 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     {"error": "widget_density must be 'more' or 'less'"}, status=400
                 )
             updates["widget_density"] = val
+        if "link_patterns" in body:
+            val = body["link_patterns"]
+            cleaned: list[dict[str, str]] = []
+            # Reject (not silently drop) malformed entries: this path serves the
+            # settings editor, and a dropped rule with a 200 would read as saved.
+            # Regex VALIDITY is not checked -- patterns are compiled by the
+            # browser in the JavaScript dialect, which Python cannot arbitrate.
+            ok = isinstance(val, list) and len(val) <= LINK_PATTERNS_MAX
+            if ok:
+                seen_patterns: set[str] = set()
+                for entry in val:
+                    pattern = entry.get("pattern") if isinstance(entry, dict) else None
+                    url = entry.get("url") if isinstance(entry, dict) else None
+                    if not isinstance(pattern, str) or not isinstance(url, str):
+                        ok = False
+                        break
+                    # Pattern text is stored EXACTLY as authored -- whitespace
+                    # in a regex is load-bearing, so strip() only decides
+                    # blankness (mirrors the load coercer). URL edge-trim is
+                    # safe: the template is expanded, never matched.
+                    url = url.strip()
+                    if not pattern.strip() or len(pattern) > LINK_PATTERN_PATTERN_MAX_LEN:
+                        ok = False
+                        break
+                    # http(s) only: these templates become anchors in every
+                    # transcript, so javascript:/file: must not reach disk. The
+                    # shared validator also applies the renderer's
+                    # origin-stability rule, so a rule that saves is a rule
+                    # that linkifies.
+                    if len(url) > LINK_PATTERN_URL_MAX_LEN or not link_pattern_url_ok(url):
+                        ok = False
+                        break
+                    # Duplicate patterns must be rejected here, not deduped:
+                    # the load-time coercer keeps only the first of a pair, so
+                    # accepting both would persist rules that GET then omits —
+                    # and the editor's next whole-list save would silently
+                    # delete the survivor's twin from disk.
+                    if pattern in seen_patterns:
+                        ok = False
+                        break
+                    seen_patterns.add(pattern)
+                    cleaned.append({"pattern": pattern, "url": url})
+            if not ok:
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": (
+                            f"link_patterns must be a list of at most {LINK_PATTERNS_MAX}"
+                            " {pattern, url} objects with distinct non-empty patterns and"
+                            " an absolute http(s) url template containing {match}"
+                        ),
+                        "code": "invalid_link_patterns",
+                    },
+                    status=400,
+                )
+            updates["link_patterns"] = cleaned
         # Apply ONLY when it is the sole submitted setting. The Browser panel
         # sends it alone; the Chat settings panel PUTs the whole config object
         # from its own (possibly stale) cache, and applying it on that path would
@@ -4243,6 +5087,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["session_card_source_links"] = val
+        if "model_picker_hidden_models_add" in body:
+            hidden_model_add, error_response = _validated_hidden_model_list(
+                "model_picker_hidden_models_add"
+            )
+            if error_response is not None:
+                return error_response
+            updates["model_picker_configured"] = True
+        if "model_picker_hidden_models_remove" in body:
+            hidden_model_remove, error_response = _validated_hidden_model_list(
+                "model_picker_hidden_models_remove"
+            )
+            if error_response is not None:
+                return error_response
+            updates["model_picker_configured"] = True
         # Serialize the read-modify-write under BOTH config locks so no concurrent
         # writer -- in-process OR another process -- can clobber it:
         #  * update_config_locked holds the cross-process advisory file lock
@@ -4270,6 +5128,25 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             section = data.get("dashboard")
             if not isinstance(section, dict):
                 section = data["dashboard"] = {}
+            if hidden_model_add is not None or hidden_model_remove is not None:
+                current = section.get("model_picker_hidden_models")
+                current_models = current if isinstance(current, list) else []
+                remove = set(hidden_model_remove or [])
+                merged_models: list[str] = []
+                seen_models: set[str] = set()
+                for raw_model in current_models:
+                    if not isinstance(raw_model, str):
+                        continue
+                    model = raw_model.strip()
+                    if not model or model == "auto" or model in remove or model in seen_models:
+                        continue
+                    seen_models.add(model)
+                    merged_models.append(model)
+                for model in hidden_model_add or []:
+                    if model not in seen_models:
+                        seen_models.add(model)
+                        merged_models.append(model)
+                section["model_picker_hidden_models"] = merged_models
             for _field, _value in updates.items():
                 section[_field] = _value
             return data
@@ -4362,6 +5239,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "restore_sessions": cfg.dashboard.restore_sessions,
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
+            "default_memory_mode": cfg.dashboard.default_memory_mode,
             "widget_density": cfg.dashboard.widget_density,
             "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
@@ -4373,6 +5251,8 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
+            "model_picker_hidden_models": list(cfg.dashboard.model_picker_hidden_models),
+            "model_picker_configured": cfg.dashboard.model_picker_configured,
             # Read-only here (absent from the PUT allowlist above): authorizing a
             # self-managed GitLab instance is a config-file decision, not a
             # dashboard toggle. The client uses it only to decide which pasted
@@ -4385,6 +5265,13 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # withdraws the "Share as image" menu entry; there is no toggle behind
             # it, so nothing here is writable.
             "social_share_enabled": not social_share_denied,
+            # Read-write (unlike the host allowlists above): a rule only changes
+            # how this dashboard RENDERS text -- it grants no fetch and no CLI
+            # any authority -- so the settings editor may manage it.
+            "link_patterns": [
+                {"pattern": rule.pattern, "url": rule.url}
+                for rule in cfg.dashboard.link_patterns
+            ],
         }
     )
 
@@ -4675,13 +5562,15 @@ async def api_file_sheet(request: web.Request) -> web.Response:
         return _load_sheet_payload(checked.file, max_bytes=_MAX_UPLOAD_BYTES)
 
     try:
-        result = await asyncio.to_thread(_open_and_load)
+        result = await _run_path_probe(_open_and_load, transfer=True)
     except asyncio.CancelledError:
         # Shutdown or client disconnect: the access attempt must not vanish
         # from the audit trail. No resource handling here -- the worker
         # callback owns the file's whole lifetime.
         _log("cancelled", res_path)
         raise
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=res_path, tool_name="file_sheet")
     except ImportError:
         # openpyxl absent: the preview is unavailable, not broken. The probe
         # runs inside the worker thread so even the first heavy import never
@@ -5098,6 +5987,10 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             pass
 
         result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:500]}
+        # Status paths are repo-root-relative; when the project directory sits
+        # below the repo root, every path starts with this prefix.
+        rel = os.path.relpath(base, repo_root)
+        result["_prefix"] = "" if rel in (".", "") or rel.startswith("..") else rel.replace(os.sep, posixpath.sep)
         if len(files) > 500:
             result["truncated"] = True
         if branch:
@@ -5117,27 +6010,60 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["repoRoot"] = redact(result["repoRoot"])
     if result.get("branch"):
         result["branch"] = redact(result["branch"])
-    # Redact each file path, then drop entries that duplicate an earlier one
-    # (preserving order and first occurrence). Same collision class as
-    # api_project_tree: redact() can collapse two genuinely-different paths to
-    # the same placeholder. This list feeds GitPanel, which keys its rows on
+    # Redact each file path with redact_path_segments over the same
+    # context-aware redact(): each path is redacted segment-wise, and every
+    # redacted segment carries an opaque label keyed per gateway process, so two
+    # genuinely-different paths that collapse to the same tag stay two entries
+    # instead of one placeholder -- the whole-string redact() is still the
+    # floor, never less. The label is stable across responses within this
+    # process, which is what lets the dashboard join this listing with the
+    # tree listing by path.
+    # Then drop entries that duplicate an earlier one (preserving order and
+    # first occurrence): this is the fallback for a collision the helper does
+    # not separate. This list feeds GitPanel, which keys its rows on
     # `${path}:${staged}` and takes its file total from files.length, so a
     # collision would render two indistinguishable rows under one React key and
-    # overstate the count. (It cannot reach @pierre/trees as a duplicate the way
-    # api_project_tree's list can: the tree's "changed" mode already collapses
-    # status entries by path before handing them over.) The files[:500] cap was
-    # already applied to the raw listing above, so this only removes collisions.
+    # overstate the count. (It cannot reach @pierre/trees as a duplicate the
+    # way api_project_tree's list can: the tree's "changed" mode already
+    # collapses status entries by path before handing them over.) The
+    # files[:500] cap was already applied to the raw listing above, so this
+    # only removes collisions.
     #
     # The key is (path, status, staged), NOT path alone: one file with both
     # staged and unstaged changes ("MM", "AM", "MD") legitimately yields two
     # entries sharing a path but differing in status/staged, and GitPanel
-    # renders them as separate rows. Keying on path alone would drop the
+    # renders them as separate rows (identical originals redact identically, so
+    # the pair still shares its path). Keying on path alone would drop the
     # unstaged lane and undercount the file total. A real redaction collision
     # has an identical tuple, so it still collapses.
+    # The project directory's own repo-relative prefix is redacted the same
+    # way the tree root and repoRoot are (whole-string, unlabelled), so a
+    # credential-shaped project directory reads identically on both sides of
+    # the dashboard join; only the part beneath it is labelled per segment.
+    prefix = str(result.pop("_prefix", "") or "")
+    prefix_slash = posixpath.join(prefix, "") if prefix else ""
+    redacted_prefix = redact(prefix) if prefix else ""
+
+    def _redact_status_path(path: str) -> str:
+        if prefix_slash and path.startswith(prefix_slash):
+            below = redact_path_segments(path[len(prefix_slash) :], redact)
+            joined = posixpath.join(redacted_prefix, below)
+            # Same floor redact_path_segments applies to its own assembly: the
+            # prefix and the part beneath it are redacted separately, so a
+            # token that straddles the joining slash is matched by neither
+            # half. The joined result must be a fixed point of the redactor;
+            # when it is not, the whole-path result wins, exactly as it does
+            # inside the helper.
+            return joined if redact(joined) == joined else redact(path)
+        if prefix and path == prefix:
+            return redacted_prefix
+        return redact_path_segments(path, redact)
+
     deduped_files: list[dict] = []
     seen_keys: set[tuple[str, str | None, bool | None]] = set()
-    for f in result.get("files", []):
-        f["path"] = redact(f["path"])
+    files = result.get("files", [])
+    for f in files:
+        f["path"] = _redact_status_path(f["path"])
         key = (f["path"], f.get("status"), f.get("staged"))
         if key in seen_keys:
             continue
@@ -5299,15 +6225,25 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # Egress redaction, same rationale as api_project_git_status: listed names
     # are repo content and this body is rendered by the dashboard.
     result["root"] = redact(result["root"])
-    # De-duplicate after redaction, preserving order and first occurrence.
-    # redact() collapses each matched token to a fixed placeholder, so two
-    # genuinely-different project-relative paths (e.g. a src/ vs target/ Maven
-    # prefix and a credential-shaped filename token) can flatten to the same
-    # redacted string. The dashboard tree hands this list straight to
-    # @pierre/trees, whose appendPresortedPaths throws "Duplicate path" on
-    # adjacent identical entries. dict.fromkeys keeps first occurrence. This
-    # does not affect "truncated": the cap is applied to the raw listing above.
-    result["paths"] = list(dict.fromkeys(redact(p) for p in result["paths"]))
+    # Redact each path with redact_path_segments over the same context-aware
+    # redact(): the whole-string redact() collapses each matched token to a
+    # fixed placeholder, so two genuinely-different project-relative paths
+    # whose only differing segment is credential-shaped redact to the same
+    # string. The helper redacts each path segment-wise and suffixes every
+    # redacted segment with an opaque label keyed per gateway process, so both
+    # stay in the tree; it never emits less redaction than redact() itself, and
+    # the label is stable across responses within this process, so the git
+    # status listing labels the same path identically and the dashboard's join
+    # by path holds.
+    # Then de-duplicate, preserving order and first occurrence, as the fallback
+    # for a collision the helper does not separate: the dashboard tree hands
+    # this list straight to @pierre/trees, whose appendPresortedPaths throws
+    # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
+    # occurrence. This does not affect "truncated": the cap is applied to the
+    # raw listing above.
+    result["paths"] = list(
+        dict.fromkeys(redact_path_segments(p, redact) for p in result["paths"])
+    )
     return web.json_response(result)
 
 

@@ -1,4 +1,4 @@
-"""Tests for #9284: a closer stays in an ``[OPTIONS:]`` label only where it is
+"""A closer stays in an ``[OPTIONS:]`` label only where it is
 MATCHED by an earlier ``[``, or where it CONTINUES the label list.
 
 A label may legitimately carry a closer -- ``[OPTIONS: Alpha ] | Bravo ]]`` is a
@@ -36,8 +36,8 @@ one step further down, to ``split_options_trailer``, because narrowing the gramm
 is what made that function's partial-cut gate load-bearing: a marker the grammar
 declines must not be silently deleted by the consumer instead.
 
-Measured against ``origin/main`` at 56f67aa43 (post-#9174): every case in
-``OVERREACH`` and ``TRAILER_OVERREACH`` matches there and deletes the prose shown.
+Under an unconditional closer, every case in
+``OVERREACH`` and ``TRAILER_OVERREACH`` matches whole and deletes the prose shown.
 """
 
 from __future__ import annotations
@@ -59,12 +59,12 @@ OVERREACH = [
     "Pick [OPTIONS: A | B] and the type is dict[str, Any]",
     "All set [OPTIONS: Ship | Hold] before you diff src/app[0]",
     "Ready [OPTIONS: Yes | No] see the note in docs[2]",
-    # The wrapped forms of the same shape, on #9174's leading-wrapper path.
+    # The wrapped forms of the same shape, on the leading-wrapper (``lwrap``) path.
     "`[OPTIONS: A | B] then check arr[0]`",
     "**[OPTIONS: Merge | Wait] then read CHANGELOG[1]**",
 ]
 
-#: End-of-buffer shapes for the DOTALL grammar, where the body used to cross blank
+#: End-of-buffer shapes for the DOTALL grammar, where an unconditional closer lets the body cross blank
 #: lines and take the whole closing paragraph.
 TRAILER_OVERREACH = [
     "[OPTIONS: A | B]\n\nAnd then a whole closing paragraph about arr[0]",
@@ -135,13 +135,23 @@ class TestACloserMustBeMatchedOrContinueTheList:
             assert match is not None, text
             assert match.group("labels").startswith(" Fix "), text
 
-    def test_an_unmatched_opener_in_a_label_still_parses(self):
-        # The pair alternative must not become a REQUIREMENT: a stray ``[`` with no
-        # closer of its own is still just a character in the label, as it was
-        # before this rule.
-        match = OPTIONS_RE_LINE.search("[OPTIONS: Fix [x logging | Skip]")
-        assert match is not None
-        assert match.group("labels") == " Fix [x logging | Skip"
+    def test_an_unmatched_opener_in_a_label_is_refused(self):
+        """The one shape the balanced-labels rule costs.
+
+        A stray ``[`` with no closer of its own cannot be treated as ordinary label
+        text, because that shape is indistinguishable from a marker the model never
+        closed: in ``[OPTIONS: A | B then check arr[0]`` the only closer belongs to
+        ``arr[0]``, and the body would run through the prose to reach it. Both hold
+        one unmatched opener and a closer at the end anchor, so accepting either
+        accepts both -- and accepting the second deletes a line of prose.
+
+        So the marker now renders as visible text. Nothing is removed, which is the
+        direction every cost in this grammar fails in, and the full argument lives at
+        :func:`kiro_crew.constants._marker_labels_have_unmatched_opener`.
+        """
+        text = "[OPTIONS: Fix [x logging | Skip]"
+        assert OPTIONS_RE_LINE.search(text) is None
+        assert OPTIONS_RE_LINE.sub("", text) == text
 
 
 class TestAcceptedCosts:
@@ -228,21 +238,25 @@ class TestAcceptedCosts:
         # here, and neither does this one.
         assert OPTIONS_RE_LINE.search("Note [OPTIONS: see [OPTIONS: x] below | Skip]") is None
 
-    def test_the_separator_tail_form_is_out_of_scope_and_unchanged(self):
-        # NOT reachable by this rule, and pinned so it is not read as a regression
-        # introduced here: ``], `` DOES continue the label list, by the very rule
-        # that makes ``[OPTIONS: Alpha ], Bravo]`` legal, so no guard applied at the
-        # internal closer can tell the two apart. Resolving it means deciding which
-        # shape loses -- a separate call with its own cost. Behaviour here is
-        # byte-for-byte what origin/main does.
+    def test_the_separator_tail_form_is_declined_rather_than_truncated(self):
+        # Not reachable by the matched-or-continues rule: ``], `` DOES continue the
+        # label list, by the very rule that makes ``[OPTIONS: Alpha ], Bravo]``
+        # legal, so no guard applied at the INTERNAL closer can tell the two apart.
+        # The terminator gate reaches it from the other end -- the ``[`` of
+        # ``CHANGELOG[1]`` is the opener whose partner would end the marker, so the
+        # bare form is refused and the line stays whole.
+        #
+        # Declining is the affordable outcome: truncating deleted ``, details in
+        # CHANGELOG[1]`` from the message and handed it back as the pill label
+        # ``Wait], details in CHANGELOG[1``.
         text = "Done. [OPTIONS: Merge | Wait], details in CHANGELOG[1]"
-        match = OPTIONS_RE_LINE.search(text)
-        assert match is not None
-        assert OPTIONS_RE_LINE.sub("", text) == "Done. "
+        assert OPTIONS_RE_LINE.search(text) is None
+        assert OPTIONS_RE_LINE.sub("", text) == text
+        assert split_options_trailer(text) == (text, [])
 
 
 class TestTheWideningIsNotOverlyNarrow:
-    """Everything #9174 and the closer widening added must still parse."""
+    """Everything the wrapper tolerance and the closer widening admit must still parse."""
 
     def test_the_plain_marker_still_parses_on_both_grammars(self):
         for text in ("Done.\n\n[OPTIONS: Merge | Wait]", "Done. [OPTIONS: Merge | Wait]"):
@@ -262,8 +276,8 @@ class TestTheWideningIsNotOverlyNarrow:
             assert match.group("lwrap") == wrap, text
 
     def test_a_wrapped_marker_with_a_continuing_closer_still_parses(self):
-        # The two rules compose: the wrapper is #9174's, the mid-label closer is
-        # this one's, and a marker carrying both is still a marker.
+        # The two rules compose: wrapper tolerance and the mid-label closer are independent,
+        # and a marker carrying both is still a marker.
         match = OPTIONS_RE_LINE.search("`[OPTIONS: Alpha ] | Bravo]`")
         assert match is not None
         assert match.group("lwrap") == "`"

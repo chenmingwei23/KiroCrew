@@ -26,7 +26,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from kiro_crew import model_registry
+from kiro_crew import acp_tool_gate, model_registry
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     build_permission_event,
@@ -46,11 +46,19 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _COMPACTION_FAILED_TURN_BUDGET,
+    DEFAULT_MODEL,
+    AcpClient,
+    AcpError,
+    AcpModelUnavailable,
     AcpProcessDied,
     AcpTimeoutError,
+    AcpToolGateUnroutable,
     _effective_prompt_timeout_async,
+    _is_config_value_rejection,
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
+    _jsonrpc_error_code,
+    _push_model_via_effort_split,
     _raise_acp_error,
     compaction_failure_detail,
     compaction_failure_is_transient,
@@ -79,6 +87,10 @@ from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_st
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_STEER,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -116,6 +128,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
     AcpPromptStats,
     JsonRpcMessage,
+    effort_config_option_id,
 )
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -198,7 +211,10 @@ def _clamp_to_prompt_ceiling(key: str, value: float, chat_ceiling: float) -> flo
         "watchdog.%s=%.0fs leaves no room inside the %.0fs prompt timeout; "
         "clamping to %.0fs. The turn's own timeout would fire first, so the "
         "larger window cannot take effect.",
-        key, value, ceiling, budget,
+        key,
+        value,
+        ceiling,
+        budget,
     )
     return budget
 
@@ -217,11 +233,13 @@ def _warn_if_above_chat_ceiling(key: str, value: float, chat_ceiling: float) -> 
             "watchdog.%s=%.0fs exceeds agent.chat_turn_timeout_secs=%.0fs — a "
             "dashboard turn ends before this window can act, so a stall there "
             "surfaces as the turn-limit card instead of stall recovery.",
-            key, value, chat_ceiling,
+            key,
+            value,
+            chat_ceiling,
         )
 
 
-def _load_watchdog_settings(crew_agent: str = "") -> WatchdogSettings:
+def _load_watchdog_settings(crew_agent: str = "", cfg: Any = None) -> WatchdogSettings:
     """Snapshot ``watchdog.*`` from config. Function-level import (mirrors
     ``_sync_effort_levels``) avoids the config -> dashboard -> acp import
     cycle; any failure falls back to defaults rather than breaking a handle.
@@ -235,12 +253,18 @@ def _load_watchdog_settings(crew_agent: str = "") -> WatchdogSettings:
     ``watchdog_tool_stall_*`` overrides overlay the globals (> 0 means
     override; 0 inherits — the same empty-inherits convention as the agent's
     ``model``).
+
+    ``cfg`` is an already-loaded ``KiroCrewConfig``. The config watcher's
+    hot-apply hands in the config it just loaded so the re-clamp runs on the
+    event loop without a filesystem read; ``None`` loads (a fingerprint-cache
+    hit in practice) for the per-session paths that resolve off-loop.
     """
     try:
         # circular import: config.loader -> dashboard -> session -> acp
         from kiro_crew.config.loader import KiroCrewConfig
 
-        cfg = KiroCrewConfig.load()
+        if cfg is None:
+            cfg = KiroCrewConfig.load()
         w = cfg.watchdog
         raw = {key: float(getattr(w, key)) for key in _TURN_BOUNDED_WINDOWS}
         overridden = False
@@ -398,6 +422,79 @@ def parse_advertised_models(resp: dict[str, Any]) -> list[dict[str, str]]:
     return []
 
 
+def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, Any] | None:
+    """A ``models`` envelope synthesized from a ``model`` select, or ``None``.
+
+    Some hosts advertise no ``models`` object at all and put their model list in
+    ``configOptions`` instead, as a ``select`` whose ``options`` carry the ids
+    ``session/set_config_option`` accepts -- so a caller that reads only ``models``
+    records nothing and the picker it feeds is empty. Gated on membership in
+    ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` (harness-parity H6): the fold is
+    only meaningful where the advertised list IS the vocabulary, and a host outside
+    that set keeps whatever the static registry gave it.
+
+    Authored once because both drivers need the same answer -- ``AcpClient`` on the
+    per-session path and ``AcpSessionHandle`` on the shared-runtime one -- and a
+    second copy is free to disagree about the select's shape.
+    """
+    if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+        return None
+    for opt in resp.get("configOptions") or []:
+        if not isinstance(opt, dict) or opt.get("id") != "model" or opt.get("type") != "select":
+            continue
+        options = [o for o in opt.get("options") or [] if isinstance(o, dict) and o.get("value")]
+        if not options:
+            return None
+        envelope: dict[str, Any] = {
+            "availableModels": [
+                {
+                    "modelId": o["value"],
+                    "name": o.get("name") or o["value"],
+                    "description": o.get("description") or "",
+                }
+                for o in options
+            ]
+        }
+        current = opt.get("currentValue")
+        if isinstance(current, str) and current:
+            envelope["currentModelId"] = current
+        return envelope
+    return None
+
+
+def session_models_envelope(resp: dict[str, Any], backend: str) -> Any:
+    """The ``models`` payload of a session response, with the select folded in.
+
+    One home for "where does this host's model list live", so a reader cannot know
+    about the ``models`` object and not about the ``configOptions`` select. Returns
+    whatever shape the response carried when it carried one, the synthesized
+    envelope when it did not and the host advertises a ``model`` select, and the
+    original absent value when neither applies -- so a caller's own shape branches
+    stay exactly as they were.
+    """
+    models = resp.get("models") or resp.get("availableModels")
+    if models is None or models == {} or models == []:
+        models = models_from_config_options(resp, backend) or models
+    return models
+
+
+def advertised_models_from_session(resp: dict[str, Any], backend: str) -> list[dict[str, str]]:
+    """The normalized advertised-model list for a session response, either shape.
+
+    What a caller wants when it needs the LIST and not the envelope -- the
+    entitlement probe, which re-asks the question on a throwaway session. Reading
+    ``parse_advertised_models`` alone answers ``[]`` for a host whose list is a
+    ``configOptions`` select, and an empty probe result is contractually "no
+    evidence", so the snapshot it exists to correct would never heal.
+    """
+    env = session_models_envelope(resp, backend)
+    if isinstance(env, dict):
+        return parse_advertised_models({"models": env})
+    if isinstance(env, list):
+        return parse_advertised_models({"availableModels": env})
+    return []
+
+
 class AcpRuntimeError(Exception):
     """Base error for AcpRuntime operations."""
 
@@ -436,6 +533,18 @@ class AcpRuntimeProtocol(Protocol):
     """Minimal interface that AcpSessionHandle needs from AcpRuntime."""
 
     _last_activity: float
+    """Monotonic ts of the last frame the runtime read or wrote, on ANY session.
+
+    Runtime-wide by construction: the single reader bumps it per stdout line, so
+    a co-tenant session's traffic keeps it fresh. A caller must NOT read it as
+    evidence about one session — neither that this session is progressing nor
+    that its turn produced anything — which is why the per-session clocks in the
+    dispatch loop carry their own timestamps and only FOLD this one in.
+
+    Read through :meth:`AcpSessionHandle._runtime_idle_secs`, the single seam
+    that converts it to an idle duration, so a runtime that later publishes a
+    public accessor is adopted in one line instead of at every call site.
+    """
 
     @property
     def pid(self) -> int | None:
@@ -472,34 +581,44 @@ class AcpRuntimeProtocol(Protocol):
         """
         ...
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int:
-        ...
+    async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
 
     async def probe_advertised_models(self) -> list[dict[str, str]]:
         """Fresh advertised-model snapshot from a throwaway ``session/new``
         (``[]`` = probe failed / advertised nothing — never evidence)."""
         ...
 
-    async def send_notification(self, method: str, params: dict[str, Any]) -> None:
+    async def send_notification(self, method: str, params: dict[str, Any]) -> None: ...
+
+    async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None: ...
+
+    async def send_error(self, request_id: str | int, code: int, message: str) -> None: ...
+
+    def mark_turn_active(self, session_id: str, active: bool) -> None: ...
+
+    def unregister_session(self, session_id: str) -> None: ...
+
+    async def terminate_session(self, session_id: str) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def _mark_dead(self, reason: str, *, expected: bool = False) -> None:
+        """Fail the runtime: poison every session queue and reject pending waits.
+
+        Declared rather than reached for with ``getattr`` so a runtime that
+        cannot honour it fails the type check instead of silently skipping the
+        escalation — the handle calls this only when a write it cannot verify
+        leaves the child waiting on a stranded oneshot, and a swallowed call
+        there is an invisible hang rather than a degraded session.
+
+        A caller must NOT assume it is the only way the runtime dies, that it
+        kills the process synchronously, or that a second call does anything:
+        it is idempotent, and ``expected=True`` merely marks a death the caller
+        caused so the reason does not read as a fault.
+        """
         ...
 
-    async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None:
-        ...
-
-    async def send_error(self, request_id: str | int, code: int, message: str) -> None:
-        ...
-
-    def mark_turn_active(self, session_id: str, active: bool) -> None:
-        ...
-
-    def unregister_session(self, session_id: str) -> None:
-        ...
-
-    async def terminate_session(self, session_id: str) -> None:
-        ...
-
-    def is_alive(self) -> bool:
-        ...
+    def death_summary(self) -> str | None: ...
 
 
 class AcpSessionHandle:
@@ -523,6 +642,13 @@ class AcpSessionHandle:
         # When True, destroy() skips the transcript unlink (subagent
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
+        # Token carried by THIS session's injected broker-stub entries
+        # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
+        # that created the session. It is what a later claim-push names so
+        # gatewayd re-targets this session's stub connections and not every
+        # session's on the shared runtime. Empty when the gateway injected no
+        # stubs. Never logged: it is a bearer name for this session's identity.
+        self.stub_session_token: str = ""
         # Watchdog windows are snapshotted here (construction time) so the
         # dispatch loop never reads config; the liveness oracle carries the
         # per-session evidence state (tracked child, counter samples).
@@ -694,6 +820,19 @@ class AcpSessionHandle:
     def session_id(self) -> str:
         return self._session_id
 
+    def _died(self, base: str) -> AcpProcessDied:
+        """Build an AcpProcessDied carrying the runtime's death attribution.
+
+        The poison sentinel tells a waiting turn only THAT the runtime died;
+        the runtime's ``death_summary()`` (reason + returncode + stderr tail,
+        composed at ``_mark_dead`` time) says who/why. Field experience: three
+        unattributed mid-turn deaths in five days were undiagnosable from the
+        bare message alone. ``getattr``-guarded so a minimal runtime double
+        without ``death_summary`` degrades to the bare message.
+        """
+        summary = getattr(self._runtime, "death_summary", lambda: None)()
+        return AcpProcessDied(f"{base} — {summary}" if summary else base)
+
     @property
     def is_turn_active(self) -> bool:
         # Factor _cancelled (parity with AcpClient.has_active_turn) so a second
@@ -701,11 +840,7 @@ class AcpSessionHandle:
         # Also require the runtime alive (parity: AcpClient checks _is_process_alive)
         # so a turn on a dead runtime reads inactive -> AcpProvider.cancel() returns
         # "no_turn" instead of firing cancel_session on a corpse.
-        return (
-            (not self._turn_done.is_set())
-            and (not self._cancelled)
-            and self._runtime.is_alive()
-        )
+        return (not self._turn_done.is_set()) and (not self._cancelled) and self._runtime.is_alive()
 
     @property
     def has_unfinished_turn(self) -> bool:
@@ -730,9 +865,7 @@ class AcpSessionHandle:
 
     # ── Prompt ──
 
-    async def prompt(
-        self, message: str, timeout: float | None = None
-    ) -> AsyncIterator[AcpEvent]:
+    async def prompt(self, message: str, timeout: float | None = None) -> AsyncIterator[AcpEvent]:
         """Send session/prompt and yield AcpEvent objects until the turn completes.
 
         Dispatches events from the per-session queue with the same logic as
@@ -754,7 +887,7 @@ class AcpSessionHandle:
                 message,
                 allow_image=self._runtime.supports_image_prompt,
             )
-            # Content-free outbound STRUCTURE diagnostics (issue #6022): one
+            # Content-free outbound STRUCTURE diagnostics: one
             # line per turn build recording block counts, per-type counts, and
             # the serialized byte size — NEVER any block text or bytes — so an
             # operator can tell a stale/invalid model id apart from a
@@ -989,9 +1122,7 @@ class AcpSessionHandle:
                     # runtime's dead-marking so the child's wait dies with
                     # the process instead of hanging invisibly.
                     logger.exception("failed to answer stranded permission request")
-                    _md = getattr(self._runtime, "_mark_dead", None)
-                    if _md is not None:
-                        _md("pre-turn drain reject failed")
+                    self._runtime._mark_dead("pre-turn drain reject failed")
                     continue
                 logger.warning(
                     "rejected permission request id=%s stranded in the "
@@ -1010,9 +1141,7 @@ class AcpSessionHandle:
                     stale.id,
                     str(_stale_title),
                     "stranded_request_pre_turn_drain",
-                    sub_session_id=(
-                        _stale_sid if _stale_sid != self._session_id else ""
-                    ),
+                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
                 )
             else:
                 # Everything that is not a permission request is DISCARDED, which
@@ -1280,7 +1409,7 @@ class AcpSessionHandle:
         aborted" the adapter throws on a ``cancelled`` outcome). Falls back to
         ``cancelled`` when no deny-shaped option was advertised — NOT a per-tool
         signal: kiro-cli maps it to cancelling the TURN, auto-denying every
-        later tool call in it without prompting (#7681).
+        later tool call in it without prompting.
         """
         recorded = self._permission_options.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
@@ -1293,8 +1422,8 @@ class AcpSessionHandle:
             )
         else:
             # Same last-resort warning as AcpClient.reject_tool — this is the
-            # second of the two ``cancelled`` fallback sites, and the silent
-            # cascade is the bug report's whole complaint (#7681).
+            # second of the two ``cancelled`` fallback sites, and the cascade
+            # it can trigger is otherwise silent.
             logger.warning(
                 "reject_tool: no deny option advertised for req=%s; answering "
                 "'cancelled', which the backend may treat as cancelling the "
@@ -1392,10 +1521,30 @@ class AcpSessionHandle:
             # Inherit the backend default — nothing to send. For the ephemeral
             # _bg session the current model IS session/new's served default.
             return
-        if self._runtime.acp_backend == ACP_BACKEND_KAS:
+        backend = self._runtime.acp_backend
+        if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+            # A harness whose adapter judges the model VALUE rather than only the
+            # option: the spelling Crew stored may not be the spelling this build
+            # serves, so the candidate ladder decides. Non-strict, because this
+            # is the substitute path — an exhausted ladder means "stay on the
+            # backend default", the same answer an unresolvable id gets above.
+            applied = await self._push_model_config_option(resolved, strict=False)
+            if not applied:
+                return
+            # Record the spelling that actually went on the wire, not the one
+            # asked for: the context meter looks the window up by this id, and a
+            # fallback spelling can carry a different one.
+            resolved = applied
+        elif backend == ACP_BACKEND_KAS:
             # KAS implements no ``session/set_model``; the model is one of its
             # session config options instead. Same effect, different verb — so
             # the bookkeeping below is shared rather than duplicated.
+            #
+            # Deliberately NOT folded into the branch above, and KAS is
+            # deliberately absent from that membership set: KAS advertises the
+            # option and accepts the resolved id, so a ladder here would only add
+            # retries after a failure that is already terminal, and it would turn
+            # a refusal into a silent stay-on-default where today it raises.
             await self.set_config_option(MODEL_CONFIG_ID, resolved)
         else:
             await self._runtime.send_request(
@@ -1417,6 +1566,103 @@ class AcpSessionHandle:
             else None
         )
         self.last_prompt_stats.rebase_to_window(win or 0)
+
+    async def _push_model_config_option(self, model_id: str, *, strict: bool) -> str:
+        """Push the model over ``session/set_config_option``, trying each spelling.
+
+        Returns the spelling that was accepted, or ``""`` when none was and the
+        session must stay on the backend default.
+
+        Three answers are possible when a write fails, and conflating any two of
+        them breaks a session:
+
+        * ``unknown config option`` — this adapter build has no model option at
+          all, so no spelling can help. Strict re-raises; otherwise the caller
+          stays on the default.
+        * ``config option model`` in the message — the adapter named the option
+          while refusing the VALUE, so the next spelling is worth trying.
+        * a bare ``-32602`` — the request shape here is fixed and the value is
+          the only thing that varies, so the code IS the refusal. Read as a
+          protocol failure instead, it re-raises, the session init fails, and a
+          model pin carried over from another harness kills every session at
+          startup.
+
+        Anything else is a transport or protocol fault and must keep propagating:
+        swallowing it would report a model switch that never reached the process.
+
+        ``strict=True`` (an explicit user pick) raises
+        :class:`~kiro_crew.acp.client.AcpModelUnavailable` on exhaustion, because
+        reporting success while running something else is worse than failing.
+        ``strict=False`` (a substitute or inherited value) returns ``""``.
+        """
+        last_exc: AcpError | None = None
+        # ONE home for the spelling ladder, imported rather than copied: the
+        # order is a fact about how a model id is spelled on the wire, not about
+        # which driver is asking, and two copies of an ORDER drift silently --
+        # both still return candidates and only a cold cache on one driver shows
+        # which list ran.
+        for cand in AcpClient._model_config_candidates(model_id):
+            try:
+                await self.set_config_option(MODEL_CONFIG_ID, cand)
+            except AcpError as exc:
+                lowered = str(exc).lower()
+                if "unknown config option" in lowered:
+                    if strict:
+                        raise
+                    logger.debug(
+                        "adapter exposes no %r config option; skipping model push",
+                        MODEL_CONFIG_ID,
+                    )
+                    return ""
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                    raise
+                last_exc = exc
+                continue
+            if cand != model_id:
+                logger.info(
+                    "ACP model %r rejected by the adapter; applied fallback spelling %r",
+                    model_id,
+                    cand,
+                )
+            return cand
+        # Every spelling refused as one value. A ``<model>[<effort>]`` pair --
+        # the shape codex-acp advertises but its ``model`` option does not take --
+        # is applied as its two halves instead (shared seam with AcpClient).
+        split_applied = await _push_model_via_effort_split(
+            self, self._runtime.acp_backend, model_id
+        )
+        if split_applied:
+            return split_applied
+        # Redacted through the platform context before the id reaches a log or an
+        # exception message: it is caller-supplied text on a path that ends up in
+        # front of a user, and this process can compose a companion redactor -- so
+        # the baseline two-pass call would scan it with the weaker pass. Same call
+        # this file already makes for the unserved-default warning, which is the
+        # same shape of value going to the same kind of place.
+        _rejected_log = redact_log_via_context(str(model_id))
+        advertised_ids = self._advertised_model_ids()
+        if strict:
+            raise AcpModelUnavailable(
+                _rejected_log,
+                advertised_ids,
+                # Only a pair-id harness earns the adapter-mismatch wording: on
+                # those the advertised list IS the entitlement, so refusing
+                # something on it is the adapter contradicting itself. Elsewhere an
+                # advertised id may simply be out of the account's reach, and the
+                # entitlement wording plus the `whoami` hint is the true answer.
+                advertised_but_refused=(
+                    model_id in advertised_ids
+                    and self._runtime.acp_backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+                ),
+            ) from last_exc
+        logger.warning(
+            "ACP model %s rejected by the adapter; staying on the backend default %s "
+            "(advertised: %s)",
+            _rejected_log,
+            self._resolved_model_id or DEFAULT_MODEL,
+            ", ".join(advertised_ids) or "none",
+        )
+        return ""
 
     async def steer(self, message: str) -> bool:
         """Inject a mid-turn steer into the running turn via kiro-cli's
@@ -1463,8 +1709,17 @@ class AcpSessionHandle:
 
     @property
     def supports_steer(self) -> bool:
-        """True — AcpRuntime is kiro-cli only, which supports _session/steer."""
-        return True
+        """True when this session's host implements ``_session/steer``.
+
+        Membership in ``ACP_BACKENDS_STEER`` (harness-parity H6), read from the
+        runtime's own backend id -- the same answer, from the same table, that
+        ``AcpClient.supports_steer`` gives. A capability is granted by opt-in
+        membership, so a host the runtime learns to drive does not inherit an
+        extension it never demonstrated: answering True for one would advertise
+        the steer affordance and then meet the user's mid-turn correction with
+        ``-32601``.
+        """
+        return self._runtime.acp_backend in ACP_BACKENDS_STEER
 
     # ── Commands & Config ──
 
@@ -1485,7 +1740,11 @@ class AcpSessionHandle:
         try:
             msg = await self._wait_for_response(req_id, timeout=60.0)
             result = msg.result or {}
-            raw = result.get("text", "") or result.get("message", "") if isinstance(result, dict) else ""
+            raw = (
+                result.get("text", "") or result.get("message", "")
+                if isinstance(result, dict)
+                else ""
+            )
             # Two-pass redaction (URLs + credentials) before returning — command
             # output is backend-echoed text that reaches the dashboard. Explicit
             # here (rather than redact_text) so the security control is auditable
@@ -1507,6 +1766,68 @@ class AcpSessionHandle:
             {"sessionId": self._session_id, "configId": config_id, "value": value},
         )
         await self._wait_for_response(req_id, timeout=10.0)
+
+    async def apply_session_permission_routing(self) -> None:
+        """Make a ``SESSION_CONFIG`` harness actually ask, or refuse to run it.
+
+        Self-gating on the harness's routing mechanism, so it is inert for every
+        harness whose privileged tools are made to ask some other way: kiro-cli
+        and the KAS relay both route through the agent spec
+        (``Routing.AGENT_SPEC``), so the body below never runs for them and
+        neither backend sends an extra write.
+
+        Two outcomes, and each is a different verdict on purpose:
+
+        * the option was not advertised -> ``INDETERMINATE``, because Crew cannot
+          tell what the adapter will do, and "cannot tell" must not read as armed;
+        * the write was rejected -> ``BYPASSED``, an observed failure rather than
+          missing evidence.
+
+        Only the enforced mechanisms refuse, and ``enforce_runtime_routing`` owns
+        that decision, so the scope is not re-derived here.
+        """
+        backend = self._runtime.acp_backend
+        if acp_tool_gate.routing_for(backend) is not acp_tool_gate.Routing.SESSION_CONFIG:
+            return
+        option_id, value = acp_tool_gate.permission_config_for(backend)
+        issue = acp_tool_gate.session_config_issue(backend, self._config_options)
+        if issue:
+            # Not advertised: INDETERMINATE, never BYPASSED. The adapter may well
+            # ask anyway; Crew simply has no evidence, and the enforcement treats
+            # the two identically while the message stays honest.
+            try:
+                acp_tool_gate.enforce_runtime_routing(
+                    backend,
+                    issue,
+                    verdict=acp_tool_gate.Verdict.INDETERMINATE,
+                    remedy=acp_tool_gate.remediation_for(backend),
+                )
+            except acp_tool_gate.ToolGateUnroutable as exc:
+                raise AcpToolGateUnroutable(str(exc)) from None
+            return
+
+        try:
+            await self.set_config_option(option_id, value)
+        except AcpError as exc:
+            # The option was advertised and the write still failed, so this is an
+            # observed bypass rather than missing evidence.
+            try:
+                acp_tool_gate.enforce_runtime_routing(
+                    backend,
+                    "the adapter rejected its required session permission configuration",
+                    verdict=acp_tool_gate.Verdict.BYPASSED,
+                    remedy=acp_tool_gate.remediation_for(backend),
+                )
+            except acp_tool_gate.ToolGateUnroutable as gate_exc:
+                raise AcpToolGateUnroutable(str(gate_exc)) from exc
+            return
+
+        logger.info(
+            "ACP permission route armed: %s=%s (%s)",
+            option_id,
+            value,
+            acp_tool_gate.label_for(backend),
+        )
 
     # ── Compaction ──
 
@@ -1577,16 +1898,14 @@ class AcpSessionHandle:
                 if remaining <= 0:
                     break
                 try:
-                    msg = await asyncio.wait_for(
-                        self._queue.get(), timeout=min(remaining, 5.0)
-                    )
+                    msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))
                 except asyncio.TimeoutError:
                     continue
                 if msg is None:
                     # Re-poison (in the finally, AFTER the buffered frames are
                     # restored) so the live turn / next consumer also sees death.
                     poisoned = True
-                    raise AcpProcessDied("Runtime died while waiting for compaction")
+                    raise self._died("Runtime died while waiting for compaction")
                 # Check for compaction status
                 if msg.method == "_kiro.dev/compaction/status":
                     params = msg.params or {}
@@ -1598,9 +1917,7 @@ class AcpSessionHandle:
                             # loop, so it must drop the stale counts itself —
                             # mirrors AcpClient._handle_compaction_status.
                             self.last_prompt_stats.reset_after_compaction()
-                            poisoned = await self._drain_post_compaction_metadata(
-                                buffered=buffered
-                            )
+                            poisoned = await self._drain_post_compaction_metadata(buffered=buffered)
                         # Redact backend-echoed summary before it reaches callers
                         # (compact() surfaces this to the dashboard).
                         return {
@@ -1690,11 +2007,21 @@ class AcpSessionHandle:
 
     # ── Responsiveness ──
 
+    def _runtime_idle_secs(self) -> float:
+        """Seconds since the runtime last moved a frame on ANY of its sessions.
+
+        The only place the runtime's activity clock is read outside the dispatch
+        loop's own per-session bookkeeping. A caller must NOT read the result as
+        this session's idleness: on a shared process a co-tenant's traffic keeps
+        it near zero while this session has produced nothing.
+        """
+        return time.monotonic() - self._runtime._last_activity
+
     def is_responsive(self, stale_threshold: float = 600.0) -> bool:
         """True if runtime is alive AND has had activity within threshold seconds."""
         if not self._runtime.is_alive():
             return False
-        return (time.monotonic() - self._runtime._last_activity) < stale_threshold
+        return self._runtime_idle_secs() < stale_threshold
 
     # ── State tracking ──
 
@@ -1762,16 +2089,22 @@ class AcpSessionHandle:
         if not self._config_options:
             return True
         return any(
-            isinstance(opt, dict) and opt.get("id") == config_id
-            for opt in self._config_options
+            isinstance(opt, dict) and opt.get("id") == config_id for opt in self._config_options
         )
 
     def get_valid_effort_levels(self) -> list[str]:
-        """Return valid effort levels from config options, preserving order."""
+        """Return valid effort levels from config options, preserving order.
+
+        The option id is resolved per backend (``effort`` for most,
+        ``reasoning_effort`` for codex-acp): a hard-coded spelling returns an
+        empty list on a backend that spells it differently, which every caller
+        reads as "this model has no effort levels".
+        """
+        effort_option = effort_config_option_id(self._runtime.acp_backend)
         for opt in self._config_options:
             if not isinstance(opt, dict):
                 continue
-            if opt.get("id") == "effort":
+            if opt.get("id") == effort_option:
                 options = opt.get("options", [])
                 if isinstance(options, list):
                     return [
@@ -1781,9 +2114,7 @@ class AcpSessionHandle:
                     ]
         return []
 
-    def rebind_watchdog(
-        self, crew_agent: str, settings: WatchdogSettings | None = None
-    ) -> None:
+    def rebind_watchdog(self, crew_agent: str, settings: WatchdogSettings | None = None) -> None:
         """Re-snapshot the watchdog windows for a new canonical crew identity.
 
         Called on warm-pool rekey: the pooled runtime was spawned before any
@@ -1815,7 +2146,14 @@ class AcpSessionHandle:
         if isinstance(config_options, list):
             self._config_options = config_options
             self._sync_effort_levels()
-        models = resp.get("models") or resp.get("availableModels")
+        # Where this host's model list lives is asked in ONE place
+        # (``session_models_envelope``): a host in
+        # ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` advertises no ``models`` object
+        # and puts the list in a ``configOptions`` ``model`` select, and a reader that
+        # knows about one shape and not the other is how the entitlement probe came to
+        # answer ``[]`` for codex while this path answered correctly. Absent stays
+        # absent, so the shape branches below are untaken exactly as before.
+        models = session_models_envelope(resp, self._runtime.acp_backend)
         if isinstance(models, dict):
             # Record the resolved model id (kiro-cli's currentModelId) so
             # _backfill_context_window can look up the window on pct-only
@@ -1826,8 +2164,8 @@ class AcpSessionHandle:
             avail = models.get("availableModels", [])
             if isinstance(avail, list):
                 # The shape walk is delegated to the canonical parser so this
-                # snapshot and a probe's answer stay directly comparable
-                # (#6382). The envelope is the same checked-binding discipline
+                # snapshot and a probe's answer stay directly comparable.
+                # The envelope is the same checked-binding discipline
                 # as the client's, though here the parser's dict-or-list
                 # fallback is unreachable by construction (the inner dict
                 # always has a key). The isinstance check above is the
@@ -1835,7 +2173,7 @@ class AcpSessionHandle:
                 # clobber a previously-stored list. A well-formed EMPTY list
                 # still overwrites — that asymmetry with
                 # ``AcpClient._capture_available_models`` (non-empty guard) is
-                # pre-existing policy, deliberately unchanged here.
+                # deliberate, not an oversight.
                 self._available_models = parse_advertised_models(
                     {"models": {"availableModels": avail}}
                 )
@@ -1917,11 +2255,13 @@ class AcpSessionHandle:
             model_id = m.get("modelId") or m.get("value") or ""
             if not model_id:
                 continue
-            captured.append({
-                "modelId": str(model_id),
-                "name": str(m.get("name") or model_id),
-                "description": str(m.get("description") or ""),
-            })
+            captured.append(
+                {
+                    "modelId": str(model_id),
+                    "name": str(m.get("name") or model_id),
+                    "description": str(m.get("description") or ""),
+                }
+            )
         return captured
 
     async def refresh_available_models(self) -> list[dict[str, str]]:
@@ -1955,6 +2295,7 @@ class AcpSessionHandle:
         if levels:
             # circular import: chat_persistence -> dashboard -> session -> acp
             from kiro_crew.dashboard.chat_persistence import update_reasoning_effort_values
+
             update_reasoning_effort_values(levels)
 
     # NOTE: resume is done via AcpRuntime.load_session() (issues session/load
@@ -2059,7 +2400,7 @@ class AcpSessionHandle:
                 if msg is None:
                     # Runtime died: re-poison for the live turn / next consumer.
                     self._queue.put_nowait(None)
-                    raise AcpProcessDied("Runtime process died while waiting for response")
+                    raise self._died("Runtime process died while waiting for response")
                 if msg.is_response_for(req_id):
                     if msg.error:
                         # Delegate to the shared raise helper so this path gets
@@ -2073,7 +2414,22 @@ class AcpSessionHandle:
                         # The advertised ids let the shared entitlement
                         # discriminator tell "your plan lacks this model"
                         # (terminal) from a capacity blip (retryable).
-                        _raise_acp_error(msg.error, self._advertised_model_ids())
+                        #
+                        # The raw JSON-RPC code is re-attached on the way out:
+                        # the shared helper decides everything from the frame's
+                        # prose, and a bare ``-32602 Invalid params`` carries no
+                        # prose to decide from. A config-option write is the one
+                        # request whose shape is fixed and whose value is the
+                        # only variable, so for it that code IS a value refusal
+                        # rather than a malformed request. Nothing else branches
+                        # on ``code``, so setting it cannot change any other
+                        # path's outcome.
+                        try:
+                            _raise_acp_error(msg.error, self._advertised_model_ids())
+                        except AcpError as _exc:
+                            if getattr(_exc, "code", None) is None:
+                                _exc.code = _jsonrpc_error_code(msg.error)
+                            raise
                     return msg
                 # Not our response — buffer (do not drop) for re-injection,
                 # and advance the ingress sequence for EVERY buffered frame:
@@ -2142,7 +2498,7 @@ class AcpSessionHandle:
                 # `failed` and the backend has since gone silent past the budget,
                 # so no prompt response or end_turn is coming. End the turn with
                 # an explicit stop reason so the caller releases the slot instead
-                # of draining to the chat-turn ceiling (issue #3583). Consumer
+                # of draining to the chat-turn ceiling. Consumer
                 # park time is subtracted, like every other idle clock here, so a
                 # long human approval cannot be charged to the backend.
                 #
@@ -2205,24 +2561,30 @@ class AcpSessionHandle:
                         logger.warning(
                             "Stale turn on session %s unrecovered after %.1fs cancel "
                             "grace — signalling auto-recovery",
-                            self._session_id, self._cancel_grace_secs,
+                            self._session_id,
+                            self._cancel_grace_secs,
                         )
-                        yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_STALE_RECOVER,
-                                       usage=self.last_prompt_stats.to_turn_usage())
+                        yield AcpEvent(
+                            kind=EVENT_COMPLETE,
+                            stop_reason=STOP_REASON_STALE_RECOVER,
+                            usage=self.last_prompt_stats.to_turn_usage(),
+                        )
                         return
                     logger.warning(
                         "Cancel unacked after %.1fs on session %s — unblocking caller "
                         "(runtime kept alive for co-tenants)",
-                        self._cancel_grace_secs, self._session_id,
+                        self._cancel_grace_secs,
+                        self._session_id,
                     )
-                    yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="error: cancel unacked",
-                                   usage=self.last_prompt_stats.to_turn_usage())
+                    yield AcpEvent(
+                        kind=EVENT_COMPLETE,
+                        stop_reason="error: cancel unacked",
+                        usage=self.last_prompt_stats.to_turn_usage(),
+                    )
                     return
 
                 try:
-                    msg = await asyncio.wait_for(
-                        self._queue.get(), timeout=min(remaining, 5.0)
-                    )
+                    msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))
                 except asyncio.TimeoutError:
                     # ── Verdict-driven watchdogs ──
                     # Wellness (the liveness oracle) is the detector; timeouts
@@ -2303,8 +2665,8 @@ class AcpSessionHandle:
                             # frame landing inside the oracle await therefore
                             # still defers the tool clock, but by ONE tick: when
                             # it is dequeued the ownership check below leaves
-                            # last_own_data_ts alone, so the unbounded deferral
-                            # this branch used to allow cannot re-form.
+                            # last_own_data_ts alone, so the deferral cannot
+                            # compound into an unbounded one.
                             last_data_ts = time.monotonic()
                             last_own_data_ts = last_data_ts
                             parked_at_own_data = self._parked_total
@@ -2354,13 +2716,15 @@ class AcpSessionHandle:
                             _suspect = min(wd.stale_window_secs, _suspect)
                         _suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         _acting = (
-                            verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
-                            or _tool_idle > _suspect
+                            verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT) or _tool_idle > _suspect
                         )
                         if not _acting:
                             continue  # UNKNOWN, within budget — keep waiting
                         self._emit_watchdog_metric(
-                            "cancel", verdict, evidence, _tool_idle,
+                            "cancel",
+                            verdict,
+                            evidence,
+                            _tool_idle,
                             window="narrowed" if _narrowed else "standard",
                         )
                         async for ev in self._end_stalled_tool(verdict, evidence, _tool_idle):
@@ -2423,9 +2787,7 @@ class AcpSessionHandle:
                             # the think, so it gets the extended window. The hard
                             # cap bounds any UNKNOWN deferral absolutely.
                             window = (
-                                wd.model_silent_probe_secs
-                                if _flat_wait
-                                else wd.stale_window_secs
+                                wd.model_silent_probe_secs if _flat_wait else wd.stale_window_secs
                             )
                             if _stale_idle <= min(window, wd.tool_stall_hard_cap_secs):
                                 continue
@@ -2444,28 +2806,33 @@ class AcpSessionHandle:
                         # branch — emitting "extended" lets dashboards distinguish
                         # the two cases correctly.
                         self._emit_watchdog_metric(
-                            "probe", verdict, evidence, _stale_idle,
+                            "probe",
+                            verdict,
+                            evidence,
+                            _stale_idle,
                             window="extended" if _flat_wait else "standard",
                         )
                         logger.warning(
                             "Stale turn on session %s (idle %.0fs, verdict=%s: %s) — "
                             "probing via session/cancel",
-                            self._session_id, _stale_idle, verdict, evidence,
+                            self._session_id,
+                            _stale_idle,
+                            verdict,
+                            evidence,
                         )
                         try:
-                            await asyncio.wait_for(
-                                self.cancel(_stale_probe=True), timeout=5.0
-                            )
+                            await asyncio.wait_for(self.cancel(_stale_probe=True), timeout=5.0)
                         except Exception:
                             logger.debug(
                                 "stale-probe session/cancel failed for %s",
-                                self._session_id, exc_info=True,
+                                self._session_id,
+                                exc_info=True,
                             )
                     continue
 
                 if msg is None:
                     # Runtime process died — sentinel
-                    raise AcpProcessDied("Runtime process died during prompt")
+                    raise self._died("Runtime process died during prompt")
 
                 last_data_ts = time.monotonic()
                 parked_at_data = self._parked_total
@@ -2494,9 +2861,12 @@ class AcpSessionHandle:
                             self._last_stop_reason = reason
                             self._tool_dispatched = False
                             self._turn_done.set()
-                            yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason,
-                                           refusal=_refusal,
-                                           usage=self.last_prompt_stats.to_turn_usage())
+                            yield AcpEvent(
+                                kind=EVENT_COMPLETE,
+                                stop_reason=reason,
+                                refusal=_refusal,
+                                usage=self.last_prompt_stats.to_turn_usage(),
+                            )
                             return
                         # Same as _wait_for_response: route through the shared
                         # raise helper so a mid-turn failure surfaces actionable
@@ -2525,7 +2895,8 @@ class AcpSessionHandle:
                         logger.info(
                             "Stale-probe cancel acked on session %s — reclassifying "
                             "to %s for auto-recovery",
-                            self._session_id, STOP_REASON_STALE_RECOVER,
+                            self._session_id,
+                            STOP_REASON_STALE_RECOVER,
                         )
                         reason = STOP_REASON_STALE_RECOVER
                         # Single-shot: the flag is consumed here so a later genuine
@@ -2551,16 +2922,17 @@ class AcpSessionHandle:
                                     else ""
                                 )
                                 if name:
-                                    yield AcpEvent(
-                                        kind=EVENT_AGENT_SWITCHED, text=name
-                                    )
+                                    yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=name)
                     reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
                     self._turn_done.set()
-                    yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason,
-                                   refusal=_refusal,
-                                   usage=self.last_prompt_stats.to_turn_usage())
+                    yield AcpEvent(
+                        kind=EVENT_COMPLETE,
+                        stop_reason=reason,
+                        refusal=_refusal,
+                        usage=self.last_prompt_stats.to_turn_usage(),
+                    )
                     return
                 if msg.method is None and msg.id is not None:
                     # Response frame for a DIFFERENT req_id: a concurrent
@@ -2580,9 +2952,7 @@ class AcpSessionHandle:
                         self._queue.put_nowait(msg)
                         await asyncio.sleep(0)
                     else:
-                        logger.debug(
-                            "Dropping stray response frame id=%s (no waiter)", msg.id
-                        )
+                        logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
                     continue
 
                 # Dispatch by method
@@ -2645,8 +3015,9 @@ class AcpSessionHandle:
                             self._emit_tool_interrupted_sel("_dispatch_events")
                             self._tool_dispatched = False
                             self._turn_done.set()
-                            yield AcpEvent(kind=EVENT_COMPLETE,
-                                           usage=self.last_prompt_stats.to_turn_usage())
+                            yield AcpEvent(
+                                kind=EVENT_COMPLETE, usage=self.last_prompt_stats.to_turn_usage()
+                            )
                             return
                 elif action == "steer":
                     # Mid-turn steer lifecycle echo from kiro-cli (_session/steer).
@@ -2654,6 +3025,18 @@ class AcpSessionHandle:
                     # text. Never trust backend-echoed steer text: redact before it
                     # can reach any surface. Mirrors AcpClient._dispatch_events.
                     params = msg.params or {}
+                    _steer_sid = str(params.get("sessionId") or "")
+                    if _steer_sid and _steer_sid != self._session_id:
+                        # A steer echo naming ANOTHER session — an announced
+                        # child's frame routed to this single-owner queue
+                        # (either session/update spelling). Only a frame this
+                        # session OWNS may settle this session's steer
+                        # ledger: surfacing a child's steering_consumed as a
+                        # parent EVENT_STEER_CONSUMED could settle a pending
+                        # user steer or policy-refusal continuation the
+                        # parent backend never consumed. Same trust boundary
+                        # the compaction branch draws with owns_frame.
+                        continue
                     _upd = params.get("update")
                     _upd = _upd if isinstance(_upd, dict) else {}
                     _disc = str(_upd.get("sessionUpdate") or "")
@@ -2669,7 +3052,9 @@ class AcpSessionHandle:
                 elif action == "compaction":
                     params = msg.params or {}
                     status = params.get("status", {})
-                    status_type = status.get("type", "") if isinstance(status, dict) else str(status)
+                    status_type = (
+                        status.get("type", "") if isinstance(status, dict) else str(status)
+                    )
                     # A compaction notification carrying no sessionId is fanned
                     # out to EVERY co-tenant queue (AcpRuntime marks the copies
                     # fanout_no_owner once more than one session is registered),
@@ -2680,11 +3065,11 @@ class AcpSessionHandle:
                     # peer and reap its live turn (every consumer resets the
                     # session on that terminal), and an ownerless `completed`
                     # would disarm a peer's legitimate budget and restore the
-                    # #3583 hang this fix exists to close.  Same trust boundary
+                    # hang the budget exists to close.  Same trust boundary
                     # the budget's own clock already draws (last_own_data_ts) and
                     # the subagent roster already draws (runtime_global=).  A lone
                     # session's frame is left unmarked and genuinely is its own,
-                    # so single-session behaviour is unchanged.  The event still
+                    # so a single-session run is unaffected.  The event still
                     # surfaces either way — only the mutations are gated.
                     owns_frame = not msg.fanout_no_owner
                     if status_type == "completed" and owns_frame:
@@ -2706,9 +3091,7 @@ class AcpSessionHandle:
                             # reason so the notice stops collapsing to
                             # "unknown error".
                             self._compaction_failed_at = time.monotonic()
-                            self.last_compaction_transient = (
-                                compaction_failure_is_transient(params)
-                            )
+                            self.last_compaction_transient = compaction_failure_is_transient(params)
                         summary = compaction_failure_detail(params)
                     yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
                 elif action == "clear":
@@ -2750,12 +3133,69 @@ class AcpSessionHandle:
                     ssid = str(params.get("sessionId") or "")
                     upd = params.get("update") or {}
                     upd = upd if isinstance(upd, dict) else {}
+                    if ssid and ssid != self._session_id:
+                        # A backend-internal child's update under the
+                        # extension method `_kiro.dev/session/update`. BOTH
+                        # session-update spellings are live carriers, not a
+                        # version succession: kiro-cli 2.21.x uses the
+                        # extension method for the child stream regardless
+                        # of the plain/extension ordering the steer comment
+                        # in _dispatch.classify_notification describes. Run
+                        # the payload through the shared parser for its
+                        # cache SIDE EFFECTS ONLY — the origin-scoped
+                        # per-toolCallId writes (command bytes, raw params,
+                        # shell classification, and the `_meta.kiro`
+                        # server/tool identity) that a later child
+                        # permission request's trust split reads. Without
+                        # this parse the caches stay empty for the extension
+                        # spelling, a child MCP call cannot verify its
+                        # identity, and every auto-approve path falls to the
+                        # interactive UNVERIFIED card. Identity still comes
+                        # ONLY from a frame this client parsed: the runtime
+                        # routes the method solely for an announced child on
+                        # a single-owner runtime. Same
+                        # cache-side-effects-only shape as the KAS child
+                        # nested-tool path in _handle_update.
+                        #
+                        # The activity events stay the hand-rolled yields
+                        # below, and they INTENTIONALLY differ from
+                        # _handle_update's child re-tag path (the plain
+                        # spelling's route): this branch emits activity for
+                        # any update carrying a toolCallId — including
+                        # discriminant-less frames and tool_call_update
+                        # refinements the parser suppresses — a display
+                        # shape pinned by the pre-existing
+                        # test_dispatch_subagent_activity_* tests. The
+                        # security caches are the shared, parser-derived
+                        # part; the coarse crew-monitor display is not.
+                        parse_session_update(
+                            upd,
+                            tool_input_cache=self._tool_call_inputs,
+                            tool_input_redacted_cache=self._tool_call_input_redacted,
+                            shell_cache=self._tool_call_is_shell,
+                            raw_params_cache=self._tool_call_raw_params,
+                            diff_path_cache=self._tool_call_diff_path,
+                            mcp_server_name_cache=self._tool_call_mcp_server,
+                            tool_name_cache=self._tool_call_tool_name,
+                            cache_scope=ssid,
+                        )
                     tcid = str(upd.get("toolCallId") or "")
                     # Single-source the text-shape read via the shared parser so the
                     # sub-agent text path matches the main one (content.text + flat).
                     _su_text_val, _su_thinking = parse_text_chunk(upd)
                     su_text = _su_text_val or ""
                     su_kind = str(upd.get("sessionUpdate") or "")
+                    # A frame naming THIS session is this turn's own stream, not a
+                    # child's, so it yields no sub-agent activity. kiro-cli sends
+                    # the extension spelling for the parent's own tool-call chunk
+                    # as well as for a child's update, and the two are told apart
+                    # only by the sessionId -- the same discriminant the cache
+                    # scoping above uses. Without this the crew monitor shows a
+                    # sub-agent for every tool call of an ordinary turn, whose id
+                    # is the session the user is already looking at.
+                    own_session = bool(ssid) and ssid == self._session_id
+                    if own_session:
+                        continue
                     if ssid and tcid:
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
@@ -2818,8 +3258,11 @@ class AcpSessionHandle:
             # distinguishing stop_reason so callers that break on EVENT_COMPLETE can
             # tell this apart from a normal turn end.
             self._turn_done.set()
-            yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="timeout",
-                           usage=self.last_prompt_stats.to_turn_usage())
+            yield AcpEvent(
+                kind=EVENT_COMPLETE,
+                stop_reason="timeout",
+                usage=self.last_prompt_stats.to_turn_usage(),
+            )
         finally:
             for _m in _buffered:
                 self._queue.put_nowait(_m)
@@ -2926,13 +3369,13 @@ class AcpSessionHandle:
         if now - self._working_logged_ts < _WORKING_LOG_INTERVAL_SECS:
             return
         self._working_logged_ts = now
-        warn_after = min(
-            _WORKING_WARN_AFTER_SECS, turn_timeout * _WORKING_WARN_DEADLINE_FRACTION
-        )
+        warn_after = min(_WORKING_WARN_AFTER_SECS, turn_timeout * _WORKING_WARN_DEADLINE_FRACTION)
         logger.log(
             logging.WARNING if idle >= warn_after else logging.INFO,
             "Watchdog deferral on session %s: idle %.0fs but verdict WORKING (%s)",
-            self._session_id, idle, evidence,
+            self._session_id,
+            idle,
+            evidence,
         )
         # Telemetry rides the same rate limit as the log line: one deferral
         # point per interval per session, so an hours-long WORKING build contributes a
@@ -2940,7 +3383,12 @@ class AcpSessionHandle:
         self._emit_watchdog_metric("deferral", VERDICT_WORKING, evidence, idle)
 
     def _emit_watchdog_metric(
-        self, action: str, verdict: str, evidence: str, idle: float, *,
+        self,
+        action: str,
+        verdict: str,
+        evidence: str,
+        idle: float,
+        *,
         window: str = "standard",
     ) -> None:
         """Emit kirocrew.watchdog.action + kirocrew.watchdog.idle.duration (best-effort).
@@ -3008,14 +3456,18 @@ class AcpSessionHandle:
         logger.warning(
             "Tool stall on session %s (idle %.0fs, verdict=%s: %s) — cancelling "
             "session (runtime kept alive for co-tenants)",
-            self._session_id, idle, verdict, evidence,
+            self._session_id,
+            idle,
+            verdict,
+            evidence,
         )
         try:
             await asyncio.wait_for(self.cancel(), timeout=5.0)
         except Exception:
             logger.debug(
                 "session/cancel after tool stall failed for %s",
-                self._session_id, exc_info=True,
+                self._session_id,
+                exc_info=True,
             )
         self._turn_done.set()
         yield AcpEvent(
@@ -3077,11 +3529,9 @@ class AcpSessionHandle:
         Thin wrapper binding this handle's resolved model id (kiro-agent
         ``currentModelId``, else the user-picked alias); the shared logic lives
         on ``AcpPromptStats.backfill_context_window`` (the AcpClient path
-        delegates to the same method, so the two can no longer drift).
+        delegates to the same method, so the two cannot drift).
         """
-        self.last_prompt_stats.backfill_context_window(
-            pct, self._resolved_model_id or self._model
-        )
+        self.last_prompt_stats.backfill_context_window(pct, self._resolved_model_id or self._model)
 
     def _emit_tool_interrupted_sel(self, site: str) -> None:
         """Emit a SEL audit + WARNING when kiro-cli's security filter cancels tools.
@@ -3109,9 +3559,7 @@ class AcpSessionHandle:
                 },
             )
         except Exception:
-            logger.warning(
-                "SEL audit failed for tool_interrupted at %s", site, exc_info=True
-            )
+            logger.warning("SEL audit failed for tool_interrupted at %s", site, exc_info=True)
 
     def queued_frame_count(self) -> int:
         """How many frames are waiting on this session's queue right now.
@@ -3304,14 +3752,13 @@ class AcpSessionHandle:
                     p = msg.params or {}
                     logger.info(
                         "MCP server init failure on %s: %s",
-                        self._session_id, p.get("serverName") or "",
+                        self._session_id,
+                        p.get("serverName") or "",
                     )
             except Exception:
                 logger.debug("drain_init: error processing init frame", exc_info=True)
         if drained:
-            logger.debug(
-                "drain_init: drained %d init frame(s) for %s", drained, self._session_id
-            )
+            logger.debug("drain_init: drained %d init frame(s) for %s", drained, self._session_id)
 
     def _classify(self, msg: JsonRpcMessage) -> str:
         """Classify a notification message into an action string."""
@@ -3421,11 +3868,11 @@ class AcpSessionHandle:
             elif kind == kas_wire.KIND_SUMMARIZATION_FAILED:
                 status_type = "failed"
                 # Parity with AcpClient._handle_compaction_status: log the WHOLE
-                # frame at WARNING. This branch previously logged nothing at
-                # all, so a KAS summarization failure left the chat row as the
-                # only record of it — and when the row's reason collapsed to a
-                # placeholder there was nothing to grep server-side and no way
-                # to learn which field the reason actually arrived in.
+                # frame at WARNING. Without it a KAS summarization failure
+                # leaves the chat row as the only record of it — and when the
+                # row's reason collapses to a placeholder there is nothing to
+                # grep server-side and no way to learn which field the reason
+                # actually arrived in.
                 # redact_text, not the bare frame: conversationSummary rides in
                 # this payload, so an unredacted dump would persist whatever the
                 # conversation contained -- a pasted credential included -- into
@@ -3504,10 +3951,12 @@ class AcpSessionHandle:
                         "initialQuery": s_name,
                         "status": {"type": s_status, "message": ""},
                     }
-            return [AcpEvent(
-                kind=EVENT_SUBAGENT_LIST,
-                subagents=list(self._kas_subagent_roster.values()),
-            )]
+            return [
+                AcpEvent(
+                    kind=EVENT_SUBAGENT_LIST,
+                    subagents=list(self._kas_subagent_roster.values()),
+                )
+            ]
 
         # Individual agent-subtask frame (kind == "agent-subtask") → PARENT.
         is_parent = kiro.get(kas_wire.FIELD_KIND) == kas_wire.KIND_AGENT_SUBTASK
@@ -3524,10 +3973,12 @@ class AcpSessionHandle:
                 "initialQuery": title,
                 "status": {"type": status, "message": ""},
             }
-            return [AcpEvent(
-                kind=EVENT_SUBAGENT_LIST,
-                subagents=list(self._kas_subagent_roster.values()),
-            )]
+            return [
+                AcpEvent(
+                    kind=EVENT_SUBAGENT_LIST,
+                    subagents=list(self._kas_subagent_roster.values()),
+                )
+            ]
 
         # Child nested tool_call/tool_call_update (has agentSubtaskId but NOT
         # kind:"agent-subtask" or pipeline) → return None so the caller falls
@@ -3548,9 +3999,8 @@ class AcpSessionHandle:
         if not isinstance(subtask_id, str) or not subtask_id:
             return None
         # Must NOT have kind:"agent-subtask" or pipeline — those are parent frames
-        if (
-            kiro.get(kas_wire.FIELD_KIND) == kas_wire.KIND_AGENT_SUBTASK
-            or kiro.get(kas_wire.FIELD_PIPELINE)
+        if kiro.get(kas_wire.FIELD_KIND) == kas_wire.KIND_AGENT_SUBTASK or kiro.get(
+            kas_wire.FIELD_PIPELINE
         ):
             return None
         text, _thinking = parse_text_chunk(update)
@@ -3559,11 +4009,13 @@ class AcpSessionHandle:
             # surface as visible sub-agent activity — parity with the kiro native
             # subagent path, which only forwards non-thinking agent_message_chunk.
             return []
-        return [AcpEvent(
-            kind=EVENT_SUBAGENT_ACTIVITY,
-            sub_session_id=subtask_id,
-            text=redact_text(text),
-        )]
+        return [
+            AcpEvent(
+                kind=EVENT_SUBAGENT_ACTIVITY,
+                sub_session_id=subtask_id,
+                text=redact_text(text),
+            )
+        ]
 
     def _build_child_tool_activity_prefix(self, update: dict) -> list[AcpEvent]:
         """Build an EVENT_SUBAGENT_ACTIVITY prefix for a child nested tool frame.
@@ -3582,12 +4034,14 @@ class AcpSessionHandle:
         if not tool_call_id:
             return []
         title = redact_text(str(update.get("title") or ""))
-        return [AcpEvent(
-            kind=EVENT_SUBAGENT_ACTIVITY,
-            sub_session_id=subtask_id,
-            tool_call_id=tool_call_id,
-            title=title,
-        )]
+        return [
+            AcpEvent(
+                kind=EVENT_SUBAGENT_ACTIVITY,
+                sub_session_id=subtask_id,
+                tool_call_id=tool_call_id,
+                title=title,
+            )
+        ]
 
     def _apply_kas_context_pct(self, pct: object) -> None:
         """Apply a KAS ``context_usage`` percentage to the context meter.

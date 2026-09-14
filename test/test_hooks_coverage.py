@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import stat as _stat
+import sys
 import uuid
 from pathlib import Path
 
@@ -390,6 +391,103 @@ class TestValidateFilePath:
         f = _write(tmp_path / "ok.txt", "x")
         assert _same(validate_file_path(str(f)) or "", str(f))
 
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (r"\\?\C:\Users\me\.aws\creds", r"C:\Users\me\.aws\creds"),
+            (r"\\?\c:\x", r"c:\x"),
+            ("\\\\?\\C:/x", "C:/x"),
+            (r"\\?\UNC\host\share", r"\\?\UNC\host\share"),
+            (r"\\?\GLOBALROOT\Device\Mup\host\share", r"\\?\GLOBALROOT\Device\Mup\host\share"),
+            (r"C:\plain", r"C:\plain"),
+            ("//host/share", "//host/share"),
+            ("", ""),
+        ],
+        ids=[
+            "drive-local-folds",
+            "lowercase-drive",
+            "forward-slash-remainder",
+            "unc-longform-untouched",
+            "globalroot-untouched",
+            "plain-drive-untouched",
+            "posix-doubled-slash-untouched",
+            "empty",
+        ],
+    )
+    def test_fold_extended_length_local(self, raw, expected):
+        r"""Only a drive-absolute ``\\?\`` remainder folds to a plain
+        local path; ``\\?\UNC\`` and every other extended namespace are left
+        intact so they stay UNC-shaped and fail closed."""
+        from kiro_crew import hooks as hooks_mod
+
+        assert hooks_mod._fold_extended_length_local(raw) == expected
+
+    def test_extended_length_local_secret_path_is_refused(self, monkeypatch):
+        r"""An extended-length credential path is folded at the INPUT and
+        refused as sensitive.
+
+        ``is_unc_shape`` reports ``\\?\C:\`` as non-UNC (it names a local drive,
+        not a share), so the UNC gate does not fire on it. The prefix is folded
+        at the input instead, so the sensitive-path fence sees the plain ``C:\``
+        path and refuses a read of ``\\?\C:\Users\<user>\<secret-dir>\<leaf>``.
+        The probe asserts the fence never sees the ``\\?\`` prefix -- the
+        property that makes the credential leaf recognisable."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        seen: list[str] = []
+        secret_dir = "." + "aws"
+
+        def _probe(p):
+            seen.append(p)
+            return secret_dir in p.lower()
+
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: False)
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", _probe)
+        assert validate_file_path("\\\\?\\C:\\Users\\me\\" + secret_dir + "\\creds") is None
+        assert seen, "the sensitive-path fence was never consulted"
+        assert all(not p.startswith("\\\\?\\") for p in seen), seen
+
+    def test_extended_length_local_persona_still_resolves(self, monkeypatch):
+        r"""Non-vacuity: a benign extended-length local path
+        (``\\?\C:\...\persona.md``) must still read -- the fold makes
+        ``is_unc_shape`` see a plain (non-UNC) ``C:\`` path, and the fence
+        passes a non-secret file. Proves the refusal above is the fence firing,
+        not a blanket ``\\?\`` ban."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: False)
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda _p: False)
+        assert validate_file_path(r"\\?\C:\Users\me\project\persona.md") is not None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            r"\\?\UNC\evil-host\share\doc.txt",
+            r"\\?\GLOBALROOT\Device\Mup\evil-host\share\doc.txt",
+            r"\\.\PhysicalDrive0",
+        ],
+        ids=["unc-longform", "globalroot", "physicaldrive"],
+    )
+    def test_extended_namespace_input_is_refused_before_resolution(self, monkeypatch, raw):
+        r"""A raw ``\\?\UNC\...``, ``\\?\GLOBALROOT\...`` or ``\\.\device`` input
+        is NOT folded to a local path: it stays UNC-shaped and the UNC
+        trusted-root gate refuses it before any resolution (``realpath`` wired
+        to explode proves the gate returned first)."""
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("resolution ran on an extended-namespace input")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        assert validate_file_path(raw) is None
+
     def _windows(self, monkeypatch, realpath=os.path.realpath):
         """Simulate the Windows gates without patching the global os.name
         (which would make pathlib dispatch WindowsPath on a POSIX host).
@@ -427,7 +525,7 @@ class TestValidateFilePath:
 
     def test_linked_ancestor_is_refused_before_realpath(self, tmp_path, monkeypatch):
         """realpath resolves the whole ancestor chain, so it IS the outbound
-        SMB probe when an ancestor junction targets a UNC share (#5962).
+        SMB probe when an ancestor junction targets a UNC share.
         Wiring realpath to explode proves the walk returned first."""
         from kiro_crew import platform_compat
 
@@ -727,7 +825,7 @@ class TestValidateFilePath:
         assert validate_file_path("~/doc.txt") is None
 
     def test_unc_home_sessions_transcript_is_refused(self, monkeypatch):
-        """#6733: a kiro-cli session transcript under a Windows roaming-profile
+        """A kiro-cli session transcript under a Windows roaming-profile
         (UNC) home is refused by the UNC trusted-root gate, because the sessions
         dir is not one of unc_probe_allowed's admitted roots. This is the exact
         refusal the usage page counts as ``refused_transcripts`` instead of
@@ -735,8 +833,8 @@ class TestValidateFilePath:
         string through validate_file_path -- so it runs on a POSIX host; the
         Windows CI shard confirms the native backslash form.
 
-        The fix for #6733 does NOT relax this refusal: admitting the sessions
-        dir to the gate is a separate trust decision (open issue #8079). This
+        This refusal is NOT relaxed: admitting the sessions
+        dir to the gate is a separate trust decision. This
         test therefore pins that the transcript STAYS refused.
         """
         from kiro_crew import platform_compat
@@ -780,7 +878,7 @@ class TestSafeReadFile:
     def test_sensitive_refusal_message_escapes_the_path(self, monkeypatch):
         """The refused path is caller/attacker influenced and the message reaches
         log records via ``exc_info``; a raw newline in it would forge a second
-        record (refs #6371, the #6281/#6315 log-forgery class).
+        record (the log-forgery class).
         """
         forged = "/tmp/pods/wt-evil\nWARNING forged: reclaim authorized"
         # The message carries the RESOLVED path (drive-lettered and
@@ -800,18 +898,24 @@ class TestSafeReadFile:
         """
         import errno as _errno
 
+        from kiro_crew import platform_compat as _pc
+
         f = tmp_path / "map.json"
         f.write_text("{}", encoding="utf-8")
         resolved = os.path.realpath(str(f))
 
-        real_open = os.open
+        real_no_reparse = _pc.open_file_no_reparse
 
-        def _eloop(path, flags, *args, **kwargs):
+        # Patch the open the code actually performs, not one platform's
+        # implementation of it: the Windows arm of open_file_no_reparse reaches
+        # CreateFileW, so a patch on os.open would simulate the race on POSIX only
+        # and the assertion would pass for the wrong reason on the Windows shard.
+        def _eloop(path, *args, **kwargs):
             if str(path) == resolved:
                 raise OSError(_errno.ELOOP, "symlink swapped in")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
             safe_read_file(str(f))
         message = str(excinfo.value)
@@ -861,18 +965,22 @@ class TestSafeReadFileBytesWithIdentity:
     def test_symlink_swap_at_final_component_is_refused(self, tmp_path, monkeypatch):
         # validate_file_path resolves symlinks, so the refusal is reached by
         # making the post-validation open report ELOOP -- the TOCTOU shape the
-        # O_NOFOLLOW guard exists for.
+        # final-component guard exists for. Patching open_file_no_reparse rather
+        # than os.open keeps the simulation faithful on Windows, whose arm of that
+        # helper reaches CreateFileW instead.
         f = _write(tmp_path / "a.txt", "payload")
         import errno as _errno
 
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eloop(path, flags, *args, **kwargs):
+        real_no_reparse = _pc.open_file_no_reparse
+
+        def _eloop(path, *args, **kwargs):
             if _same(str(path), str(f)):
                 raise OSError(_errno.ELOOP, "symlink swapped in")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink"):
             safe_read_file_bytes_with_identity(str(f), {_identity(f)})
 
@@ -1135,6 +1243,27 @@ class TestSafeCopyFileNolink:
         assert Path(copied).parent == dest
         assert Path(copied).suffix == ".png"
 
+    def test_binary_payload_is_copied_byte_for_byte(self, tmp_path):
+        """A media file must survive the copy exactly, 0x1A and CRLF included.
+
+        This function exists to hand a large binary to a subprocess BY PATH, so
+        byte fidelity is its whole contract. Two Windows-specific hazards can break
+        it while every text-content test still passes: a CRT descriptor in text mode
+        translates CRLF, and it reports end-of-file at the first 0x1A. The copy loop
+        reads with a raw ``os.read``, which honours that mode, so the descriptor has
+        to be opened in binary — a payload of ASCII would not detect either fault.
+        """
+        payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + b"\r\ntail\x1amore\x00\xff"
+        src = tmp_path / "clip.mp4"
+        src.write_bytes(payload)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        copied = safe_copy_file_nolink(str(src), str(dest))
+
+        assert copied is not None
+        assert Path(copied).read_bytes() == payload
+
     def test_copy_is_private(self, tmp_path):
         if _IS_WINDOWS:
             pytest.skip("POSIX mode bits are not meaningful on Windows")
@@ -1252,14 +1381,19 @@ class TestSafeReadFileInternal:
             "_emit_internal_read_audit",
             lambda read_id, outcome: outcomes.append(outcome) or True,
         )
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eacces(path, flags, *args, **kwargs):
+        real_no_reparse = _pc.open_file_no_reparse
+
+        # Patch the seam the read performs. os.open is only the POSIX arm of
+        # open_file_no_reparse, so a patch there would leave the Windows shard
+        # opening the real file and classifying it by contents.
+        def _eacces(path, *args, **kwargs):
             if str(path).endswith(os.path.basename(rel)):
                 raise PermissionError("denied")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eacces)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eacces)
         assert safe_read_file_internal("unreadable") is None
         assert outcomes == ["unreadable"]
 
@@ -1501,9 +1635,8 @@ class TestScriptHookStorePersistence:
         assert store.update(hook.id, {"timeout": 300}).timeout == 300
 
     def test_a_bool_timeout_is_rejected(self, tmp_path):
-        # The deliberate tightening the old test anticipated (issue #5444):
         # ``bool`` is an ``int`` subclass, but ``True`` as a timeout is
-        # meaningless, so the shared validator now rejects it at the update
+        # meaningless, so the shared validator rejects it at the update
         # boundary rather than silently landing a 1-second timeout.
         store = ScriptHookStore(tmp_path)
         hook = store.create({"name": "h1", "command": "true"})
@@ -1950,15 +2083,19 @@ class TestSafeReadFileSymlinkRace:
     def test_eloop_after_canonicalization_is_refused(self, tmp_path, monkeypatch):
         import errno as _errno
 
-        f = _write(tmp_path / "a.txt", "x")
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eloop(path, flags, *args, **kwargs):
+        f = _write(tmp_path / "a.txt", "x")
+        real_no_reparse = _pc.open_file_no_reparse
+
+        # The seam is open_file_no_reparse, which is what carries the
+        # final-component refusal on both platforms; os.open is only its POSIX arm.
+        def _eloop(path, *args, **kwargs):
             if isinstance(path, str) and _same(path, str(f)):
                 raise OSError(_errno.ELOOP, "swapped for a symlink")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink"):
             safe_read_file(str(f))
 
@@ -2082,7 +2219,7 @@ class TestSafeWriteFileNolinkXattrs:
         caller-supplied content, so it shares ``atomic_write``'s allowlist:
         replaying ``security.capability`` there would attach the old file's
         privileges to the new bytes, and ``security.ima``/``security.evm`` are
-        signatures over bytes that no longer exist. The ACL beside them is still
+        signatures over bytes that are gone. The ACL beside them is still
         carried, so this is a filter and not a blanket stop.
         """
         self._require_xattrs()
@@ -2506,3 +2643,97 @@ class TestVerifiedReplaceFileNolink:
         f = _write(tmp_path / "a.txt", "old")
         assert safe_write_file_nolink(str(f), "new") is True
         assert f.read_text(encoding="utf-8") == "new"
+
+
+class TestValidateFilePathRepresentability:
+    """Only an UNREPRESENTABLE path is refused here -- deliberately not more.
+
+    This is a shared chokepoint: `safe_read_file_bytes_nolink` routes through it,
+    and its callers include diagnostics that enumerate a file whose name holds a
+    control character in order to report on it. A broader refusal here turns such
+    a report into "could not be compared" and suppresses the finding, so the
+    control-character class belongs to the boundary that receives the path
+    (`_validate_dashboard_path`) rather than to this function.
+
+    Every caller treats None as the refusal, so a string that got past this point
+    surfaced from the dashboard handlers as an uncaught HTTP 500 rather than a 400.
+    """
+
+    def test_refuses_an_embedded_nul(self):
+        # realpath raises ValueError on it, and no file can be named with one, so
+        # refusing it costs no real name.
+        assert validate_file_path("/tmp/a\x00b") is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "/tmp/(a\x1b[2Jb)",
+            "/tmp/a\x9bb",
+            "/tmp/a\rb",
+            "/tmp/a\tb",
+        ],
+    )
+    def test_does_not_refuse_another_control_character(self, raw):
+        # An agent-writeable directory can hold such a name, and a diagnostic
+        # enumerates it to report divergence, escaping the name for display. If
+        # this function refused it, that report would degrade to "could not be
+        # compared" and the divergence would go unreported -- a suppressed
+        # finding, which is worse than the display hazard it would be guarding.
+        assert validate_file_path(raw) is not None
+
+    def test_refuses_a_path_the_platform_cannot_encode(self):
+        """A lone surrogate: refused where the platform's own encoder refuses it.
+
+        Which answer is correct here is a PLATFORM FACT, not a policy choice, and
+        that is the point of asking the encoder rather than listing characters.
+        On POSIX the handler is surrogateescape, which cannot carry U+D800, so
+        realpath would raise and the path is refused. On Windows it is
+        surrogatepass, which carries it -- and an unpaired surrogate can appear in
+        a legal NTFS name, so refusing it there would reject a real file, which is
+        the harm this gate exists to avoid.
+
+        So the expectation is derived from the same encoder the code consults,
+        rather than hardcoded: a fixed answer here would assert POSIX behaviour on
+        Windows and fail against correct code.
+        """
+        raw = "/tmp/\ud800x"
+        try:
+            raw.encode(sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())
+        except (UnicodeError, ValueError):
+            assert validate_file_path(raw) is None
+        else:
+            assert validate_file_path(raw) is not None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Canonically composed and canonically DECOMPOSED spellings of the
+            # same name. macOS stores the decomposed form, so refusing every
+            # string a sanitizer would alter would reject real files there.
+            "caf\u00e9.md",
+            "cafe\u0301.md",
+            # A name may legally end in a space on POSIX.
+            "trailing ",
+            # The reserved-character shape the schema gate was widened for.
+            "One on one (2026) #1.md",
+        ],
+    )
+    def test_accepts_a_representable_name(self, tmp_path, name):
+        target = tmp_path / name
+        target.write_text("x", encoding="utf-8")
+        assert validate_file_path(str(target)) is not None
+
+    def test_accepts_a_surrogate_escaped_raw_byte_name(self, tmp_path):
+        # A filename holding bytes that are not valid UTF-8 arrives
+        # surrogate-escaped. The platform's own filesystem error handler
+        # round-trips that range, so it is a real file rather than a crash, and
+        # must not be refused alongside the lone surrogate above. Reading the
+        # handler from sys rather than hardcoding one is what keeps this true on
+        # Windows, where it is surrogatepass and an unpaired surrogate can appear
+        # in a legal NTFS name.
+        target = tmp_path / "\udc80raw.md"
+        try:
+            target.write_text("x", encoding="utf-8")
+        except (OSError, UnicodeEncodeError):
+            pytest.skip("filesystem refuses non-UTF-8 names")
+        assert validate_file_path(str(target)) is not None

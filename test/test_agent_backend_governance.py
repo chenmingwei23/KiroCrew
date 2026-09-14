@@ -5,9 +5,8 @@ between them: ``agent_sdk.backends.selectable_backends`` answers "can this BUILD
 (a capability fact, not governable) and this scope answers "may THIS DEPLOYMENT
 select it".
 
-The semantics under test is the decision #6622 was blocked on: an ``allow`` list ADDS
-to the floor rather than replacing the set, so no policy can leave an install with no
-startable harness.
+The semantics under test: an ``allow`` list ADDS to the floor rather than replacing
+the set, so no policy can leave an install with no startable harness.
 
 The ENFORCEMENT POSITION is equally load-bearing and is pinned here too. Policy
 narrows the registry once at boot; nothing downstream gains a check. That is what
@@ -331,7 +330,15 @@ class TestWhenAPolicyChangeBinds:
 
         pd.apply_ceiling(ceiling)
 
-        assert ctx_mod.current_context().governance is ceiling
+        # ``apply_ceiling`` composes the whole ladder around the pushed document (the
+        # local tiers beneath it), so the installed object is the COMPOSED ceiling
+        # tagged ``tier="central"`` -- equal in every control to the argument, not the
+        # same object. Asserting on the deny it carries, not on identity, is what this
+        # test is about: the change bound.
+        installed = ctx_mod.current_context().governance
+        assert installed is not None
+        assert installed.tier == "central"
+        assert not installed.controls["agent_backend"].permits("kas").permitted
 
     def test_a_restart_applies_it(self, monkeypatch):
         # The promise itself: the same denied policy, taken at boot, does bind. This is

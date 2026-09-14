@@ -24,7 +24,13 @@ from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.dashboard.handlers import autonudge as h
-from kiro_crew.monitoring.models import MonitorOutcome, MonitorState, monitor_state_public_dict
+from kiro_crew.monitoring.models import (
+    MonitorCreationSurface,
+    MonitorObservationStatus,
+    MonitorOutcome,
+    MonitorState,
+    monitor_state_public_dict,
+)
 
 
 class _FakeSvc:
@@ -130,6 +136,8 @@ async def test_session_monitor_read_requires_and_uses_authenticated_binding(
     loop = _monitor_loop(slot_key="chat-1-111")
     assert loop.monitor is not None
     loop.monitor.wake_count = 3
+    loop.monitor.last_observation_status = MonitorObservationStatus.PENDING
+    loop.monitor.last_observation_reason_code = "checks_pending"
     _svc(monkeypatch, _FakeSvc([loop]))
 
     cookie_only = await h.api_session_monitor_get(
@@ -155,6 +163,9 @@ async def test_session_monitor_read_requires_and_uses_authenticated_binding(
     assert payload["monitor_id"] == loop.id
     assert payload["monitor"]["target"] == "https://github.com/acme/widgets/pull/7"
     assert payload["monitor"]["wake_count"] == 3
+    assert payload["monitor"]["last_observation_status"] == "pending"
+    assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
+    assert "last_observation_summary" not in payload["monitor"]
 
 
 @pytest.mark.asyncio
@@ -349,6 +360,7 @@ async def test_monitor_list_excludes_persistence_only_fields(
     loop.monitor.last_observation = {
         "blocking_review": "none",
         "checks": {"failed": [], "passed": [], "pending": [], "unknown": []},
+        "checks_complete": True,
         "draft": False,
         "head_revision": "abc123",
         "kind": "github_pull_request",
@@ -392,6 +404,110 @@ async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPa
     assert kwargs["monitor"].budgets.max_tokens == 250_000
     assert kwargs["monitor"].budgets.max_provider_errors == 3
     assert kwargs["replace_existing"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_close_record_cannot_be_restarted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.active = False
+    loop.monitor.outcome = MonitorOutcome.SESSION_CLOSE
+    _svc(monkeypatch, _FakeSvc([loop]))
+    authorize = AsyncMock()
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    restart = await h.api_monitor_restart(
+        _mk(
+            "POST",
+            "/api/monitors/mon-1/restart",
+            match={"monitor_id": loop.id},
+        )
+    )
+
+    assert restart.status == 409
+    assert _body(restart)["code"] == "monitor_not_restartable"
+    authorize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_infers_the_provider_kind_from_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    load_hosts = AsyncMock(return_value=frozenset())
+    monkeypatch.setattr(h, "ensure_gitlab_hosts_loaded", load_hosts, raising=False)
+    authorize = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "target": "https://gitlab.com/acme/widgets/-/merge_requests/8",
+        },
+    )
+
+    response = await h.api_monitor_create(request)
+
+    assert response.status == 200
+    load_hosts.assert_awaited_once_with()
+    assert authorize.await_args.kwargs["monitor"].kind == "gitlab_merge_request"
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_names_a_disallowed_gitlab_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(
+        h,
+        "ensure_gitlab_hosts_loaded",
+        AsyncMock(return_value=frozenset()),
+        raising=False,
+    )
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "kind": "gitlab_merge_request",
+            "target": "https://git.example/acme/widgets/-/merge_requests/8",
+        },
+    )
+
+    response = await h.api_monitor_create(request)
+
+    assert response.status == 400
+    assert _body(response)["code"] == "gitlab_host_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_names_an_invalid_pull_request_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(
+        h,
+        "ensure_gitlab_hosts_loaded",
+        AsyncMock(return_value=frozenset()),
+        raising=False,
+    )
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "kind": "azure_devops_pull_request",
+            "target": "https://dev.azure.com/acme/Bad~Project/_git/widgets/pullrequest/9",
+        },
+    )
+
+    response = await h.api_monitor_create(request)
+
+    assert response.status == 400
+    assert _body(response)["code"] == "invalid_pull_request_url"
 
 
 @pytest.mark.asyncio
@@ -501,6 +617,7 @@ async def test_monitor_restart_is_conditional_on_the_record_it_read(
     loop.active = False
     loop.monitor.outcome = MonitorOutcome.USER_STOP
     loop.monitor.config_generation = 7
+    loop.monitor.creation_surface = MonitorCreationSurface.CHANNEL
     _svc(monkeypatch, _FakeSvc([loop]))
     authorize = AsyncMock(return_value=(loop, None, 200))
     monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
@@ -515,6 +632,7 @@ async def test_monitor_restart_is_conditional_on_the_record_it_read(
     assert response.status == 200
     assert authorize.await_args.kwargs["expected_existing_monitor_id"] == "mon-1"
     assert authorize.await_args.kwargs["expected_existing_config_generation"] == 7
+    assert authorize.await_args.kwargs["creation_surface"] is MonitorCreationSurface.CHANNEL
 
 
 @pytest.mark.asyncio
@@ -536,6 +654,29 @@ async def test_monitor_update_sends_only_explicit_patch_fields(
 
     assert response.status == 200
     assert update.await_args.kwargs["patch"] == {"wake_instructions": "Check the failing jobs."}
+
+
+@pytest.mark.asyncio
+async def test_monitor_update_does_not_reparse_untouched_persisted_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.monitor.target = "malformed persisted target"
+    _svc(monkeypatch, _FakeSvc([loop]))
+    update = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_update_monitor", update)
+    request = _mk(
+        "PATCH",
+        "/api/monitors/mon-1",
+        match={"monitor_id": "mon-1"},
+        body={"cadence_secs": 600},
+    )
+
+    response = await h.api_monitor_update(request)
+
+    assert response.status == 200
+    assert update.await_args.kwargs["patch"] == {"cadence_secs": 600}
 
 
 @pytest.mark.asyncio
@@ -698,6 +839,8 @@ async def test_structured_legacy_row_carries_exactly_the_entitled_keys(
         "approval_stalled",
         "next_due_ts",
         "self_armed",
+        "terminal_notification_outcome",
+        "terminal_notification_stopped_at",
         # Mapped from the monitor's own accounting, not withheld -- withholding
         # them handed the component a default whose label reads "0 = infinity".
         "max_cycles",
@@ -1184,7 +1327,7 @@ async def test_delete_of_an_unknown_loop_is_audited_as_a_noop(
     assert kwargs["session_key"] == ""
 
 
-# --- #9194: an armed auto-nudge loop must read as armed, distinct from none ---
+# --- An armed auto-nudge loop must read as armed, distinct from none ---
 
 
 def _authed_session_monitor_request() -> web.Request:
@@ -1202,7 +1345,7 @@ async def test_session_monitor_read_reports_no_loop_as_not_armed(
 ) -> None:
     """A session with NOTHING armed reads as not armed.
 
-    This is the negative case #9194 turns on: a loop that did not arm must be
+    This is the negative case: a loop that did not arm must be
     distinguishable from one that did. Here no loop exists at all.
     """
     _svc(monkeypatch, _FakeSvc([]))
@@ -1219,8 +1362,8 @@ async def test_session_monitor_read_reports_armed_autonudge_loop(
 ) -> None:
     """A plain auto-nudge loop reads as armed via ``autonudge_loop``.
 
-    Previously this collapsed to ``monitor: None`` — identical to the no-loop
-    case above — which is the observability gap the issue reports.
+    A plain loop must not collapse to ``monitor: None`` — that would be identical
+    to the no-loop case above, the observability gap this pins.
     """
     loop = _loop(slot_key="chat-1-111")
     loop.cycle_count = 4

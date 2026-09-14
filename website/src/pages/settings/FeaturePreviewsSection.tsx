@@ -4,7 +4,7 @@ import { ArrowRight } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
 
 /**
@@ -40,7 +40,7 @@ import { i18nT } from '../../i18n/t'
  * short-lived, so the cost of a card is paid once and then deleted with it.
  *
  * Under `pages/settings/` ON PURPOSE, reversing the old tab's stance:
- * `gen-settings-registry.mjs` scans this directory, so the three toggles ARE
+ * `gen-settings-registry.mjs` scans this directory, so these toggles ARE
  * indexed into Settings search (`PANEL_TAB_MAP` maps this file to `developer`).
  * The old tab kept itself out of the index so that searching "webhooks" would
  * not advertise a hidden page. In Settings the calculus flips: a control the
@@ -88,7 +88,7 @@ function webhooksIntro(): FeaturePreviewIntro {
   }
 }
 
-/** Crew: BOTH doors the one flag opens — the Members page and the create-menu entry. */
+/** Crew Members: the `/members` page, the flag's only door. */
 function crewIntro(): FeaturePreviewIntro {
   return {
     summary: i18nT('pages.developer.featurePreviewsTab.intro.crew_summary'),
@@ -99,12 +99,6 @@ function crewIntro(): FeaturePreviewIntro {
         light: `${MEDIA_BASE}/crew-members-light.png`,
         dark: `${MEDIA_BASE}/crew-members-dark.png`,
         caption: i18nT('pages.developer.featurePreviewsTab.intro.crew_media_members'),
-      },
-      {
-        kind: 'gif',
-        light: `${MEDIA_BASE}/crew-menu-light.gif`,
-        dark: `${MEDIA_BASE}/crew-menu-dark.gif`,
-        caption: i18nT('pages.developer.featurePreviewsTab.intro.crew_media_menu'),
       },
     ],
   }
@@ -126,6 +120,7 @@ export function FeaturePreviewsSection() {
   const webhooks = usePreviewFlag(PREVIEW_WEBHOOKS)
   const crew = usePreviewFlag(PREVIEW_CREW)
   const remoteCrewChat = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  const instanceSessions = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
 
   return (
     // The wrapper exists for the legacy redirect: `?highlight=key:<anchor>`
@@ -178,41 +173,41 @@ export function FeaturePreviewsSection() {
           )}
         </div>
       </SettingsCard>
-      {/* One card, one flag, BOTH crew doors: the Crew Members rail item and the
-          sidebar's "New Crew Mode chat" entry. The toggle copy names both, because
-          a reader who only sees "Crew" cannot predict which of the two moves — and
-          the two appear in places far enough apart that discovering the second one
-          by flipping the switch is not reliable.
+      {/* One card, one flag, one door: the Crew Members page (`/members`) and its
+          rail item. Crew Mode — the second door this card used to name — retired
+          in favour of that page; the sidebar create menu keeps a "Crew Members"
+          entry that opens the page, or lands HERE with this card ringed while the
+          flag is still off (`ChatSidebar.openCrewMembers`).
 
           NO ingress button here, deliberately, unlike the webhooks card above. That
           one needs its link because `/webhooks` is `hiddenFromNav` and the card is
-          its ONLY door. Crew is not: flipping this switch puts the Crew Members row
-          back on the rail in the same tick (`usePreviewFlagRevision`), so a link
-          here would be a second spelling of a door the user can already see — and
-          one that costs a catalog key in twelve languages permanently. */}
+          its ONLY door. Crew Members is not: flipping this switch puts the row back
+          on the rail in the same tick (`usePreviewFlagRevision`), so a link here
+          would be a second spelling of a door the user can already see — and one
+          that costs a catalog key in twelve languages permanently. */}
       <SettingsCard>
         <SettingsToggle
-          label={i18nT('pages.developer.featurePreviewsTab.crew')}
-          description={i18nT('pages.developer.featurePreviewsTab.the_crew_members_page_and_crew_mode_chats_both_a')}
+          label={i18nT('pages.developer.featurePreviewsTab.crew_members')}
+          description={i18nT('pages.developer.featurePreviewsTab.crew_members_desc')}
           checked={crew}
           onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
         />
-        {/* "See what it looks like" is not an ingress: it shows the two doors instead of
-            opening one, which is exactly what a reader who cannot predict which
-            surfaces move needs BEFORE flipping the switch. */}
+        {/* "See what it looks like" is not an ingress: it shows the page instead of
+            opening it, which is what a reader deciding whether to flip the switch
+            needs BEFORE flipping it. */}
         <div className="pt-1">
           <FeaturePreviewIntroButton
-            title={i18nT('pages.developer.featurePreviewsTab.crew')}
+            title={i18nT('pages.developer.featurePreviewsTab.crew_members')}
             intro={crewIntro()}
             checked={crew}
             onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
           />
         </div>
       </SettingsCard>
-      {/* A SEPARATE card from Crew above, because the word names two unrelated
-          things: that flag holds Crew Mode and the Crew Members page, this one
-          holds a chat dispatched to another MACHINE over the instances tunnel.
-          One card each keeps a reader from flipping the wrong switch.
+      {/* A SEPARATE card from Crew Members above, because the word names two
+          unrelated things: that flag holds the Crew Members page, this one holds
+          a chat dispatched to another MACHINE over the instances tunnel. One card
+          each keeps a reader from flipping the wrong switch.
 
           NO ingress button, for the same reason as the crew card: turning it on
           puts the create-menu entry back in the same tick, and that menu is
@@ -231,6 +226,23 @@ export function FeaturePreviewsSection() {
           description={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc')}
           checked={remoteCrewChat}
           onChange={v => setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, v)}
+        />
+      </SettingsCard>
+      {/* Adjacent to the card above and still SEPARATE from it, because the two
+          point opposite ways across the same tunnel: that flag DISPATCHES a chat
+          to another machine, this one LISTS the sessions that machine already
+          owns. Sharing a card would imply flipping one gets the other.
+
+          NO ingress button, and for a different reason than the crew cards: they
+          omit it because their door is already on screen, whereas this preview
+          has no page of its own at all — it changes the Sessions list every user
+          is already looking at, so the toggle IS the whole affordance. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.remote_instance_sessions')}
+          description={i18nT('pages.developer.featurePreviewsTab.merge_a_connected_remote_instances_live_sessions')}
+          checked={instanceSessions}
+          onChange={v => setPreviewFlag(PREVIEW_INSTANCE_SESSIONS, v)}
         />
       </SettingsCard>
     </SettingsSection>

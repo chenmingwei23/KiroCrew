@@ -34,14 +34,18 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.config import live
+from kiro_crew.config.sections import _normalize_threshold_pair
 from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import compact_unsupported_backend
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
     drive_turn,
+    hold_inbound_callback,
     inbound_permitted,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
@@ -60,6 +64,7 @@ if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
     from kiro_crew.weixin.client import ContextTokenStore, TypingTicketCache, WeixinClient
+    from kiro_crew.weixin.transport import WeixinTransport
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +99,7 @@ _COMPACT_NOTHING = "ℹ️ 当前没有可压缩的对话。"
 _COMPACT_DONE = "🗜️ 已压缩上下文。"
 _COMPACT_FAILED = "⚠️ 压缩失败，请重试。"
 #: This surface speaks Chinese; the wording translates
-#: ``messaging.commands.compact_unsupported_reply`` (#8156).
+#: ``messaging.commands.compact_unsupported_reply``.
 _COMPACT_AUTO_MANAGED = "ℹ️ 当前后端会自动压缩上下文，无需手动 /compact。"
 
 
@@ -130,18 +135,69 @@ class WeixinDispatcher:
         self.conv_log = conv_log
         self.approval_mode = approval_mode
         self.client: "WeixinClient | None" = None
+        # Set by maybe_start_weixin after construction; the config applier pushes
+        # reloaded authorization fields at it.
+        self.transport: "WeixinTransport | None" = None
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Held on self: the watcher holds the owner WEAKLY.
+        self._config_sub = live.watch_section(
+            self, "weixin", "messaging", target="transport", name="WeixinDispatcher"
+        )
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when armed, else a fingerprint-cached ``load()``,
+        else the boot copy -- a rotation window or a threshold is not an
+        authorization decision, so a momentarily unreadable file keeps the turn
+        running on the value the operator last had in force.
+        """
+        return live.current(self.cfg, log_prefix="weixin")
+
+    def _thresholds(self) -> tuple[int, int]:
+        """``(soft, hard)`` context thresholds from the live config.
+
+        Re-runs the loader's pair normalization: read live without it, an
+        inverted pair makes the soft nudge unreachable because ``_maybe_notice``
+        tests ``pct >= hard`` first.
+        """
+        section = self._live_cfg().weixin
+        return _normalize_threshold_pair(
+            int(getattr(section, "soft_threshold_pct", 80)),
+            int(getattr(section, "hard_threshold_pct", 95)),
+        )
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
     async def handle_message(self, inbound: InboundMessage) -> None:
-        """Drive one authorized inbound Weixin message through TurnDriver."""
+        """Reserve and drive one authorized inbound Weixin callback."""
         assert self.client is not None, "WeixinDispatcher.client must be set"
-        # Inbound channels-governance gate (off-loop) — recheck per message so a
-        # host-profile deny added after connect stops dispatch without a restart
-        # (the startup gate only blocks CONNECTING). Silently drop on deny.
-        if not await inbound_permitted("weixin"):
-            return
+        inbound_route = InboundRoute(
+            conversation_id=inbound.conversation_id,
+            text=inbound.text,
+            user_id=inbound.user_id,
+            attachments_dropped=len(inbound.attachments or ()),
+        )
+        # Weixin dispatches inline on its long-lived poll task. A task-done lease
+        # would therefore stay held until disconnect and defer every later update;
+        # this scope releases exactly when this one callback returns.
+        async with hold_inbound_callback(
+            self.sessions,
+            channel_type="weixin",
+            route=inbound_route,
+        ) as admitted:
+            if not admitted:
+                return
+            # Recheck governance only after this accepted callback is visible;
+            # the off-loop policy read must not precede reservation.
+            if not await inbound_permitted("weixin"):
+                return
+            await self._handle_admitted(inbound)
+
+    async def _handle_admitted(self, inbound: InboundMessage) -> None:
+        """Drive one callback after update admission has been reserved."""
         user_id = inbound.user_id
         text = inbound.text
         logger.info("weixin inbound from %s: %d chars", user_id, len(text or ""))
@@ -159,7 +215,15 @@ class WeixinDispatcher:
                 await self._say(user_id, _ATTACHMENT_WITH_COMMAND)
             if cmd == "new":
                 self._conv.bump_gen(user_id)
-                await self._say(user_id, _NEW_SESSION)
+                saved = await reserve_new_generation(
+                    self.sessions,
+                    self._session_key(user_id),
+                    channel_type="Weixin",
+                )
+                message = _NEW_SESSION
+                if not saved:
+                    message += "\n⚠️ 新对话无法保存，重启后可能恢复到上一段对话。"
+                await self._say(user_id, message)
                 return
             if cmd == "help":
                 await self._say(user_id, build_help())
@@ -185,10 +249,10 @@ class WeixinDispatcher:
         attachment_temp_paths: list[str] = []
         # Captured BEFORE ingestion, which clears ``inbound.attachments`` and
         # inlines the temp paths into the text. The durable inbound spool needs
-        # both originals (issue #2217): the count is what tells the restart
+        # both originals: the count is what tells the restart
         # notice this turn carried media that was not carried over, and the
         # pre-ingestion text is what the notice quotes -- the ingested form
-        # holds paths to files that no longer exist.
+        # holds paths to temp files that are gone after a restart.
         original_text = text
         original_attachments = len(inbound.attachments or ())
         if inbound.attachments:
@@ -272,9 +336,9 @@ class WeixinDispatcher:
         """Session acquisition + turn dispatch for one already-ingested message.
 
         ``original_text`` / ``original_attachments`` are the pre-ingestion values,
-        which this frame can no longer recover: ingestion clears
+        which this frame cannot recover: ingestion clears
         ``inbound.attachments`` and rewrites the text with temp paths that are gone
-        after a restart. They exist for the durable inbound spool (issue #2217).
+        after a restart. They exist for the durable inbound spool.
         """
         assert self.client is not None
         # ── Mid-turn concurrency: check the CURRENT-generation key for an
@@ -285,11 +349,12 @@ class WeixinDispatcher:
             await self._handle_busy(inbound, session_key)
             return
 
+        messaging = self._live_cfg().messaging
         self._conv.maybe_rotate(
             user_id,
             time.time(),
-            idle_minutes=self.cfg.messaging.idle_reset_minutes,
-            daily_reset_hour=self.cfg.messaging.daily_reset_hour,
+            idle_minutes=messaging.idle_reset_minutes,
+            daily_reset_hour=messaging.daily_reset_hour,
         )
         session_key = self._session_key(user_id)
         conversation_id = f"weixin:{user_id}"
@@ -312,7 +377,7 @@ class WeixinDispatcher:
             ChannelTurn(
                 channel_type="weixin",
                 session_key=session_key,
-                # Durable inbound spool (issue #2217): the peer id IS the reply
+                # Durable inbound spool: the peer id IS the reply
                 # target on this DM-only channel, and the reply's context_token
                 # is already persisted off-loop, so the restart notice can land.
                 # ``original_text`` with NO fallback to the ingested ``text``: the
@@ -463,7 +528,7 @@ class WeixinDispatcher:
             self._resolve_agent(),
             user_id,
             gen=gen,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _seed_gen(self, user_id: str) -> int:
@@ -472,7 +537,7 @@ class WeixinDispatcher:
             channel="weixin",
             agent=self._resolve_agent(),
             user_id=user_id,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _persist_turn(
@@ -517,10 +582,9 @@ class WeixinDispatcher:
         an additional safety net.
         """
         pct = self.sessions.check_context_usage(session_key, provider)
-        hard = getattr(self.cfg.weixin, "hard_threshold_pct", 95)
-        soft = getattr(self.cfg.weixin, "soft_threshold_pct", 80)
+        soft, hard = self._thresholds()
         if pct >= soft:
-            # Capability gate (#8156): no forced compaction to run and the
+            # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
             # on its own as context fills.
             unsupported = compact_unsupported_backend(provider)
@@ -555,7 +619,7 @@ class WeixinDispatcher:
             if provider is None:
                 await self._say(user_id, _COMPACT_NOTHING)
                 return
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate (mirroring the dashboard's gate): a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # unbounded wait below. Informational, never an error.

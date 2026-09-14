@@ -292,11 +292,45 @@ access token.
   retires running identity-store processes (`dashboard/handlers/kas_login.py`), so
   neither a refresh in flight nor a process holding the old access token in memory
   outlives the logout.
-- Known limit: the spawn-time probe (`auth/bridge.vault_holds_identity`) accepts a
-  stored identity whose access token is live or which carries a refresh token; it
-  cannot know without a network call that an issuer will reject that refresh token.
-  A persistently rejected one surfaces as a failed callback (the engine's sign-in
-  prompt) and is shown by `kirocrew doctor` (`crew vault:` line); signing out clears
-  it and the next spawn is kiro-cli-owned. Automatic demotion to cli-owned after a
-  persistent refresh failure is not implemented.
-- Mounting `KasLoginGate` at the app root.
+- Known limit, by decision: the spawn-time probe (`auth/bridge.vault_holds_identity`)
+  accepts a stored identity whose access token is live or which carries a refresh
+  token; it cannot know without a network call that an issuer will reject that
+  refresh token. When a refresh IS refused (issuer answers 400/401/403,
+  `auth/refresh.RefreshRejected`), the refresher records a token-free marker beside
+  the vault (`TokenStore.mark_refresh_rejected`, cleared by any new credential
+  landing in the slot), and that marker is what `kirocrew doctor` (`crew vault:`
+  line), `KasLoginService.status()` (`refresh_rejected`) and the dashboard's
+  Kiro sign-in card report as "sign-in expired -- sign in again". The marker does
+  NOT feed the spawn decision: a lapsed Crew identity is told to the user (the
+  card, and the agent's "not signed in" error row with its sign-in deep link),
+  never silently handed back to whatever `kiro-cli login` holds. Automatic
+  demotion to cli-owned after a persistent refresh failure is therefore not a
+  gap to close but a behaviour deliberately not built (see #9772); the
+  pre-existing "expired access token with no refresh token" case, which the probe
+  already treats as no usable identity, is left as it is and not extended.
+- The product entry point for the flow is the **Kiro sign-in card** on Developer >
+  Agent Backend (`website/src/pages/developer/KiroSignInCard.tsx`), rendered by
+  `AgentBackendTab` under the backend switch and only while KAS is a backend that
+  switch offers -- the stored identity is consumed by the KAS relay alone, so a
+  build or policy that cannot select KAS has nothing to sign in for. The card
+  embeds the same views `KasLoginGate` renders (`KasLoginEmbedded`, card chrome
+  instead of the scrim + aside door) and adds a signed-in summary (provider,
+  expiry, renewability -- never a token) with sign-out and sign-in-again. It is
+  reachable from the chat error row an `AcpAuthRequired` turn produces
+  (`chat_utils.AUTH_REQUIRED_KIND` → "Sign in to Kiro", navigating to
+  `KIRO_SIGN_IN_PATH` = `/developer?tab=agent-backend&highlight=key:kiro-sign-in`
+  with the colon percent-encoded, from `pages/developer/kiroSignInLink.ts`,
+  whose `highlight` rings the card through `useSettingHighlight`, which the
+  Developer page mounts for exactly this link) and from the KAS remedy
+  strings in `agent_sdk/host_auth.py`. Its intro sentence names the backend
+  ("Used only by the KAS (kiro-agent) backend") and says Kiro CLI keeps its own
+  kiro-cli login, because the card sits under a switch that also lists Kiro
+  CLI. It is deliberately NOT on Settings > Overview and not indexed into
+  Settings search: KAS is a Developer Mode preview, and a provider chooser on
+  the landing page read as a required step to every user, first-run installs
+  included. Overview carries only a one-line signpost to the card
+  (`KiroSignInMovedPointer`), rendered while `agent.acp_backend` is `kas`, for
+  the users who read token expiry there. The `/developer` route is always mounted;
+  only its sidebar entry is behind Developer Mode, which a user running KAS
+  turned on to select it. `KasLoginGate` itself is still not mounted at the app
+  root; the full-screen form stays available for that.

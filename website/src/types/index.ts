@@ -185,6 +185,8 @@ export interface UpdateCheckResult {
   mode?: string
   can_download?: boolean
   can_apply?: boolean
+  /** This install can use the nonce-backed host approval flow. */
+  can_arm?: boolean
   requires_restart?: boolean
   channel?: string
   latest_version?: string
@@ -392,6 +394,8 @@ export interface SessionTrashResult {
 }
 
 export interface CronJob {
+  member_id?: string
+  memory_store?: string
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
@@ -404,11 +408,18 @@ export interface CronJob {
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
   hide_in_chat?: boolean
-  /** When true, this cron's runs skip memory, lessons, steering, skills and
-   * prior session history, so a routine job stops paying for context it never
-   * reads. Default false. */
+  /** When true, omit optional saved context and prior session history. V1 also
+   * skips its memory, lessons, steering and skills injection; member V2 retains
+   * its complete essential guidance and protected identity. Default false. */
   minimal_context?: boolean
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
+  /** Retry telemetry for the LAST completed run: how many transient-backend
+   *  retries it took (0 = none needed) and when that run finished. Absent on
+   *  an older gateway or a job that has never run. */
+  last_retry_count?: number
+  /** The `last_run_ts` `last_retry_count` describes; a mismatch means the count
+   *  belongs to an earlier run (a cancelled run advances `last_run_ts` only). */
+  last_retry_run_ts?: number
   /** IANA timezone the cron expression's hour/minute fields are stored in.
    * Absent / null for legacy jobs created without an explicit TZ — treat as UTC. */
   timezone?: string | null
@@ -430,10 +441,105 @@ export interface CronJob {
    * which is invisible to every chat session and manageable only from the
    * Schedule page or the CLI. */
   session_key?: string | null
+  /** Schedule-page template preset id this job was seeded from (e.g.
+   * "error-digest"), or null/absent for a blank create or any non-dashboard
+   * create surface. Compared against the live SCHEDULE_PRESETS catalog on the
+   * Schedule page to hint when the source template's prompt has since changed. */
+  source_preset?: string | null
+  /** The source template's prompt text as it was when this job was saved. The
+   * Schedule page compares THIS against the live template prompt (did the
+   * template move?), never the job's current message (which the user may have
+   * edited), so the "template updated" hint is attributable. Null/absent when
+   * the job carries no template lineage. */
+  source_template_prompt?: string | null
 }
 
 export interface Lesson {
   rule: string; category: string; ts: string
+}
+
+/** One row of `GET /api/memory/stores` — a declared memory store.
+ *
+ *  Every count is BEST-EFFORT. A store whose file is missing or unreadable
+ *  answers `exists: false` with null counts instead of failing the listing, so
+ *  one damaged silo cannot hide every healthy one from the picker. `null`
+ *  therefore means "not known" and must never be rendered as zero.
+ */
+export interface MemoryStoreSummary {
+  /** Declared name. `'default'` addresses the global store. */
+  name: string
+  owner_member?: string
+  /** The owner's validated avatar override; use owner_member as its exact seed. */
+  owner_avatar?: unknown
+  memory_version?: number | null
+  is_default: boolean
+  /** `'v1'` is the shared schema every install starts on; `'crew'` is the
+   *  faceted per-silo schema. Typed open so a lineage added later still
+   *  renders instead of falling through a closed union. */
+  lineage: 'v1' | 'crew' | string
+  exists: boolean
+  semantic_count: number | null
+  episodic_count: number | null
+  lessons_count: number | null
+  /** Whether carve facets apply. False on the v1 lineage, whose rows carry no
+   *  facet columns at all — which is a different answer from "no rows". */
+  facets_supported: boolean
+  backup_count: number | null
+  /** ISO-8601 UTC, or null when the store has never been backed up. */
+  newest_backup: string | null
+}
+
+/** One row of `GET /api/memory/retired` — an episode a semantic write superseded.
+ *
+ *  Nothing hard-deletes an episode, so the text survives and the row can be put
+ *  back. `retired_times` counts retirements rather than rows, because an episode
+ *  can be retired, restored and retired again.
+ */
+export interface RetiredMemory {
+  id: string
+  text: string
+  /** Key of the semantic entry that superseded it; empty when unrecorded. */
+  superseded_by?: string
+  retired_times?: number
+  /** ISO-8601 stamp of the MOST RECENT retirement. */
+  ts?: string
+}
+
+/** One row of `GET /api/memory/backups`.
+ *
+ *  `name` is the only handle a restore takes. The route returns no filesystem
+ *  path on purpose: that would hand the browser the data-home layout.
+ */
+export interface MemoryBackup {
+  name: string
+  size_bytes: number
+  /** ISO-8601 UTC, read from the stamped file name rather than the file's mtime,
+   *  which a copy or a restore rewrites while the name still says when the
+   *  contents were taken. */
+  taken_at: string
+}
+
+/** One row of a carve page (`GET /api/memory/carve` with no `count_by`).
+ *
+ *  The embedding and `value_json` are absent from the wire by design, so a
+ *  carve hands back a partition rather than a vector.
+ */
+export interface MemoryCarveEntry {
+  id: string
+  kind: string
+  key?: string
+  text?: string
+  tags?: string
+  importance?: number
+  confidence?: number
+  source?: string
+  created_at?: string
+  updated_at?: string
+  scope?: string
+  surface?: string
+  crew?: string
+  session_key?: string
+  derived_from?: string
 }
 
 export interface Skill {
@@ -785,6 +891,15 @@ export interface TodoList {
 export interface McpSessionReport {
   /** Server names Kiro Crew put on the wire for this session. */
   configured: string[]
+  /**
+   * Agent-spec `@server` tool refs that named no server this session receives.
+   *
+   * A different claim from every bucket below: those say what a *configured*
+   * server reported, this says the spec asked for one that was never
+   * configured — so it has no row here to be missing from. Optional because a
+   * gateway from before the guard shipped sends no such key.
+   */
+  unresolved_refs?: string[]
   /** Reported initialized. */
   ready: string[]
   /** Reported a startup failure. */
@@ -900,7 +1015,19 @@ export interface ChatSlot {
    *  inside a request routed back through that instance. */
   executor?: 'local' | 'remote'
   instance_id?: string
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  /** The identity the sidebar renders this row under, resolved by the SERVER.
+   *
+   *  A purely local session is its own key. A remote-bound one — minted on a crew
+   *  or adopted from a peer row — is `<instance_id>:<peer_key>`, the identity the
+   *  peer row already carried. Preserving it across the bind is what makes the row
+   *  the user clicked BECOME the session, rather than a second element appearing
+   *  beside it, and it keeps a `data-session-row` selector stable across the adopt.
+   *
+   *  Absent on an older payload, and absent on a peer row — `sessionRowIdentity`
+   *  falls back to `peer_id` + `key` for those. Never parse it to recover the local
+   *  slot key: read `key`. */
+  row_identity?: string
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -1147,6 +1274,13 @@ export interface ChatMessage {
   _toolCount?: number
   /** Message kind discriminator for special message types (e.g. 'stop_event'). */
   kind?: string
+  /** On a `streaming` row of a slot snapshot: the newest chunk seq the server
+   *  folded into it. The client seeds its replay guard (`lastChunkSeq`) from it
+   *  so a live chunk that races the snapshot is not appended a second time.
+   *  Absent from an older gateway, which means "apply every chunk as before". */
+  seq?: number
+  /** Gateway process generation that numbered `seq` (folded snapshot rows). */
+  gen?: string
 }
 
 export interface SubagentActivity {

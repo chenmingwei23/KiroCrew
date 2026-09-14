@@ -12,6 +12,10 @@ consumer asks instead of naming a harness is
 tool calls reach the PreToolUse gate is :mod:`kiro_crew.agent_sdk.tool_gate`.
 
 Machine-local backend readiness lives in :mod:`kiro_crew.agent_sdk.backend_install`.
+How a harness signs in -- which store holds its entitlement, and the remedy to
+print when it does not -- is declared once per harness in
+:mod:`kiro_crew.agent_sdk.host_auth`, and the credential floor, the sandbox mask,
+the doctor row and the backend panel all project from that one declaration.
 Promptless structured command batches live in
 :mod:`kiro_crew.agent_sdk.native_commands`; their ACP process lifecycle and
 exception translation stay in the driver, and only plain data crosses upward.
@@ -72,6 +76,15 @@ from kiro_crew.agent_sdk.capabilities import (
     capabilities_for,
     capabilities_of,
 )
+from kiro_crew.agent_sdk.drivers.acp import finish_suspended_spawn
+from kiro_crew.agent_sdk.host_auth import (
+    UNKNOWN_AGENT_AUTH,
+    AgentAuthDeclaration,
+    AgentInteractiveLogin,
+    declaration_for,
+    entitlement_label,
+    signs_in_separately,
+)
 from kiro_crew.agent_sdk.native_commands import NativeCommandBatch, run_kiro_native_commands
 
 TURN_STOP_REASON_CANCELLED = "cancelled"
@@ -92,6 +105,12 @@ __all__ = [
     "UNKNOWN_BACKEND_CAPABILITIES",
     "capabilities_for",
     "capabilities_of",
+    "UNKNOWN_AGENT_AUTH",
+    "AgentAuthDeclaration",
+    "AgentInteractiveLogin",
+    "declaration_for",
+    "entitlement_label",
+    "signs_in_separately",
     "CACHE_TTL_SECONDS",
     "COMPONENT_CLAUDE_ACP_ADAPTER",
     "COMPONENT_CLAUDE_CODE_CLI",
@@ -102,6 +121,7 @@ __all__ = [
     "BackendInstallState",
     "NativeCommandBatch",
     "clear_probe_cache",
+    "finish_suspended_spawn",
     "probe_backend",
     "probe_backends",
     "run_kiro_native_commands",

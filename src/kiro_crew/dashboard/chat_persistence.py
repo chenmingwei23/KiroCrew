@@ -14,11 +14,17 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterator, Mapping
 from itertools import islice
+from pathlib import Path
 
 from kiro_crew import model_registry
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import agent_model_map
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.chat_attachments import (
+    ImageBudget,
+    persist_inline_images,
+    same_text_modulo_images,
+)
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
@@ -65,6 +71,7 @@ from kiro_crew.history import (
     transcript_sort_key,
     update_metadata_off_loop,
 )
+from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -228,6 +235,32 @@ def _validate_reasoning_effort(raw: object) -> str:
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
     return ""
+
+
+#: Retired session modes. A slot persisted under one of these comes back as a
+#: PLAIN chat: the transcript is untouched and still renders; there is no
+#: mode-specific dispatch for it, because the mode itself is gone.
+#:
+#: ``crew`` — Crew Mode (one session fanning topics out to sub-sessions),
+#: retired in favour of the Crew Members page. Its durable store under
+#: ``<data home>/crew/`` is neither read nor deleted here; the transcript is
+#: the user's record and the store held only routing state.
+_RETIRED_MODES: frozenset[str] = frozenset({"crew"})
+
+
+def _restored_mode(raw: object) -> str:
+    """The mode a persisted slot comes back with, or "" for plain chat.
+
+    Maps a :data:`_RETIRED_MODES` value to "" rather than refusing the restore:
+    the session and its history are still the user's, the mode that once
+    dispatched them is not. Anything that is not a non-empty string is "" too,
+    which matches what the old ``if meta.get("mode")`` guard admitted.
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    if raw in _RETIRED_MODES:
+        return ""
+    return raw
 
 
 def _validate_autocompact_pct(raw: object) -> float | None:
@@ -765,6 +798,70 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
         slot.messages[-1]["variant_idx"] = m.get("variant_idx", 0)
 
 
+def _pin_private_agent_assignment(
+    session_key: str,
+    agent: str,
+    config: KiroCrewConfig,
+    *,
+    conversation_log=None,
+    native_context: bool = False,
+) -> str:
+    """Pin an owner-selected member, never a name recovered from history.
+
+    Callers must positively authorize the owner request before using this
+    helper. Legacy members keep their declared V1 memory until owner opt-in.
+    """
+    selected = agent or config.default_agent
+    if selected == "default":
+        return ""
+    member = config.agents.get(selected)
+    store = getattr(member, "memory_store", "")
+    if not store:
+        return ""
+    record = config.memory_stores.get(store) if isinstance(store, str) else None
+    if record is None or record.memory_version != 2:
+        return ""
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    store = require_member_memory_store(config, selected)
+    log = conversation_log if conversation_log is not None else ConversationLog()
+    if read_private_session_store(session_key) is None and (
+        native_context or log.has_log(session_key)
+    ):
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        raise UnknownMemoryStore(
+            "This conversation retains its V1 history. Open a new conversation for private memory."
+        )
+    bind_private_session_store(session_key, store)
+    return store
+
+
+async def pin_private_agent_store(
+    state: DashboardState, session_key: str, agent: str, config: KiroCrewConfig
+) -> str:
+    """Run :func:`_pin_private_agent_assignment` off the loop for one slot.
+
+    ``native_context`` is whether the session already has a live or resumable
+    provider: such a session carries V1 context no transcript row shows yet.
+    Callers snapshot the slot before awaiting and re-compare afterwards; this
+    helper only owns the file IO hop and the probe.
+    """
+    return await asyncio.to_thread(
+        _pin_private_agent_assignment,
+        session_key,
+        agent,
+        config,
+        conversation_log=state.conversation_log,
+        native_context=(
+            state.sessions.get_provider(session_key) is not None
+            or bool(state.sessions.resumable_sid(session_key))
+        ),
+    )
+
+
 def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     """Resolve a member slot's restore identity from its binding.
 
@@ -778,14 +875,13 @@ def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     # Function-local ON PURPOSE: kiro_crew.members imports kiro_crew.artifacts
     # (slugify), and importing that at module scope closes the
     # artifacts -> ... -> webhooks -> validation -> artifacts cycle when this
-    # module loads inside crew_chat's import graph
-    # (test_crew_chat_does_not_import_the_dashboard_handler_tree pins this).
+    # module is imported outside the dashboard handler tree.
     from kiro_crew import members as members_mod
 
     prefix = members_mod.DM_SLOT_KEY_PREFIX
     if not slot_name.startswith(prefix):
         return None
-    binding = members_mod.read_dm_binding(slot_name[len(prefix) :])
+    binding = members_mod.read_dm_binding_for_slot(slot_name)
     member = (binding or {}).get("member", "")
     if not member:
         logger.warning(
@@ -942,6 +1038,7 @@ def _rehydrate_slot_from_history(
         # Legacy metadata has no ``created_at``: record the observation
         # itself so the guard's missing-file witness still fires for it.
         slot._disk_meta_observed = bool(meta)
+        slot._memory_assignment_from_history = True
         # Member keys keep the binding-derived agent/mode: transcript metadata
         # is the operator-editable file the pin must not re-derive from.
         if meta.get("agent") and _member_identity is None:
@@ -970,6 +1067,8 @@ def _rehydrate_slot_from_history(
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
+        if meta.get("memory_store"):
+            slot.memory_store = str(meta["memory_store"])
         if meta.get("project"):
             slot.project = meta["project"]
         # Restore the remote executor marker INDEPENDENTLY of its target fields.
@@ -1001,8 +1100,8 @@ def _rehydrate_slot_from_history(
             # dispatched, so there is no in-flight tail to recover.
             if slot.is_remote:
                 _relay_was_in_flight = bool(meta.get("relay_in_flight"))
-        if meta.get("mode") and _member_identity is None:
-            slot.mode = meta["mode"]
+        if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
+            slot.mode = _mode
         if meta.get("created_by"):
             # Creator attribution restored so the member ownership boundary in
             # session-control authorization survives a restart: without it every
@@ -1044,6 +1143,11 @@ def _rehydrate_slot_from_history(
             if getattr(state, "_tags_authoritative", True):
                 known = {t.get("id") for t in state._tags}
                 slot.tags = [t for t in slot.tags if t in known]
+            # Keep "tags changed => revision changed" everywhere tags are
+            # replaced (chat_tags.py cannot be imported here: it imports us).
+            bump_revision = getattr(slot, "bump_tags_revision", None)
+            if callable(bump_revision):
+                bump_revision()
         if meta.get("auto_tagged"):
             slot._auto_tagged = True
         if meta.get("human_seen"):
@@ -1507,6 +1611,7 @@ def _apply_recent_session(
     # Legacy metadata has no ``created_at``: record the observation itself so
     # the guard's missing-file witness still fires for it.
     slot._disk_meta_observed = bool(meta)
+    slot._memory_assignment_from_history = True
     # Member keys keep the binding-derived agent/mode: transcript metadata is
     # the operator-editable file the pin must not re-derive from.
     if meta.get("agent") and _member_identity is None:
@@ -1532,10 +1637,12 @@ def _apply_recent_session(
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
+    if meta.get("memory_store"):
+        slot.memory_store = str(meta["memory_store"])
     if meta.get("project"):
         slot.project = meta["project"]
-    if meta.get("mode") and _member_identity is None:
-        slot.mode = meta["mode"]
+    if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
+        slot.mode = _mode
     if meta.get("created_by"):
         # Same rehydration as _rehydrate_slot_from_history: without it a
         # member-created worker restored through the recent-session path
@@ -1578,6 +1685,11 @@ def _apply_recent_session(
         if getattr(state, "_tags_authoritative", True):
             known = {t.get("id") for t in state._tags}
             slot.tags = [t for t in slot.tags if t in known]
+        # Keep "tags changed => revision changed" everywhere tags are
+        # replaced (chat_tags.py cannot be imported here: it imports us).
+        bump_revision = getattr(slot, "bump_tags_revision", None)
+        if callable(bump_revision):
+            bump_revision()
     if meta.get("auto_tagged"):
         slot._auto_tagged = True
     if meta.get("human_seen"):
@@ -1959,25 +2071,60 @@ _entry_cache: OrderedDict[str, tuple[dict | None, int]] = OrderedDict()
 _entry_cache_bytes = 0
 
 # Lazily resolved ``(max_entries, max_bytes)`` for the entry cache. Resolved
-# once per process and then served from this module global: the builder runs on
-# every message of every flush, so it must not stat or parse ``config.json``
-# per call, and the one-time read keeps the hot path free of config I/O the way
-# the loader's push pattern does for the event loop. A changed value therefore
-# takes effect on the next gateway restart, which the config field descriptions
-# state. ``None`` means "not resolved yet"; tests reset it via the autouse
-# cache-isolation fixture in ``test/conftest.py``.
+# once and then served from this module global: the builder runs on every
+# message of every flush, so it must not stat or parse ``config.json`` per call,
+# and the memo keeps the hot path free of config I/O the way the loader's push
+# pattern does for the event loop. The memo is INVALIDATED on a config write
+# (see ``_on_config_change``), so a changed bound takes effect on the next flush
+# rather than on the next gateway restart. ``None`` means "not resolved yet";
+# tests reset it via the autouse cache-isolation fixture in ``test/conftest.py``.
 _entry_cache_bounds_cached: tuple[int, int] | None = None
 _entry_cache_bounds_read_warned = False
+
+#: The registered bounds applier, kept so ``watch_config`` stays idempotent.
+_entry_cache_config_sub: object = None
+
+
+def _on_config_change(change: object) -> None:
+    """Drop the memoised entry-cache bounds so the next read re-resolves them.
+
+    Invalidation rather than a push, because the memo is read on the flush hot
+    path and a config write is rare: clearing it costs one assignment and the
+    next flush pays a single fingerprint-cached load. The read-failure warning
+    latch is cleared with it, so a bound that starts working again warns once
+    more instead of staying silent about a NEW failure.
+    """
+    del change  # either bound changing invalidates the same pair
+    global _entry_cache_bounds_cached, _entry_cache_bounds_read_warned
+    _entry_cache_bounds_cached = None
+    _entry_cache_bounds_read_warned = False
+
+
+def watch_config() -> None:
+    """Register the entry-cache bounds invalidator on the process config watcher."""
+    global _entry_cache_config_sub
+    if _entry_cache_config_sub is not None:
+        return
+    from kiro_crew.config import live
+
+    _entry_cache_config_sub = live.subscribe(
+        "dashboard.chat_entry_cache_max_entries",
+        "dashboard.chat_entry_cache_max_bytes",
+        callback=_on_config_change,
+        name="chat-entry-cache-bounds",
+    )
 
 
 def _entry_cache_bounds() -> tuple[int, int]:
     """Configured ``(max_entries, max_bytes)`` bounds for the entry cache.
 
     Reads the validated config once (loader-clamped to the documented ranges)
-    and memoises the pair for the process lifetime. Falls back to the built-in
-    defaults when the loaded values are not real integers (a stubbed config
+    and memoises the pair until a config write invalidates it (see
+    ``_on_config_change``). Falls back to the built-in defaults when the loaded
+    values are not real integers (a stubbed config
     object would otherwise flow a non-numeric value into the eviction
-    comparison) -- that shape is process-permanent, so it latches. A config
+    comparison) -- that shape does not change without a config write, so it
+    memoises like any other resolved pair. A config
     read that RAISES falls back to the defaults for this call WITHOUT
     latching, so a transient failure retries on the next call instead of
     discarding an operator's setting for the process lifetime; ``load()``
@@ -2045,7 +2192,7 @@ def _approx_window_payload_bytes(window: list[dict]) -> int:
     return total
 
 
-def _build_message_entry(m: dict) -> dict | None:
+def _build_message_entry(m: dict, *, attachments: tuple[Path, str] | None = None) -> dict | None:
     """Memoised front door to :func:`_build_message_entry_uncached`.
 
     The cached value is the POST-redaction entry, never the raw input, so a hit
@@ -2063,14 +2210,20 @@ def _build_message_entry(m: dict) -> dict | None:
         payload = json.dumps(m, sort_keys=True, default=str)
     except Exception:
         # An unserializable message must still persist; fall back to computing it.
-        return _build_message_entry_uncached(m)
+        return _build_message_entry_uncached(m, attachments=attachments)
     key = hashlib.sha256(payload.encode()).hexdigest()
+    # *attachments* is part of the cache KEY, not just of the computation: the
+    # entry it produces names a path inside ONE session's attachment directory,
+    # so serving it to another session would point that session's transcript at
+    # a file its own delete will never reclaim. Folded in AFTER the digest rather
+    # than into its input, so the message payload keeps exactly one hashing site.
+    key = f"{attachments}\x00{key}"
     size = len(payload)
     with _entry_cache_lock:
         if key in _entry_cache:
             _entry_cache.move_to_end(key)
             return _entry_cache[key][0]
-    entry = _build_message_entry_uncached(m)
+    entry = _build_message_entry_uncached(m, attachments=attachments)
     if size > _ENTRY_MAX_CACHEABLE_BYTES:
         return entry
     # Refuse to STORE a pairing whose key and entry may describe different states.
@@ -2100,12 +2253,23 @@ def _build_message_entry(m: dict) -> dict | None:
     return entry
 
 
-def _build_message_entry_uncached(m: dict) -> dict | None:
+def _build_message_entry_uncached(
+    m: dict, *, attachments: tuple[Path, str] | None = None
+) -> dict | None:
     """Build one persisted JSONL message dict from an in-memory slot message.
 
     Returns None for transient roles that are never persisted. Applies the
     same redaction the overwrite path used so append and rewrite produce
     byte-identical lines for the same message.
+
+    *attachments* is ``(sessions directory, transcript stem)`` when the caller
+    knows which session this row belongs to, which turns on inline-image
+    preservation: the image a ``![alt](/abs/path.png)`` names is copied into that
+    session's attachment directory and the PERSISTED destination is rewritten to
+    point there (see :mod:`kiro_crew.chat_attachments`), and the in-memory row is
+    updated to the same destination so every later flush of the window is a
+    no-op for it. ``None`` skips the step, which is what a caller with no session
+    context (a test, a preview) gets.
     """
     role = m.get("role", "assistant")
     if role in ("chunk", "done", "streaming", "queued", "permission"):
@@ -2117,6 +2281,37 @@ def _build_message_entry_uncached(m: dict) -> dict | None:
     # redact `system` on the way in, so excluding it here would let unredacted
     # bytes from a legacy or foreign writer survive the rewrite indefinitely.
     if role != "user":
+        if attachments is not None:
+            # One budget for the whole row: the variants below draw on it too.
+            image_budget = ImageBudget()
+            # COMMITTED back into the live row, not computed on the side. This
+            # function re-serializes the whole window on every flush from the
+            # in-memory rows, so a row that kept naming the scratch file would
+            # be re-resolved from scratch each time -- and once the agent's
+            # scratch is reclaimed, that resolution fails open to the dead path
+            # and the flush OVERWRITES the good persisted row with it. Writing
+            # the durable path into the row makes every later flush idempotent
+            # by construction (the destination is already inside the store),
+            # and the live UI reads the image from disk at view time either
+            # way, so nothing it shows changes.
+            #
+            # Before redaction, so the file read is of the path as written.
+            # Redaction still runs on the result, so what lands on disk is
+            # exactly as redacted as before.
+            #
+            # Compare-and-set, not a blind assignment: this runs in the save's
+            # worker thread while the event loop owns the same row dict, and a
+            # variant switch can replace the row's content between the read
+            # above and this line. Writing the rewrite of the OLD text over the
+            # user's newly chosen reply would lose that choice; when the row has
+            # moved on, the next flush rewrites whatever it holds then.
+            rewritten = persist_inline_images(
+                content, sessions_dir=attachments[0], stem=attachments[1], budget=image_budget
+            )
+            if rewritten != content:
+                if m.get("content") == content:
+                    m["content"] = rewritten
+                content = rewritten
         content, _ = redact_exfiltration_urls(content)
         content, _ = redact_credentials(content)
     entry: dict = {
@@ -2141,6 +2336,20 @@ def _build_message_entry_uncached(m: dict) -> dict | None:
             if not isinstance(v, dict):
                 continue
             vc = v.get("content", "")
+            # A variant is an alternate reply the user can switch BACK to, so its
+            # images break in exactly the way this rewrite exists to stop. It is
+            # persisted and redacted here, so it is rewritten here too -- from
+            # the SAME budget as the primary content, so a row with many
+            # variants cannot copy many times the per-message ceiling -- and
+            # committed into the live variant for the reason the primary is.
+            if attachments is not None and role != "user":
+                rewritten = persist_inline_images(
+                    vc, sessions_dir=attachments[0], stem=attachments[1], budget=image_budget
+                )
+                if rewritten != vc:
+                    if v.get("content") == vc:  # compare-and-set, as for the primary
+                        v["content"] = rewritten
+                    vc = rewritten
             vc, _ = redact_exfiltration_urls(vc)
             vc, _ = redact_credentials(vc)
             redacted_variants.append({**v, "content": vc})
@@ -2449,9 +2658,13 @@ def _frozen_prefix_and_foreign_appends(
     # the ``/api/chat`` meta rides through), so a bare id equality is not proof
     # of sameness the way a minted-uuid contract would suggest:
     #   * corroborated (same (role, content) — a durable copy — or same ``ts``
-    #     — an in-place edit): consume the entry and drop the line (the window
-    #     re-serializes it). The ids matching exactly makes this NOT a dedup
-    #     drop, so it is not routed to the ``foreign-dedup`` archive.
+    #     — an in-place edit — or the same text modulo PRESERVED IMAGES: the
+    #     durable copy landed by ``append_if_absent`` names an image's stored
+    #     copy while the window entry, whose rewrite failed open once the
+    #     agent's scratch file was gone, still names the original): consume
+    #     the entry and drop the line (the window re-serializes it). The ids
+    #     matching exactly makes this NOT a dedup drop, so it is not routed to
+    #     the ``foreign-dedup`` archive.
     #   * id matches an unconsumed entry but NEITHER body nor ``ts`` agrees
     #     (an id reused across two genuinely distinct messages): leave the
     #     entry unconsumed and let the line fall through to the legacy tiers
@@ -2476,8 +2689,19 @@ def _frozen_prefix_and_foreign_appends(
             continue
         for _i in _live:
             _e = window_entries[_i]
-            if (_role, _content) == (_e.get("role"), _e.get("content", "")) or (
-                _ts and _ts == _e.get("ts")
+            if (
+                (_role, _content) == (_e.get("role"), _e.get("content", ""))
+                or (_ts and _ts == _e.get("ts"))
+                or (
+                    _role == _e.get("role")
+                    and isinstance(_content, str)
+                    and same_text_modulo_images(
+                        _content,
+                        _e.get("content", ""),
+                        sessions_dir=path.parent,
+                        stem=path.stem,
+                    )
+                )
             ):
                 consumed[_i] = True
                 handled[_j] = True
@@ -2850,6 +3074,14 @@ def _save_slot_to_history(
                     fields["agent"] = slot.agent
                 if slot.workspace:
                     fields["workspace"] = slot.workspace
+                # CLEARABLE, and it has to be: the merge cannot delete a key, so a
+                # crew rebound from a silo back to the default store would keep
+                # consolidating into the silo it left. The cleared spelling is ""
+                # rather than "default" so it reads as falsy everywhere -- the
+                # rehydrate mirror and the consolidator's own resolver both treat
+                # falsy as "the global store", which is also how a session written
+                # before crew stores existed reads.
+                fields["memory_store"] = named_store_or_empty(slot.memory_store)
                 if slot.project:
                     fields["project"] = slot.project
                 if slot._app:
@@ -3159,6 +3391,8 @@ def _save_slot_to_history(
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
                 meta_line["workspace"] = slot.workspace
+            if _named := named_store_or_empty(slot.memory_store):
+                meta_line["memory_store"] = _named
             if slot.project:
                 meta_line["project"] = slot.project
             # Remote-execution binding. All three are written together or not at
@@ -3386,7 +3620,12 @@ def _save_slot_to_history(
                 or _approx_window_payload_bytes(window) > cache_max_bytes
                 else _build_message_entry
             )
-            window_entries = [e for m in window if (e := build_entry(m)) is not None]
+            # ``path`` is this session's transcript, so its directory and stem are
+            # what pairs an attachment with the session that will delete it.
+            attachments = (path.parent, path.stem)
+            window_entries = [
+                e for m in window if (e := build_entry(m, attachments=attachments)) is not None
+            ]
             window_lines = [json.dumps(e) + "\n" for e in window_entries]
             frozen_prefix, foreign_lines, dedup_dropped = _frozen_prefix_and_foreign_appends(
                 slot, path, disk_older, window_entries, collect_foreign=not rewrite
@@ -3817,35 +4056,27 @@ async def save_slot_off_loop(
             _finish_guarded_metadata_write()
 
 
-def _build_history_prefix(slot: _ChatSlot) -> str:
-    """Build a condensed history prefix from slot messages for session re-injection.
+def _build_history_prefix(
+    slot: _ChatSlot,
+    *,
+    conversation_log: ConversationLog | None = None,
+    current_message: dict | None = None,
+    model_window: int | None = None,
+) -> str:
+    """Legacy no-builder entry point; share the canonical merge and budget."""
+    from kiro_crew.context import build_session_replay
 
-    Redacts here as defence in depth. The returned prefix is prepended to the ACP
-    prompt, so it leaves the dashboard's own storage and is persisted by kiro-cli
-    into its session file — an egress path, not an internal read, so it does not
-    rely solely on the load-time content pass upstream. Redaction is idempotent,
-    so the common case is a no-op.
-    """
-    lines: list[str] = []
-    total = 0
-    for m in slot.messages:
-        role = m.get("role", "")
-        if role in ("chunk", "done", "streaming", "queued", "permission", "error", "tool"):
-            continue
-        label = "User" if role == "user" else "Assistant"
-        text = m.get("content", "")[:500]
-        if role != "user":
-            text, _ = redact_exfiltration_urls(text)
-            text, _ = redact_credentials(text)
-        line = f"{label}: {text}"
-        if total + len(line) > _MAX_HISTORY_CHARS:
-            break
-        lines.append(line)
-        total += len(line)
-    if not lines:
+    replay = build_session_replay(
+        conversation_log,
+        slot_history_key(slot),
+        pending_messages=list(slot.messages),
+        current_message=current_message,
+        model_window=model_window,
+    )
+    if not replay:
         return ""
     return (
         "[Previous chat history for this tab — session was reset after stop]\n"
-        + "\n".join(lines)
+        + replay
         + "\n[End of history]\n\n"
     )

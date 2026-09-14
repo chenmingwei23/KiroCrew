@@ -51,7 +51,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
 )
@@ -165,7 +164,9 @@ class TestAuthOwnership:
         Crew-owned), so staying conservative costs one respawn, never a turn on
         stale credentials.
         """
-        assert ACP_BACKEND_KAS in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        from kiro_crew.acp.types import backends_retired_by_host_logout
+
+        assert ACP_BACKEND_KAS in backends_retired_by_host_logout()
 
     def test_the_runtime_declares_the_identity_capability(self, tmp_path):
         """The sweep reads the declared property, not the frozenset directly."""
@@ -226,7 +227,7 @@ class TestAuthOwnership:
             return rendered
 
         with (
-            patch("kiro_crew.acp.runtime.answer_get_access_token", side_effect=fake_answer),
+            patch("kiro_crew.acp.harness.kas.answer_get_access_token", side_effect=fake_answer),
             patch.object(runtime, "send_response", side_effect=record_response),
         ):
             await runtime._answer_get_access_token(7)
@@ -250,7 +251,7 @@ class TestAuthOwnership:
             raise HostAuthCallbackError("not signed in to Kiro Crew")
 
         with (
-            patch("kiro_crew.acp.runtime.answer_get_access_token", side_effect=refuse),
+            patch("kiro_crew.acp.harness.kas.answer_get_access_token", side_effect=refuse),
             patch.object(runtime, "send_error", side_effect=record_error),
         ):
             await runtime._answer_get_access_token(8)
@@ -304,8 +305,8 @@ class TestSandboxClassification:
         async def fake_bin(*, environ=None, home=None):
             return "/usr/bin/kiro-cli"
 
-        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
-        monkeypatch.setattr("kiro_crew.acp.runtime.ensure_agent_materialized", lambda _agent: None)
+        monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", fake_bin)
+        monkeypatch.setattr("kiro_crew.agent.ensure_agent_materialized", lambda _agent: None)
         runtime = AcpRuntime(work_dir=tmp_path / "sbx2", sandbox_mode="off")
         with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
@@ -446,7 +447,7 @@ def kas_stub(tmp_path, monkeypatch):
     async def fake_bin(*, environ=None, home=None) -> str:
         return str(launcher)
 
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
+    monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", fake_bin)
     monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
     agents_dir = kiro_agents_dir()
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -524,8 +525,10 @@ class TestKasInvocation:
             acp_backend=ACP_BACKEND_KAS,
         )
         with (
-            patch("kiro_crew.acp.runtime.vault_holds_identity_off_loop", side_effect=has_identity),
-            patch("kiro_crew.acp.runtime.answer_get_access_token", side_effect=fake_answer),
+            patch(
+                "kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", side_effect=has_identity
+            ),
+            patch("kiro_crew.acp.harness.kas.answer_get_access_token", side_effect=fake_answer),
         ):
             try:
                 await runtime.spawn()
@@ -555,8 +558,10 @@ class TestKasInvocation:
             acp_backend=ACP_BACKEND_KAS,
         )
         with (
-            patch("kiro_crew.acp.runtime.vault_holds_identity_off_loop", side_effect=no_identity),
-            patch("kiro_crew.acp.runtime.answer_get_access_token", side_effect=must_not_run),
+            patch(
+                "kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", side_effect=no_identity
+            ),
+            patch("kiro_crew.acp.harness.kas.answer_get_access_token", side_effect=must_not_run),
         ):
             try:
                 await runtime.spawn()
@@ -581,8 +586,10 @@ class TestKasInvocation:
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
-        with patch("kiro_crew.acp.runtime.vault_holds_identity_off_loop", side_effect=no_identity):
-            argv = await runtime._resolve_spawn_argv()
+        with patch(
+            "kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", side_effect=no_identity
+        ):
+            argv = (await runtime._resolve_spawn_plan()).argv
         assert argv == build_kas_argv(str(kas_stub))
         assert Path(argv[0]).name == "kiro-cli-stub"
         assert runtime._kas_host_auth is False
@@ -602,8 +609,10 @@ class TestKasInvocation:
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
-        with patch("kiro_crew.acp.runtime.vault_holds_identity_off_loop", side_effect=has_identity):
-            argv = await runtime._resolve_spawn_argv()
+        with patch(
+            "kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", side_effect=has_identity
+        ):
+            argv = (await runtime._resolve_spawn_plan()).argv
         assert argv == build_kas_argv(str(kas_stub), host_auth=True)
         assert "--auth-method" not in argv
         assert runtime._kas_host_auth is True
@@ -616,11 +625,11 @@ class TestKasInvocation:
         async def no_bin(*, environ=None, home=None) -> None:
             return None
 
-        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", no_bin)
+        monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", no_bin)
         runtime = AcpRuntime(
             work_dir=tmp_path / "ws4",
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
         with pytest.raises(AcpRuntimeError, match="kiro-cli"):
-            await runtime._resolve_spawn_argv()
+            await runtime._resolve_spawn_plan()

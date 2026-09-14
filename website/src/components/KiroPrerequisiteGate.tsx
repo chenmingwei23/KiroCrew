@@ -299,13 +299,9 @@ function CopyCommand({ children }: { children: ReactNode }) {
   const handleCopy = async () => {
     const text = hostRef.current?.textContent?.trim() ?? ''
     if (!text) return
-    try {
-      await copyToClipboard(text)
-    } catch {
-      // Both clipboard paths failed (no clipboard API, execCommand denied):
-      // leave the glyph alone rather than announcing a copy that did not happen.
-      return
-    }
+    // Both clipboard paths failed (no clipboard API, execCommand denied):
+    // leave the glyph alone rather than announcing a copy that did not happen.
+    if (!(await copyToClipboard(text))) return
     setCopied(true)
     if (resetTimer.current) clearTimeout(resetTimer.current)
     resetTimer.current = setTimeout(() => setCopied(false), 1500)
@@ -981,6 +977,21 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   }
   if (prerequisite.setup_allowed === false) {
     return <OwnerSetupRequired retrying={retrying} onRetry={retryStatus} />
+  }
+  // A first-run install whose probe genuinely could not verify the CLI (not the
+  // sandbox/timeout/acp branches above, which have their own screens): the
+  // backend's last-resort backstop degrades an exception to a 200 not-ready
+  // body rather than a 500, so `prerequisite` IS resolved and the earlier
+  // `!prerequisite` branch never sees it. Without this the "Setup Check
+  // Unavailable" screen had no diagnostic at all (the desktop symptom this
+  // covers) — `probe_error`/`probe_status` name the failing probe verbatim.
+  if (status.probe_error) {
+    const withStatus = typeof status.probe_status === 'number'
+      ? `${status.probe_error} (exit ${status.probe_status})`
+      : status.probe_error
+    return (
+      <SetupStatusError message={withStatus} retrying={retrying} onRetry={retryStatus} />
+    )
   }
   // The CLI is present and executable, but verification runs it INSIDE the
   // sandbox, so a host that cannot build one fails verification. Telling that

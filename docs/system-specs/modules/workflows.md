@@ -94,9 +94,13 @@ param-by-param (name, kind, default) and for async-ness by
 
 `now` is fixed for the whole run on purpose. `time`, `random`, `uuid` and
 `datetime` are unreachable inside a script (see Sandbox), so `ctx.now` is the only
-clock, which is what makes the event journal and the resume prefix stable. The
-runner does use `time.monotonic()` in **host** code for the wall-clock guard and
-the run duration; that is never exposed to the script.
+clock in script scope, which is what keeps the deterministic call order (and thus
+the resume prefix) stable. The event journal's `ts` is separate: the runner stamps
+each event from a HOST wall clock (`host_now_iso`, real UTC) so the journal records
+when each event actually happened, while `ctx.now` stays fixed for the script. The
+runner also uses `time.monotonic()` in **host** code for the wall-clock guard and
+the run duration; none of these host clocks are exposed to the script, so a
+workflow gains no new time capability.
 
 `_RunContext` also exposes `agent_results` (`call_index -> result` for calls
 already settled in this run). It is in `validate.CORE_CTX_SURFACE`, so a script may
@@ -312,7 +316,7 @@ Envelope (exactly these five keys, pinned by
 |-------|------|---------|
 | `run_id` | `str` | the run this event belongs to |
 | `seq` | `int` | monotonic from 0 within the run, contiguous |
-| `ts` | `str` | timestamp, supplied by the caller (the runner passes `ctx.now`) |
+| `ts` | `str` | wall-clock stamp; the runner stamps each event from a HOST clock (real UTC), distinct from the fixed script-visible `ctx.now`. `EventStream` takes an optional injected `clock` (the runner injects `runner.host_now_iso`; tests monkeypatch that host function) and falls back to the caller-supplied stamp when it is unset. Event journals already on disk keep whatever stamp their writer supplied; a load does not and cannot reconstruct a real wall-clock time for events recorded before the host clock existed |
 | `type` | `str` | one of `EVENT_TYPES` |
 | `data` | `dict` | per-type fields, below |
 
@@ -511,6 +515,24 @@ as it settles rather than only after the run ends
 (`test_workflows_resilience.py`). Without that, a run killed at the ceiling would
 write `agent_results: {}` and discard every payload it had already paid for.
 
+On a **caller cancellation** the runner cancels the in-flight script and drains
+it before emitting `run_cancelled`, as on the timeout path. Cooperative cleanup
+and checkpoints settle before the terminal event, and cancellation exceptions are
+consumed. After the initial cancellation, the runner shields and repeatedly drains
+ordinary script cleanup, the pre-terminal hook, and background completion cleanup;
+further cancel requests cannot cancel their awaited work. Cleanup exceptions are
+retrieved without replacing an already-selected timeout, failure or cancellation.
+A successful script return alone does not commit success: the pre-terminal hook
+reports any caller cancellation it observes after draining, and the runner emits
+one `run_cancelled` instead of `run_finished`, without rerunning the hook. Publishing
+a terminal event commits the outcome. During subsequent background completion
+cleanup, registry cancellation returns false even while the final registry status
+is pending; direct shutdown cancellation still drains cleanup without rewriting
+that event. Both paths depend on adapters cooperating with cancellation; they do
+not forcibly terminate Python code that ignores cancellation. A terminal status
+must not be published merely because a cleanup deadline elapsed while owned work
+is still executing.
+
 ## Run registry, persistence, and resume
 
 ### `registry.py`
@@ -528,14 +550,29 @@ ancestry, and the driving `task`. Statuses: `running`, `finished`, `failed`,
 
 Two distinct serializations:
 
-- `snapshot(include_events=)` is the **UI view**. The compact form adds derived
-  live progress (`phase` from the last `phase_started`, `last_log` from the last
-  `log`) plus `partial_result_count` / `agent_error_count`; the full form adds
-  `events`, `source`, `partial_results` and `agent_errors`. Partials are keyed on
+- `snapshot(include_events=, include_result=)` is the **UI view**. The compact
+  form (`include_events=False, include_result=False`, what `list()` builds) adds
+  derived live progress (`phase` from the last `phase_started`, `last_log` from
+  the last `log`) plus `partial_result_count` / `agent_error_count`, and omits
+  the `result` payload — a finished run's result can be hundreds of KB, so it
+  rides only on the detail view, exactly like `events` and `source`. The full
+  form adds `result`, `events`, `source`, `partial_results`, `agent_results` and
+  `agent_errors`.
+  The `on_done` completion snapshot keeps `include_result=True`, so
+  result-to-chat injection is unaffected. Partials are keyed on
   **status**, not on `result is None`: a run can finish and legitimately return
   `None`, and a running run has no result yet, so neither lost anything and
   reporting partials for them would mislead the reader and resend every payload on
-  every poll.
+  every poll. A **finished** run additionally exposes its settled per-call outputs
+  — `agent_result_count` in the compact form and `agent_results` (the payloads) in
+  the full form. This is additive and status-keyed: `partial_results` stays the
+  failed/cancelled channel so a run never reports both, an active run omits both
+  (it is still accumulating), and the exposure is a factual record of the calls
+  that settled, not a claim the run produced a validated business artifact. The
+  `workflow_result` MCP projection includes these outputs through the same
+  recursive redaction as the aggregate result and errors. The completion message
+  names the recorded-call count and this field, and explicitly separates a
+  returned workflow function from verified required artifacts.
 - `to_store_json()` / `from_store_json()` is the **durable** round-trip of the
   complete run. `from_store_json` demotes a stored `running` run to `failed` with
   `"interrupted: gateway restarted while running"`, because it can never resume in
@@ -565,6 +602,14 @@ host lifecycle checkpoint may stall the gateway event loop or move live registry
 state across threads. Cancellation drains an in-flight registration write before
 asynchronously deleting the partial run, so a late atomic replace cannot resurrect an
 identity that was never returned to its host driver.
+
+The read handlers extend the same rule to the response path: the run list, run
+detail, and definition list/get endpoints serialize the payload once
+synchronously on the event loop (an atomic snapshot — no await, so no
+loop-driven mutation can interleave), then a worker thread rebuilds its own
+structure from that immutable string and performs redaction + the final JSON
+serialization. The thread only ever touches objects it created itself, so it
+can never observe or race live registry state.
 
 ### `store.py`
 
@@ -597,7 +642,67 @@ Properties that matter:
 
 `RunRegistry.load_persisted()` rehydrates on startup, fills only ids not already
 in memory, and re-runs eviction so a store with more records than `max_runs`
-cannot leave the registry over its bound.
+cannot leave the registry over its bound. A record stored as `running` was
+demoted to `failed` by `from_store_json` (it can never resume in a new process);
+`load_persisted` then persists that corrected state back to the store,
+idempotently — only the `running`→`failed` case writes, an already-terminal
+record is left untouched — so the durable record matches memory and a later
+restart does not re-demote the same zombie every time. The writeback goes through
+`to_store_json`, so agent payloads, source, provenance and args are retained.
+
+After the socket binds and dashboard readiness is published, the dashboard
+schedules one owned initialization task for `WorkflowService.create()`; it never
+awaits user-data-scaled rehydration on the boot-to-ready path. Until initialization
+settles, `workflow_service` remains unpublished and workflow routes return their
+existing 503 unavailable response. Before its first startup await, the dashboard
+calls `TaskRunner.defer_workflow_attachment()` on the shared gateway instance.
+Plan, direct run, background start, execute-plan and retry admission then refuse
+with an initializing/retry message before creating run state. This covers channel
+callers retaining `orch.task_runner` as well as dashboard admission paths.
+`attach_workflow_service(service)` releases admission atomically with attachment;
+`attach_workflow_service(None)` releases standalone fallback only on actual
+initialization failure, never on slowness or cancellation. If storage blocks
+indefinitely, mutation requests deliberately keep returning 503 with
+`code: workflow_initializing`; reads and cancellation remain available. Treating
+slowness as standalone mode would admit permanently unlinked fresh runs and permit
+linked task records to diverge while the original restore worker still exists.
+A known absent/failed publication service is different from an unresolved one;
+only the former uses the established best-effort standalone fallback. Ordinary standalone
+and headless constructors do not defer admission. The dashboard retains its runner
+pointer throughout initialization, so existing-task status and cancellation remain
+available. Deletion and plan/step edits require the same readiness boundary before
+any mutation: otherwise their workflow propagation would be skipped during restore.
+All task admission and linked-mutation handlers translate `WorkflowInitializing`
+from the shared check to an initializing 503, not a generic runtime error.
+Chat-to-plan checks before creating its placeholder; status and cancel do not
+require workflow readiness.
+The task attaches both directions and releases admission without an intervening
+await. Initialization failure is logged, keeps workflows unavailable, and restores
+the previous standalone TaskRunner fallback. A non-blocking aiohttp `on_shutdown`
+hook fences publication before cleanup begins, including while tunnel teardown is
+stalled. Tunnel teardown remains the first `on_cleanup` hook; only after it finishes
+(or reaches its existing bound) does workflow cleanup cancel and drain initialization,
+even under repeated cancellation. A factory returning during tunnel teardown or
+after cancellation cannot publish.
+
+`WorkflowService.create()` constructs the unpublished service off-loop, including
+run-store config lookup and definition-library path resolution. The constructor
+creates no asyncio tasks or locks; `live.bind` registers its weak setter under the
+watcher's thread lock without invoking it. Cancellation drains the owned constructor
+before propagating, even if construction subsequently fails. Registry hydration
+then runs on the owning loop. `WorkflowRunStore.load_all()` reads every run JSON
+before registry eviction: `DEFAULT_MAX_RUNS=200` bounds retained memory, not disk
+scan count or payload size, and is not an upper bound on startup I/O.
+
+The `load_persisted_async()` path reads records, writes
+restart corrections, and deletes evicted records off-loop; handle hydration and
+mutation remain on the owning loop. This is startup-only on an unpublished
+registry, never concurrent with live runs or host reopen. Cancellation (including
+repeated cancellation) drains the owned load before propagating, leaving no late
+writer to race a subsequent initialization. The synchronous constructor and
+`load_persisted()` remain available for standalone callers. Both paths retain the
+store's best-effort failure semantics: awaiting I/O does not certify a successful
+write when the store itself reports failure only through debug logging.
 
 ### Reusable definition library
 
@@ -724,6 +829,16 @@ host lifecycle (`begin_host_run`, `bind_task`, `phase`, `log`, `step`, `pause`,
 `timeout_secs` property. Every trusted host lifecycle mutation is async when it can
 produce a durable checkpoint, so host drivers await the off-loop persistence path.
 
+Dynamic workflows do not yet support private member memory propagation. Service
+admission resolves the protected parent binding before authoring or creating a
+run, including source, intent, saved-definition and restored or edited
+subtree-rerun entry points. Both the author session and result-routing session
+are checked when supplied. Private identity refuses with
+`workflow_private_memory_unsupported`; unreadable identity refuses with
+`workflow_memory_unavailable`. Refusal creates no author, worker or run and
+preserves the parent's binding. Global V1 execution is unchanged. A saved
+task-plan started through this façade takes the same check before its driver.
+
 Host-driven runs carry `driver`, `source_format`, `task_id`, `capabilities`, and
 saved-definition provenance in every compact and full snapshot. `paused` is an
 active, durable workflow status. A restored paused host run, or a host run
@@ -831,6 +946,12 @@ never spawns `kiro-cli` in tests. Two production adapters:
   `_MAX_TURNS_PER_STEP` is imported from `agent_exec` rather than duplicated, so
   one edit retunes both paths; `test_workflows_agent_pool.py` pins them equal.
 
+Named workflow sessions retain their provider and conversation, not their turn
+lease. Both adapters release every successfully acquired named lease in a
+`finally` block with `cleanup=False`, on success, exception and cancellation.
+A failed or cancelled acquisition must not release a lease held by another
+caller. A later call on that same name reuses the retained history.
+
 Pool init failure is caught and falls back to `build_agent_fn`, so pooling can
 never break a run start. The runner's `on_complete` hook fires on every exit path
 (success, failure, cancellation) to shut the pool down, so warm sessions are always
@@ -849,6 +970,15 @@ Registered in `dashboard/server.py`, handled in
 `dashboard/handlers/workflows.py`. These back both the chat `workflow_*` MCP tools
 (which call them with `X-Internal-Secret`) and the Workflows dashboard tab; the
 caller's `X-Session-Key` header becomes the run's `author` and `session_key`.
+
+Before author, source run, intent run, saved-definition run or subtree rerun
+calls the service, `internal_memory_scope` verifies the request's protected
+caller against its claimed session. Verification refusals pass through unchanged;
+a verified private store returns HTTP 409 with
+`workflow_private_memory_unsupported` before service dispatch. Omitting or
+replacing the session header cannot turn a private process into an unbound
+caller, and rerunning a Global V1 record still checks the current caller.
+Owner-browser and verified unbound V1 dispatch retain their existing behavior.
 
 | Route | Body / params | Response |
 |-------|---------------|----------|
