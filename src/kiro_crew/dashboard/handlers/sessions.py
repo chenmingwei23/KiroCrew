@@ -1636,6 +1636,12 @@ class _HistoryDeleteClaim:
     complete: bool
     slot_task: Any | None = None
     cron_owner_keys: frozenset[str] = frozenset()
+    #: The ACP session id behind *session_key*, read before the teardown that
+    #: destroys the session it names. This is what identifies the session
+    #: LEDGER, whose unit id is the ACP id rather than the slot key, and it is
+    #: captured here for the same reason every other field is: after the
+    #: teardown there is nothing left to ask.
+    acp_session_id: str | None = None
 
 
 def _history_delete_candidate_keys(key: str) -> tuple[str, ...]:
@@ -1694,6 +1700,23 @@ def _capture_history_delete_claim(state: DashboardState, key: str) -> _HistoryDe
                 path_match_verified,
                 False,
             )
+        # Best-effort and read LAST: an unreadable ACP id must not downgrade a
+        # claim the checks above already completed, because every other cleanup
+        # this claim authorizes is more important than collecting one ledger --
+        # which the retention sweep collects anyway once the session is closed.
+        # Type-checked rather than merely truthy: this value goes on to ADDRESS a
+        # directory, so anything that is not a real id must read as absent.
+        try:
+            resumable = state.sessions.resumable_sid(session_key)
+        except Exception:
+            logger.debug(
+                "History delete: ACP session id unreadable for %s; leaving its ledger "
+                "to the retention sweep",
+                session_key,
+                exc_info=True,
+            )
+            resumable = None
+        acp_session_id = resumable if isinstance(resumable, str) and resumable else None
         return _HistoryDeleteClaim(
             candidate_key,
             candidate_slot,
@@ -1703,6 +1726,7 @@ def _capture_history_delete_claim(state: DashboardState, key: str) -> _HistoryDe
             path_match_verified,
             True,
             getattr(candidate_slot, "task", None),
+            acp_session_id=acp_session_id,
         )
     return _HistoryDeleteClaim(None, None, None, None, 0, True, True)
 
@@ -1723,6 +1747,9 @@ def _resolve_history_delete_claim(
             session_key=None,
             path_match_verified=True,
             complete=False,
+            # Travels with ``session_key``: a claim that names no session must not
+            # still name a session's ledger.
+            acp_session_id=None,
         )
     try:
         matches = log._path(key).stem == log._path(claim.history_key).stem
@@ -1739,6 +1766,9 @@ def _resolve_history_delete_claim(
             session_key=None,
             path_match_verified=True,
             complete=False,
+            # Travels with ``session_key``: a claim that names no session must not
+            # still name a session's ledger.
+            acp_session_id=None,
         )
     if matches:
         return replace(claim, path_match_verified=True)
@@ -2165,6 +2195,7 @@ async def _remove_slot_for_history_key(
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
 
+    session_destroyed = False
     if slot and target_session_key is not None:
         try:
             destroyed = await state.sessions.destroy_if(
@@ -2179,6 +2210,7 @@ async def _remove_slot_for_history_key(
                     "a current slot owner; preserving it",
                     target_session_key,
                 )
+            session_destroyed = bool(destroyed)
         except Exception:
             logger.warning(
                 "History delete: conditional session destroy failed for %s",
@@ -2190,6 +2222,30 @@ async def _remove_slot_for_history_key(
     # transcript can be created or restored by another process after any owner
     # scan, so deleting those sidecars cannot be made atomic here. Preserve them:
     # stale state is reversible, while deleting a successor's state is not.
+
+    # The append-only SESSION LEDGER is not one of those sidecars, and the
+    # difference is mechanical rather than a re-reading of the rule above. What
+    # makes a work ledger unsafe to delete here is that its identity is the SLOT
+    # KEY, which is recycled -- a successor tab in the same slot legitimately
+    # inherits and resumes that record, and no check here can prove one is not
+    # about to. A session ledger is keyed by the ACP SESSION ID, which never
+    # names a different conversation, so removing it cannot reach a successor's
+    # state.
+    #
+    # Gated on the teardown having SUCCEEDED, not merely on having been
+    # attempted. ``destroy_if`` refuses when the session was replaced by a
+    # successor generation, is busy, or still has a live slot owner -- and in each
+    # of those cases the session it names is preserved and may be writing right
+    # now, so removing its ledger would take a live conversation's log. The write
+    # lease is not a substitute for this check: ownership ends BETWEEN turns by
+    # design, so an idle-but-live session holds nothing for the removal to be
+    # refused by. A refused teardown therefore leaves the ledger alone and the
+    # retention sweep collects it once the session is genuinely closed.
+    #
+    # Only an id this claim PROVED is used -- captured pre-unlink, dropped on every
+    # path that disowned the slot -- so an unresolvable one removes nothing.
+    if session_destroyed and claim.acp_session_id:
+        await asyncio.to_thread(_remove_session_ledger, claim.acp_session_id, key)
 
     # Cron ownership is different from the independent sidecars above: every key
     # here came from the strict store scan or from linked_session_key while the
@@ -2223,6 +2279,47 @@ async def _remove_slot_for_history_key(
                 key,
                 ", ".join(released),
             )
+
+
+def _remove_session_ledger(session_id: str, history_key: str) -> None:
+    """Remove the append-only ledger of *session_id*. Never raises.
+
+    Imported lazily: this handler module is loaded on every startup while the
+    ledger store is only reachable behind ``KIROCREW_SESSION_LEDGER``, so a
+    launch without the flag should not pay for the import.
+
+    Best-effort, like every other step of this teardown. The transcript row is
+    already gone by the time this runs, so raising would turn a ledger that could
+    not be collected into a failed delete the user has to retry against a row that
+    is absent -- and the retention sweep collects it on age regardless.
+    ``owned`` is the ordinary answer when a queued write still holds the lease,
+    and it is not an error: that pass simply does nothing.
+    """
+    try:
+        from kiro_crew.ledger.schema import KIND_SESSION
+        from kiro_crew.ledger.store import REMOVE_REMOVED, remove_unit
+
+        # Accept-all guard, deliberately. The sweep's guard re-reads the ledger
+        # because ITS reason is a property of the file -- an age it sampled outside
+        # the lease. This caller's reason is not in the file at all: the session
+        # this ledger belongs to was destroyed by the teardown above, which is
+        # checked before this runs. Re-reading here would answer a question nobody
+        # asked, and a close entry still queued behind the teardown would make the
+        # honest answer "not closed" and skip a ledger whose session is gone.
+        status = remove_unit(KIND_SESSION, session_id, guard=lambda _dir: True)
+    except Exception:
+        logger.warning(
+            "History delete: could not remove the session ledger for %s", history_key, exc_info=True
+        )
+        return
+    if status == REMOVE_REMOVED:
+        logger.info("History delete: removed the session ledger for %s", history_key)
+    else:
+        logger.info(
+            "History delete: session ledger for %s not removed (%s); leaving it to retention",
+            history_key,
+            status,
+        )
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:

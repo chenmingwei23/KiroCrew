@@ -74,6 +74,10 @@ def _make_state(slots: dict) -> MagicMock:
 
     state.sessions.destroy_if = AsyncMock(side_effect=destroy_if)
     state.sessions.drop_autocompact_overrides_matching = MagicMock(return_value=0)
+    # No ACP session id unless a test says otherwise. A bare MagicMock would hand
+    # back a truthy Mock, which is not an id, and the teardown would try to
+    # address a ledger directory with it.
+    state.sessions.resumable_sid = MagicMock(return_value=None)
     state.remove_chat_pins_for_slots = AsyncMock()
     state.conversation_log = MagicMock()
     state.crons = None
@@ -3167,3 +3171,201 @@ class TestUnreadableMetadataAbortsTheDelete:
         assert log.calls.index(f"get_metadata:{history_key}") < log.calls.index(
             f"delete_session:{history_key}"
         )
+
+
+class TestSessionLedgerOnPermanentDelete:
+    """Permanently deleting a session takes its append-only ledger with it.
+
+    The work ledger is deliberately PRESERVED by this same funnel, and these
+    tests hold both halves of that line at once. The difference is mechanical:
+    a work ledger is keyed by the recycled SLOT KEY, so a successor tab in the
+    same slot legitimately inherits it and no check here can prove one is not
+    coming; a session ledger is keyed by the ACP SESSION ID, which never names a
+    different conversation, and it carries a write lease so the removal is
+    refused rather than racing a writer.
+    """
+
+    @staticmethod
+    def _ledger(session_id: str):
+        from kiro_crew import ledger as lg
+
+        return lg.Ledger.create(lg.KIND_SESSION, session_id, owner="default", agent="kirocrew")
+
+    @staticmethod
+    def _exists(session_id: str) -> bool:
+        from kiro_crew import ledger as lg
+
+        return lg.Ledger.exists(lg.KIND_SESSION, session_id)
+
+    @pytest.mark.asyncio
+    async def test_the_deleted_sessions_ledger_is_removed(self, monkeypatch):
+        """The gap the retention writer exists to close, on the delete path.
+
+        Bodies live in the ledger now, so a delete that took only the transcript
+        left the larger half of the same history on disk.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-doomed")
+        assert self._exists("acp-doomed")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-doomed")
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert not self._exists("acp-doomed")
+
+    @pytest.mark.asyncio
+    async def test_no_other_sessions_ledger_is_touched(self, monkeypatch):
+        """Only the id this claim proved. A sibling conversation is not collateral."""
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-doomed")
+        self._ledger("acp-bystander")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-doomed")
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert not self._exists("acp-doomed")
+        assert self._exists("acp-bystander")
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_acp_id_removes_nothing(self, monkeypatch):
+        """No proven id, no removal -- retention collects it on age instead.
+
+        Reading the id is best-effort and happens LAST, so a session manager that
+        cannot answer must not turn a delete into a guess about which ledger to
+        remove.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-unknown")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(side_effect=RuntimeError("store unreadable"))
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert self._exists("acp-unknown")
+
+    @pytest.mark.asyncio
+    async def test_a_non_string_session_id_is_read_as_absent(self, monkeypatch):
+        """This value goes on to ADDRESS a directory, so it is type-checked.
+
+        Anything that is not a real id must read as absent rather than being
+        folded into a path.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-safe")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value=MagicMock())
+
+        claim = _capture_history_delete_claim(state, "dashboard_chat-1-100")
+        assert claim.acp_session_id is None
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+        assert self._exists("acp-safe")
+
+    @pytest.mark.asyncio
+    async def test_a_claim_that_lost_its_slot_also_loses_the_ledger_id(self):
+        """The id travels with ``session_key``, on every path that disowns the claim.
+
+        A claim the worker proved does not own the transcript must not still name
+        that session's ledger -- otherwise resolving ownership DOWN would still
+        authorize the removal it just withdrew.
+        """
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-should-not-travel")
+        claim = replace(
+            _capture_history_delete_claim(state, "dashboard_chat-1-100"),
+            path_match_verified=False,
+            history_key=None,
+        )
+        assert claim.acp_session_id == "acp-should-not-travel"
+
+        resolved = _resolve_history_delete_claim(MagicMock(), "dashboard_chat-1-100", claim)
+
+        assert resolved.session_key is None
+        assert resolved.acp_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_a_ledger_a_writer_still_owns_is_left_to_retention(self, monkeypatch):
+        """``owned`` is an ordinary answer here, not an error.
+
+        A queued write can still hold the lease when the teardown runs. The delete
+        does not wait for it and does not fail: the retention sweep collects the
+        ledger once its writer is gone.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        held = self._ledger("acp-busy")
+        # The append is what claims the lease -- ownership is taken lazily, on a
+        # handle's first write.
+        held.append("session/opened", {"resumed": False}, src="gateway")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-busy")
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert self._exists("acp-busy")
+        assert held.path.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_teardown_keeps_the_ledger(self, monkeypatch):
+        """Gated on the teardown SUCCEEDING, not on having been attempted.
+
+        ``destroy_if`` refuses when the session was replaced by a successor
+        generation, is busy, or still has a live slot owner -- and in each case the
+        session it names is preserved and may be writing right now. The write lease
+        is no substitute: ownership ends BETWEEN turns by design, so an
+        idle-but-live session holds nothing for the removal to be refused by.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-preserved")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-preserved")
+        # A successor generation won the slot, so the conditional destroy refuses.
+        state.sessions.destroy_if = AsyncMock(return_value=False)
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert self._exists("acp-preserved")
+
+    @pytest.mark.asyncio
+    async def test_a_raising_teardown_keeps_the_ledger(self, monkeypatch):
+        """A destroy that threw proves nothing about whether the session is gone."""
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._ledger("acp-unknown-state")
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-unknown-state")
+        state.sessions.destroy_if = AsyncMock(side_effect=RuntimeError("manager unreachable"))
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert self._exists("acp-unknown-state")
+
+    @pytest.mark.asyncio
+    async def test_a_failing_ledger_removal_never_fails_the_delete(self, monkeypatch):
+        """The transcript row is already gone by the time this runs.
+
+        Raising would ask the user to retry a delete against a row that is absent,
+        and the sweep collects the ledger on age regardless.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-explodes")
+
+        from kiro_crew.ledger import store as ledger_store
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("ledger tree unreadable")
+
+        monkeypatch.setattr(ledger_store, "remove_unit", _boom)
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
+
+        assert "dashboard_chat-1-100" not in state._slots
