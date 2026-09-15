@@ -384,6 +384,55 @@ class TestMounting:
         ]
         assert session_mcp.session_mcp_disabled_tools(None) == frozenset()
 
+    def test_a_tool_switched_off_by_its_retired_name_stays_off_after_the_rename(self, agents_dir):
+        """A dashboard tool-off is keyed by the tool's name AT THE TIME.
+
+        ``monitor_start`` is now ``monitor_patrol``. A pair carrying the old
+        spelling matches nothing, so the tool the user switched off is back on with
+        nothing saying so -- the same silent fail-open as a persisted exclusion, one
+        layer further out, and this one was set by hand in a UI rather than written
+        by a spec author. Exercised through the real producer and its real
+        projection, not through the widening helper: a test on the helper passes on
+        code where neither source is wired to it.
+        """
+        _write_spec(
+            agents_dir,
+            servers={"kirocrew-core": {"command": "/x", "disabledTools": ["monitor_start"]}},
+            tools=["@kirocrew-core"],
+        )
+        pairs = session_mcp.session_mcp_disabled_tools("kirocrew")
+        # The retired spelling is KEPT as well as expanded: a restriction can only
+        # ever restrict, and dropping it would narrow what the user switched off.
+        assert ("kirocrew-core", "monitor_patrol") in pairs
+        assert ("kirocrew-core", "monitor_start") in pairs
+        # The deny-rule spelling is derived from these pairs, so it cannot drift.
+        assert "mcp__kirocrew-core__monitor_patrol" in session_mcp.session_mcp_deny_rules(
+            "kirocrew"
+        )
+        # And the GLOBAL settings file -- the source the dashboard's tool-off action
+        # actually writes, which is why fixing only the spec would miss the case
+        # that reaches a real user.
+        assert session_mcp.session_mcp_disabled_tools(
+            None,
+            spec=None,
+            settings={"mcpServers": {"third": {"disabledTools": ["monitor_start"]}}},
+        ) == frozenset({("third", "monitor_start"), ("third", "monitor_patrol")})
+
+    def test_a_grant_naming_the_retired_tool_is_not_widened_here_either(self, agents_dir):
+        """``autoApprove`` is a GRANT: restrictions widen, grants never.
+
+        This module drops the key deliberately rather than for want of a mapping, so
+        the retired name must not become an approval for the current one by any
+        route. The pin exists so that completing the symmetry reddens a test.
+        """
+        _write_spec(
+            agents_dir,
+            servers={"kirocrew-core": {"command": "/x", "autoApprove": ["monitor_start"]}},
+            tools=["@kirocrew-core"],
+        )
+        assert session_mcp.session_mcp_disabled_tools("kirocrew") == frozenset()
+        assert session_mcp.session_mcp_deny_rules("kirocrew") == []
+
     def test_disabled_tools_written_by_the_dashboard_to_the_global_file_count(
         self, tmp_path, agents_dir
     ):

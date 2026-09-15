@@ -89,6 +89,7 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
+from kiro_crew.tool_retirement import widen_restriction_for_retired_names
 
 logger = logging.getLogger(__name__)
 
@@ -479,9 +480,17 @@ def session_mcp_disabled_tools(
             disabled = entry.get("disabledTools")
             if not isinstance(disabled, list):
                 continue
-            for tool in disabled:
-                if isinstance(tool, str) and tool:
-                    pairs.add((str(name), tool))
+            names = [tool for tool in disabled if isinstance(tool, str) and tool]
+            if not names:
+                continue
+            # A tool-off records the tool as it was spelled THEN. Once that tool is
+            # renamed the pair matches nothing, and the tool the user switched off
+            # is back on with nothing saying so -- the same fail-open as the
+            # exclusion set, one layer further out, and this one was set by hand in
+            # a UI rather than written by a spec author. Widening a RESTRICTION is
+            # the safe direction; grants have no equivalent, deliberately.
+            for tool in widen_restriction_for_retired_names(names):
+                pairs.add((str(name), tool))
     return frozenset(pairs)
 
 
