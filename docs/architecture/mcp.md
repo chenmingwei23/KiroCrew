@@ -791,7 +791,7 @@ answers `tools/list` from):
     deliver into the parent's chat window. An unresolvable identity refuses the
     call rather than guessing.
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
-  `ask_question`, `suggest_followup`, `monitor_start`, `monitor_watch`,
+  `ask_question`, `suggest_followup`, `monitor_patrol`, `monitor_watch`,
   `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`,
   `reset_conversation`
 - **Memory recall (V1 and V2):** `memory_recall` resolves authenticated session identity
@@ -1382,7 +1382,7 @@ identity, would hand the answer to whichever session the shared process last saw
 and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
-is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
+is what the `ask_question` MCP tool itself now does, along with `monitor_patrol`,
 `monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`
 and `suggest_followup`, and `reset_conversation`
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
@@ -1400,7 +1400,7 @@ tool call it arrived under was recorded, from kiro-cli's out-of-band `_meta`
 channel, as an MCP-served call whose canonical name (`_meta.kiro.toolName`, with
 `_meta.kiro.mcpServerName` equal to `kirocrew-core`) is in `DIRECTIVE_TOOLS`. The
 LLM-authored `title` is explicitly not accepted, because a shell command titled
-`monitor_start` whose stdout forges the marker must not be honored. The gate fails
+`monitor_patrol` whose stdout forges the marker must not be honored. The gate fails
 closed when `_meta` identity is absent, and refuses native-sub-agent tool calls,
 which surface as flat events in the parent's loop but have no independently
 bindable slot. The marker is ASCII-only: an earlier invisible-separator prefix was
@@ -1492,7 +1492,7 @@ Structured creation is admitted only from dashboard, Slack, and Discord sessions
 the surfaces with typed wake dispatch and completion correlation. Webex retains
 finite legacy prompt loops but refuses `monitor_watch` at both the stateless tool
 and authoritative consumer boundaries.
-The legacy `monitor_start` descriptor routes supported pull-request readiness
+The legacy `monitor_patrol` descriptor routes supported pull-request readiness
 through `monitor_watch` only when typed provider facts fully determine the
 objective. Objectives that require interpreting comments or advisory review
 evidence keep a finite legacy loop instead of claiming the structured probe

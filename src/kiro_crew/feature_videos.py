@@ -257,7 +257,7 @@ CATALOG: tuple[VideoEntry, ...] = (
         poster=f"{ASSET_PREFIX}monitor-loops.jpg",
         duration_s=22.0,
         doc="monitor-loops.md",
-        used_when=("sel_event_seen:monitor_start",),
+        used_when=("sel_event_seen:monitor_patrol",),
     ),
 )
 

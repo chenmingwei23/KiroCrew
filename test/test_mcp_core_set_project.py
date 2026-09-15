@@ -434,17 +434,17 @@ class TestApplierAuditAndFailSoft:
         def _boom() -> object:
             raise RuntimeError("autonudge exploded")
 
-        # _monitor_start does `from kiro_crew.autonudge import get_instance`
+        # _monitor_patrol does `from kiro_crew.autonudge import get_instance`
         # then calls it first — patch the source symbol so it raises.
         monkeypatch.setattr("kiro_crew.autonudge.get_instance", _boom)
         slot = _FakeSlot()
         state = _FakeState()
         result = await apply_session_directive(
-            state, slot, "dashboard:chat-1", "monitor_start", {"message": "x"}
+            state, slot, "dashboard:chat-1", "monitor_patrol", {"message": "x"}
         )
-        assert result.startswith("Error applying monitor_start")
+        assert result.startswith("Error applying monitor_patrol")
         assert [c["outcome"] for c in sel_spy.calls] == ["error"]
-        assert sel_spy.calls[0]["tool_name"] == "monitor_start"
+        assert sel_spy.calls[0]["tool_name"] == "monitor_patrol"
 
     @pytest.mark.asyncio
     async def test_sensitive_path_denied_without_filesystem_probe(self, monkeypatch, sel_spy):

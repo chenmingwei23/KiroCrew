@@ -62,7 +62,7 @@ from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
     AUTONUDGE_STOP_SCHEMA,
     MONITOR_INSPECT_SCHEMA,
-    MONITOR_START_SCHEMA,
+    MONITOR_PATROL_SCHEMA,
     MONITOR_STOP_SCHEMA,
     MONITOR_UPDATE_SCHEMA,
     MONITOR_WATCH_SCHEMA,
@@ -374,7 +374,7 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
-            "name": "monitor_start",
+            "name": "monitor_patrol",
             "description": (
                 "Start a finite prompt loop for repeated work on YOUR CURRENT session, "
                 "including first-class self-session patrol by conductor agents. For "
@@ -399,7 +399,7 @@ def schemas() -> list[dict[str, Any]]:
                 "Discord, use monitor_update to revise or re-arm the instruction "
                 "if what you are watching changes. On Webex, stop the loop and "
                 "create a new finite one instead. One automation may occupy a "
-                "session; monitor_start "
+                "session; monitor_patrol "
                 "is create-only and refuses while an ACTIVE one exists (a "
                 "system-stopped or expired automation — an approval stall, a "
                 "spent cap or budget, a finished subject — is replaced by the "
@@ -824,7 +824,7 @@ def wait(name: str, args: dict[str, Any]) -> str:
     # pinging there is no collision to detect.
     #
     # `require_strict_session_key` is the shared gate for exactly this class
-    # of session-mutating tool (monitor_start, autonudge_stop, set_project)
+    # of session-mutating tool (monitor_patrol, autonudge_stop, set_project)
     # -- it drops the walk and accepts only gateway-injected caller context,
     # KIROCREW_SESSION_KEY, or a HMAC-verified pid sidecar.
     # When it comes back empty the identity is a guess, so the ping degrades
@@ -1175,28 +1175,28 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
     )
 
 
-def monitor_start(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, MONITOR_START_SCHEMA)
+def monitor_patrol(name: str, args: dict[str, Any]) -> str:
+    args = validate_tool_args(args, MONITOR_PATROL_SCHEMA)
     # STRICT resolution via the shared gate (env-var only, no PID walk):
-    # monitor_start creates a persistent unattended loop that repeatedly runs
+    # monitor_patrol creates a persistent unattended loop that repeatedly runs
     # tools in the bound session. A subagent under the parent's process tree
     # must NOT be able to PID-walk into the parent's identity and mint a loop
     # the parent user never asked for (crosses the session authorization
     # boundary). Resolve-half only: the short-circuit below is on context,
     # not identity, so an empty key falls through to the directive.
-    sk, _ = mcp_core.require_strict_session_key("monitor_start")
+    sk, _ = mcp_core.require_strict_session_key("monitor_patrol")
     # Stateless: only short-circuit contexts where a directive can
     # never be applied (cron/hook/subagent). The session-aware consumer
     # (chat_runner) supplies the binding key and arms the loop.
     if mcp_core._autonudge_binding_key(sk) is None and sk:
         return (
-            "monitor_start only works from within a dashboard, Slack, Discord, "
+            "monitor_patrol only works from within a dashboard, Slack, Discord, "
             f"or Webex session (current session_key={sk!r}). For other "
             "contexts use cron_add or a HEARTBEAT.md task."
         )
     message = args["message"].strip()
     if not message:
-        return "monitor_start: message must not be empty."
+        return "monitor_patrol: message must not be empty."
     interval_secs = int(args.get("interval_secs") or 300)
     # Default to bounded cycle and runtime caps. A loop without either bound
     # only ever stops when the model volunteers an autonudge_stop, and observed
@@ -1248,7 +1248,7 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # {interval}s", which for a gated loop is untrue, and this whole change
     # exists because a cadence change nobody could see had no effect.
     return _emit_directive(
-        "monitor_start",
+        "monitor_patrol",
         payload,
         (
             "Monitor loop requested on this session: "
@@ -1505,7 +1505,7 @@ def monitor_stop(name: str, args: dict[str, Any]) -> str:
 def monitor_update(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, MONITOR_UPDATE_SCHEMA)
     # STRICT resolution via the shared gate, same rationale as
-    # monitor_start/autonudge_stop: this mutates persistent loop state that
+    # monitor_patrol/autonudge_stop: this mutates persistent loop state that
     # drives unattended turns, so a subagent must not PID-walk into the
     # parent's identity and rewrite the parent session's instruction.
     sk, strict_err = mcp_core.require_strict_session_key(
@@ -1625,7 +1625,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "register_hook": register_hook,
     "autonudge_stop": autonudge_stop,
     "ask_question": ask_question,
-    "monitor_start": monitor_start,
+    "monitor_patrol": monitor_patrol,
     "monitor_watch": monitor_watch,
     "monitor_inspect": monitor_inspect,
     "monitor_stop": monitor_stop,

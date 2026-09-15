@@ -27,8 +27,8 @@ On Webex, use the finite legacy path even for a supported pull request.
 |---|---|
 | User is waiting, total work under 30 minutes | Bounded in-turn `wait` + poll |
 | One supported pull request, readiness decided by typed provider facts | `monitor_watch` |
-| Generic comments/advisory findings, or a required final report or notification | Finite `monitor_start` with `gate=false` |
-| Act on a schedule, multiple subjects, unsupported ticket or deployment | Finite `monitor_start` |
+| Generic comments/advisory findings, or a required final report or notification | Finite `monitor_patrol` with `gate=false` |
+| Act on a schedule, multiple subjects, unsupported ticket or deployment | Finite `monitor_patrol` |
 | Fresh-session work needing no approval-bound tools | `cron_add` |
 | Post-merge cleanup after verified merge | Script cron, roughly every 5 minutes |
 | External system calls back | `register_hook` |
@@ -100,7 +100,7 @@ explicit restart action. Never erase that evidence or retry the refusal.
 ## Example: legacy comment-aware recipe
 
 ```text
-monitor_start({
+monitor_patrol({
   "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
   "interval_secs": 300,
   "max_cycles": 24,
@@ -145,7 +145,7 @@ security. Fix, commit and push only within the user's authorization.
   preserves the count and omitted fields. Do not mix these with structured-only
   `target`, `objective`, `max_agent_turns`, `max_tokens`, `max_provider_errors`
   or `wake_instructions`. On Webex, stop and create a new finite loop instead.
-- One automation occupies a session. `monitor_start` is create-only; update an
+- One automation occupies a session. `monitor_patrol` is create-only; update an
   active loop rather than replacing it. A budget-paused legacy loop resumes only
   by raising the bound it reached with user authorization. Manual pauses and user
   stops stay preserved; retained evidence needs the owner action above. Do not
@@ -320,5 +320,5 @@ read its end reason; do not reissue a wait the user stopped.
 
 Kill switches: the driver's stop tool, dashboard automation popover, cycle/turn
 cap and runtime budget. A STOP sentinel exists only if explicitly configured
-through `stop_sentinel_path` on the HTTP arming path; `monitor_start` creates none.
+through `stop_sentinel_path` on the HTTP arming path; `monitor_patrol` creates none.
 Treat `[auto-nudge cycle N]` as your scheduled wake, not a new human request.

@@ -118,7 +118,7 @@ def test_monitor_modes_have_distinct_stop_paths_and_real_exit_conditions() -> No
     _require(
         monitor,
         r"monitor_watch.*monitor_inspect.*monitor_stop.*NOT `autonudge_stop`",
-        r"Structured monitors support dashboard/Slack/Discord only; Webex uses `monitor_start`",
+        r"Structured monitors support dashboard/Slack/Discord only; Webex uses `monitor_patrol`",
         r"exit condition.*autonudge_stop",
         r"gate=false.*generic comments/advisory scans.*silence itself needs action",
         r"Arming failure.*not a transient reconnect",

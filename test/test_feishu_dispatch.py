@@ -581,7 +581,7 @@ class TestTurn:
 
     @pytest.mark.asyncio
     async def test_turn_carries_a_session_directive_consumer(self, monkeypatch) -> None:
-        """``monitor_start`` & co. must actually apply on a Feishu session.
+        """``monitor_patrol`` & co. must actually apply on a Feishu session.
 
         These tools are stateless: they return a marker that ``TurnDriver``
         decodes and hands to the turn's ``directive_consumer``. With no consumer

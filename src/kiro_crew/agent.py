@@ -5852,11 +5852,11 @@ it.
 
 ## Patrol
 
-Arm a loop on your own session with `monitor_start`, carrying the cycle
+Arm a loop on your own session with `monitor_patrol`, carrying the cycle
 instructions AND the exit condition, then end the turn. A reply saying
 *requested* is success — do not retry it. If arming is refused outright, say no
 loop is running and drive that one round with `wait`. Call `autonudge_stop` when
-you stop. (The loop is on a timer today. When `monitor_start` accepts a
+you stop. (The loop is on a timer today. When `monitor_patrol` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
 costing a turn.)
 
@@ -5924,7 +5924,7 @@ Your tools:
   you beside your workers, not floating at the top level), `chat_folder_tree`,
   `chat_folder_create`.
 - Your own state across rounds — `session_ledger_read`, `session_ledger_record`.
-- Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
+- Patrol — `monitor_patrol`, `monitor_update`, `autonudge_stop`, `wait`.
 - Capacity, before standing up several sessions at once — `resource_status`.
 - Talking to the person — `ask_question` puts a decision that is not yours to
   make to them as a card, after which you END your turn and their answer
@@ -6148,7 +6148,7 @@ _WORKER_WORK_GRANTS: tuple[str, ...] = (
 )
 
 _CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
-    "@kirocrew-core/monitor_start",
+    "@kirocrew-core/monitor_patrol",
     "@kirocrew-core/monitor_update",
     "@kirocrew-core/autonudge_stop",
     "@kirocrew-core/wait",
@@ -6644,6 +6644,7 @@ def _filter_auto_approve(refs: tuple[str, ...], *, source: str) -> list[str]:
     A helper rather than three copies because the copies are what drift: the
     per-installer difference is ``source`` alone, and the three conductor specs'
     tests pin that the emitted list is unchanged by the extraction.
+
     """
     granted: list[str] = []
     withheld: list[str] = []
@@ -6785,7 +6786,7 @@ def _conductor_spec(*, name: str, description: str, filename: str, source: str) 
         "report",
         # Load-bearing, not decoration: with MCP Tool Search active the
         # session-control specs are deferred, so the conductor cannot reach
-        # ``session_create`` / ``chat_folder_*`` / ``monitor_start`` at all until
+        # ``session_create`` / ``chat_folder_*`` / ``monitor_patrol`` at all until
         # it loads them by id. Named in the prompt's tool inventory for that
         # reason, and auto-approved below so the load itself never prompts.
         "tool_search",
@@ -6959,7 +6960,7 @@ compute from transcripts. A script your install does not carry reads as UNKNOWN
 for the questions it answers — never as permission; the skill says what to do
 in that case.
 
-**Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
+**Patrol with `monitor_patrol`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
 when you stop. A reply saying *requested* is success — do not retry it. If
 arming is refused outright, say no loop is running and drive that one round
@@ -6972,7 +6973,7 @@ Your tools:
 - Keeping the pipeline's sessions together — `chat_folder_tree`,
   `chat_folder_create`.
 - State that outlives a round — `session_ledger_read`, `session_ledger_record`.
-- Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
+- Patrol — `monitor_patrol`, `monitor_update`, `autonudge_stop`, `wait`.
 - Capacity, before dispatching — `resource_status`.
 - Inspecting a suspect worker — `spawn_run`, bounded and read-only.
 - Talking to the person — `ask_question` puts a decision that is not yours to
@@ -7012,7 +7013,7 @@ instruction with `monitor_update` so every later cycle honors it.
 #: stays mounted-but-gated and unattended runs get it from the operator's
 #: session-level trust grant.
 _PIPELINE_CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
-    "@kirocrew-core/monitor_start",
+    "@kirocrew-core/monitor_patrol",
     "@kirocrew-core/monitor_update",
     "@kirocrew-core/autonudge_stop",
     "@kirocrew-core/wait",
@@ -7893,7 +7894,7 @@ you END your turn: any active testing beyond static review plus a local
 unit-level proof of concept, and any fixer dispatch. Waiting on an unanswered
 gate is the correct state; assuming its answer is not.
 
-**Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
+**Patrol with `monitor_patrol`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
 when you stop. A reply saying *requested* is success — do not retry it. If
 arming is refused outright, say no loop is running and drive that one round
@@ -7909,7 +7910,7 @@ Your tools:
   verifiers then go under `<audit>/<agent>`), `chat_folder_tree`,
   `chat_folder_create`.
 - State that outlives a round — `session_ledger_read`, `session_ledger_record`.
-- Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
+- Patrol — `monitor_patrol`, `monitor_update`, `autonudge_stop`, `wait`.
 - Capacity, before dispatching — `resource_status`.
 - Inspecting a suspect child — `spawn_run`, bounded and read-only.
 - Talking to the person — `ask_question` puts a decision that is not yours to

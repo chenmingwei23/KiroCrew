@@ -60,6 +60,7 @@ from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.platform.governance import may_skip_gate_now
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.tool_retirement import widen_restriction_for_retired_names
 
 logger = logging.getLogger(__name__)
 
@@ -521,7 +522,11 @@ def to_client_custom_agent(
 
     excluded = spec.get("excludedTools")
     if isinstance(excluded, list):
-        entries = [t for t in excluded if isinstance(t, str) and t]
+        # Same widening as the runtime exclusion set: a spec that excludes a tool
+        # by its OLD name must keep excluding it after the rename. Relaying the
+        # block verbatim would hand the backend a restriction that matches nothing.
+        # Sorted so the relayed list is stable rather than set-ordered.
+        entries = sorted(widen_restriction_for_retired_names(excluded))
         if entries:
             out["excludedTools"] = entries
 

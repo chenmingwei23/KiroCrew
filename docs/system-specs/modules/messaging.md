@@ -4521,7 +4521,7 @@ into a once-ever one. `messaging.idle_reset_minutes` / `daily_reset_hour` are
 honoured through `ConversationState.maybe_rotate`, called AFTER the busy check
 — rotating first would mint a new generation and miss an in-flight turn on the
 current key — with the session key re-derived afterwards. The turn carries a
-`build_directive_consumer` so the session-directive tools (`monitor_start`,
+`build_directive_consumer` so the session-directive tools (`monitor_patrol`,
 `autonudge_stop`, …) apply against the Feishu session rather than returning a
 marker the driver leaves inert while still reporting success to the model;
 dashboard-only directives stay refused for a channel turn (`slot=None`,

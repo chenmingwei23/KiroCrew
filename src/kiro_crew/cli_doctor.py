@@ -1643,7 +1643,7 @@ def _doctor_trust_root() -> None:
 
 
 #: MCP servers that host strict-identity tools — the reflexive verbs
-#: (``monitor_start``, ``session_ledger_*``, ``set_project``, ``ask_question``)
+#: (``monitor_patrol``, ``session_ledger_*``, ``set_project``, ``ask_question``)
 #: and the authorization-subject ones (session control, ``chat_folder_*``).
 #: Mirrors ``mcp_core._STRICT_IDENTITY_SERVERS``; ``kirocrew-dashboard`` is
 #: opt-in per agent, so it is reported only when an agent actually references it.
@@ -1734,7 +1734,7 @@ def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
     names = ", ".join(unrouted)
     print(f"  strict identity: ⏹ no identity channel for {names}")
     _print_wrapped(
-        "Tools that must know which session is calling (monitor_start, "
+        "Tools that must know which session is calling (monitor_patrol, "
         "session_ledger_*, set_project, ask_question, session control, "
         "chat_folder_*) are refused while a server is unrouted: on the kiro "
         "backend the session's AcpRuntime carries no session key in its "

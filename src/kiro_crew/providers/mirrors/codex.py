@@ -554,7 +554,7 @@ class CodexMirror(AgentConfigMirror):
         starts from ``env_clear()`` plus an allowlist, so without them Crew's own
         control plane comes up with no session to act on, and the out-of-band
         session-directive path (``dashboard/directive_queue``) -- the one that
-        carries ``monitor_start`` and friends on a backend emitting no
+        carries ``monitor_patrol`` and friends on a backend emitting no
         ``_meta.kiro`` -- has nothing to claim against.
 
         ``work_dir`` is the session's project checkout and is required for

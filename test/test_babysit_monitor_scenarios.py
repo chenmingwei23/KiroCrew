@@ -40,7 +40,7 @@ def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -
 
     assert "triggers: babysit" in skill
     assert "monitor_watch" in prompt
-    assert "Use `monitor_start`" in prompt
+    assert "Use `monitor_patrol`" in prompt
     assert "only for unsupported targets" in prompt
     assert "HEARTBEAT.md" in prompt
     assert "kiro_crew.heartbeat.append_heartbeat_task(entry)" in prompt
@@ -48,15 +48,15 @@ def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -
 
 def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> None:
     skill = _BABYSIT_SKILL.read_text(encoding="utf-8")
-    legacy_recipe, _ = json.JSONDecoder().raw_decode(skill.split("monitor_start(", 1)[1])
+    legacy_recipe, _ = json.JSONDecoder().raw_decode(skill.split("monitor_patrol(", 1)[1])
     legacy_recipe["message"] = legacy_recipe["message"].replace("<unsupported target>", _TARGET)
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_SESSION_KEY):
-        legacy = control.monitor_start(
-            "monitor_start",
+        legacy = control.monitor_patrol(
+            "monitor_patrol",
             legacy_recipe,
         )
 
-    legacy_args = session_directive.decode(legacy, "monitor_start")
+    legacy_args = session_directive.decode(legacy, "monitor_patrol")
     assert legacy_args is not None
     assert legacy_args["max_cycles"] == 24
     assert legacy_args["max_runtime_secs"] == 14_400
@@ -78,15 +78,15 @@ def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> N
     recipe = next(
         textwrap.dedent(block).strip()
         for block in skill.split("```")
-        if textwrap.dedent(block).strip().startswith("monitor_start(")
+        if textwrap.dedent(block).strip().startswith("monitor_patrol(")
     )
     call = ast.parse(recipe, mode="eval").body
     assert isinstance(call, ast.Call)
     args = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
     args["message"] = args["message"].replace("#<n>", _TARGET)
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_SESSION_KEY):
-        result = control.monitor_start("monitor_start", args)
-    applied = session_directive.decode(result, "monitor_start")
+        result = control.monitor_patrol("monitor_patrol", args)
+    applied = session_directive.decode(result, "monitor_patrol")
     assert applied is not None
     loop = NudgeLoop(
         id="prepare-pr",
@@ -110,7 +110,7 @@ def test_babysit_routes_webex_sessions_to_the_finite_legacy_path() -> None:
 
 
 def test_legacy_tool_description_scopes_structured_review_evidence() -> None:
-    descriptor = next(item for item in control.schemas() if item["name"] == "monitor_start")
+    descriptor = next(item for item in control.schemas() if item["name"] == "monitor_patrol")
     description = descriptor["description"]
 
     assert "fully determined by typed provider facts" in description

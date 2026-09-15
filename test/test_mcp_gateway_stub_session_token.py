@@ -545,7 +545,7 @@ async def test_a_subagent_session_survives_its_parents_rekey(
     subagent's stub must still forward as the SUBAGENT.
 
     Then the consequence that matters: with the identity gatewayd stamps on that
-    connection, ``require_strict_session_key`` — the one gate ``monitor_start``
+    connection, ``require_strict_session_key`` — the one gate ``monitor_patrol``
     and every other reflexive tool routes through — answers with the subagent's
     key. A subagent cannot arm a loop on, or report into, its parent's slot.
     """

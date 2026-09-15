@@ -373,7 +373,7 @@ def browser(name: str, args: dict[str, Any]) -> str:
     # tool does (artifacts, sessions, skills, wait): the LENIENT resolver, whose
     # ladder ends in a libproc/proc ancestor walk. This is deliberate, not a
     # relaxation of the strict resolver used by session-MUTATING tools
-    # (monitor_start, set_project). On a DEFAULT install the pooled gateway is
+    # (monitor_patrol, set_project). On a DEFAULT install the pooled gateway is
     # off, so there is no per-call caller context and no KIROCREW_SESSION_KEY,
     # and macOS/Windows have no HMAC pid sidecar -- i.e. ALL THREE sources the
     # strict resolver accepts are absent, so strict returns "" for the user's

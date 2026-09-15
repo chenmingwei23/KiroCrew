@@ -99,7 +99,7 @@ Then:
 2. Open `<anchor>/GOAL.md` — confirm issue-discovery sources (defaults: tree
    grep, kanban backlog). Add/remove.
 3. `ls <anchor>/STOP` must say "No such file".
-4. Arm the loop: `monitor_start(message, interval_secs, max_cycles)` from a live
+4. Arm the loop: `monitor_patrol(message, interval_secs, max_cycles)` from a live
    session, the UI 🎯 "Set a goal", or `POST /api/autonudge`. Revise a running
    loop in place with `PATCH /api/autonudge/{loop_id}` (or `monitor_update`),
    which keeps its cycle count; `DELETE /api/autonudge/{loop_id}` stops it.

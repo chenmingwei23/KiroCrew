@@ -1249,14 +1249,14 @@ MONITOR_STOP_SCHEMA = ToolSchema(
     fields=[FieldSpec("reason", str, max_len=MAX_MONITOR_STOP_REASON_CHARS, clamp_to_max=True)],
 )
 
-# monitor_start creates an AutoNudge loop bound to the calling session (the
+# monitor_patrol creates an AutoNudge loop bound to the calling session (the
 # agent-facing "babysit this PR" primitive). message caps match the REST
 # endpoint's 8000-char limit; interval bounds mirror autonudge's
 # _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. Both caps must be positive; the 7-day
 # runtime ceiling keeps a typo like 6e9 from arming an effectively unbounded
 # loop while still covering week-long babysits.
-MONITOR_START_SCHEMA = ToolSchema(
-    tool_name="monitor_start",
+MONITOR_PATROL_SCHEMA = ToolSchema(
+    tool_name="monitor_patrol",
     fields=[
         FieldSpec("message", str, required=True, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
@@ -1276,8 +1276,8 @@ MONITOR_START_SCHEMA = ToolSchema(
 
 # monitor_update revises the loop already bound to the calling session. Every
 # field is optional (a no-field call is a no-op the handler rejects), and the
-# bounds mirror MONITOR_START_SCHEMA so a loop cannot be updated into a state
-# that monitor_start would have refused to create.
+# bounds mirror MONITOR_PATROL_SCHEMA so a loop cannot be updated into a state
+# that monitor_patrol would have refused to create.
 MONITOR_UPDATE_SCHEMA = ToolSchema(
     tool_name="monitor_update",
     fields=[
@@ -1292,7 +1292,7 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
         # Same bound as the arm side, for the reason the comment above gives: a
-        # loop must not be updatable into a state monitor_start would refuse.
+        # loop must not be updatable into a state monitor_patrol would refuse.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
     ],
 )
@@ -1487,7 +1487,7 @@ MAX_FOLLOWUP_ITEMS = 3
 MAX_FOLLOWUP_TITLE = 120
 MAX_FOLLOWUP_DESCRIPTION = 600
 # The handoff prompt is a full agent instruction, so it gets the same 8000-char
-# ceiling as monitor_start's message rather than MAX_MEDIUM_STRING.
+# ceiling as monitor_patrol's message rather than MAX_MEDIUM_STRING.
 MAX_FOLLOWUP_PROMPT = 8_000
 MAX_FOLLOWUP_BRANCH = 80
 
@@ -3000,7 +3000,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "monitor_watch": MONITOR_WATCH_SCHEMA,
     "monitor_inspect": MONITOR_INSPECT_SCHEMA,
     "monitor_stop": MONITOR_STOP_SCHEMA,
-    "monitor_start": MONITOR_START_SCHEMA,
+    "monitor_patrol": MONITOR_PATROL_SCHEMA,
     "monitor_update": MONITOR_UPDATE_SCHEMA,
     "ask_question": ASK_QUESTION_SCHEMA,
     "delete_message": DELETE_MESSAGE_SCHEMA,

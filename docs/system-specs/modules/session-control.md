@@ -527,7 +527,7 @@ onto a different session, and popping that would tear down the replacement while
 saving the stale slot (409 `target_replaced`). Being synchronous is the whole
 point — there is no suspension between the last retirement, this re-check, and
 the pop, so nothing (a channel mirror/link landing, a re-mint, or a racing
-`monitor_start` arming a loop) can change between the final authorization and the
+`monitor_patrol` arming a loop) can change between the final authorization and the
 archival; an awaited re-check, by contrast, reopens exactly those windows. Any
 refusal aborts the close, rolls back the retired nudge loop, and surfaces as the
 guard's own status. This is the same "re-gate adjacent to the mutation, comparing

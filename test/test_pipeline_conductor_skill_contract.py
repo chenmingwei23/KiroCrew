@@ -982,7 +982,7 @@ class TestProbeSignalsAreDocumented:
 
 
 class TestPatrolLoopEnumeratesTheTags:
-    """The armed `monitor_start` message is the per-cycle action list that
+    """The armed `monitor_patrol` message is the per-cycle action list that
     actually runs. A tag missing from the ACTION TABLE is a lookup that fails; a
     tag missing from here is an instruction the conductor never receives."""
 
@@ -1233,7 +1233,7 @@ class TestOutageRecoveryAndLoopLiveness:
         than left for the reader to discover."""
         body = _flat(_skill_section(self.HEADING))
         assert "patrol interval" in body
-        assert "monitor_start" in body
+        assert "monitor_patrol" in body
 
 
 class TestWorkOrderBriefClauses:

@@ -297,7 +297,7 @@ def binding_key_for(session_key: str) -> str | None:
     session keys pass through unchanged (channel-bound loops). Anything else
     (``cron:``, ``hook:``, ``subagent:`` ...) is not a nudge-able session.
 
-    Single source of truth shared by the ``monitor_start`` MCP tool and the
+    Single source of truth shared by the ``monitor_patrol`` MCP tool and the
     workflow ``ctx.nudge`` port so both agree on what "nudge-able" means.
 
     NARROWER THAN :data:`_CHANNEL_KEY_PREFIXES` ON PURPOSE, and for a different
@@ -621,14 +621,14 @@ class NudgeLoop:
     banner: str = ""
     # WHO armed this loop, reduced to the one distinction the authorizer needs:
     # True when the arming request came from a turn OF THE BOUND SESSION ITSELF
-    # (the ``monitor_start`` / ``monitor_watch`` session directive, applied by
+    # (the ``monitor_patrol`` / ``monitor_watch`` session directive, applied by
     # the turn loop to the exact session that produced it), False for every
     # external arm (REST, workflow ``ctx.nudge``, an app handler).
     #
     # Exists because crew- and member-mode slots refuse automation turns armed
     # from OUTSIDE the session -- nothing may inject work into a member's own
     # thread -- yet a member is by definition a self-directed resident agent,
-    # and refusing its own ``monitor_start`` left the conductor member thread
+    # and refusing its own ``monitor_patrol`` left the conductor member thread
     # never waking again (the very loop it exists to run). The authorizer
     # admits the self-arm and records it here so the FIRE-time re-check in
     # ``GatewayOrchestrator._fire_dashboard_nudge`` can tell "this slot was a
@@ -1456,7 +1456,7 @@ class AutoNudgeService:
         banner: str = "",
         admission_check: Callable[[], bool] | None = None,
         # UNGATED by default, and the default lives at the ARMING SURFACES instead.
-        # The evidence for gating is about monitor_start -- a babysit loop whose work
+        # The evidence for gating is about monitor_patrol -- a babysit loop whose work
         # IS the pull request. This service also arms loops whose work is not: a goal
         # loop, an app's own timer. Defaulting to gated here inferred a monitor from
         # any message that merely MENTIONED one PR, which throttles such a loop and,
@@ -1875,7 +1875,7 @@ class AutoNudgeService:
                 # (approval-stalled, capped, budget-spent, or a terminal record
                 # kept for inspection) otherwise deadlocks the session's only
                 # re-arm: monitor_update's approval-stall refusal names
-                # monitor_start as the remedy. The wake-in-flight guard below
+                # monitor_patrol as the remedy. The wake-in-flight guard below
                 # still runs for the replaced-inactive case, so a terminal
                 # record whose accepted wake is awaiting completion evidence
                 # keeps its own refusal rather than having its correlation
@@ -1952,11 +1952,11 @@ class AutoNudgeService:
                 # here: whatever the caller already wrote is where the target comes
                 # from, on every surface. Gating itself is no longer inherited by
                 # construction, though -- that claim was true before the default
-                # moved and is not now. Each arming surface chooses: monitor_start's
+                # moved and is not now. Each arming surface chooses: monitor_patrol's
                 # directive gates by default, the generic REST route does not.
                 #
                 # ``gate=False`` is the one escape, and it is an opt-OUT of a
-                # default that lives at the ARMING SURFACE: monitor_start's own
+                # default that lives at the ARMING SURFACE: monitor_patrol's own
                 # directive gates unless told otherwise, while this service and the
                 # generic REST route default to ungated -- they also arm loops whose
                 # work is not a pull request. So it cannot repeat the zero-adoption
@@ -4574,7 +4574,7 @@ class AutoNudgeService:
         # are free. Calling it wakes would undercount what the number actually
         # bounds, which is what the user pays for. A watch can still sit on a pull
         # request for days inside a small cap, which is the intended reading of the
-        # number, and monitor_start's own description says so at the arming surface.
+        # number, and monitor_patrol's own description says so at the arming surface.
         #
         # Exception-safe on purpose, and exception-safe in the SPENDING
         # direction. The gate resolves every uncertainty it can reason about

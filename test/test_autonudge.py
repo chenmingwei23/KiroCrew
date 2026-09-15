@@ -213,13 +213,13 @@ async def test_arming_a_loop_that_names_one_pr_gates_it_without_any_parameter(tm
     the instruction the caller had already written. Every earlier version of this
     saving was an opt-in and measured zero adoption; there is nothing to opt into.
 
-    The default lives at the ARMING SURFACES (the monitor_start tool, its directive,
+    The default lives at the ARMING SURFACES (the monitor_patrol tool, its directive,
     the REST route), not in ``AutoNudgeService.add``. That distinction is the point
     rather than a detail: the service also arms loops whose work is NOT a pull
     request -- a goal loop, an app's own timer -- and inferring a monitor from any
     message that merely mentions one PR would throttle those and, if the PR is
     already merged, deactivate them before their first turn. The surfaces' own
-    defaults are pinned where they live: ``test_monitor_start_ack`` asserts the
+    defaults are pinned where they live: ``test_monitor_patrol_ack`` asserts the
     tool's directive payload carries ``gate: true`` when the caller passed nothing,
     and ``test_autonudge_handlers_cov80`` asserts the REST route passes ``gate=True``
     on an absent field. What THIS test owns is the other half -- that a gated arming
@@ -604,7 +604,7 @@ async def test_a_direct_service_call_is_not_gated(tmp_path):
     was given -- "drive PR #42 to green" is the ordinary phrasing. Gating by default
     at this layer would throttle such a loop to the quiet-streak floor, and if that
     PR is already merged or closed it would deactivate the loop before its first
-    agent turn. The evidence for gating is about monitor_start specifically, so the
+    agent turn. The evidence for gating is about monitor_patrol specifically, so the
     default belongs to that surface and not to everyone who calls ``add``.
     """
     service = AutoNudgeService(base_dir=tmp_path)
@@ -1720,7 +1720,7 @@ async def test_a_channel_loop_gets_a_final_turn_but_a_dashboard_loop_does_not(
     """The expiry notification only reaches the dashboard bell.
 
     A loop armed in a Slack thread or a Discord DM would otherwise finish with
-    nothing said where its user is actually watching -- and monitor_start advertises
+    nothing said where its user is actually watching -- and monitor_patrol advertises
     those surfaces as first-class. Returning False for a channel key delivers one
     final turn so the agent reports into the thread; a dashboard loop already got the
     bell and does not need to pay for a turn.
@@ -3218,7 +3218,7 @@ async def test_add_legacy_loop_create_only_preserves_an_existing_monitor(svc):
 @pytest.mark.asyncio
 async def test_create_only_add_replaces_an_inactive_approval_stalled_loop(svc):
     """The approval-stall deadlock: ``monitor_update`` refuses to revive an
-    approval-stalled loop and names ``monitor_start`` as the remedy, so the
+    approval-stalled loop and names ``monitor_patrol`` as the remedy, so the
     directive re-arm (``replace_stopped=True``) must not read that retained
     INACTIVE row as an occupying automation. Observed live: a babysit re-arm
     bounced off its own predecessor's approval-stall tombstone with "session

@@ -651,7 +651,7 @@ async def handle_message_transport(
             # PreToolUse deny/auto gate (runs before the ladder in TurnDriver;
             # a DENY is un-overridable by auto/trust/YOLO).
             tool_gate=_tool_gate,
-            # Session-directive consumer: monitor_start / autonudge_stop / ...
+            # Session-directive consumer: monitor_patrol / autonudge_stop / ...
             # return a marker the driver decodes; apply it against THIS turn's
             # session key. ``gateway`` (when the caller passed one) carries the
             # live ``dashboard_state``; without it the consumer falls back to

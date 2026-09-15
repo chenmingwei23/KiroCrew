@@ -43,9 +43,9 @@ The second fact is that a body is not re-sent per turn so much as permanent. ACP
 | Who claims it | `_repair_escaped_marker` then apply | `directive_queue.claim(session_key, input_digest, not_before=turn_start)` |
 | `_repair_escaped_marker` | load-bearing | deleted, zero hits in `src/` |
 
-The consequence for this RFC is narrowing, and welcome: `monitor_start` and `monitor_watch` now share the transport completely, one `_emit_directive`, one queue, one digest, one claim, one `apply_session_directive` dispatch. What remains unshared is exactly the observation layer and the wake decision. That is the whole remaining scope.
+The consequence for this RFC is narrowing, and welcome: `monitor_patrol` and `monitor_watch` now share the transport completely, one `_emit_directive`, one queue, one digest, one claim, one `apply_session_directive` dispatch. What remains unshared is exactly the observation layer and the wake decision. That is the whole remaining scope.
 
-Two asymmetries survive and the merged design has to pick one. `monitor_watch` uses the full strict session gate and refuses on a non-strict key through `require_strict_session_key`, while `monitor_start` uses the resolve half only and lets an empty key fall through to the directive. And [#9073](https://github.com/kirodotdev/KiroCrew/pull/9073) verifiably did not touch the `gate` parameter or the `irq.poll` path from [#7634](https://github.com/kirodotdev/KiroCrew/pull/7634): its only file under `autonudge*`, `irq` or `probes` is a test.
+Two asymmetries survive and the merged design has to pick one. `monitor_watch` uses the full strict session gate and refuses on a non-strict key through `require_strict_session_key`, while `monitor_patrol` uses the resolve half only and lets an empty key fall through to the directive. And [#9073](https://github.com/kirodotdev/KiroCrew/pull/9073) verifiably did not touch the `gate` parameter or the `irq.poll` path from [#7634](https://github.com/kirodotdev/KiroCrew/pull/7634): its only file under `autonudge*`, `irq` or `probes` is a test.
 
 ## Target shape
 
@@ -81,7 +81,7 @@ Duplication here means the same decision or the same state implemented twice, no
 |---|---|
 | the single-fingerprint computation in `monitoring/github_pull_request.py` | replaced by a derivation from the named entries, so there is one source of truth rather than two hashes that can drift |
 | irq's own delivered-cycle counting and quiet-streak floor | the structured budgets subsume them, and they were only ever a stand-in for accounting irq does not have |
-| the `gate` parameter's separate path on `monitor_start` ([#7634](https://github.com/kirodotdev/KiroCrew/pull/7634)) | once the observation layer is shared, a second gate on one of the two tools has nothing left to do |
+| the `gate` parameter's separate path on `monitor_patrol` ([#7634](https://github.com/kirodotdev/KiroCrew/pull/7634)) | once the observation layer is shared, a second gate on one of the two tools has nothing left to do |
 | `builtin_skills/kirocrew-dev/babysit/scripts/gh_merge_watch.py` (local, unversioned) | `pr_watch.py` already raises `Done` on merge and adds a state file, per-head dedupe and an error backstop that `gh_merge_watch` lacks |
 
 [#8919](https://github.com/kirodotdev/KiroCrew/pull/8919) is not duplicate. It extends the same stack rather than reimplementing it: it adds a `self_armed` bit and a keystone-gated trust record so a member slot can arm its own loop, reusing `NudgeLoop`, `add_monitor()` and the `authorize_and_add_nudge` chokepoint. It is integrated, not deleted. Separately, [#3127](https://github.com/kirodotdev/KiroCrew/pull/3127) was a pure structural move of the monitor tool descriptors from `mcp_core.py` into `mcp_tools/control.py`; it changes where this work edits, not what it merges.
@@ -194,8 +194,8 @@ Retiring the remaining marker consumers is [#9073](https://github.com/kirodotdev
 
 Whether the out-of-session cron driver stays a supported channel or retires with the legacy babysit recipe. It is the only path that survives the session it was armed from, and everything the session-bound path can watch it can also watch.
 
-Whether [#5186](https://github.com/kirodotdev/KiroCrew/pull/5186) scopes legacy to the targets it does not support rather than demoting `monitor_start` wholesale. `goal-conductor` and `pipeline-conductor` patrol their own session with it as their primary use, neither sets `max_cycles` or `max_runtime_secs`, and under the legacy defaults of 24 cycles and 4 hours a long-horizon patrol stops silently.
+Whether [#5186](https://github.com/kirodotdev/KiroCrew/pull/5186) scopes legacy to the targets it does not support rather than demoting `monitor_patrol` wholesale. `goal-conductor` and `pipeline-conductor` patrol their own session with it as their primary use, neither sets `max_cycles` or `max_runtime_secs`, and under the legacy defaults of 24 cycles and 4 hours a long-horizon patrol stops silently.
 
-Which session gate the merged arming path takes: `monitor_watch`'s strict refusal or `monitor_start`'s resolve-half fall-through.
+Which session gate the merged arming path takes: `monitor_watch`'s strict refusal or `monitor_patrol`'s resolve-half fall-through.
 
 `docs/system-specs/modules/babysit-pr-watch.md` states there are two current monitoring modes. [#5186](https://github.com/kirodotdev/KiroCrew/pull/5186) does not touch it, so it becomes false when [#5186](https://github.com/kirodotdev/KiroCrew/pull/5186) lands.

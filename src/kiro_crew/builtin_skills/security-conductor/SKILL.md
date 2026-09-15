@@ -282,7 +282,7 @@ another tool's output.
 
 ## The patrol cycle
 
-Arm the patrol with `monitor_start` (interval ~120s), never `wait`. Pass
+Arm the patrol with `monitor_patrol` (interval ~120s), never `wait`. Pass
 `max_cycles` explicitly — the default expires long before a round drains, and the
 loop then stops with no symptom. Call `autonudge_stop` yourself when a stop
 condition fires; coasting into the cycle cap is a failure, not a finish.

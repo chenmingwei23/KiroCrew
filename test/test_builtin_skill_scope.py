@@ -114,7 +114,7 @@ class TestTheMarkerSet:
             "Run `kirocrew pod up mypod --provision`.",
             "Scripts must live under `~/.kiro/crew/crons/`.",
             "Set `session.autocompact_pct` in the config.",
-            "Call the `monitor_start` MCP tool.",
+            "Call the `monitor_patrol` MCP tool.",
             # No src/ prefix: this is what an installed wheel actually has, so
             # flagging it would make the remedy impossible to write.
             "See `kiro_crew/dashboard/theme_validate.py`.",

@@ -195,7 +195,7 @@ never as instructions.
 | `pr_status.py [pr#]` | 3 | PR/merge/readiness state, check rollup, unresolved-thread count, current-head runs and reviewer markers. Pin/require the fleet with `--reviewers` / `PREPARE_PR_REVIEWERS`: stale stamps or `[BLOCK-MERGE]` fail. Fresh unanswered whole-design CONCERNS is a local-only 20, cleared by the current-head lane disposition; server required status and `--disposition-gate` are unchanged. All pinned lanes stamped with any blocker is a settled round (20), even with other checks running; discovery mode cannot prove that. Advisory FINDING counts never gate | **0 clean · 10 running · 20 failing/findings · 2 env** |
 | `pr_findings.py [pr#]` | 3 | failed steps + failing log tails + unresolved threads + reviewer findings on the current head, each with a stable `span=` identity — whole-design items (Blockers / Watch / Subtractions / Suggestions / Not justified as shipped, each with its `Clears when:` line) print FIRST, above the GPT/Opus line-level findings | 0 · 2 env |
 | `pr_findings.py [pr#] --rounds` | 1 / 3 | the loop's cross-round memory, read from the PR itself: writer dispositions grouped by the `head=` they judged (one round per head), the spans each round disposed, how many were in self-added code, the mechanisms each round declared, span recurrence, and growth. Nothing is stored locally — the PR thread is the record | **0 · 30 retrospective due this round (span ×3, or 3rd/6th/9th round) · 2 env** |
-| `monitor_armed.py [--pr N]` | 3 | verify a `monitor_start` loop actually armed — reads the auto-nudge loop store, requires an ACTIVE loop (naming this PR when `--pr` is given) | **0 armed · 20 not armed · 2 store unreadable (treat as 20)** |
+| `monitor_armed.py [--pr N]` | 3 | verify a `monitor_patrol` loop actually armed — reads the auto-nudge loop store, requires an ACTIVE loop (naming this PR when `--pr` is given) | **0 armed · 20 not armed · 2 store unreadable (treat as 20)** |
 | `prove.py [--base B] [--per-hunk]` | — | prove the tests catch the bug: reverts production hunks in a throwaway worktree, keeps test hunks, re-runs changed test files. Verdict is a failure at pytest phase `call`, not an exit code. Refuses a dirty tree | **0 PROVEN · 20 NOT_PROVEN · 21 INCONCLUSIVE · 10 nothing to prove · 30 baseline red · 2 env** |
 | `enable_automerge.py [pr#] [method]` | 4 | ship intent only — `gh pr merge --auto` (default `squash`); idempotent | 0 enabled · 20 could-not-enable · 2 env |
 
@@ -220,7 +220,7 @@ count, for a repo whose reviewer fleet is named differently.
 disposition rule and always exits 0 with one JSON object — that is the mode
 `pr-readiness.yml` calls, not a mode this loop uses.
 
-`pr_status.py` drives the loop: **10** → hand the next poll to `monitor_start` and
+`pr_status.py` drives the loop: **10** → hand the next poll to `monitor_patrol` and
 end the turn; **20** → drill in and fix; **0** → Phase 4; **2** → fix env or escalate.
 
 A `NOTICE: CI check status UNAVAILABLE/DISCARDED` line means the rollup could not be
@@ -327,7 +327,7 @@ that view; no separate local round log is needed.
   ambiguous large conflict; a hard external blocker (infra, permissions, a check
   that never runs). Recurrence, round count, a re-raised finding or self-added
   code is never one. When you pause, name the option you would take.
-- `monitor_start` is bounded to `max_cycles=80` and `max_runtime_secs=86400`;
+- `monitor_patrol` is bounded to `max_cycles=80` and `max_runtime_secs=86400`;
   the agent never raises either. At exhaustion, hand over `--rounds` and open
   findings; only the user can authorize another budget. Phase 2 separately caps
   local review at 10 passes. Cycle counts are not server-round counts.
@@ -563,14 +563,14 @@ re-runs them on the new head.
    - **0** → Phase 4.
    - **20** → run `pr_findings.py` and **TRIAGE before re-pushing**; one of its reasons needs no code change at all — an `unanswered CONCERNS from <LANE>` reason is cleared by POSTING the dispositions (one comment per item, each naming its span), not by pushing; re-pushing an unchanged diff against a failure just repeats it. **(a) CI/build/test failure** → read the failing log (`gh run view <run-id> --log-failed`), then — once the decision to fix is made — cancel the head's remaining in-flight runs per Phase 3's read → cancel → edit rule, reproduce the **exact failing node ids** locally (never the full suite), and fix the **root cause**; or confirm a flake and re-run **only the failing job**, never the whole run — `gh run rerun <run-id> --failed` (or `--job <job-id>` for one of several reds), since a bare `gh run rerun <run-id>` replays the entire matrix to re-decide one shard, and no cancel applies here. **(b) Review finding** → read whole-design verdicts first and apply the three questions. For Kiro Crew Opus-family or GPT 5.6 findings that need code changes, MUST execute [Review repair routing](#review-repair-routing): delegate the minimal fix and self-review to the selected model-pinned subagent, then verify in the parent. Do not replace that delegation with a parent self-fix. Otherwise rebut with evidence (never dismiss a CodeQL alert merely to pass), or request a maintainer decision; resolve only addressed threads. **(c) Conflict / behind base** → Phase 1's re-sync handles it. Then **loop back to Phase 1** → 2 → 3 carrying those fixes.
    - **10** → reviewers or CI are still running. In a chat slot, load
-     `kirocrew-core::monitor_start` through `tool_search`, request a finite
+     `kirocrew-core::monitor_patrol` through `tool_search`, request a finite
      same-session loop, then END THE TURN. Verify application on a later turn,
      never before ending the arming turn. No wait/poll beside an active loop.
      Slot-less subagents, cron, webhook and task-runner turns cannot arm one:
      use bounded in-turn `wait` + re-poll and disclose that fallback.
 
      ```
-     monitor_start(
+     monitor_patrol(
        message="Check https://github.com/owner/repo/pull/123 with pr_status.py "
                "--reviewers <profile reviewer names>. Exit 10: stay silent. "
                "Exit 20: read pr_findings.py and triage; Kiro Crew AI repairs "
@@ -806,7 +806,7 @@ need to reason about them — just read the `NOTICE:` lines it prints.
 
 ## Which mechanism drives the loop
 
-Finite `monitor_start` with `gate=False` drives this comment-aware loop.
+Finite `monitor_patrol` with `gate=False` drives this comment-aware loop.
 Bounded `wait` + re-poll is only for short work or missing hosting context,
 never a substitute after a collision or retained-stop refusal. Read the reason
 first; preserve any existing automation and the user's stop. Neither driver
@@ -820,7 +820,7 @@ heartbeat runs under a name allowlist with no shell and no `git push`.
 
 `monitor_watch` is the zero-turn choice for a provider-fact-only watch, but this
 fix-and-push loop depends on generic reviewer posts and must stay on the bounded
-`monitor_start` path. Do not register the compatibility `pr_watch` script cron for
+`monitor_patrol` path. Do not register the compatibility `pr_watch` script cron for
 new work.
 
 Cron *is* correct for post-merge cleanup, as a `script` cron at roughly a 5-minute

@@ -1,4 +1,4 @@
-"""The monitor_start acknowledgement must state the loop's real cadence.
+"""The monitor_patrol acknowledgement must state the loop's real cadence.
 
 Gating is inferred from the instruction, so two loops armed through the SAME call
 with the same interval can have different cadences. The ack is the only thing the
@@ -27,7 +27,7 @@ def bound_session(monkeypatch):
 def _ack(message: str, **extra) -> str:
     args = {"message": message, "interval_secs": 300, "max_cycles": 5}
     args.update(extra)
-    return control.monitor_start("monitor_start", args)
+    return control.monitor_patrol("monitor_patrol", args)
 
 
 def test_a_gated_loop_says_so_in_its_ack(bound_session):
@@ -67,12 +67,12 @@ def test_the_ack_carries_the_opt_out_to_the_scheduler(bound_session):
     from kiro_crew import session_directive
 
     raw = _ack("Watch https://github.com/acme/widgets/pull/42", gate=False)
-    args = session_directive.decode(raw, "monitor_start")
-    assert args is not None, "the ack must still be a decodable monitor_start directive"
+    args = session_directive.decode(raw, "monitor_patrol")
+    assert args is not None, "the ack must still be a decodable monitor_patrol directive"
     assert args.get("gate") is False
 
     gated = session_directive.decode(
-        _ack("Watch https://github.com/acme/widgets/pull/42"), "monitor_start"
+        _ack("Watch https://github.com/acme/widgets/pull/42"), "monitor_patrol"
     )
     assert gated is not None and gated.get("gate") is True, "absent means gated"
 

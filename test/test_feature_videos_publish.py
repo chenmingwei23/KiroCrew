@@ -116,7 +116,7 @@ def _entry(**overrides: Any) -> dict[str, Any]:
         "title": "Let one session watch a pull request",
         "description": "A monitor loop re-injects your check instructions on an interval.",
         "doc": ALLOWED_DOC,
-        "used_when": ["sel_event_seen:monitor_start"],
+        "used_when": ["sel_event_seen:monitor_patrol"],
         "min_version": "",
         "duration_s": 22.0,
     }

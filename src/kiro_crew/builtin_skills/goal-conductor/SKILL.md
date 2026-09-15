@@ -198,11 +198,11 @@ pass the agent name to `session_create` yourself.
 
 ### Patrol
 
-After dispatching, arm a loop on your own session with `monitor_start`. Put the
+After dispatching, arm a loop on your own session with `monitor_patrol`. Put the
 check AND the exit condition in the message and pass explicit positive
 `max_cycles` and `max_runtime_secs` from the operator's round/time budget. When
 no tighter budget exists, use 240 cycles and 86,400 seconds. If live work needs a
-larger bound, re-arm it with `monitor_update`; `monitor_start` is create-only.
+larger bound, re-arm it with `monitor_update`; `monitor_patrol` is create-only.
 Then end your turn.
 
 Each cycle:
@@ -439,7 +439,7 @@ what the composer renders:
 
 ## Known limits of this version
 
-- **The patrol loop is on a timer, not on the ledger.** `monitor_start` gates on
+- **The patrol loop is on a timer, not on the ledger.** `monitor_patrol` gates on
   a single pull-request URL and nothing else today, so a cycle fires whether or
   not anything was reported. When it accepts a `watch: "work-ledger"` field,
   arm that instead and the quiet cycles stop costing a turn. Until then, size
@@ -452,8 +452,8 @@ what the composer renders:
   DEFERRED, not missing: load it with
   `tool_search(tool_id="kirocrew-dashboard::session_create")` — `tool_search` is
   auto-approved for exactly this, so the load never prompts — then repeat the
-  call. `chat_folder_create` is on the same server; `monitor_start` is served by
-  `kirocrew-core` (`kirocrew-core::monitor_start`); the two ledger verbs are
+  call. `chat_folder_create` is on the same server; `monitor_patrol` is served by
+  `kirocrew-core` (`kirocrew-core::monitor_patrol`); the two ledger verbs are
   `kirocrew-work::work_ledger_read` and `kirocrew-work::work_ledger_record`.
 - **`work_brief` and `work_report` answer `not_bound` to a ROOT conductor.**
   They are the worker half of the same server, and with no parent there is
@@ -485,7 +485,7 @@ what the composer renders:
   `work_ledger_record` — so a patrol cycle that wakes on a nudge with nobody at
   the keyboard never blocks, and filing rides the create itself (the `folder`
   argument), so it costs no extra approval. The `@kirocrew-core` verbs are
-  granted by name too, and only these: `monitor_start`, `monitor_update`,
+  granted by name too, and only these: `monitor_patrol`, `monitor_update`,
   `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
   `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
   `select_crew`, `send_message`, `send_notification`, `ask_question`. That covers

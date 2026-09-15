@@ -80,7 +80,7 @@ With a conductor the human appears exactly twice: the merge click, and genuine d
   at gateway boot, with per-verb dashboard grants and installer tests.
 - The session-control surface exists: the `kirocrew-dashboard` MCP server (session
   create/read/send/stop, chat folders), opt-in per agent.
-- The patrol loop exists (`monitor_start`, deadline-preserving, survives gateway restarts), as do
+- The patrol loop exists (`monitor_patrol`, deadline-preserving, survives gateway restarts), as do
   the durable session ledger and live host posture (`resource_status`: ample/tight/critical).
 - Per-session spend is measurable: usage shards record per-turn `credits` keyed by session slot.
   Only dashboard-chat turns are instrumented today — subagent and non-chat sessions burn

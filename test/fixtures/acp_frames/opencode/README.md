@@ -45,7 +45,10 @@ facts about the same harness.
 `mcp-directive-call-live.jsonl` is a turn whose ONLY tool is a Crew MCP directive
 tool. The server rode the `session/new` `mcpServers` array as a stdio element named
 `kirocrew-core` exposing `monitor_start`; the model was a local OpenAI-compatible
-stub with no credential and no network, driven to call that tool once. Three facts
+stub with no credential and no network, driven to call that tool once. That tool
+has since been renamed `monitor_patrol`, and this capture keeps the name it was
+recorded under: it is dated evidence of what OpenCode put on the wire, and what it
+establishes is the NAMING SHAPE below, which no rename touches. Three facts
 come out of it, none of them inferred:
 
 - the tool reaches the model as `kirocrew-core_monitor_start` -- server and tool

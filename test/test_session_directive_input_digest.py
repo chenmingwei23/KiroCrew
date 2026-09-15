@@ -68,7 +68,7 @@ def _clean_queue():
 
 
 def _tool_text() -> str:
-    return session_directive.encode("monitor_start", VALIDATED_ARGS, "Monitor loop requested.")
+    return session_directive.encode("monitor_patrol", VALIDATED_ARGS, "Monitor loop requested.")
 
 
 # ── the live KAS result shapes, verbatim in structure ────────────────────────
@@ -150,10 +150,10 @@ async def _drive(state, slot, events, monkeypatch, *, park=True, park_input=None
             parked.append(True)
             directive_queue.publish(
                 effective_session_key(slot),
-                "monitor_start",
+                "monitor_patrol",
                 VALIDATED_ARGS,
                 session_directive.call_input_digest(
-                    "monitor_start", CALL_ARGS if park_input is None else park_input
+                    "monitor_patrol", CALL_ARGS if park_input is None else park_input
                 ),
             )
         for ev in events:
@@ -176,7 +176,7 @@ async def _drive(state, slot, events, monkeypatch, *, park=True, park_input=None
 
 def _opencode_events(
     *,
-    wire_title: str = "kirocrew-core_monitor_start",
+    wire_title: str = "kirocrew-core_monitor_patrol",
     result_text: str = "Monitor loop requested.",
     tool_call_id: str = "tc-oc",
 ):
@@ -224,8 +224,8 @@ def _kas_events(result_text: str, *, raw_input=FRAME_INPUT, tool_call_id="tc-kas
         AcpEvent(
             kind=EVENT_TOOL_CALL,
             tool_call_id=tool_call_id,
-            title="@kirocrew-core/monitor_start",
-            wire_title="@kirocrew-core/monitor_start",
+            title="@kirocrew-core/monitor_patrol",
+            wire_title="@kirocrew-core/monitor_patrol",
             tool_kind="other",
             tool_name="",
             mcp_server_name="",
@@ -248,14 +248,14 @@ class TestEveryKasResultShapeArms:
     async def test_arms_with_the_marker_unreadable(self, tmp_path, monkeypatch, shape):
         result_text = SHAPES[shape](_tool_text())
         # The premise: the RESULT names no directive a reader could trust.
-        assert session_directive.decode(result_text, "monitor_start") is None, shape
+        assert session_directive.decode(result_text, "monitor_patrol") is None, shape
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot(f"kas-{shape}")
         slot._titled = True
         spy = await _drive(state, slot, _kas_events(result_text), monkeypatch)
         spy.assert_called_once()
         kind, args = spy.call_args.args[3], spy.call_args.args[4]
-        assert kind == "monitor_start"
+        assert kind == "monitor_patrol"
         assert args == VALIDATED_ARGS, "the RECORD's payload is applied, never the frame's"
         assert directive_queue.depth(effective_session_key(slot)) == 0
 
@@ -286,7 +286,7 @@ class TestRawInputArrivesLate:
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-late",
-                title="monitor_start",
+                title="monitor_patrol",
                 tool_name="",
                 mcp_server_name="",
                 raw_tool_params={},
@@ -294,8 +294,8 @@ class TestRawInputArrivesLate:
             AcpEvent(
                 kind=EVENT_TOOL_CALL_UPDATE,
                 tool_call_id="tc-late",
-                title="@kirocrew-core/monitor_start",
-                wire_title="@kirocrew-core/monitor_start",
+                title="@kirocrew-core/monitor_patrol",
+                wire_title="@kirocrew-core/monitor_patrol",
                 raw_tool_params=FRAME_INPUT,
             ),
             AcpEvent(
@@ -393,9 +393,9 @@ class TestTheKeyStillGrantsNothing:
         monkeypatch.setattr(directive_queue.time, "monotonic", lambda: _real() - 1.0)
         directive_queue.publish(
             effective_session_key(slot),
-            "monitor_start",
+            "monitor_patrol",
             VALIDATED_ARGS,
-            session_directive.call_input_digest("monitor_start", CALL_ARGS),
+            session_directive.call_input_digest("monitor_patrol", CALL_ARGS),
         )
         monkeypatch.setattr(directive_queue.time, "monotonic", _real)
         with caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"):
@@ -433,18 +433,18 @@ class TestTheToolSideOfTheKey:
         posted: list[tuple[str, dict]] = []
         monkeypatch.setattr(mcp_core, "_post", lambda p, b, **kw: posted.append((p, b)))
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1-1")
-        out = mcp_core._call_tool("monitor_start", CALL_ARGS)
+        out = mcp_core._call_tool("monitor_patrol", CALL_ARGS)
         assert session_directive.has_marker(out)
         assert posted == [
-            ("/api/session-directive", {"tool": "monitor_start", "raw_args": CALL_ARGS})
+            ("/api/session-directive", {"tool": "monitor_patrol", "raw_args": CALL_ARGS})
         ]
         body = posted[0][1]
         # What the gateway does with it:
         derived = mcp_core.derive_directive(body["tool"], body["raw_args"], "dashboard:chat-1-1")
-        assert derived is not None and derived[0] == "monitor_start"
+        assert derived is not None and derived[0] == "monitor_patrol"
         digest = session_directive.call_input_digest(body["tool"], body["raw_args"])
         # ...equals what the consumer computes from the frame (with its _meta).
-        assert digest == session_directive.call_input_digest("monitor_start", FRAME_INPUT)
+        assert digest == session_directive.call_input_digest("monitor_patrol", FRAME_INPUT)
         directive_queue.publish("dashboard:chat-1-1", derived[0], derived[1], digest)
         assert directive_queue.claim("dashboard:chat-1-1", digest) is not None
 
@@ -470,17 +470,17 @@ class TestTheToolSideOfTheKey:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1-1")
         monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1-1")
 
-        mcp_core._call_tool("monitor_start", CALL_ARGS)  # the stub side
-        assert [r["tool_name"] for r in rows] == ["monitor_start"], rows
+        mcp_core._call_tool("monitor_patrol", CALL_ARGS)  # the stub side
+        assert [r["tool_name"] for r in rows] == ["monitor_patrol"], rows
         assert rows[0]["outcome"] == "completed"
 
-        derived = mcp_core.derive_directive("monitor_start", CALL_ARGS, "dashboard:chat-1-1")
-        assert derived is not None and derived[0] == "monitor_start"
+        derived = mcp_core.derive_directive("monitor_patrol", CALL_ARGS, "dashboard:chat-1-1")
+        assert derived is not None and derived[0] == "monitor_patrol"
         assert len(rows) == 1, f"derivation must not log a second invocation: {rows}"
 
         # A rejected replay logs nothing either, and derives nothing.
         assert (
-            mcp_core.derive_directive("monitor_start", {"bogus": 1}, "dashboard:chat-1-1") is None
+            mcp_core.derive_directive("monitor_patrol", {"bogus": 1}, "dashboard:chat-1-1") is None
         )
         assert len(rows) == 1, rows
 
@@ -492,7 +492,7 @@ class TestTheToolSideOfTheKey:
         posted: list[tuple[str, dict]] = []
         monkeypatch.setattr(mcp_core, "_post", lambda p, b, **kw: posted.append((p, b)))
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1-1")
-        out = control.monitor_start("monitor_start", dict(CALL_ARGS))
+        out = control.monitor_patrol("monitor_patrol", dict(CALL_ARGS))
         assert session_directive.has_marker(out)
         assert posted == []
 
@@ -636,17 +636,17 @@ class TestPlantedRecordIsNotClaimedByADifferentTool:
         """A shell frame carries no _meta.kiro identity and a model-authored title;
         neither resolves, so it records no digest and can claim nothing."""
         assert session_directive.directive_tool_from_call("", "execute_bash", "echo x") == ""
-        assert session_directive.directive_tool_from_call("", "", "monitor_start") == ""
-        assert session_directive.directive_tool_from_call("", "", "@other/monitor_start") == ""
+        assert session_directive.directive_tool_from_call("", "", "monitor_patrol") == ""
+        assert session_directive.directive_tool_from_call("", "", "@other/monitor_patrol") == ""
 
     def test_kas_wire_title_and_kiro_cli_identity_both_resolve(self):
         assert (
-            session_directive.directive_tool_from_call("", "", "@kirocrew-core/monitor_start")
-            == "monitor_start"
+            session_directive.directive_tool_from_call("", "", "@kirocrew-core/monitor_patrol")
+            == "monitor_patrol"
         )
         assert (
-            session_directive.directive_tool_from_call("kirocrew-core", "monitor_start", "x")
-            == "monitor_start"
+            session_directive.directive_tool_from_call("kirocrew-core", "monitor_patrol", "x")
+            == "monitor_patrol"
         )
 
 
@@ -856,11 +856,13 @@ class TestClaudeBackendResolvesTheTool:
 
     def test_resolver_accepts_the_raw_mcp_name(self):
         assert (
-            session_directive.directive_tool_from_call("", "", "mcp__kirocrew-core__monitor_start")
-            == "monitor_start"
+            session_directive.directive_tool_from_call("", "", "mcp__kirocrew-core__monitor_patrol")
+            == "monitor_patrol"
         )
         # Server half still checked: another server's same-named tool is not ours.
-        assert session_directive.directive_tool_from_call("", "", "mcp__other__monitor_start") == ""
+        assert (
+            session_directive.directive_tool_from_call("", "", "mcp__other__monitor_patrol") == ""
+        )
         assert session_directive.directive_tool_from_call("", "", "mcp__kirocrew-core__nope") == ""
 
     def test_legacy_tool_call_builder_carries_the_wire_title(self):
@@ -872,20 +874,20 @@ class TestClaudeBackendResolvesTheTool:
                 {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tc-cc",
-                    "title": "mcp__kirocrew-core__monitor_start",
+                    "title": "mcp__kirocrew-core__monitor_patrol",
                     "kind": "other",
                     "rawInput": CALL_ARGS,
                 }
             )
         )
         assert ev is not None and ev.kind == EVENT_TOOL_CALL
-        assert ev.wire_title == "mcp__kirocrew-core__monitor_start"
+        assert ev.wire_title == "mcp__kirocrew-core__monitor_patrol"
         assert ev.raw_tool_params == CALL_ARGS
         assert (
             session_directive.directive_tool_from_call(
                 ev.mcp_server_name, ev.tool_name, ev.wire_title
             )
-            == "monitor_start"
+            == "monitor_patrol"
         )
 
     def test_legacy_builder_preserves_an_explicit_empty_raw_input(self):
@@ -926,13 +928,13 @@ class TestClaudeBackendResolvesTheTool:
                 {
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "tc-cc2",
-                    "title": "mcp__kirocrew-core__monitor_start",
+                    "title": "mcp__kirocrew-core__monitor_patrol",
                     "rawInput": CALL_ARGS,
                 }
             )
         )
         assert ev is not None and ev.kind == EVENT_TOOL_CALL_UPDATE
-        assert ev.wire_title == "mcp__kirocrew-core__monitor_start"
+        assert ev.wire_title == "mcp__kirocrew-core__monitor_patrol"
         assert ev.raw_tool_params == CALL_ARGS
 
     def test_legacy_builder_keeps_a_shell_description_out_of_the_wire_title(self):
@@ -983,8 +985,8 @@ class TestClaudeBackendResolvesTheTool:
             AcpEvent(
                 kind=EVENT_TOOL_CALL_UPDATE,
                 tool_call_id="tc-cl",
-                title="mcp__kirocrew-core__monitor_start",
-                wire_title="mcp__kirocrew-core__monitor_start",
+                title="mcp__kirocrew-core__monitor_patrol",
+                wire_title="mcp__kirocrew-core__monitor_patrol",
                 raw_tool_params=CALL_ARGS,
             ),
             AcpEvent(
@@ -998,7 +1000,7 @@ class TestClaudeBackendResolvesTheTool:
         ]
         spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_called_once()
-        assert spy.call_args.args[3] == "monitor_start"
+        assert spy.call_args.args[3] == "monitor_patrol"
 
 
 class TestKasWireTitleCarriesTheBackendPrefix:
@@ -1013,12 +1015,12 @@ class TestKasWireTitleCarriesTheBackendPrefix:
         "title,expected",
         [
             ("Running: @kirocrew-core/ask_question", "ask_question"),
-            ("Running: @kirocrew-core/monitor_start", "monitor_start"),
-            ("@kirocrew-core/monitor_start", "monitor_start"),
-            ("Running: @other-server/monitor_start", ""),
-            ("Running: Running: @kirocrew-core/monitor_start", ""),  # one prefix, not a loop
+            ("Running: @kirocrew-core/monitor_patrol", "monitor_patrol"),
+            ("@kirocrew-core/monitor_patrol", "monitor_patrol"),
+            ("Running: @other-server/monitor_patrol", ""),
+            ("Running: Running: @kirocrew-core/monitor_patrol", ""),  # one prefix, not a loop
             ("Loading tool: kirocrew-core::ask_question", ""),  # tool_search, not the call
-            ("Running: echo @kirocrew-core/monitor_start", ""),
+            ("Running: echo @kirocrew-core/monitor_patrol", ""),
         ],
     )
     def test_prefixed_wire_title_resolves(self, title, expected):
@@ -1032,8 +1034,8 @@ class TestKasWireTitleCarriesTheBackendPrefix:
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot("kas-prefixed-title")
         events = _kas_events(_kas_offloaded(_tool_text()))
-        events[0].title = "Running: @kirocrew-core/monitor_start"
-        events[0].wire_title = "Running: @kirocrew-core/monitor_start"
+        events[0].title = "Running: @kirocrew-core/monitor_patrol"
+        events[0].wire_title = "Running: @kirocrew-core/monitor_patrol"
         spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_called_once()
 
@@ -1054,7 +1056,7 @@ class TestDisplayStripKeepsAnEnvelopeReadable:
         wire = SHAPES[shape](_tool_text())
         shown = session_directive.strip_marker(wire)
         assert session_directive.SENTINEL not in shown
-        assert "monitor_start" not in shown or "kind" not in shown, "payload removed"
+        assert "monitor_patrol" not in shown or "kind" not in shown, "payload removed"
         parsed = json.loads(shown)  # the envelope survives as valid JSON
         # Every envelope field is still there, and the human line is intact.
         assert "Monitor loop requested." in json.dumps(parsed)
@@ -1114,7 +1116,7 @@ class TestDisplayStripKeepsAnEnvelopeReadable:
     @pytest.mark.parametrize(
         "kind,args_of",
         [
-            ("monitor_start", lambda m: {"message": m}),  # message at depth 2: ``}}`` closes it
+            ("monitor_patrol", lambda m: {"message": m}),  # message at depth 2: ``}}`` closes it
             ("monitor_update", lambda m: {"patch": {"message": m}}),  # depth 3
         ],
     )
@@ -1266,14 +1268,14 @@ class TestConcurrentDirectivesInOneSession:
                 ],
             ),
             AcpEvent(kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="sub-1", tool_call_id="tc-child"),
-            call("tc-a", "monitor_start", a_args),
+            call("tc-a", "monitor_patrol", a_args),
             call("tc-q", "ask_question", q_args),
             call("tc-child", "reset_conversation", child_args),
-            call("tc-b", "monitor_start", b_args),
+            call("tc-b", "monitor_patrol", b_args),
             # Results arrive out of call order.
-            result("tc-b", "monitor_start", b_args),
+            result("tc-b", "monitor_patrol", b_args),
             result("tc-child", "reset_conversation", child_args),
-            result("tc-a", "monitor_start", a_args),
+            result("tc-a", "monitor_patrol", a_args),
             result("tc-q", "ask_question", q_args),
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
             AcpEvent(kind=EVENT_COMPLETE),
@@ -1287,10 +1289,10 @@ class TestConcurrentDirectivesInOneSession:
                 parked.append(True)
                 sk = effective_session_key(slot)
                 for tool, args in (
-                    ("monitor_start", a_args),
+                    ("monitor_patrol", a_args),
                     ("ask_question", q_args),
                     ("reset_conversation", child_args),  # the child's, under the parent key
-                    ("monitor_start", b_args),
+                    ("monitor_patrol", b_args),
                 ):
                     kind, validated = mcp_core.derive_directive(tool, args, sk)
                     directive_queue.publish(
@@ -1313,8 +1315,8 @@ class TestConcurrentDirectivesInOneSession:
             (c.args[3], c.args[4].get("message") or c.args[4].get("questions"))
             for c in spy.call_args_list
         ]
-        assert ("monitor_start", "loop A") in applied
-        assert ("monitor_start", "loop B") in applied
+        assert ("monitor_patrol", "loop A") in applied
+        assert ("monitor_patrol", "loop B") in applied
         assert any(k == "ask_question" for k, _ in applied)
         assert all(k != "reset_conversation" for k, _ in applied), "child never reaches parent"
         assert len(applied) == 3
@@ -1325,10 +1327,13 @@ class TestOpenCodeBackendResolvesTheTool:
     """opencode names an MCP tool ``<server>_<tool>`` -- ONE underscore -- and emits
     no ``_meta.kiro`` at all, so the wire title is the only channel that names the
     tool it called. CAPTURED off 1.18.30 with a Crew MCP server (``kirocrew-core``,
-    exposing ``monitor_start``) riding the ``session/new`` ``mcpServers`` array:
+    exposing the tool then called ``monitor_start``, since renamed
+    ``monitor_patrol``) riding the ``session/new`` ``mcpServers`` array:
     ``{"sessionUpdate":"tool_call","toolCallId":"call_live_1",``
     ``"title":"kirocrew-core_monitor_start","kind":"other",...}``
-    (``test/fixtures/acp_frames/opencode/mcp-directive-call-live.jsonl``).
+    (``test/fixtures/acp_frames/opencode/mcp-directive-call-live.jsonl``, quoted
+    verbatim -- the capture is dated evidence and is never rewritten to track a
+    rename; what it proves is the NAMING SHAPE, which no rename changes).
     Every recogniser returned ``""`` for that spelling, so a session with Crew's
     control plane mounted would answer every directive tool and apply none of them.
     """
@@ -1344,19 +1349,19 @@ class TestOpenCodeBackendResolvesTheTool:
             # The server half is the guard, exactly as in the KAS and Claude
             # branches: a third-party server's own tool never carries Crew's
             # server name as its prefix.
-            "evil-mcp_monitor_start",
+            "evil-mcp_monitor_patrol",
             "other_reset_conversation",
             # ...and a third-party server exposing a tool LITERALLY named
-            # "kirocrew-core_monitor_start" spells its own id with its own name
+            # "kirocrew-core_monitor_patrol" spells its own id with its own name
             # in front, so it fails the prefix too.
-            "evil-mcp_kirocrew-core_monitor_start",
+            "evil-mcp_kirocrew-core_monitor_patrol",
             # A single underscore is NOT treated as a separator, which is why
             # match_tool was left alone: these must all stay unresolved.
-            "do_monitor_start",
-            "evilmonitor_start",
+            "do_monitor_patrol",
+            "evilmonitor_patrol",
             # Longer than the tool name: the DIRECTIVE_TOOLS membership check on
             # the tool half is what refuses it.
-            "kirocrew-core_monitor_start_extra",
+            "kirocrew-core_monitor_patrol_extra",
             # A real Crew tool that is not a directive tool.
             "kirocrew-core_resource_status",
             "kirocrew-core_spike_marker_tool",
@@ -1383,7 +1388,7 @@ class TestOpenCodeBackendResolvesTheTool:
         with caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"):
             spy = await _drive(state, slot, _opencode_events(), monkeypatch)
         spy.assert_awaited_once()
-        assert spy.call_args.args[3] == "monitor_start"
+        assert spy.call_args.args[3] == "monitor_patrol"
         assert spy.call_args.args[4] == VALIDATED_ARGS, "the RECORD's payload is applied"
         assert directive_queue.depth(effective_session_key(slot)) == 0
         assert "UNCLAIMED_AT_TURN_END" not in caplog.text
@@ -1402,7 +1407,7 @@ class TestOpenCodeBackendResolvesTheTool:
             spy = await _drive(
                 state,
                 slot,
-                _opencode_events(wire_title="kirocrew-core_monitor_start_extra"),
+                _opencode_events(wire_title="kirocrew-core_monitor_patrol_extra"),
                 monkeypatch,
             )
         spy.assert_not_called()
@@ -1414,10 +1419,10 @@ class TestOpenCodeBackendResolvesTheTool:
         ]
         assert len(warnings) == 1
         warning = warnings[0]
-        digest = session_directive.call_input_digest("monitor_start", CALL_ARGS)[:12]
+        digest = session_directive.call_input_digest("monitor_patrol", CALL_ARGS)[:12]
         assert f"session_key={effective_session_key(slot)!r}" in warning
         assert "count=1" in warning
-        assert f"record_digests=('monitor_start:{digest}',)" in warning
+        assert f"record_digests=('monitor_patrol:{digest}',)" in warning
         assert "tool_identities=('tc-oc:-:-',)" in warning
 
     @pytest.mark.asyncio
@@ -1431,7 +1436,7 @@ class TestOpenCodeBackendResolvesTheTool:
             spy = await _drive(
                 state,
                 slot,
-                _opencode_events(wire_title="kirocrew-core_monitor_start_extra"),
+                _opencode_events(wire_title="kirocrew-core_monitor_patrol_extra"),
                 monkeypatch,
                 park=False,
             )

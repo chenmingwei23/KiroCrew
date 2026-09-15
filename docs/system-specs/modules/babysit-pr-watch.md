@@ -9,13 +9,13 @@ budgets, and wakes the owning session only for a new actionable fingerprint.
 Provider-fact-only GitHub review readiness therefore spends no agent turn while
 the pull request is unchanged.
 
-`monitor_start` creates a finite same-session AutoNudge loop for objectives or
+`monitor_patrol` creates a finite same-session AutoNudge loop for objectives or
 evidence the structured provider cannot decide, including generic comments and
 advisory review text. Its stateless directive is validated by
-`mcp_tools.control.monitor_start`, then applied by
-`dashboard.session_directive_apply._monitor_start` through
+`mcp_tools.control.monitor_patrol`, then applied by
+`dashboard.session_directive_apply._monitor_patrol` through
 `autonudge_authz.authorize_and_add_nudge`. `AutoNudgeService` persists and
-schedules the loop. Those two `monitor_start` surfaces are the only callers that
+schedules the loop. Those two `monitor_patrol` surfaces are the only callers that
 ask for the gate; the chokepoint defaults every other caller UNGATED, the generic
 REST route included. Gating is the state that can silently stop work, so a caller
 that names no value resolves toward spending a turn per interval rather than toward
@@ -25,7 +25,7 @@ that path is the bounded legacy fallback rather than the babysit recipe.
 
 The bundled `pr_watch.py:watch` cron adapter remains a compatibility asset for
 existing registered jobs. New babysit requests do not copy or register it; they
-use `monitor_watch` or a finite `monitor_start` loop owned by the session that can
+use `monitor_watch` or a finite `monitor_patrol` loop owned by the session that can
 inspect and act on a wake. `probes.gh_pr.PrWatchProbe` stays in the package because
 the legacy AutoNudge gate and existing script jobs share its classifier.
 
@@ -46,7 +46,7 @@ behind it while a wrongly-spent tick costs what every tick costs today.
 
 ## Same-session monitor contract
 
-`monitor_start`, `monitor_update`, and `autonudge_stop` are session directives,
+`monitor_patrol`, `monitor_update`, and `autonudge_stop` are session directives,
 not direct AutoNudge mutations. `mcp_tools.control` validates the tool payload,
 uses strict session-key resolution only as a context guard, and returns an
 encoded directive. `dashboard.session_directive_apply.apply_session_directive`
@@ -69,7 +69,7 @@ declare about its `rawInput`. The consumer-side failure paths log at `warning`
 (`session-directive NOT APPLIED`, `NO CALL INPUT`, `CLAIM MISS`, `DENIED`), which
 is what makes this class of drop visible in `gateway.log` instead of silent.
 
-`monitor_start` binds one loop to the calling session and is create-only. It
+`monitor_patrol` binds one loop to the calling session and is create-only. It
 refuses when either automation kind already occupies the binding, preserving the
 existing record and its evidence. `monitor_update` is the only way to revise or
 re-arm the bound legacy loop. The binding-key and collision tests in
@@ -86,9 +86,9 @@ sides of the contract. Channel-bound loops re-arm after their unattended turn
 in `AutoNudgeService._run_fire_cycle` because they do not use the dashboard
 turn-lifecycle hooks.
 
-The schemas in `validation.MONITOR_START_SCHEMA` and
+The schemas in `validation.MONITOR_PATROL_SCHEMA` and
 `validation.MONITOR_UPDATE_SCHEMA` bound the message, interval, cycle cap, and
-wall-clock budget. `mcp_tools.control.monitor_start` supplies bounded positive
+wall-clock budget. `mcp_tools.control.monitor_patrol` supplies bounded positive
 defaults from `mcp_tools._limits`; zero and negative cycle or runtime limits are
 rejected. The cap is a runaway backstop, not evidence that the watched work
 completed: `AutoNudgeService._timer` deactivates a capped loop and emits
@@ -220,6 +220,6 @@ The babysit skill no longer registers new script jobs.
 The structured GitHub monitor does not parse generic comment bodies or decide
 whether an advisory finding is valid. It reports typed provider facts and leaves
 judgment, source inspection, and any reply to the reactivated babysit session.
-`monitor_start` remains appropriate when each delivered cycle requires the agent
+`monitor_patrol` remains appropriate when each delivered cycle requires the agent
 to make progress, the objective requires untyped evidence, or the watched subject
 is unsupported by a structured provider.

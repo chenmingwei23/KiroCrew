@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""monitor_armed.py - verify a monitor_start loop actually armed.
+"""monitor_armed.py - verify a monitor_patrol loop actually armed.
 
-``monitor_start`` is a STATELESS session directive: the MCP tool only validates
+``monitor_patrol`` is a STATELESS session directive: the MCP tool only validates
 its arguments and returns "Monitor loop requested ...", and the loop is armed
 later, when the turn's tool result is consumed by the session-aware consumer.
 Every drop on that path is silent to the model - an ``_meta.kiro.mcpServerName``
@@ -23,7 +23,7 @@ Usage:  python3 monitor_armed.py [--pr N] [--match TEXT] [--json]
                        (case-insensitive); repeatable
           --json       print the matching loops as JSON instead of text
 Exit:   0  an active loop is present (and matches, when a filter was given)
-       20  nothing armed - call monitor_start once more, and if it is still 20
+       20  nothing armed - call monitor_patrol once more, and if it is still 20
            fall back to an in-turn wait + re-poll loop this same turn
         2  the loop store could not be read (missing/corrupt/permission) -
            treat exactly like 20: assume NOT armed
@@ -134,7 +134,7 @@ def main(argv):
         elif not active:
             err(
                 "NOT ARMED: the loop store holds no active loop ({} total entr"
-                "{}). monitor_start reported a request, but nothing was applied."
+                "{}). monitor_patrol reported a request, but nothing was applied."
                 "".format(len(loops), "y" if len(loops) == 1 else "ies")
             )
         else:

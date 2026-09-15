@@ -61,14 +61,14 @@ vocabulary: `interval_secs` and `max_cycles` as the MCP tools name them.
 
 ## How to start a loop
 
-**From an agent session (preferred):** call the MCP tools. `monitor_start(message,
+**From an agent session (preferred):** call the MCP tools. `monitor_patrol(message,
 interval_secs?, max_cycles?)` arms a loop on the calling session,
 `monitor_update(message?, interval_secs?, max_cycles?)` revises it in place without
 losing its cycle count, and `autonudge_stop()` halts it. No token handling is
 involved. The tool's `interval_secs` (default 300) is stored as the loop's
 `idle_secs`; the raw REST/dataclass field defaults to 60.
 
-`max_cycles` defaults to 24 through `monitor_start` and to 0 (unlimited) on the raw
+`max_cycles` defaults to 24 through `monitor_patrol` and to 0 (unlimited) on the raw
 REST surface. Reaching the cap is a runaway backstop, not a successful finish: check
 the exit condition every cycle and call `autonudge_stop` deliberately.
 
@@ -253,5 +253,5 @@ Before clicking 🎯 "Set a goal" → Start loop:
 6. Test execution lives in a sandbox — never in the local workspace for ops that touch live systems.
 7. One cycle, one step. Compound cycles build features.
 8. Human approval required for Done. Loop only moves cards to Review.
-9. `max_cycles: 30` cap every arming — this recipe's own recommendation, not a code default (`monitor_start` defaults to 24, the raw surface to 0 = unlimited). Re-arm manually for more.
+9. `max_cycles: 30` cap every arming — this recipe's own recommendation, not a code default (`monitor_patrol` defaults to 24, the raw surface to 0 = unlimited). Re-arm manually for more.
 10. `stop_sentinel_path` never blank at loop start.

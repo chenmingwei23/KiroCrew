@@ -75,10 +75,10 @@ class TestSecurityConductorInstaller:
         data = self._install(tmp_path, monkeypatch)
         assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
 
-    def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
+    def test_prompt_drives_patrol_with_monitor_patrol_not_wait(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
         prompt = " ".join(data["prompt"].split())
-        assert "Patrol with `monitor_start`, never with `wait`" in prompt
+        assert "Patrol with `monitor_patrol`, never with `wait`" in prompt
         assert "autonudge_stop" in prompt
 
     def test_prompt_names_the_three_child_roles(self, tmp_path, monkeypatch):
@@ -195,7 +195,7 @@ class TestSecurityConductorInstaller:
         under a session-level trust grant."""
         data = self._install(tmp_path, monkeypatch)
         allowed = set(data["allowedTools"])
-        assert "@kirocrew-core/monitor_start" in allowed
+        assert "@kirocrew-core/monitor_patrol" in allowed
         assert "@kirocrew-core/resource_status" in allowed
         assert "@kirocrew-core/session_ledger_record" in allowed
         assert "@kirocrew-core/ask_question" in allowed
@@ -280,10 +280,10 @@ class TestSecurityConductorInstaller:
         data = self._install(
             tmp_path,
             monkeypatch,
-            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_start",
+            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_patrol",
         )
         rules = json.dumps(data["permissions"])
-        assert "monitor_start" not in rules
+        assert "monitor_patrol" not in rules
         assert "monitor_update" in rules
 
     def test_governed_host_withholds_and_audits(self, tmp_path, monkeypatch):
@@ -299,8 +299,8 @@ class TestSecurityConductorInstaller:
         data = self._install(
             tmp_path,
             monkeypatch,
-            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_start",
+            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_patrol",
         )
-        assert "@kirocrew-core/monitor_start" not in data["allowedTools"]
+        assert "@kirocrew-core/monitor_patrol" not in data["allowedTools"]
         withheld = [e for e in events if e.get("operation") == "mcp_auto_approve_withheld"]
         assert withheld and withheld[0]["source"] == "_install_security_conductor_agent"

@@ -346,7 +346,7 @@
     {
       "kind": "flow",
       "surface": "monitoring",
-      "command_or_flow": "monitor_start",
+      "command_or_flow": "monitor_patrol",
       "platform": "any",
       "reason": "Arming a same-session monitor loop is how a long CI or review wait is survived without a human babysitting it. An MCP tool with no command line, so exercising it is a human step."
     },

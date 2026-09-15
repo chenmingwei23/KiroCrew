@@ -6,7 +6,7 @@ time found "a healthy daemon already owns the socket" and ADOPTED it -- the
 adoption gate compared target stems, which had not changed, and nothing else.
 The daemon's pooled ``kirocrew mcp-core`` backend was a day older than the
 control-frame shape the gateway read (``/api/session-directive`` moved from
-``{kind,args}`` to ``{tool,raw_args}``), so every ``monitor_start`` for a day was
+``{kind,args}`` to ``{tool,raw_args}``), so every ``monitor_patrol`` for a day was
 refused as ``not_derivable`` while the tool reported success.
 
 Four properties close it, each pinned below:

@@ -1174,7 +1174,7 @@ async def test_start_carries_the_gate_opt_out_to_the_authorizer(
         "where the work is usually not a pull request even when the instruction names "
         "one -- gating on that mention would deactivate a recurring task when the PR "
         "closed. An earlier version of this test asserted the opposite; only "
-        "monitor_start's own directive has the evidence to gate by default."
+        "monitor_patrol's own directive has the evidence to gate by default."
     )
 
 

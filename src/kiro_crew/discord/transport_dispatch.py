@@ -911,7 +911,7 @@ class DiscordDispatcher:
                 # of this rung in TurnDriver, so a policy refusal still wins.
                 auto_approve_session=lambda: safety_override().is_active(),
                 tool_gate=_tool_gate,
-                # Session-directive consumer: monitor_start / autonudge_stop /
+                # Session-directive consumer: monitor_patrol / autonudge_stop /
                 # ... return a marker the driver decodes; apply it against THIS
                 # turn's session key (dashboard-only directives stay refused
                 # for channel sessions).

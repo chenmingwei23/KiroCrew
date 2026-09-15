@@ -777,7 +777,7 @@ def _resolve_session_key_strict() -> str:
        signed with the SEL trust root (``sel_hmac.key``), which agents
        cannot read, and binds the pid into the MAC so another pid's
        pair cannot be replayed. Without this branch,
-       ``monitor_start``/``monitor_update``/``autonudge_stop``/``set_project``
+       ``monitor_patrol``/``monitor_update``/``autonudge_stop``/``set_project``
        fail closed
        in every sandboxed dashboard session even though the session is
        fully identified.

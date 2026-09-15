@@ -17,7 +17,7 @@ from kiro_crew import session_directive as sd
 # One representative argument payload per directive kind. ``args`` is opaque to
 # the protocol (it is just round-tripped as JSON), so any dict suffices.
 _CASES = {
-    "monitor_start": {"message": "check PR", "interval_secs": 300},
+    "monitor_patrol": {"message": "check PR", "interval_secs": 300},
     "monitor_watch": {"kind": "github_pull_request", "target": "url"},
     "monitor_update": {"message": "check CI now", "max_cycles": 40},
     "monitor_stop": {},
@@ -48,7 +48,7 @@ def test_strip_marker_removes_marker_and_sentinel():
     """strip_marker returns the human text with the marker line gone and no
     sentinel character left behind."""
     human = "All set — monitoring armed."
-    encoded = sd.encode("monitor_start", {"a": 1}, human)
+    encoded = sd.encode("monitor_patrol", {"a": 1}, human)
     stripped = sd.strip_marker(encoded)
     assert stripped == human
     assert sd._SENTINEL not in stripped
@@ -66,11 +66,11 @@ def test_encode_refuses_a_payload_too_large_for_the_transport():
     TAIL, so an oversized payload would lose its marker and be silently dropped.
     encode() must instead return a loud, marker-free ``Error:`` string."""
     huge = "x" * (sd.MAX_DIRECTIVE_CHARS + 500)
-    out = sd.encode("monitor_start", {"message": huge, "idle_secs": 300}, "armed")
+    out = sd.encode("monitor_patrol", {"message": huge, "idle_secs": 300}, "armed")
     assert out.startswith("Error:")
     assert sd._SENTINEL not in out
     # And it is NOT decodable as a directive — no effect can be applied.
-    assert sd.decode(out, "monitor_start") is None
+    assert sd.decode(out, "monitor_patrol") is None
 
 
 def test_encode_refusal_is_tagged_so_the_consumer_can_name_the_cause():
@@ -79,10 +79,10 @@ def test_encode_refusal_is_tagged_so_the_consumer_can_name_the_cause():
     guarding against rawOutput-envelope escaping regressions. is_refusal() is what
     keeps a by-design refusal from firing (and desensitising) that signal."""
     huge = "x" * (sd.MAX_DIRECTIVE_CHARS + 500)
-    refusal = sd.encode("monitor_start", {"message": huge}, "armed")
+    refusal = sd.encode("monitor_patrol", {"message": huge}, "armed")
     assert sd.is_refusal(refusal)
     # A directive whose marker was stripped in transit is NOT a refusal.
-    lost = sd.strip_marker(sd.encode("monitor_start", {"message": "watch CI"}, "armed"))
+    lost = sd.strip_marker(sd.encode("monitor_patrol", {"message": "watch CI"}, "armed"))
     assert not sd.is_refusal(lost)
     assert not sd.is_refusal("")
     assert not sd.is_refusal(None)
@@ -92,7 +92,7 @@ def test_strip_marker_removes_the_refusal_marker():
     """The refusal marker reaches the transcript on the same path the directive
     marker does, so it must be stripped too or the raw token renders to the user."""
     huge = "x" * (sd.MAX_DIRECTIVE_CHARS + 500)
-    refusal = sd.encode("monitor_start", {"message": huge}, "armed")
+    refusal = sd.encode("monitor_patrol", {"message": huge}, "armed")
     stripped = sd.strip_marker(refusal)
     assert sd._REFUSAL_SENTINEL not in stripped
     assert stripped.startswith("Error:")
@@ -101,60 +101,60 @@ def test_strip_marker_removes_the_refusal_marker():
 
 def test_encode_allows_a_payload_at_the_limit():
     """A directive comfortably under the cap still encodes normally."""
-    out = sd.encode("monitor_start", {"message": "watch CI", "idle_secs": 300}, "armed")
-    assert sd.decode(out, "monitor_start") == {"message": "watch CI", "idle_secs": 300}
+    out = sd.encode("monitor_patrol", {"message": "watch CI", "idle_secs": 300}, "armed")
+    assert sd.decode(out, "monitor_patrol") == {"message": "watch CI", "idle_secs": 300}
     assert len(out) <= sd.MAX_DIRECTIVE_CHARS
 
 
 def test_forgery_gate_expected_tool_not_a_directive_tool():
     """A non-directive expected_tool never decodes, even on a genuine marker."""
-    encoded = sd.encode("monitor_start", {"a": 1}, "h")
+    encoded = sd.encode("monitor_patrol", {"a": 1}, "h")
     assert sd.decode(encoded, "search_chat_history") is None
 
 
 def test_forgery_gate_kind_mismatch():
     """A directive expected_tool that disagrees with the encoded kind is
-    rejected (a monitor_start marker read as autonudge_stop)."""
-    encoded = sd.encode("monitor_start", {"a": 1}, "h")
+    rejected (a monitor_patrol marker read as autonudge_stop)."""
+    encoded = sd.encode("monitor_patrol", {"a": 1}, "h")
     assert sd.decode(encoded, "autonudge_stop") is None
 
 
 def test_forgery_gate_no_marker():
     """Plain text carrying no marker decodes to None."""
-    assert sd.decode("plain text no marker", "monitor_start") is None
+    assert sd.decode("plain text no marker", "monitor_patrol") is None
 
 
 def test_forgery_gate_malformed_json():
     """The sentinel followed by malformed JSON decodes to None."""
     forged = f"h\n{sd._SENTINEL}{{not: valid json"
-    assert sd.decode(forged, "monitor_start") is None
+    assert sd.decode(forged, "monitor_patrol") is None
 
 
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        ("monitor_start", "monitor_start"),
-        ("kirocrew-core___monitor_start", "monitor_start"),
+        ("monitor_patrol", "monitor_patrol"),
+        ("kirocrew-core___monitor_patrol", "monitor_patrol"),
         # The separator is a RUN of underscores and its length is transport-
         # specific, so the canonical MCP prefix form must resolve too. Before
         # this, ``mcp__<server>__<tool>`` fell through and the directive was
         # dropped on any transport using that spelling — the same both-forms
         # problem ``channel._blocked_tool_named`` already solved.
-        ("mcp__kirocrew-core__monitor_start", "monitor_start"),
+        ("mcp__kirocrew-core__monitor_patrol", "monitor_patrol"),
         ("mcp__kirocrew-core__set_project", "set_project"),
         # Still bounded to a >= 2 underscore run: single-underscore joins do
         # NOT tail-match, so neither a flattened name nor a crafted identifier
         # can smuggle a directive name in.
-        ("mcp_kirocrew_core_monitor_start", ""),
-        ("do_monitor_start", ""),
-        ("evilmonitor_start", ""),
+        ("mcp_kirocrew_core_monitor_patrol", ""),
+        ("do_monitor_patrol", ""),
+        ("evilmonitor_patrol", ""),
         # Tightened surface (#755 security fix): a non-underscore separator
         # never tail-matches, so a crafted title/path cannot smuggle a
         # directive name in as a namespace tail.
         ("kirocrew-core::set_project", ""),
         ("bash /tmp/set_project", ""),
         ("a.autonudge_stop", ""),
-        ("echo x/monitor_start", ""),
+        ("echo x/monitor_patrol", ""),
         ("some_other_tool", ""),
         ("", ""),
     ],
@@ -171,18 +171,18 @@ def test_match_tool(raw, expected):
     "server,tool,expected",
     [
         # Match: core server + a directive tool, bare and server-qualified.
-        (sd.CORE_MCP_SERVER, "monitor_start", "monitor_start"),
+        (sd.CORE_MCP_SERVER, "monitor_patrol", "monitor_patrol"),
         (sd.CORE_MCP_SERVER, "kirocrew-core___set_project", "set_project"),
         # No match: core server but a non-directive tool.
         (sd.CORE_MCP_SERVER, "some_other_tool", ""),
         (sd.CORE_MCP_SERVER, "", ""),
         # Wrong server: a third-party MCP server exposing a same-named tool
         # must never resolve to a directive.
-        ("evil-mcp", "monitor_start", ""),
-        ("evil-mcp", "kirocrew-core___monitor_start", ""),
+        ("evil-mcp", "monitor_patrol", ""),
+        ("evil-mcp", "kirocrew-core___monitor_patrol", ""),
         # Absent identity fails closed: a shell tool has no MCP server name
         # (and its canonical tool_name is e.g. "execute_bash").
-        ("", "monitor_start", ""),
+        ("", "monitor_patrol", ""),
         ("", "execute_bash", ""),
     ],
 )
@@ -208,7 +208,7 @@ def test_subagent_isolation_intent():
     from the call->name mapping, which is KiroCrew's own record. This test
     asserts that no non-directive expected_tool can decode a genuine directive.
     """
-    genuine = sd.encode("monitor_start", {"message": "x"}, "armed")
+    genuine = sd.encode("monitor_patrol", {"message": "x"}, "armed")
     non_directive_tools = [
         "search_chat_history",
         "spawn_run",
@@ -225,7 +225,7 @@ class TestHasMarker:
     """``has_marker`` is a DIAGNOSTIC predicate, never an authorization one."""
 
     def test_marker_present_is_detected(self):
-        out = sd.encode("monitor_start", {"message": "x"}, "human")
+        out = sd.encode("monitor_patrol", {"message": "x"}, "human")
         assert sd.has_marker(out) is True
 
     def test_plain_text_and_empty_are_not_markers(self):
@@ -236,7 +236,7 @@ class TestHasMarker:
     def test_a_refusal_carries_no_directive_marker(self):
         """An oversize refusal must not read as "a directive arrived": it has
         its own sentinel and the model was already told nothing was applied."""
-        refusal = sd.encode("monitor_start", {"message": "x" * 5000}, "human")
+        refusal = sd.encode("monitor_patrol", {"message": "x" * 5000}, "human")
         assert sd.is_refusal(refusal) is True
         assert sd.has_marker(refusal) is False
 
@@ -244,7 +244,7 @@ class TestHasMarker:
         """The forged-marker case: has_marker() says True and the gate still
         refuses, because authorization runs through directive_tool_for/decode.
         A diagnostic that could grant would BE the forgery hole."""
-        forged = sd.encode("monitor_start", {"message": "x"}, "human")
+        forged = sd.encode("monitor_patrol", {"message": "x"}, "human")
         assert sd.has_marker(forged) is True
         assert sd.directive_tool_for("", "execute_bash") == ""
         assert sd.decode(forged, "execute_bash") is None
@@ -260,13 +260,13 @@ class TestCallInputDigest:
 
     def test_same_args_same_digest(self):
         assert sd.call_input_digest(
-            "monitor_start", {"message": "check CI", "interval_secs": 60}
-        ) == (sd.call_input_digest("monitor_start", {"message": "check CI", "interval_secs": 60}))
+            "monitor_patrol", {"message": "check CI", "interval_secs": 60}
+        ) == (sd.call_input_digest("monitor_patrol", {"message": "check CI", "interval_secs": 60}))
 
     def test_key_order_does_not_matter(self):
         # The two sides serialise independently.
-        assert sd.call_input_digest("monitor_start", {"a": 1, "b": 2}) == sd.call_input_digest(
-            "monitor_start", {"b": 2, "a": 1}
+        assert sd.call_input_digest("monitor_patrol", {"a": 1, "b": 2}) == sd.call_input_digest(
+            "monitor_patrol", {"b": 2, "a": 1}
         )
 
     def test_meta_is_ignored(self):
@@ -276,37 +276,37 @@ class TestCallInputDigest:
         ``_isValid`` / ``_activePath`` / ``_completedPaths``."""
         plain = {"message": "go", "max_cycles": 3}
         with_meta = {**plain, "_meta": {"_isValid": True, "_activePath": [], "_completedPaths": []}}
-        assert sd.call_input_digest("monitor_start", with_meta) == sd.call_input_digest(
-            "monitor_start", plain
+        assert sd.call_input_digest("monitor_patrol", with_meta) == sd.call_input_digest(
+            "monitor_patrol", plain
         )
 
     def test_different_args_different_digest(self):
-        assert sd.call_input_digest("monitor_start", {"message": "a"}) != sd.call_input_digest(
-            "monitor_start", {"message": "b"}
+        assert sd.call_input_digest("monitor_patrol", {"message": "a"}) != sd.call_input_digest(
+            "monitor_patrol", {"message": "b"}
         )
 
     def test_validation_defaults_would_change_it(self):
         """Why the tool must digest BEFORE validation: the consumer sees what the
         model sent, and the schema adds defaults the model never typed."""
-        assert sd.call_input_digest("monitor_start", {"message": "a"}) != sd.call_input_digest(
-            "monitor_start", {"message": "a", "max_cycles": 24}
+        assert sd.call_input_digest("monitor_patrol", {"message": "a"}) != sd.call_input_digest(
+            "monitor_patrol", {"message": "a", "max_cycles": 24}
         )
 
     def test_unserialisable_value_still_digests(self):
         # Mirrors encode's default=str so a value only one side could serialise
         # compares equal instead of raising.
-        assert sd.call_input_digest("monitor_start", {"when": object})
+        assert sd.call_input_digest("monitor_patrol", {"when": object})
 
     def test_non_dict_input_digests_by_str(self):
-        assert sd.call_input_digest("monitor_start", "hello") == sd.call_input_digest(
-            "monitor_start", "hello"
+        assert sd.call_input_digest("monitor_patrol", "hello") == sd.call_input_digest(
+            "monitor_patrol", "hello"
         )
-        assert sd.call_input_digest("monitor_start", None) == sd.call_input_digest(
-            "monitor_start", None
+        assert sd.call_input_digest("monitor_patrol", None) == sd.call_input_digest(
+            "monitor_patrol", None
         )
 
     def test_it_is_a_full_sha256(self):
-        d = sd.call_input_digest("monitor_start", {})
+        d = sd.call_input_digest("monitor_patrol", {})
         assert len(d) == 64 and all(c in "0123456789abcdef" for c in d)
 
     def test_the_tool_is_part_of_the_key(self):
@@ -318,4 +318,4 @@ class TestCallInputDigest:
 
     def test_reveals_nothing_of_the_input(self):
         secret = "AKIAIOSFODNN7EXAMPLE"
-        assert secret not in sd.call_input_digest("monitor_start", {"message": secret})
+        assert secret not in sd.call_input_digest("monitor_patrol", {"message": secret})

@@ -4,7 +4,7 @@ The defect these pin: ``autonudge_authz`` refused every arm on a crew- or
 member-mode slot with "<mode>-mode sessions do not accept direct automation
 turns". The intent of that refusal is to keep a cron, another session or an app
 from injecting automation turns into a member's own thread. The side effect
-was that a member's OWN ``monitor_start`` was refused too, and the MCP tool
+was that a member's OWN ``monitor_patrol`` was refused too, and the MCP tool
 had already answered "requested" over its own pipe, so nothing told anyone:
 the conductor member thread armed its patrol loop, ended its turn, and was
 never woken again -- ``autonudge.json`` never held the loop.
@@ -17,7 +17,7 @@ Three states, each pinned here:
     and the fire-time re-check lets it wake.
 (b) EXTERNAL STILL REFUSED -- no initiator, or an initiator that is a
     different session: 409, nothing armed, unchanged from before.
-(c) REFUSAL VISIBLE -- a refused ``monitor_start``/``monitor_watch`` directive
+(c) REFUSAL VISIBLE -- a refused ``monitor_patrol``/``monitor_watch`` directive
     writes a ``notice`` row into the session transcript instead of dying in
     the log.
 
@@ -421,7 +421,7 @@ async def test_external_arm_kwargs_shape_is_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_monitor_start_directive_passes_its_own_binding_as_initiator() -> None:
+async def test_monitor_patrol_directive_passes_its_own_binding_as_initiator() -> None:
     """The consumer applies a directive to the exact session whose turn
     produced it, so it -- and only it -- may vouch for a self-arm."""
     captured: dict[str, Any] = {}
@@ -441,7 +441,7 @@ async def test_monitor_start_directive_passes_its_own_binding_as_initiator() -> 
             state,
             slot,
             "dashboard:member-conductor",
-            "monitor_start",
+            "monitor_patrol",
             {"message": "patrol", "idle_secs": 1200, "max_cycles": 0},
             producer_is_user_facing=True,
         )
@@ -487,7 +487,7 @@ async def test_monitor_watch_directive_passes_its_own_binding_as_initiator() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+@pytest.mark.parametrize("kind", ["monitor_patrol", "monitor_watch"])
 async def test_refused_arm_writes_a_notice_row_into_the_session(kind: str) -> None:
     """(c) The MCP tool already said "requested"; a refusal that only reaches
     the log leaves a session that believes it armed a loop. The consumer must
@@ -547,7 +547,7 @@ async def test_refused_arm_without_a_slot_returns_the_reason_and_writes_no_row()
         patch.object(sda, "_audit"),
     ):
         result = await sda.apply_session_directive(
-            SimpleNamespace(), None, "dashboard:chat-1", "monitor_start", {"message": "m"}
+            SimpleNamespace(), None, "dashboard:chat-1", "monitor_patrol", {"message": "m"}
         )
     assert "unknown slot" in result
     surfaced.assert_not_called()
@@ -571,7 +571,7 @@ async def test_notice_failure_never_masks_the_denial() -> None:
             SimpleNamespace(),
             SimpleNamespace(key="chat-1", _app="", messages=[]),
             "dashboard:chat-1",
-            "monitor_start",
+            "monitor_patrol",
             {"message": "m"},
         )
     assert result.startswith("Failed to start monitor loop: crew-mode")
@@ -717,7 +717,7 @@ class TestFireTimeModeRecheck:
 
 
 @pytest.mark.asyncio
-async def test_successful_monitor_start_writes_a_notice_and_names_loop_and_first_wake() -> None:
+async def test_successful_monitor_patrol_writes_a_notice_and_names_loop_and_first_wake() -> None:
     """Both channels on success: the applier's ack (which overwrites the
     transcript tool_result row) AND a notice row carry the loop id and the
     first wake time, read off the ARMED record's ``next_due_ts``."""
@@ -743,7 +743,7 @@ async def test_successful_monitor_start_writes_a_notice_and_names_loop_and_first
             state,
             slot,
             "dashboard:member-conductor",
-            "monitor_start",
+            "monitor_patrol",
             {"message": "patrol", "idle_secs": 1200, "max_cycles": 0},
         )
 
@@ -758,7 +758,7 @@ async def test_successful_monitor_start_writes_a_notice_and_names_loop_and_first
 
 
 @pytest.mark.asyncio
-async def test_refused_monitor_start_carries_the_status_code() -> None:
+async def test_refused_monitor_patrol_carries_the_status_code() -> None:
     async def _refuse(**kw: Any) -> tuple[None, str, int]:
         return None, external_arm_refusal("member"), 409
 
@@ -772,7 +772,7 @@ async def test_refused_monitor_start_carries_the_status_code() -> None:
             SimpleNamespace(),
             SimpleNamespace(key="member-conductor", _app="", messages=[]),
             "dashboard:member-conductor",
-            "monitor_start",
+            "monitor_patrol",
             {"message": "patrol"},
         )
     assert result.startswith("Failed to start monitor loop: member-mode")
@@ -882,7 +882,7 @@ def test_only_the_session_directive_consumer_passes_initiator_slot_key() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+@pytest.mark.parametrize("kind", ["monitor_patrol", "monitor_watch"])
 async def test_a_headless_turn_in_a_member_session_gets_no_self_arm_provenance(kind: str) -> None:
     """A cron injection, a sub-agent sharing the slot, an app- or nudge-driven
     turn all run IN the member's session without BEING it. Without the
@@ -1134,7 +1134,7 @@ async def test_self_arm_denies_when_no_free_id_can_be_reserved(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+@pytest.mark.parametrize("kind", ["monitor_patrol", "monitor_watch"])
 async def test_the_slots_own_wake_turn_may_re_arm_its_loop(kind: str) -> None:
     """(a) A member's loop firing on the member's slot is the member keeping
     itself awake; the arm it issues from inside that cycle is its own act, so

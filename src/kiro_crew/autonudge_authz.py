@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # slot is a named member's own thread; neither may have work injected by a
 # cron, another session or an app through a nudge loop. The refusal is NOT
 # about the mode being unable to run a loop -- a member is a self-directed
-# resident agent, and its own ``monitor_start`` is the normal way it keeps
+# resident agent, and its own ``monitor_patrol`` is the normal way it keeps
 # itself awake -- so the one admitted exception is a SELF-ARM: the arming
 # request came from a turn of the bound session itself. See
 # :func:`is_self_arm`.
@@ -706,7 +706,7 @@ async def authorize_and_add_nudge(
     # UNGATED by default: this chokepoint is shared with callers whose work is not
     # a pull request (an app's own timer, a goal loop), and inferring a monitor from
     # a message that merely mentions one PR throttles those and can deactivate them
-    # outright. The monitor_start surfaces pass ``gate=True`` themselves.
+    # outright. The monitor_patrol surfaces pass ``gate=True`` themselves.
     gate: bool = False,
     monitor: MonitorState | None = None,
     replace_existing: bool = True,
@@ -754,7 +754,7 @@ async def authorize_and_add_nudge(
     slot_key = (slot_key or "").strip()
     message = (message or "").strip()
     # The nudge message is LLM-influenced (workflow-authored ctx.nudge and
-    # agent-issued monitor_start alike), gets PERSISTED to the loop store, and
+    # agent-issued monitor_patrol alike), gets PERSISTED to the loop store, and
     # is later re-injected into chat / posted to messaging channels on every
     # fire. Redact credential patterns and exfiltration URLs at this single
     # chokepoint so no delivery surface can leak them (same guard as other

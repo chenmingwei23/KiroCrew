@@ -67,7 +67,7 @@ def test_legacy_monitor_descriptors_route_structured_watches_correctly() -> None
     """Model-facing compatibility tools must not steal supported PR watches."""
     descriptors = {tool["name"]: tool["description"] for tool in _domain("control").schemas()}
 
-    start = descriptors["monitor_start"].lower()
+    start = descriptors["monitor_patrol"].lower()
     assert "unsupported" in start
     assert "monitor_watch" in start
     assert "supported pull-request" in start

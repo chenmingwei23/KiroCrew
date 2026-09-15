@@ -3654,7 +3654,7 @@ acknowledgement remains pending until the current turn ends, so agent inspection
 happens only at the start of a later user/wake turn. It also explains that
 reported-token enforcement may be incomplete while runtime and completed-turn
 limits remain hard fallbacks. It does not reproduce provider polling policy in
-the prompt. Its legacy `monitor_start` recipe is limited to unsupported targets
+the prompt. Its legacy `monitor_patrol` recipe is limited to unsupported targets
 and requires a positive cadence, cycle cap, and runtime bound while naming the
 full-turn/token cost and ordinary approval policy. A supported provider's setup
 or authentication refusal never falls back to the costly legacy loop.

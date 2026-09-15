@@ -167,7 +167,7 @@ Shipped signals:
 |--------|-----------|
 | `tips_feedback_exists` | The user has reacted to a feature tip in any way. |
 | `artifacts_nonempty` | The artifact library holds at least one artifact. |
-| `sel_event_seen:<tool_name>` | A recent audit-log row names that tool, e.g. `sel_event_seen:monitor_start`. |
+| `sel_event_seen:<tool_name>` | A recent audit-log row names that tool, e.g. `sel_event_seen:monitor_patrol`. |
 | `config_key_set:<dotted.path>` | The user set that key in `config.json` or `config.local.json`. Presence in the file, not the effective value, so a shipped default never fires it. |
 
 To add one, register a function in `_PROBES` (no argument) or `_PARAM_PROBES` (the part after the first `:` is passed in). Keep it cheap: probes run on a polled route, at most once per `/api/feature-videos/next` request, and only for entries no earlier check has already ruled out.

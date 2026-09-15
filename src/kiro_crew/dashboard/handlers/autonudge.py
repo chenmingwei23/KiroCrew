@@ -829,7 +829,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
             stop_sentinel_path?, gate?, banner? }
 
     ``gate`` defaults to FALSE here: this route arms whatever the goal popover was
-    given, and only ``monitor_start`` has the evidence to gate by default. Pass
+    given, and only ``monitor_patrol`` has the evidence to gate by default. Pass
     ``gate: true`` to probe-gate a loop armed through this route.
 
     ``banner`` is the optional short stand-in shown in the transcript row
@@ -874,13 +874,13 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
     # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
-    # ABSENT MEANS UNGATED on this route, unlike the monitor_start tool. This is a
+    # ABSENT MEANS UNGATED on this route, unlike the monitor_patrol tool. This is a
     # GENERIC arming route: its only caller is the goal popover, where a person
     # types a recurring instruction whose work is usually NOT a pull request. Such
     # an instruction routinely mentions one anyway ("keep driving PR #42"), and
     # gating on that mention throttles the task to the quiet-streak floor and, when
     # that PR is closed or merged, DEACTIVATES a recurring task that had nothing to
-    # do with it. Gating by default belongs to monitor_start, whose directive sets
+    # do with it. Gating by default belongs to monitor_patrol, whose directive sets
     # `gate: true` itself; it does not extend to this route.
     #
     # A non-boolean is still refused rather than coerced: `"false"` is truthy and

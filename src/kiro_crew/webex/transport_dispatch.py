@@ -538,7 +538,7 @@ class WebexDispatcher:
                     channel_type="webex",
                     session_key=session_key,
                     inbound_route=inbound_route,
-                    # Session-directive consumer: monitor_start / autonudge_stop /
+                    # Session-directive consumer: monitor_patrol / autonudge_stop /
                     # ... return a marker TurnDriver decodes; apply it against THIS
                     # turn's session key (dashboard-only directives stay refused
                     # for channel sessions).

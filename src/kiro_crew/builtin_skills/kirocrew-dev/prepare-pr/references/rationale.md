@@ -243,11 +243,11 @@ default, so it refuses the whole call as an *"unresolved shell variable in path
 position"* and ends the turn before any script runs. The unresolved value taints
 every path derived from it, so splitting the assignment across lines does not help.
 
-## Why the driver is `monitor_start` and not a cron
+## Why the driver is `monitor_patrol` and not a cron
 
 A turn is capped at 2 hours and a CI round here costs 20–40 minutes, so an in-turn
 poll loop reliably hits the cap around iteration 3–4 — losing the loop, though not
-the work. `monitor_start` gives each round a fresh turn and survives a tab close or
+the work. `monitor_patrol` gives each round a fresh turn and survives a tab close or
 gateway restart.
 
 Cron and heartbeat cannot drive the fix loop, and both report success while doing

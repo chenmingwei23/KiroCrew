@@ -61,7 +61,7 @@ narrows, and each narrowing is a permission decision:
 
 Auto-approved core verbs are reads (`resource_status`, `list_sessions`,
 `skill_search`, `skill_fetch`), the conductor's own patrol lifecycle
-(`monitor_start`, `monitor_update`, `autonudge_stop`, `wait`), its own durable
+(`monitor_patrol`, `monitor_update`, `autonudge_stop`, `wait`), its own durable
 ledger (`session_ledger_read`, `session_ledger_record`), and reporting to the
 owner (`send_message`, `send_notification`, `ask_question`). Auto-approved
 dashboard verbs are create-or-read only: `chat_folder_tree`,
@@ -194,7 +194,7 @@ healthy install is the same outage as one that admits a bad one.
 
 ## The patrol cycle
 
-The conductor patrols with `monitor_start`, never `wait`, at roughly a 90-second
+The conductor patrols with `monitor_patrol`, never `wait`, at roughly a 90-second
 interval, and arms the loop with both the full cycle instructions and the exit
 condition. Two cycle-order rules are structural rather than stylistic:
 
@@ -249,7 +249,7 @@ invisible unless it keeps its own list.
 - **An absent script reads as `UNKNOWN`, never as permission.** Presence is
   checked at first use rather than assumed, so an install that does not carry a
   script loses that script's answers instead of gaining a default yes.
-- **The patrol expires silently.** `monitor_start` defaults to 24 cycles, so a
+- **The patrol expires silently.** `monitor_patrol` defaults to 24 cycles, so a
   90-second patrol runs out in well under an hour, long before a fleet drains,
   and the loop simply stops with no symptom. `max_cycles` is passed explicitly
   and raised mid-run with `monitor_update`. Coasting into the cap is a failure,
@@ -305,7 +305,7 @@ derive `permissions` from the filtered list; only the conductor mounts
 
 | Test | What it holds |
 |---|---|
-| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, the verbosity placeholder, patrol via `monitor_start` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
+| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, the verbosity placeholder, patrol via `monitor_patrol` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
 | `test/test_pipeline_conductor_skill_contract.py` | That the skill cites the script rather than a prose predicate, that every exit code has a documented action, that all five verdicts are named, that `UNKNOWN` is never permission, that a prose closure request needs author authorization, that an absent script has defined behaviour, and that a `verifier.repro_gate` outside its two declared values refuses the run instead of degrading to the generic contract |
 | `test/test_pipeline_conductor_probe_roundtrip.py` | That the probe classifies what the conversation log actually wrote, that the watchdog patterns match the constants the gateway emits, that the index needle matches the real writer, that a raw slot key finds the transcript the dashboard writes, and that `credit_spend.py` sums what the recorder wrote |
 | `test/test_pipeline_conductor_claim_preflight.py` | The claim verdict lattice: merged-PR coverage and its near misses, fork PRs, prose self-claims, closure requests outranking claims, and absent-symbol risk handling |

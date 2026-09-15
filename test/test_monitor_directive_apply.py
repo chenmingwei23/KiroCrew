@@ -622,7 +622,7 @@ async def test_monitor_watch_does_not_replace_a_legacy_loop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_monitor_start_does_not_replace_a_structured_monitor(tmp_path):
+async def test_monitor_patrol_does_not_replace_a_structured_monitor(tmp_path):
     service = AutoNudgeService(base_dir=tmp_path)
     structured = await service.add_monitor(
         slot_key="chat-1",
@@ -639,7 +639,7 @@ async def test_monitor_start_does_not_replace_a_structured_monitor(tmp_path):
             state,
             slot,
             "dashboard:chat-1",
-            "monitor_start",
+            "monitor_patrol",
             {"message": "legacy prompt", "idle_secs": 60},
         )
 

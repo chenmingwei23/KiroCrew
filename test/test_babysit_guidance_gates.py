@@ -38,22 +38,22 @@ def _gating_urls(text: str) -> list[str]:
     return [url for url in _URL.findall(text) if infer("Check %s now." % url) is not None]
 
 
-def test_the_monitor_start_guidance_demonstrates_a_gating_subject() -> None:
+def test_the_monitor_patrol_guidance_demonstrates_a_gating_subject() -> None:
     body = PROMPT.read_text(encoding="utf-8")
-    start = body.index("**Using monitor_start:**")
+    start = body.index("**Using monitor_patrol:**")
     block = body[start : start + 1200]
     assert _gating_urls(block), (
-        "the monitor_start guidance in prompt.md must show the subject as a pull-request "
+        "the monitor_patrol guidance in prompt.md must show the subject as a pull-request "
         "URL that inference accepts; a bare 'PR #123' leaves the loop ungated"
     )
 
 
 def test_the_babysit_example_message_names_its_subject_by_url() -> None:
     body = BABYSIT_SKILL.read_text(encoding="utf-8")
-    # Anchor on the Example section: ``monitor_start(`` also appears far above it
+    # Anchor on the Example section: ``monitor_patrol(`` also appears far above it
     # as the tool's signature in the Overview, which carries no subject at all.
     example = body.index("## Example")
-    start = body.index("monitor_start(", example)
+    start = body.index("monitor_patrol(", example)
     message = body[start : start + 400]
     assert _gating_urls(message), (
         "the babysit skill's worked example must name the pull request by a URL "
@@ -103,7 +103,7 @@ def test_the_skill_warns_that_a_typed_provider_keeps_same_labelled_rows_apart() 
 def test_the_spec_states_the_arming_gate_default_the_chokepoint_implements() -> None:
     """The ungated default is the one a new caller inherits by writing nothing.
 
-    Only the two ``monitor_start`` surfaces ask for the gate. Every other caller
+    Only the two ``monitor_patrol`` surfaces ask for the gate. Every other caller
     reaches ``authorize_and_add_nudge`` without naming a value and inherits its
     parameter default, so the spec has to say which way that resolves: gating is
     the state that can silently stop work, so an unnamed value spends a turn per
@@ -113,7 +113,7 @@ def test_the_spec_states_the_arming_gate_default_the_chokepoint_implements() -> 
 
     assert default is False, (
         "the shared arming chokepoint defaults ungated; flipping it silently "
-        "changes what every non-monitor_start caller arms"
+        "changes what every non-monitor_patrol caller arms"
     )
     spec = " ".join(SPEC.read_text(encoding="utf-8").split())
     assert "defaults every other caller UNGATED" in spec

@@ -334,8 +334,8 @@ Guards on `next_wake`:
 - Authorization: the tool resolves the calling job from `KIROCREW_SESSION_KEY`
   (`cron:{job.id}`) and may mutate **only that job**. It is refused outright
   from any non-`cron:` session, and from a subagent, using the strict env-only
-  resolution `monitor_start` already uses for the same reason
-  (`mcp_tools/control.py` (`monitor_start`), resolving via `mcp_core.py`
+  resolution `monitor_patrol` already uses for the same reason
+  (`mcp_tools/control.py` (`monitor_patrol`), resolving via `mcp_core.py`
   (`_resolve_session_key_strict`)) — a child process must not be able to
   PID-walk into its parent's identity and reschedule it.
 
@@ -806,7 +806,7 @@ server-side scheduling would make it tick for an audience that is not there.
 
 The honest read of the "too many schedulers" feeling is that it is an
 **API-surface** problem, not an engine problem. An agent choosing between
-`cron_add`, `monitor_start`, `HEARTBEAT.md` and `wait` has four overlapping
+`cron_add`, `monitor_patrol`, `HEARTBEAT.md` and `wait` has four overlapping
 answers with no decision rule. That is fixed with one decision table in the
 docs and sharper tool descriptions — cheap, and it does not put anyone's
 `crons.json` at risk.

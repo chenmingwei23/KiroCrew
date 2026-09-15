@@ -344,7 +344,7 @@ The first set of rows covers the operations this system cannot lose:
 - The venv `pytest` invocation the repository's own gates use.
 - Chat start plus one completed turn.
 - An existing cron firing on schedule.
-- `monitor_start` arming a loop and `autonudge_stop` ending it.
+- `monitor_patrol` arming a loop and `autonudge_stop` ending it.
 - The `prepare-pr` commit-then-push sequence.
 - Each conductor's bundled-script calls — `claim_preflight.py`, `fleet_probe.py`, `credit_spend.py`,
   `scope_check.py`, `finding_entry.py`, `verify_finding.py`, `ledger.py`.

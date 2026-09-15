@@ -33,6 +33,7 @@ from kiro_crew.mcp_caller import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session_directive import neutralize_markers
+from kiro_crew.tool_retirement import widen_restriction_for_retired_names
 from kiro_crew.validation import (
     ValidationError,
     build_tool_response,
@@ -523,7 +524,14 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
 
         exclude = policy.get("exclude", [])
         if isinstance(exclude, list):
-            resolved = {t for t in exclude if isinstance(t, str)}
+            # A rule an operator persisted against a tool's OLD name must keep
+            # denying that tool after it is renamed. The exact-name check below
+            # would otherwise stop matching silently, and the capability the rule
+            # governed would come back ungoverned with nothing saying so -- a
+            # fail-OPEN on an existing policy, produced by the rename itself.
+            # Widening a restriction is the safe direction; see
+            # ``tool_retirement`` for why the grant side has no equivalent.
+            resolved = widen_restriction_for_retired_names(exclude)
         else:
             resolved = set()
         # FIFO bound: dicts preserve insertion order; drop the oldest

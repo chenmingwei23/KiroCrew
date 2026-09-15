@@ -8904,7 +8904,7 @@ async def _run_chat(
                     producing_session_key=effective_session_key(slot),
                 )
                 # Session directive: a stateless session-bound tool
-                # (monitor_start / monitor_update / autonudge_stop / set_project
+                # (monitor_patrol / monitor_update / autonudge_stop / set_project
                 # / suggest_followup / ask_question) returns a directive marker
                 # instead of resolving its own session identity. Apply it HERE,
                 # where slot.key + session_key are the AUTHORITATIVE session for

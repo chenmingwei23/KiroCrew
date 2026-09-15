@@ -1094,7 +1094,7 @@ class TelegramDispatcher:
                     safety_override().is_active() or is_session_trusted(session_key)
                 ),
                 tool_gate=_tool_gate,
-                # Session-directive consumer: monitor_start / autonudge_stop /
+                # Session-directive consumer: monitor_patrol / autonudge_stop /
                 # ... return a marker the driver decodes; apply it against THIS
                 # turn's session key (dashboard-only directives stay refused
                 # for channel sessions).

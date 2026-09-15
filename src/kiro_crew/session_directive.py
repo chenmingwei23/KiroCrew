@@ -32,7 +32,7 @@ KiroCrew observing the tool CALL — as an MCP-served call whose CANONICAL name
 (``_meta.kiro.toolName``, with ``_meta.kiro.mcpServerName`` set) is one of
 :data:`DIRECTIVE_TOOLS`. That identity comes from kiro-cli's out-of-band ``_meta``
 channel, NOT the ``title`` (which is LLM-authored prose for shell tools — a shell
-command titled ``"monitor_start"`` whose stdout forges the marker must NOT be
+command titled ``"monitor_patrol"`` whose stdout forges the marker must NOT be
 honoured). The gate fails closed when ``_meta`` identity is absent. The payload
 never carries a session key (the session is supplied by the consumer), and the
 consumer additionally refuses native-sub-agent tool calls, which surface as flat
@@ -56,7 +56,7 @@ from typing import Any
 # wait. This drops only the mid-turn pause — never a capability.
 DIRECTIVE_TOOLS: frozenset[str] = frozenset(
     {
-        "monitor_start",
+        "monitor_patrol",
         "monitor_watch",
         "monitor_update",
         "monitor_stop",
@@ -68,10 +68,11 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+
 # The MCP server name KiroCrew registers its own tools under (kiro-cli reports
 # it in ``_meta.kiro.mcpServerName``). The consumer honours a directive ONLY
 # from a call served by THIS server — a third-party MCP server that happens to
-# expose a tool named e.g. ``monitor_start`` must never be able to drive a
+# expose a tool named e.g. ``monitor_patrol`` must never be able to drive a
 # session directive. (A downstream fork adjusts this one constant to its own
 # server name.)
 CORE_MCP_SERVER = "kirocrew-core"
@@ -447,7 +448,7 @@ def _server_underscore_qualified(name: str) -> str:
     underscore (each half with ``[^a-zA-Z0-9_-]`` replaced by ``_``; Crew's server
     names survive that unchanged). Deliberately an EXACT server-qualified match
     rather than teaching :func:`match_tool` that one underscore separates a
-    qualifier: one underscore as a separator resolves ``do_monitor_start``, which
+    qualifier: one underscore as a separator resolves ``do_monitor_patrol``, which
     that function excludes on purpose, and there is no way to tell that spelling
     apart from a bare tool name whose own words happen to end in a directive
     name. Exactness costs nothing here, because the whole point of this spelling
@@ -455,9 +456,9 @@ def _server_underscore_qualified(name: str) -> str:
 
     The SERVER half is the guard, as in the KAS and Claude branches: a
     third-party server exposing a tool literally named
-    ``kirocrew-core_monitor_start`` spells its own id
-    ``<that-server>_kirocrew-core_monitor_start`` and fails the prefix, and a
-    longer Crew-looking name (``kirocrew-core_monitor_start_extra``) fails the
+    ``kirocrew-core_monitor_patrol`` spells its own id
+    ``<that-server>_kirocrew-core_monitor_patrol`` and fails the prefix, and a
+    longer Crew-looking name (``kirocrew-core_monitor_patrol_extra``) fails the
     :data:`DIRECTIVE_TOOLS` membership check on the tool half.
     """
     prefix = f"{CORE_MCP_SERVER}_"
@@ -472,7 +473,7 @@ def match_tool(raw: str) -> str:
     or ``""``.
 
     ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
-    title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
+    title). For an MCP tool that name is the bare tool name (``"monitor_patrol"``);
     some transports server-qualify it, and the separator is NOT one fixed
     spelling: kiro-cli reports ``"<server>___<name>"`` while the canonical MCP
     prefix form is ``"mcp__<server>__<name>"``. Split on the LAST run of two or
@@ -481,8 +482,8 @@ def match_tool(raw: str) -> str:
     this deliberately mirrors rather than re-inventing.
 
     Still nothing wider than that: the separator must be a run of >= 2
-    underscores, so a crafted path/namespace tail (``"a/b/monitor_start"``,
-    ``"do_monitor_start"``) cannot smuggle a directive name in. The tool half
+    underscores, so a crafted path/namespace tail (``"a/b/monitor_patrol"``,
+    ``"do_monitor_patrol"``) cannot smuggle a directive name in. The tool half
     never authenticates the SERVER either way — :func:`directive_tool_for`
     checks ``mcp_server_name`` independently, and that is the check a
     third-party server fails.
@@ -512,7 +513,7 @@ def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
     (``mcpServerName`` / ``toolName``) — never the LLM-authored title. A shell
     tool has no MCP server name and a canonical tool name like
     ``execute_bash``, so it resolves to ``""``; so does a third-party MCP
-    server that merely exposes a tool named e.g. ``monitor_start``. Absent
+    server that merely exposes a tool named e.g. ``monitor_patrol``. Absent
     identity (empty server name) fails closed.
     """
     if mcp_server_name != CORE_MCP_SERVER:

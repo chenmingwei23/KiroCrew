@@ -332,7 +332,7 @@ class TestProbes:
         # The catalog is pinned to the tips entry plus one signal-free control.
         # Running against the SHIPPED catalog would put the second entry's
         # sel_event_seen probe on the host's real audit log, so a box that has
-        # ever called monitor_start withdraws both entries and the assertion
+        # ever called monitor_patrol withdraws both entries and the assertion
         # reads as a failure of the opt-out path it is not testing.
         control = _entry("control")
         with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
@@ -409,17 +409,17 @@ class TestProbes:
         fake_log.recent.return_value = [
             {"event_type": "tool_invocation", "operation": "execute_bash"},
             "not-a-dict",
-            {"event_type": "tool_invocation", "operation": "monitor_start"},
+            {"event_type": "tool_invocation", "operation": "monitor_patrol"},
         ]
         with patch.object(fv, "sel", return_value=fake_log):
-            assert fv.probe_fires("sel_event_seen:monitor_start") is True
+            assert fv.probe_fires("sel_event_seen:monitor_patrol") is True
             assert fv.probe_fires("sel_event_seen:cron_add") is False
 
     def test_sel_probe_read_is_bounded(self) -> None:
         fake_log = MagicMock()
         fake_log.recent.return_value = []
         with patch.object(fv, "sel", return_value=fake_log):
-            fv.probe_fires("sel_event_seen:monitor_start")
+            fv.probe_fires("sel_event_seen:monitor_patrol")
         fake_log.recent.assert_called_once_with(limit=fv._SEL_PROBE_LIMIT)
 
     def test_sel_probe_with_empty_tool_name_does_not_fire(self) -> None:

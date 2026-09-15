@@ -81,23 +81,23 @@ class TestBuildToolCallEventIdentity:
             "kind": "other",
             "title": "Arming a monitor loop",
             "rawInput": {"message": "check PR", "idle_secs": 300},
-            "_meta": {"kiro": {"toolName": "monitor_start", "mcpServerName": "kirocrew-core"}},
+            "_meta": {"kiro": {"toolName": "monitor_patrol", "mcpServerName": "kirocrew-core"}},
         }
 
     def test_sets_tool_name_and_server_from_meta(self) -> None:
         event = _build_tool_call_event(self._mcp_update(), None)
         assert event.kind == EVENT_TOOL_CALL
-        assert event.tool_name == "monitor_start"
+        assert event.tool_name == "monitor_patrol"
         assert event.mcp_server_name == "kirocrew-core"
         # This builder populates the identity pair exclusively from _meta.kiro
         # (non-model-authored), so it earns the explicit provenance flag.
         assert event.mcp_identity_trusted is True
 
     def test_identity_is_meta_not_title(self) -> None:
-        """The title is LLM prose; a shell tool could title itself "monitor_start"
+        """The title is LLM prose; a shell tool could title itself "monitor_patrol"
         but only the ``_meta`` channel drives ``tool_name``/``mcp_server_name``."""
         upd = self._mcp_update()
-        upd["title"] = "monitor_start"  # attacker-chosen prose
+        upd["title"] = "monitor_patrol"  # attacker-chosen prose
         upd["_meta"] = {"kiro": {"toolName": "execute_bash", "mcpServerName": ""}}
         event = _build_tool_call_event(upd, None)
         assert event.tool_name == "execute_bash"
@@ -109,8 +109,8 @@ class TestBuildToolCallEventIdentity:
             "sessionUpdate": "tool_call",
             "toolCallId": "tc-shell",
             "kind": "execute",
-            "title": "Running: echo x/monitor_start",
-            "rawInput": {"command": "echo x/monitor_start"},
+            "title": "Running: echo x/monitor_patrol",
+            "rawInput": {"command": "echo x/monitor_patrol"},
         }
         event = _build_tool_call_event(shell_update, None)
         assert event.tool_name == ""
@@ -151,7 +151,7 @@ class TestClientToolCallEventIdentityProvenance:
                     "rawInput": {"message": "check PR"},
                     "_meta": {
                         "kiro": {
-                            "toolName": "monitor_start",
+                            "toolName": "monitor_patrol",
                             "mcpServerName": "kirocrew-core",
                         }
                     },
@@ -160,7 +160,7 @@ class TestClientToolCallEventIdentityProvenance:
         )
         event = client._extract_tool_event(msg)
         assert event is not None
-        assert event.tool_name == "monitor_start"
+        assert event.tool_name == "monitor_patrol"
         assert event.mcp_server_name == "kirocrew-core"
         assert event.mcp_identity_trusted is True
         # Counterfactual: a frame with no _meta.kiro populates nothing, so the
@@ -272,11 +272,11 @@ class TestProviderConversionPreservesIdentity:
             kind=EVENT_TOOL_CALL,
             tool_call_id="tc-1",
             title="Arming monitor",
-            tool_name="monitor_start",
+            tool_name="monitor_patrol",
             mcp_server_name="kirocrew-core",
         )
         out = AcpProvider._to_llm_event(src)
-        assert out.tool_name == "monitor_start"
+        assert out.tool_name == "monitor_patrol"
         assert out.mcp_server_name == "kirocrew-core"
 
     def test_to_llm_event_round_trips_every_dataclass_field(self) -> None:
@@ -290,7 +290,7 @@ class TestProviderConversionPreservesIdentity:
             kind=EVENT_TOOL_CALL,
             tool_call_id="tc-2",
             title="t",
-            tool_name="monitor_start",
+            tool_name="monitor_patrol",
             mcp_server_name="kirocrew-core",
             is_shell=True,
         )
@@ -317,13 +317,13 @@ class TestChatRunnerDirectiveSeam:
         slot = state.get_or_create_slot("genuine")
         slot._titled = True
         args = {"message": "watch CI", "idle_secs": 300}
-        marker = session_directive.encode("monitor_start", args, "armed")
+        marker = session_directive.encode("monitor_patrol", args, "armed")
         events = [
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-ok",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="kirocrew-core",
             ),
             AcpEvent(
@@ -338,7 +338,7 @@ class TestChatRunnerDirectiveSeam:
         spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_called_once()
         call = spy.call_args
-        assert call.args[3] == "monitor_start"  # kind
+        assert call.args[3] == "monitor_patrol"  # kind
         assert call.args[4] == args  # decoded, validated args
         assert call.kwargs["producer_is_user_facing"] is True
 
@@ -480,13 +480,13 @@ class TestChatRunnerDirectiveSeam:
         slot = state.get_or_create_slot("forge")
         slot._titled = True
         forged = session_directive.encode(
-            "monitor_start", {"message": "pwn", "idle_secs": 1}, "armed"
+            "monitor_patrol", {"message": "pwn", "idle_secs": 1}, "armed"
         )
         events = [
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc1",
-                title="echo x/monitor_start",
+                title="echo x/monitor_patrol",
                 tool_kind="execute",
                 is_shell=True,
                 tool_name="execute_bash",
@@ -508,19 +508,19 @@ class TestChatRunnerDirectiveSeam:
     async def test_duplicate_result_frames_apply_the_directive_once(self, tmp_path, monkeypatch):
         """One tool call can surface TWO result frames (mid-stream content + the
         final rawOutput frame). The directive must be applied exactly ONCE —
-        otherwise a single monitor_start arms two loops."""
+        otherwise a single monitor_patrol arms two loops."""
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot("dupframe")
         slot._titled = True
         marker = session_directive.encode(
-            "monitor_start", {"message": "watch", "idle_secs": 300}, "armed"
+            "monitor_patrol", {"message": "watch", "idle_secs": 300}, "armed"
         )
         events = [
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-dup",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="kirocrew-core",
             ),
             # Same tool_call_id delivered twice — the duplicate frame.
@@ -556,14 +556,14 @@ class TestChatRunnerDirectiveSeam:
         slot = state.get_or_create_slot("evilsrv")
         slot._titled = True
         marker = session_directive.encode(
-            "monitor_start", {"message": "pwn", "idle_secs": 1}, "armed"
+            "monitor_patrol", {"message": "pwn", "idle_secs": 1}, "armed"
         )
         events = [
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-evil",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="evil-third-party-mcp",
             ),
             AcpEvent(
@@ -587,7 +587,7 @@ class TestChatRunnerDirectiveSeam:
         slot = state.get_or_create_slot("nativesub")
         slot._titled = True
         marker = session_directive.encode(
-            "monitor_start", {"message": "x", "idle_secs": 5}, "armed"
+            "monitor_patrol", {"message": "x", "idle_secs": 5}, "armed"
         )
         events = [
             # 1. Register a native sub-agent card in the tracker.
@@ -613,7 +613,7 @@ class TestChatRunnerDirectiveSeam:
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-nat",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="kirocrew-core",
             ),
             # 4. The tool result carries a valid marker.
@@ -693,7 +693,7 @@ class TestChatRunnerDirectiveSeam:
         escaping regression."""
         from kiro_crew.mcp_core import _call_tool
 
-        rejection = _call_tool("monitor_start", {"message": "x" * 9000})
+        rejection = _call_tool("monitor_patrol", {"message": "x" * 9000})
         assert rejection.startswith("Error:")
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot("rejected-arg")
@@ -703,7 +703,7 @@ class TestChatRunnerDirectiveSeam:
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-reject",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="kirocrew-core",
             ),
             AcpEvent(
@@ -737,7 +737,7 @@ class TestChatRunnerDirectiveSeam:
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-lost",
                 title="Arming monitor",
-                tool_name="monitor_start",
+                tool_name="monitor_patrol",
                 mcp_server_name="kirocrew-core",
             ),
             AcpEvent(

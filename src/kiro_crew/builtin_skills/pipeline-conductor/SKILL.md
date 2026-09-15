@@ -118,10 +118,10 @@ never relabel it success in the friction report.
    provenance entry and for the whole-map write rule.
 3. Open your own status file beside the spec — `conductor-status/v1`, schema
    below. The ledger tracks the items; the status file tracks YOU.
-4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
+4. Arm the patrol with `monitor_patrol` using an interval near 90 seconds, an
    explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
-   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
-   bound, raise it with `monitor_update` before it expires; `monitor_start` is
+   with `monitor_patrol`, never `wait`.** If live work needs a larger or renewed
+   bound, raise it with `monitor_update` before it expires; `monitor_patrol` is
    create-only. Call `autonudge_stop` yourself when the exit condition fires —
    coasting into the cycle cap is a failure, not a finish.
 
@@ -547,7 +547,7 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > Unstaged work and a stale base are what otherwise reach the
 > PR and cost a review round to find what a git-only check catches in a second.
 > PR: English body (What/Why/How/Tests/Other), `Closes #{n}`, full URL in
-> your reply. Babysit to green (`monitor_start` ~300s, staggered off a round
+> your reply. Babysit to green (`monitor_patrol` ~300s, staggered off a round
 > number so a dozen loops do not poll in lockstep, preferring REST over
 > GraphQL/search — the whole fleet shares one account's rate limit). Fix every
 > Critical/High; disposition every advisory explicitly; read reviewer JOB
@@ -741,7 +741,7 @@ item wakes a worker to re-read something nobody is acting on, and fires the
 probe for no signal.
 
 Then check yourself: **no wake within the patrol interval after recovery means
-your own loop is dead** and needs a fresh `monitor_start`. State the limit
+your own loop is dead** and needs a fresh `monitor_patrol`. State the limit
 plainly, because it bounds what this procedure can do — a conductor cannot
 detect its own loop's death from the inside, since the only symptom is the
 absence of a wake, and an absent wake is precisely the state in which nothing

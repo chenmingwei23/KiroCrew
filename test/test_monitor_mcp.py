@@ -101,7 +101,7 @@ def test_monitor_watch_rejects_webex_while_legacy_stop_and_start_work(gateway_po
     """A Webex session hosts a legacy timer loop but no structured monitor.
 
     So the structured arm (``monitor_watch``) is refused, while the legacy arm
-    (``monitor_start``) and the now-general stop (``monitor_stop``) both emit
+    (``monitor_patrol``) and the now-general stop (``monitor_stop``) both emit
     their directive. ``monitor_stop`` binding through the general key is what
     lets a Webex session stop the loop it is allowed to arm.
     """
@@ -122,7 +122,7 @@ def test_monitor_watch_rejects_webex_while_legacy_stop_and_start_work(gateway_po
             },
         )
         legacy = mcp_core._call_tool(
-            "monitor_start",
+            "monitor_patrol",
             {
                 "message": "Check the pull request and stop when ready.",
                 "interval_secs": 300,
@@ -134,7 +134,7 @@ def test_monitor_watch_rejects_webex_while_legacy_stop_and_start_work(gateway_po
 
     assert structured.startswith("Error:")
     assert session_directive.decode(structured, "monitor_watch") is None
-    legacy_args = session_directive.decode(legacy, "monitor_start")
+    legacy_args = session_directive.decode(legacy, "monitor_patrol")
     assert legacy_args is not None
     assert legacy_args["max_cycles"] == 24
     assert legacy_args["max_runtime_secs"] == 14_400
@@ -146,7 +146,7 @@ def test_monitor_watch_rejects_webex_while_legacy_stop_and_start_work(gateway_po
     # The refused structured arm parks nothing; the legacy arm and the stop both
     # publish.
     assert [(p, b["tool"]) for p, b in gateway_posts] == [
-        ("/api/session-directive", "monitor_start"),
+        ("/api/session-directive", "monitor_patrol"),
         ("/api/session-directive", "monitor_stop"),
     ]
 

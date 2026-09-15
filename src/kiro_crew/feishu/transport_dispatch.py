@@ -242,7 +242,7 @@ class FeishuDispatcher:
                 channel_type="feishu",
                 session_key=session_key,
                 inbound_route=inbound_route,
-                # Session-directive consumer: monitor_start /
+                # Session-directive consumer: monitor_patrol /
                 # autonudge_stop / ... return a marker TurnDriver decodes;
                 # apply it against THIS turn's session key. Without it the
                 # driver leaves the marker inert while the tool still

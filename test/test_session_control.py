@@ -4038,7 +4038,7 @@ def test_close_aborts_if_the_key_was_reminted_during_the_close(tmp_path, monkeyp
 def test_close_slot_runs_the_pre_pop_check_synchronously_after_retirement(tmp_path, monkeypatch):
     """`pre_pop_check` runs SYNCHRONOUSLY after the (awaited) nudge retirement and
     immediately before the pop, so there is no suspension between the last
-    retirement, the re-check, and the removal — a concurrent `monitor_start`
+    retirement, the re-check, and the removal — a concurrent `monitor_patrol`
     cannot arm a loop in a window that would leave a timer to rehydrate the
     archived tab, and a mirror/link cannot land between the re-authorization and
     the archival.

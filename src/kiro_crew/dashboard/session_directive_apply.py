@@ -73,7 +73,7 @@ _USER_SURFACE_DIRECTIVES = frozenset({"set_project", "reset_conversation"})
 # already answered "requested" over its own pipe by the time this consumer
 # runs, and the model's turn is over -- so a refusal that stays in the log
 # leaves a session that believes it armed a loop and is never woken again.
-_ARMING_DIRECTIVES = frozenset({"monitor_start", "monitor_watch"})
+_ARMING_DIRECTIVES = frozenset({"monitor_patrol", "monitor_watch"})
 
 # Transcript row prefix for a refused arm. Fixed text so the frontend and tests
 # can match on it; the authorizer's reason follows the colon.
@@ -272,8 +272,8 @@ async def apply_session_directive(
     # stay human-only, a wake must never retarget the slot's project.
     self_arm_ok = bool(producer_is_user_facing or producer_is_self_wake)
     try:
-        if kind == "monitor_start":
-            result = await _monitor_start(
+        if kind == "monitor_patrol":
+            result = await _monitor_patrol(
                 state,
                 session_key,
                 args,
@@ -352,7 +352,7 @@ def _structured_binding(session_key: str) -> str | None:
     return structured_monitor_binding_key_for(session_key)
 
 
-async def _monitor_start(
+async def _monitor_patrol(
     state: Any,
     session_key: str,
     args: dict[str, Any],
@@ -373,7 +373,7 @@ async def _monitor_start(
         raise _DirectiveDenied("Monitor loop NOT armed: auto-nudge is disabled on this host.")
     binding = _binding(session_key)
     if not binding:
-        raise _DirectiveDenied("monitor_start is not supported from this session type.")
+        raise _DirectiveDenied("monitor_patrol is not supported from this session type.")
     idle_secs = int(args.get("idle_secs") or 300)
     max_cycles = int(args.get("max_cycles") or 0)
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
@@ -401,7 +401,7 @@ async def _monitor_start(
         replace_existing=False,
         # The directive re-arm is the one path allowed to displace a retained
         # STOPPED row: monitor_update's approval-stall refusal names
-        # monitor_start as the remedy, so refusing here deadlocks it.
+        # monitor_patrol as the remedy, so refusing here deadlocks it.
         replace_stopped=True,
         # SELF-ARM provenance: this consumer applies the directive to the exact
         # session whose turn produced it (module docstring), so the binding IS
@@ -507,11 +507,11 @@ async def _monitor_watch(
         source="mcp-directive",
         caller="session-directive",
         replace_existing=False,
-        # Same opt-in as _monitor_start: a monitor stopped and retained for
+        # Same opt-in as _monitor_patrol: a monitor stopped and retained for
         # inspection must not block this session's next directive arm.
         replace_stopped=True,
         monitor=monitor,
-        # Self-arm provenance, same rule as _monitor_start: human-started turns only.
+        # Self-arm provenance, same rule as _monitor_patrol: human-started turns only.
         initiator_slot_key=binding if self_arm_ok else "",
         creation_surface=(
             MonitorCreationSurface.CHANNEL
@@ -555,7 +555,7 @@ async def _monitor_update(
     )
 
     svc = get_instance()
-    # Not-applied paths raise (audited denied) — see _monitor_start.
+    # Not-applied paths raise (audited denied) — see _monitor_patrol.
     if svc is None:
         raise _DirectiveDenied("Cannot update monitor loop: auto-nudge is disabled on this host.")
     binding = _binding(session_key)
@@ -677,7 +677,7 @@ async def _monitor_update(
                     bound = (
                         "its subject already merged, so the watch is over and there is "
                         "nothing left to observe; raising a bound buys cycles with no "
-                        "work in them, so arm monitor_start again only for a NEW subject"
+                        "work in them, so arm monitor_patrol again only for a NEW subject"
                     )
                 else:
                     bound = (
@@ -701,10 +701,10 @@ async def _monitor_update(
                 # who already answered by letting the grant lapse.
                 bound = (
                     "a tool it needed went unanswered at the approval prompt; "
-                    "re-enable auto-approve, then re-arm it with monitor_start"
+                    "re-enable auto-approve, then re-arm it with monitor_patrol"
                 )
             else:
-                bound = "it was paused manually; ask the user, or use monitor_start"
+                bound = "it was paused manually; ask the user, or use monitor_patrol"
             raise _DirectiveDenied(
                 f"Monitor loop {loop.id} is PAUSED (cycle {cycle_count}"
                 + (f" of {current_cap}" if current_cap else ", no cap")

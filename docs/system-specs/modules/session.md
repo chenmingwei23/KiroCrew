@@ -1816,7 +1816,7 @@ a trust root on its own; publication therefore also writes a
   are the computer-use MCP tools (`mcp_computer.py`, for audit attribution)
   and the dashboard messaging-identity path (`dashboard/handlers/messaging.py`).
   The former state-mutating session-bound tools that resolved identity here —
-  `monitor_start`, `monitor_update`, `autonudge_stop`, `set_project` (plus
+  `monitor_patrol`, `monitor_update`, `autonudge_stop`, `set_project` (plus
   `suggest_followup` and `ask_question`) — became STATELESS directive-return
   tools in issue #755 (see "Stateless session-directive tools" below); they
   still call the strict resolver, but only as a context guard, and no longer
@@ -1896,13 +1896,13 @@ a trust root on its own; publication therefore also writes a
 
 ### Stateless session-directive tools (`session_directive.py`, #755)
 
-Seven session-bound MCP tools — `monitor_start`, `monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, `ask_question`, `reset_conversation` — used to resolve their OWN session identity (the strict sidecar resolver above) and call a loopback HTTP endpoint, which only produced a usable per-call caller when MCP-gateway **pooling** was enabled. They are now **stateless**: the tool validates its arguments and returns a *directive* — a human-readable confirmation line plus a machine-readable marker (`session_directive.encode`) carrying the validated payload and NO session key. The session-aware consumer, `dashboard/chat_runner._run_chat`'s `EVENT_TOOL_RESULT` handler, decodes the marker (`session_directive.decode`) and applies the effect IN-PROCESS against ITS OWN `slot`/`session_key` via `dashboard/session_directive_apply.py`, then strips the marker from the stored transcript. This works with pooling OFF (the default) because the consumer already owns the session, so no per-process identity source is needed.
+Seven session-bound MCP tools — `monitor_patrol`, `monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, `ask_question`, `reset_conversation` — used to resolve their OWN session identity (the strict sidecar resolver above) and call a loopback HTTP endpoint, which only produced a usable per-call caller when MCP-gateway **pooling** was enabled. They are now **stateless**: the tool validates its arguments and returns a *directive* — a human-readable confirmation line plus a machine-readable marker (`session_directive.encode`) carrying the validated payload and NO session key. The session-aware consumer, `dashboard/chat_runner._run_chat`'s `EVENT_TOOL_RESULT` handler, decodes the marker (`session_directive.decode`) and applies the effect IN-PROCESS against ITS OWN `slot`/`session_key` via `dashboard/session_directive_apply.py`, then strips the marker from the stored transcript. This works with pooling OFF (the default) because the consumer already owns the session, so no per-process identity source is needed.
 
 Subagent isolation is therefore **structural, not cryptographic**: a subagent's tool result flows through the subagent's own runner and can only ever bind to the subagent's session, never its parent's — there is no `/proc` walk to get wrong. The tools still call `_resolve_session_key_strict()`, but only as a context guard to short-circuit sessions where a directive can never be applied (cron/hook/subagent) and to steer non-`dashboard:` `ask_question` callers to the `[OPTIONS:]` tag — not to bind the effect.
 
 Security properties (enforced in `session_directive.decode` plus the applier):
 
-- **Forgery gate keyed on canonical identity**: because the marker is model-visible (it returns as the tool-result text), a directive is honoured ONLY when the tool call was recorded — via kiro-cli's out-of-band `_meta` channel — as an MCP call whose canonical `_meta.kiro.toolName` (with `_meta.kiro.mcpServerName` set) is in `DIRECTIVE_TOOLS`, never the LLM-authored `title`. A shell command titled `monitor_start` whose stdout forges the marker resolves to no directive tool and is ignored; the gate fails closed when `_meta` identity is absent.
+- **Forgery gate keyed on canonical identity**: because the marker is model-visible (it returns as the tool-result text), a directive is honoured ONLY when the tool call was recorded — via kiro-cli's out-of-band `_meta` channel — as an MCP call whose canonical `_meta.kiro.toolName` (with `_meta.kiro.mcpServerName` set) is in `DIRECTIVE_TOOLS`, never the LLM-authored `title`. A shell command titled `monitor_patrol` whose stdout forges the marker resolves to no directive tool and is ignored; the gate fails closed when `_meta` identity is absent.
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
@@ -1916,7 +1916,7 @@ sequenceDiagram
     participant T as MCP tool (kirocrew-core)
     participant R as chat_runner._run_chat<br/>(EVENT_TOOL_RESULT)
     participant A as session_directive_apply
-    M->>T: call e.g. monitor_start(args)
+    M->>T: call e.g. monitor_patrol(args)
     T->>T: validate args (resolves NO session identity for the effect)
     T-->>R: tool result = human line + directive marker
     R->>R: decode(result, canonical _meta.kiro.toolName)

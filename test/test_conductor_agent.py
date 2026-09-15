@@ -83,12 +83,12 @@ class TestConductorInstaller:
         data = self._install(tmp_path, monkeypatch)
         assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
 
-    def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
+    def test_prompt_drives_patrol_with_monitor_patrol_not_wait(self, tmp_path, monkeypatch):
         """A patrol round outlives a turn, so the loop must own the turn boundary.
 
         An in-turn ``wait`` + re-poll loop spends the turn budget on latency and
         dies at the turn cap mid-round, which loses the loop. Three halves of the
-        contract are pinned: ``monitor_start`` arms the round, ``wait`` is the
+        contract are pinned: ``monitor_patrol`` arms the round, ``wait`` is the
         single-round fallback for a refused arm rather than the primary
         mechanism, and the conductor knows the tool it needs to stop the loop it
         armed. Whitespace is normalised so re-wrapping the prompt cannot fail
@@ -96,7 +96,7 @@ class TestConductorInstaller:
         """
         data = self._install(tmp_path, monkeypatch)
         prompt = " ".join(data["prompt"].split())
-        assert "Arm a loop on your own session with `monitor_start`" in prompt
+        assert "Arm a loop on your own session with `monitor_patrol`" in prompt
         assert "If arming is refused outright" in prompt
         assert "drive that one round with `wait`" in prompt
         assert "autonudge_stop" in prompt
@@ -229,7 +229,7 @@ class TestConductorInstaller:
         granted = self._install(tmp_path, monkeypatch)["allowedTools"]
         core = {g for g in granted if g.startswith("@kirocrew-core")}
         assert core == {
-            "@kirocrew-core/monitor_start",
+            "@kirocrew-core/monitor_patrol",
             "@kirocrew-core/monitor_update",
             "@kirocrew-core/autonudge_stop",
             "@kirocrew-core/wait",
@@ -465,12 +465,12 @@ class TestConductorInstaller:
         assert "root conductor gets `not_bound`" in body
 
     def test_prompt_notes_the_patrol_gate_is_still_a_timer(self, tmp_path, monkeypatch):
-        """``monitor_start`` gates on one pull-request URL and nothing else today, so
+        """``monitor_patrol`` gates on one pull-request URL and nothing else today, so
         a cycle fires whether or not anything was reported. The prompt says so, and
         says what to switch to, rather than implying a gate that does not exist.
         """
         prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "monitor_start" in prompt
+        assert "monitor_patrol" in prompt
         assert 'watch: "work-ledger"' in prompt
 
     def test_prompt_names_its_own_skill_and_not_the_deprecated_alias(self, tmp_path, monkeypatch):
@@ -567,11 +567,11 @@ class TestConductorInstaller:
         data = self._install(
             tmp_path,
             monkeypatch,
-            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_start",
+            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_patrol",
         )
         assert "@kirocrew-core" in data["tools"]
         assert "@kirocrew-core" not in data["allowedTools"]
-        assert "@kirocrew-core/monitor_start" not in data["allowedTools"]
+        assert "@kirocrew-core/monitor_patrol" not in data["allowedTools"]
         # Every sibling grant survives — the ceiling removed one verb, not the set.
         assert "@kirocrew-core/monitor_update" in data["allowedTools"]
         assert data["allowedTools"] == [
@@ -617,7 +617,7 @@ class TestConductorInstaller:
             "kirocrew-core/ask_question",
             "kirocrew-core/autonudge_stop",
             "kirocrew-core/list_sessions",
-            "kirocrew-core/monitor_start",
+            "kirocrew-core/monitor_patrol",
             "kirocrew-core/monitor_update",
             "kirocrew-core/resource_status",
             "kirocrew-core/select_crew",
@@ -663,14 +663,14 @@ class TestConductorInstaller:
         governed = self._install(
             tmp_path,
             monkeypatch,
-            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_start",
+            may_auto_approve=lambda ref: ref != "@kirocrew-core/monitor_patrol",
         )
         assert governed["permissions"] == {
             "rules": [
                 {
                     "capability": "mcp",
                     "match": [
-                        *(r for r in core_resources if r != "kirocrew-core/monitor_start"),
+                        *(r for r in core_resources if r != "kirocrew-core/monitor_patrol"),
                         *dashboard_resources,
                         *work_resources,
                     ],
@@ -745,7 +745,7 @@ class TestConductorInstaller:
             "session",
             "report",
             "tool_search",
-            "@kirocrew-core/monitor_start",
+            "@kirocrew-core/monitor_patrol",
             "@kirocrew-core/monitor_update",
             "@kirocrew-core/autonudge_stop",
             "@kirocrew-core/wait",

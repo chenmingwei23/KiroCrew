@@ -217,11 +217,11 @@ def test_arm_acknowledgement_requires_a_later_turn_not_an_immediate_retry(name):
 def test_comment_aware_recipes_are_finite_ungated_and_keep_repair_routing():
 
     babysit = _text(SKILLS / "babysit" / "SKILL.md")
-    legacy, _ = json.JSONDecoder().raw_decode(babysit.split("monitor_start(", 1)[1])
+    legacy, _ = json.JSONDecoder().raw_decode(babysit.split("monitor_patrol(", 1)[1])
     prepare_recipe = next(
         textwrap.dedent(block).strip()
         for block in _text(PREPARE).split("```")
-        if textwrap.dedent(block).strip().startswith("monitor_start(")
+        if textwrap.dedent(block).strip().startswith("monitor_patrol(")
     )
     call = ast.parse(prepare_recipe, mode="eval").body
     assert isinstance(call, ast.Call)

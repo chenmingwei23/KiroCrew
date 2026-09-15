@@ -152,7 +152,7 @@ class TestDoctorStrictIdentity:
         out = capsys.readouterr().out
         assert "no identity channel" in out
         assert "kirocrew-core" in out and "kirocrew-dashboard" in out
-        assert "monitor_start" in out and "session_ledger" in out
+        assert "monitor_patrol" in out and "session_ledger" in out
 
     def test_it_never_makes_doctor_exit_nonzero(self, monkeypatch, capsys) -> None:
         """The line is a NOTE, not a problem. ``stub_servers`` is empty by

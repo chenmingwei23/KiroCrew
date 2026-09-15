@@ -1,6 +1,6 @@
 """Contract tests for the stateless session-directive tools.
 
-``monitor_start`` / ``monitor_update`` / ``autonudge_stop`` do not resolve a
+``monitor_patrol`` / ``monitor_update`` / ``autonudge_stop`` do not resolve a
 session identity or make HTTP calls. Each VALIDATES its arguments and returns a
 DIRECTIVE string — a human-readable confirmation plus an opaque marker carrying
 the validated payload (and NO session key). The session-aware consumer
@@ -60,17 +60,17 @@ def default_install(monkeypatch):
     return monkeypatch
 
 
-# ── monitor_start ──
+# ── monitor_patrol ──
 
 
-def test_monitor_start_returns_directive_with_validated_payload(default_install, gateway_posts):
+def test_monitor_patrol_returns_directive_with_validated_payload(default_install, gateway_posts):
     """A valid call returns a directive decoding to the validated payload with
     interval_secs mapped to idle_secs."""
     result = _call_tool(
-        "monitor_start",
+        "monitor_patrol",
         {"message": "check PR #1 until green", "interval_secs": 300, "max_cycles": 5},
     )
-    args = session_directive.decode(result, "monitor_start")
+    args = session_directive.decode(result, "monitor_patrol")
     assert args == {
         "message": "check PR #1 until green",
         "idle_secs": 300,
@@ -87,7 +87,7 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install,
         (
             "/api/session-directive",
             {
-                "tool": "monitor_start",
+                "tool": "monitor_patrol",
                 "raw_args": {
                     "message": "check PR #1 until green",
                     "interval_secs": 300,
@@ -98,23 +98,23 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install,
     ]
 
 
-def test_monitor_start_runtime_budget_passes_through(default_install):
+def test_monitor_patrol_runtime_budget_passes_through(default_install):
     """An explicit wall-clock budget lands in the directive payload and is
     echoed in the confirmation."""
     result = _call_tool_inner(
-        "monitor_start",
+        "monitor_patrol",
         {"message": "watch CI", "max_runtime_secs": 7200},
     )
-    args = session_directive.decode(result, "monitor_start")
+    args = session_directive.decode(result, "monitor_patrol")
     assert args["max_runtime_secs"] == 7200
     assert "7200s" in result
 
 
-def test_monitor_start_defaults_interval_300_and_bounded_cap(default_install):
+def test_monitor_patrol_defaults_interval_300_and_bounded_cap(default_install):
     """Omitting interval_secs defaults to 300; omitting max_cycles defaults to a
     BOUNDED cap (24) — never an unbounded loop."""
-    result = _call_tool_inner("monitor_start", {"message": "watch CI"})
-    args = session_directive.decode(result, "monitor_start")
+    result = _call_tool_inner("monitor_patrol", {"message": "watch CI"})
+    args = session_directive.decode(result, "monitor_patrol")
     assert args["idle_secs"] == 300
     assert args["max_cycles"] == _MONITOR_DEFAULT_MAX_CYCLES
     assert args["max_cycles"] == 24
@@ -122,34 +122,34 @@ def test_monitor_start_defaults_interval_300_and_bounded_cap(default_install):
 
 
 @pytest.mark.parametrize("field", ["max_cycles", "max_runtime_secs"])
-def test_monitor_start_rejects_unbounded_zero_limits(default_install, field):
+def test_monitor_patrol_rejects_unbounded_zero_limits(default_install, field):
     with pytest.raises(ValidationError):
-        _call_tool_inner("monitor_start", {"message": "watch PR", field: 0})
+        _call_tool_inner("monitor_patrol", {"message": "watch PR", field: 0})
 
 
-def test_monitor_start_interval_maps_to_idle_secs(default_install):
-    result = _call_tool_inner("monitor_start", {"message": "watch", "interval_secs": 900})
-    assert session_directive.decode(result, "monitor_start")["idle_secs"] == 900
+def test_monitor_patrol_interval_maps_to_idle_secs(default_install):
+    result = _call_tool_inner("monitor_patrol", {"message": "watch", "interval_secs": 900})
+    assert session_directive.decode(result, "monitor_patrol")["idle_secs"] == 900
 
 
-def test_monitor_start_confirmation_states_idle_semantics_and_stop_duty(default_install):
+def test_monitor_patrol_confirmation_states_idle_semantics_and_stop_duty(default_install):
     """The human confirmation must state the deadline-preserving cadence (user
     messages defer, never restart) and put the stop obligation on the caller,
     framing the cap as a backstop."""
-    result = _call_tool_inner("monitor_start", {"message": "watch PR", "interval_secs": 300})
+    result = _call_tool_inner("monitor_patrol", {"message": "watch PR", "interval_secs": 300})
     assert "every 300s" in result.lower()
     assert "without restarting" in result.lower()
     assert "autonudge_stop" in result
     assert "backstop" in result.lower()
 
 
-def test_monitor_start_short_circuits_for_non_nudgeable_session(monkeypatch, gateway_posts):
+def test_monitor_patrol_short_circuits_for_non_nudgeable_session(monkeypatch, gateway_posts):
     """A non-empty but non-nudge-able key (cron/subagent) yields a plain refusal
     and NO directive."""
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "cron:job-9")
-    result = _call_tool_inner("monitor_start", {"message": "watch"})
+    result = _call_tool_inner("monitor_patrol", {"message": "watch"})
     assert "only works" in result.lower()
-    assert session_directive.decode(result, "monitor_start") is None
+    assert session_directive.decode(result, "monitor_patrol") is None
     # A short-circuit must not publish: no marker, no parked record.
     assert gateway_posts == []
 
@@ -406,7 +406,7 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             _fake_state(),
             _fake_slot(),
             _SESSION,
-            "monitor_start",
+            "monitor_patrol",
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
@@ -428,7 +428,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
             _fake_state(),
             _fake_slot(),
             _SESSION,
-            "monitor_start",
+            "monitor_patrol",
             {"message": "keep checking", "idle_secs": 300, "gate": False},
         )
     )
@@ -436,8 +436,8 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
     assert "only when it changes" not in result
 
 
-def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
-    """monitor_start arms the loop through the authz core keyed on the session's
+def test_applier_monitor_patrol_arms_via_the_session_binding_key(monkeypatch):
+    """monitor_patrol arms the loop through the authz core keyed on the session's
     binding key — never anything the caller supplied."""
     svc = _FakeSvc()
     _install_svc(monkeypatch, svc)
@@ -447,7 +447,7 @@ def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
             _fake_state(),
             _fake_slot(),
             _SESSION,
-            "monitor_start",
+            "monitor_patrol",
             {"message": "watch", "idle_secs": 300, "max_cycles": 5},
         )
     )
@@ -765,7 +765,7 @@ def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch):
     assert not update_calls, "a terminal subject must not be re-armed by a cap raise"
     assert "cycle cap" not in result, result
     assert "merged" in result
-    assert "monitor_start" in result
+    assert "monitor_patrol" in result
 
 
 def test_applier_owed_blocked_turn_is_not_reported_as_a_merge(monkeypatch):

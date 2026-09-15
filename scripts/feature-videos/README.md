@@ -35,7 +35,7 @@ whole folder, and the folder must hold nothing the manifest does not sign.
       "title": "Let one session watch a pull request",
       "description": "One or two plain sentences on what the feature does.",
       "doc": "monitor-loops.md",
-      "used_when": ["sel_event_seen:monitor_start"],
+      "used_when": ["sel_event_seen:monitor_patrol"],
       "min_version": "",
       "duration_s": 22.0
     }

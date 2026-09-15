@@ -340,7 +340,7 @@ class TurnDriver:
         Optional async callback ``(kind, args) -> None``. When set, the driver
         decodes session-directive markers from genuine directive-tool results
         (``EVENT_TOOL_RESULT``) and invokes the callback with the validated
-        payload, so a stateless session-bound tool (``monitor_start`` /
+        payload, so a stateless session-bound tool (``monitor_patrol`` /
         ``autonudge_stop`` / ...) takes effect on standalone channel
         transports. Injected by the caller with its own session key bound, so
         the driver stays channel-neutral. When omitted, directive markers are

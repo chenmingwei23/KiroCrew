@@ -374,7 +374,7 @@ next turn into the same slot:
 - **`banner` is optional on every arming surface** and defaults to absent.
   `POST /api/autonudge` and `PATCH /api/autonudge/{loop_id}` accept it; accepting it
   on `PATCH` is what lets a running loop be quieted without resetting its budgets. The
-  MCP tools `monitor_start` and `monitor_update` carry it in their input schemas, and
+  MCP tools `monitor_patrol` and `monitor_update` carry it in their input schemas, and
   `monitor_update` treats an explicit empty string as "clear", so a banner set once can
   be removed without tearing the loop down. It is capped at `MAX_BANNER_CHARS` (500),
   two orders of magnitude under the 8000-char `message` limit, because the two fields

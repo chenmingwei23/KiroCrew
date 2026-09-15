@@ -830,7 +830,7 @@ class TestNothingFromTheCorpusIsExecuted:
         while saying nothing new.
         """
         db = tmp_path / "findings.db"
-        a_golden_path(staged, kind="flow", command="monitor_start")
+        a_golden_path(staged, kind="flow", command="monitor_patrol")
         a_golden_path(staged, kind="cron", command="every:300 :: rotation-check")
         a_golden_path(staged, command="git status --porcelain")
         install_verifier(staged, VERIFIER_REJECTED)

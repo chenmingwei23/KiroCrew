@@ -178,7 +178,7 @@ class TestMarkerlessReturnsAreTaggedRefusals:
     def test_a_schema_rejection_is_tagged(self, dashboard_session):
         """The rejection happens in the dispatch wrapper, BEFORE the handler --
         the case the handler itself can never tag."""
-        out = _call_tool("monitor_start", {"message": "x" * 9000})
+        out = _call_tool("monitor_patrol", {"message": "x" * 9000})
         assert out.startswith("Error:")
         assert session_directive.is_refusal(out)
         assert not session_directive.has_marker(out)
@@ -352,7 +352,7 @@ class TestTheRefusalTagSurvivesDelivery:
 _HOSTILE_CALLS: dict[str, dict] = {
     "autonudge_stop": {"reason": "x" * 1391},
     "ask_question": {"questions": [{"text": "", "options": []}]},
-    "monitor_start": {"message": "   "},
+    "monitor_patrol": {"message": "   "},
     "monitor_watch": {
         "kind": "github_pull_request",
         "target": "http://example.com/not/a/pr",
@@ -469,9 +469,9 @@ class TestConsumerReportsARefusalAsARefusal:
         """The whole bug in one test, with no hand-written fixture: really call
         the tool, feed its real output to the consumer, and require the WARNING
         that exists to catch marker loss to stay silent."""
-        rejection = _call_tool("monitor_start", {"message": "x" * 9000})
+        rejection = _call_tool("monitor_patrol", {"message": "x" * 9000})
         with caplog.at_level("INFO"):
-            _drive("monitor_start", rejection)
+            _drive("monitor_patrol", rejection)
         assert "decode FAILED" not in caplog.text
         assert "session-directive REFUSED" in caplog.text
 
@@ -480,5 +480,5 @@ class TestConsumerReportsARefusalAsARefusal:
         authenticated directive tool whose final frame carries no marker and no
         refusal tag (a rawOutput-envelope escaping regression)."""
         with caplog.at_level("INFO"):
-            _drive("monitor_start", "Monitor loop requested.")
+            _drive("monitor_patrol", "Monitor loop requested.")
         assert "session-directive decode FAILED" in caplog.text

@@ -131,7 +131,7 @@ here, and it is what decides how each kind is treated:
       fixed code, so its answer is a constant no fix can change.
 
     Their value is the corpus, not a verdict: they name the operations
-    (``monitor_start``, a chat turn, a shipped cron) a human has to exercise, and
+    (``monitor_patrol``, a chat turn, a shipped cron) a human has to exercise, and
     they are printed for exactly that. The shipped corpus's own well-formedness is
     asserted in the test suite, at review time, where a corpus-authoring mistake
     belongs.

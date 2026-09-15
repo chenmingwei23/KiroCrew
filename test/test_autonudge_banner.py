@@ -994,7 +994,7 @@ class TestMonitorToolsCanSetTheBanner:
     design-review and first-principles-review converge: counted setters = 0, so
     the field ships dead and the 51.8%-of-session bloat continues for every loop
     armed the normal way. The lane states the remedy as a disjunction -- wire ONE
-    existing arming surface -- and names two: the MCP ``monitor_start`` schema and
+    existing arming surface -- and names two: the MCP ``monitor_patrol`` schema and
     the dashboard popover. The MCP tools are the smaller change AND are what armed
     the babysit loop the PR's own measurement came from, so wiring them is what
     makes the shipped remedy reachable by the measured offender.
@@ -1016,13 +1016,13 @@ class TestMonitorToolsCanSetTheBanner:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1-1")
         return monkeypatch
 
-    def test_monitor_start_carries_a_banner_into_the_directive(self, default_install) -> None:
+    def test_monitor_patrol_carries_a_banner_into_the_directive(self, default_install) -> None:
         """Fails on the unmodified tree: ``banner`` is not a declared field, so
         ``validate_tool_args`` rejects the call outright."""
         result = _call_tool_inner(
-            "monitor_start", {"message": "watch CI until green", "banner": "watching CI"}
+            "monitor_patrol", {"message": "watch CI until green", "banner": "watching CI"}
         )
-        args = session_directive.decode(result, "monitor_start")
+        args = session_directive.decode(result, "monitor_patrol")
         assert args.get("banner") == "watching CI"
 
     def test_monitor_update_carries_a_banner_into_the_patch(self, default_install) -> None:
@@ -1054,7 +1054,7 @@ class TestMonitorToolsCanSetTheBanner:
         """
         with pytest.raises(ValidationError) as excinfo:
             _call_tool_inner(
-                "monitor_start",
+                "monitor_patrol",
                 {"message": "watch CI", "banner": "b" * (MAX_BANNER_CHARS + 1)},
             )
         assert "unknown field" not in str(
@@ -1065,21 +1065,21 @@ class TestMonitorToolsCanSetTheBanner:
         """Negative control on the boundary: a ``>=`` in the schema bound would
         reject every legitimate at-cap banner and this is what catches it."""
         result = _call_tool_inner(
-            "monitor_start", {"message": "watch CI", "banner": "b" * MAX_BANNER_CHARS}
+            "monitor_patrol", {"message": "watch CI", "banner": "b" * MAX_BANNER_CHARS}
         )
-        args = session_directive.decode(result, "monitor_start")
+        args = session_directive.decode(result, "monitor_patrol")
         assert len(args["banner"]) == MAX_BANNER_CHARS
 
     def test_omitting_the_banner_leaves_the_payload_shape_untouched(self, default_install) -> None:
         """Negative control, and the reason the field is added CONDITIONALLY.
 
-        ``test_autonudge_stop_auth.py`` pins the monitor_start payload with EXACT
+        ``test_autonudge_stop_auth.py`` pins the monitor_patrol payload with EXACT
         dict equality, so emitting ``banner`` unconditionally would break a
         contract test belonging to another file. This assertion follows the
         finite-runtime default while keeping the banner absent.
         """
-        result = _call_tool_inner("monitor_start", {"message": "watch CI", "max_cycles": 5})
-        args = session_directive.decode(result, "monitor_start")
+        result = _call_tool_inner("monitor_patrol", {"message": "watch CI", "max_cycles": 5})
+        args = session_directive.decode(result, "monitor_patrol")
         assert args == {
             "message": "watch CI",
             "idle_secs": 300,
@@ -1106,7 +1106,7 @@ class TestMonitorToolsCanSetTheBanner:
             patch("kiro_crew.autonudge.get_instance", return_value=svc),
             patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", authz),
         ):
-            await sda._monitor_start(
+            await sda._monitor_patrol(
                 MagicMock(),
                 "chat-9-1",
                 {"message": "go", "banner": "watching CI"},
