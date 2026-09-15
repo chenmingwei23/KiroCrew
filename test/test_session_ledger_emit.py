@@ -3446,6 +3446,14 @@ def test_every_emitted_type_matches_the_documented_shape():
         "context/composed": {"turn", "sources", "chars", "tokens", "tokens_estimated"},
         "model/selected": {"model", "source"},
         "compaction/applied": {"pct_before", "pct_after", "freed_pct"},
+        "approval/requested": {"turn", "approval_id", "tool"},
+        "approval/decided": {"turn", "approval_id", "decision"},
+        "plan/updated": {"turn", "items"},
+        "background/completed": {"kind"},
+        "subagent/spawned": {"turn", "agent_id"},
+        "subagent/steered": {"agent_id"},
+        "subagent/completed": {"agent_id"},
+        "subagent/failed": {"agent_id"},
     }
     _open_session()
     emit.on_turn_started(SESSION, 1, "user")
@@ -3459,6 +3467,14 @@ def test_every_emitted_type_matches_the_documented_shape():
     emit.on_step_completed(SESSION, 1, step, ms=5)
     emit.on_model_selected(SESSION, "m", "fallback", turn=1)
     emit.on_compaction_applied(SESSION, pct_before=0.8, pct_after=0.4)
+    emit.on_approval_requested(SESSION, 1, approval_id="r1", tool="shell", reason="ls")
+    emit.on_approval_decided(SESSION, 1, approval_id="r1", decision="approved")
+    emit.on_plan_updated(SESSION, 1, items=[{"id": "a", "text": "t", "completed": False}])
+    emit.on_subagent_spawned(SESSION, 1, agent_id="ab12", agent="kirocrew", scope={"memory": True})
+    emit.on_subagent_steered(SESSION, agent_id="ab12", mode="interrupt")
+    emit.on_subagent_completed(SESSION, agent_id="ab12", duration_ms=7)
+    emit.on_subagent_failed(SESSION, agent_id="cd34", reason="boom", outcome="failed")
+    emit.on_background_completed(SESSION, kind="title", model="m", credits=0.1)
     emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
     emit.on_message_queued(SESSION, source="slack", size_bytes=3, queued_seq="q1")
     emit.on_message_steered(SESSION, 1, mode="interrupt", text="stop")

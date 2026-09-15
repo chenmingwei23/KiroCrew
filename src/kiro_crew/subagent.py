@@ -2318,6 +2318,7 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _ledger_asked: "tuple[str, int] | None" = None,
         _memory_mode: str | None = None,
     ) -> SubagentInfo | None:
         return self._admission.spawn_impl(
@@ -2344,6 +2345,7 @@ class SubagentManager:
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,
+            _ledger_asked,
             _memory_mode=_memory_mode,
         )
 
@@ -2386,6 +2388,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _ledger_asked: "tuple[str, int] | None" = None,
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
             conv_id,
@@ -2397,6 +2400,7 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode=_memory_mode,
+            _ledger_asked=_ledger_asked,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:

@@ -10745,6 +10745,30 @@ async def _run_chat(
                 )
                 _unattended_wait = slot.unattended
                 _approval_card: str | None = None
+                # Recorded HERE, one statement before the try whose `finally`
+                # records the decision, and deliberately not at the future's
+                # registration further up. Everything between the two is
+                # cancellable -- the Slack mirror awaits a network post, and its
+                # `except Exception` cannot catch the CancelledError that slot
+                # deletion raises -- so an entry written up there could escape
+                # this try entirely and leave a request that is never decided, in
+                # a file nothing rewrites. Written here, the pair is bound by
+                # control flow: either both halves land or neither does. The
+                # trade is that a prompt cancelled during its Slack delivery goes
+                # unrecorded, which is a fact the log is missing rather than a
+                # pair it gets wrong.
+                #
+                # Still before the decision on every surviving path, including the
+                # delivery failure that auto-decides above: that branch only
+                # resolves the future, and the decision is not recorded until this
+                # try's `finally`.
+                session_ledger_emit.on_approval_requested(
+                    _ledger_sid,
+                    _ledger_turn_no,
+                    approval_id=str(event.request_id),
+                    tool=event.tool_name or "",
+                    reason=event.title or "",
+                )
                 try:
                     if _approval_window <= 0:
                         # Too little of the turn left to both wait and report.
@@ -10821,6 +10845,28 @@ async def _run_chat(
                         except Exception:
                             logger.debug("Failed to render approval card", exc_info=True)
                     slot._approval_futures.pop(str(event.request_id), None)
+                    # The decision is final here and nowhere earlier: every path
+                    # out of the await above converges on this ``finally`` -- the
+                    # human's answer, the window expiring, the no-budget decline,
+                    # a failed Slack delivery, and a cancelled turn. Recording it
+                    # at the one convergence point is what keeps a single request
+                    # from being closed twice under two seqs.
+                    #
+                    # ``by`` is written only for a decision the HOST made, which
+                    # is the one attribution this site can prove:
+                    # ``_host_deny_cause`` is set exactly by the gateway's own
+                    # auto-declines. A decision that arrived through the future
+                    # came from a person at the dashboard or in Slack and this
+                    # site cannot tell which, so it names nobody rather than
+                    # guessing "user".
+                    session_ledger_emit.on_approval_decided(
+                        _ledger_sid,
+                        _ledger_turn_no,
+                        approval_id=str(event.request_id),
+                        decision=outcome,
+                        by="host" if _host_deny_cause else "",
+                        cause=_host_deny_cause,
+                    )
                     # Backstop: the future is now gone, so the permission
                     # message MUST NOT be left reading pending — the UI would
                     # keep rendering an approval bar whose every button answers
@@ -11278,6 +11324,15 @@ async def _run_chat(
                     state.broadcast_ws(
                         "todo_update",
                         {"slot": slot.key, "todo": slot.todo_payload()},
+                    )
+                    # Gated on set_todo's own change test, which is what keeps a
+                    # turn that echoes an identical snapshot on several tool
+                    # results from writing the same list repeatedly. Inside the
+                    # gate the entry is a real change to the agent's plan.
+                    session_ledger_emit.on_plan_updated(
+                        _ledger_sid,
+                        _ledger_turn_no,
+                        items=(event.todo or {}).get("tasks"),
                     )
             elif event.kind == EVENT_SUBAGENT_LIST:
                 # kiro-cli per-subagent state (native use_subagent crews).

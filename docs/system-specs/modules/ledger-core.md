@@ -124,7 +124,7 @@ opposite handling. The pair `(turn, attempt)` is therefore the identity a fold g
 | `message/sent` | `{turn, step, text, usage, interrupted?, chunks:[seq]}` | yes |
 | `message/chunk` | `{turn, step, delta}` — an oversize body's slice | overflow only |
 | `message/queued` | `{source, bytes, queued_seq}` — arrived while a turn ran | yes |
-| `message/steered` | `{turn, mode: interrupt \| follow_up, text}` | — |
+| `message/steered` | `{turn, mode: interrupt \| follow_up, text}` | no single observer |
 | `request/configured` | `{turn, model, provider, context_window, system?, system_bytes?}` — written on change only | yes |
 | `context/composed` | `{turn, step, sources:[{kind, chars, tokens}], chars, tokens, tokens_estimated}` | yes |
 | `step/started` | `{turn, step}` — one model call | yes |
@@ -140,12 +140,12 @@ every block put in front of the model — `system`, `memory`, `lessons`, `skills
 |---|---|---|
 | `tool/called` | `{turn, step, call_id, name, server, kind, args_hash?, args_bytes?}` | yes |
 | `tool/completed` | `{turn, step, call_id, status, is_error?, elapsed_ms, result_hash?, result_bytes?}` | yes |
-| `tool/searched` | `{turn, query, hits}` — lazy MCP discovery | — |
-| `tool/loaded` | `{turn, server, names:[..], spec_tokens}` | — |
-| `skill/searched` | `{turn, query, hits}` | — |
-| `skill/loaded` | `{turn, name, path, tokens, via: index \| search \| pointer}` | — |
-| `approval/requested` | `{turn, id, tool, reason}` | — |
-| `approval/decided` | `{turn, id, decision, by}` | — |
+| `tool/searched` | `{turn, query, hits}` — lazy MCP discovery | already `tool/called` |
+| `tool/loaded` | `{turn, server, names:[..], spec_tokens}` | no source for `spec_tokens` |
+| `skill/searched` | `{turn, query, hits}` | already `tool/called` |
+| `skill/loaded` | `{turn, name, path, tokens, via: index \| search \| pointer}` | no source for `tokens` |
+| `approval/requested` | `{turn, approval_id, tool?, reason?}` | yes |
+| `approval/decided` | `{turn, approval_id, decision, by?, cause?}` | yes |
 
 Arguments and results are DIGESTED, never recorded: `args_hash` / `result_hash` are the sha256 of
 the serialized payload and `args_bytes` / `result_bytes` its length. That answers "same arguments as
@@ -155,8 +155,13 @@ absent rather than zeroed when there is nothing to digest, since 0 is a real siz
 tri-state and absent when the caller did not say, because "nobody asserted this worked" is not the
 same claim as "it worked".
 
-Approvals have no emitter yet for a reason rather than a schedule: the approval coordinator carries
-a slot key, not a session id, so there is nothing to key an entry by.
+Approvals ARE emitted. An earlier revision said they could not be, because "the approval coordinator
+carries a slot key, not a session id" -- true of that class, and false of the site that actually
+raises the prompt, which sits inside the runner's turn where the session id and the turn ordinal have
+been in scope since the turn began. `reason` is the redacted title the human is shown. `by` and
+`cause` are written only for a decline the HOST made, which is the one decision this site can
+attribute: an answer that came back from a person could have arrived at the dashboard or in Slack,
+and naming a guess is worse than naming nobody.
 
 ### Model, compaction, plan, placement
 
@@ -164,26 +169,39 @@ a slot key, not a session id, so there is nothing to key an entry by.
 |---|---|---|
 | `model/selected` | `{turn?, model, source}` | yes |
 | `compaction/applied` | `{turn, pct_before, pct_after, freed_pct}` | yes |
-| `summary/written` | `{turn, text, covers:{start_seq, end_seq}}` — the fold knows what it replaced | — |
-| `plan/updated` | `{turn, items:[{id, text, state}]}` — the session's own task list | — |
-| `remote/placed` | `{provider, id}` | — |
-| `remote/lost` | `{reason}` | — |
+| `summary/written` | `{turn, text, covers:{start_seq, end_seq}}` — the fold knows what it replaced | no source for `covers` |
+| `plan/updated` | `{turn, items:[{id, text, state: done \| open}], total?}` — the session's own task list | yes |
+| `remote/placed` | `{provider, id}` | no source for `provider`/`id` |
+| `remote/lost` | `{reason}` | no source for `reason` |
 
 ### Background and children
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `background/completed` | `{kind: title \| memory_consolidation \| summary \| digest, model, tokens, credits, ms, result_ref}` | — |
-| `subagent/spawned` | `{turn, agent_id, agent, model, scope:{memory, lessons, project}}` + `ref` into the child's log | — |
-| `subagent/steered` | `{agent_id, mode}` | — |
-| `subagent/completed` | `{agent_id, tokens, credits, ms}` | — |
-| `subagent/failed` | `{agent_id, reason}` | — |
+| `background/completed` | `{kind: title \| memory_consolidation \| summary, model?, provider?, tokens?, credits?, ms?}` | yes |
+| `subagent/spawned` | `{turn?, agent_id, agent?, model?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
+| `subagent/steered` | `{agent_id, mode: interrupt \| follow_up}` | yes |
+| `subagent/completed` | `{agent_id, ms?}` — no `tokens`/`credits`, see below | yes |
+| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped, ms?}` | yes |
 
 These are the families a single-agent runtime never needs and a gateway does: every token spent on a
 session's behalf, whether a person asked for it or not, is a fact in that session's log attributed to
-what caused it. A subagent is itself a session with its own ledger, whose header `thread` points at
-the parent's `subagent/spawned` entry while that entry carries a `ref` into the child's log — the
-same pair as a crew dispatch, one level down.
+what caused it.
+
+A subagent WOULD be a session with its own ledger, whose header `thread` points at the parent's
+`subagent/spawned` entry while that entry carries a `ref` into the child's log -- the same pair as a
+crew dispatch, one level down. It is not one yet: the only site that creates a session ledger is the
+dashboard turn path, and a subagent run does not go through it. So the child's facts are written into
+the PARENT's log, `subagent/spawned` carries no `ref`, and the pair above becomes writable, unchanged,
+the day subagent sessions get ledgers of their own. Citing a child file that does not exist would be
+indistinguishable, to a reader, from citing one that was deleted.
+
+The child's spend is likewise absent rather than zeroed. Nothing in the subagent runtime measures
+tokens or credits -- a run's record carries elapsed time and peak resource use, and the child never
+reports its spend back to the parent -- so `subagent/completed` writes neither. Background calls are
+the opposite case and DO carry both, because the two background entry points already measure them for
+the usage store. `digest` is not among their kinds: the design named it, and the digest path turned
+out to be a filesystem read with no model call in it.
 
 ## 6. Rules
 

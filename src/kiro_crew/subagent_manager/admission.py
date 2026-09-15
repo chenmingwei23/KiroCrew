@@ -60,6 +60,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _ledger_asked: "tuple[str, int] | None" = None,
         _memory_mode: str | None = None,
     ) -> SubagentInfo | None:
         """Spawn a subagent for *task*.
@@ -516,6 +517,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 include_lessons=include_lessons,
                 include_project=include_project,
             )
+            self._record_ledger_dispatch(info, from_queue=_from_queue, asked=_ledger_asked)
             return info
 
         # `_agent_prevalidated` skips the on-loop agent-directory scan: a caller
@@ -575,6 +577,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         info._memory_mode_ready = not bool(conversation_key)
         self._manager._agents[agent_id] = info
+        self._record_ledger_dispatch(info, from_queue=_from_queue, asked=_ledger_asked)
         self._manager._running_count += 1
         self._manager._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
         # Batch lifecycle: announce the wave ONCE, on its first member to
@@ -692,6 +695,111 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             await self._manager._on_done(info)
         except Exception:
             logger.exception("Subagent announce failed for %s", info.id)
+
+    def _record_ledger_dispatch(
+        self,
+        info: SubagentInfo,
+        *,
+        from_queue: bool,
+        asked: "tuple[str, int] | None" = None,
+    ) -> None:
+        """PIN the parent session and turn that asked for *info*. Writes nothing.
+
+        Called from both accepted exits of ``spawn`` and from neither rejection.
+        Pinning here and writing elsewhere is deliberate: this is normally the only
+        moment the ASKING turn is knowable -- a spawn arrives as a tool call inside
+        the parent's turn -- but being accepted is not being started. Registration
+        is followed by the spawn approval gate, and a decline returns through
+        ``_claim_finalize`` + ``_safe_announce`` without ever reaching ``_run``, so
+        an entry written here would be an opener nothing closes. The entry is
+        written by ``_log_spawned``, the one site that means the run is really
+        starting, from the pin this leaves behind.
+
+        ``asked`` overrides that reading, and one caller needs it: a queued
+        follow-up is DISPATCHED by its watcher after the run it continues has
+        finished, so no turn is asking at this moment and the parent may be on an
+        unrelated one. That caller pinned the asking ordinal where the follow-up was
+        requested and hands it in; without it the continuation would be filed under
+        a turn that did not ask for it. A caller that supplies no ``asked`` is
+        dispatching from inside its own turn, where the live reading is correct.
+
+        ``from_queue`` costs nothing to honour because the pin is idempotent, and
+        it is passed for the same reason it exists elsewhere in ``spawn``: a member
+        held behind the stagger or concurrency gate re-enters under the same id,
+        and its origin must stay the one it was accepted with.
+
+        Best-effort throughout. A spawn must not fail because a log entry could
+        not be pinned, and an unresolvable parent yields an empty session id, which
+        the pin refuses -- leaving the later write with nothing to open, which is
+        the correct outcome rather than a guessed one.
+
+        Every name is imported inside the body on purpose. This method does NOT
+        end in ``_impl``, so ``bind_component_globals`` leaves it running on this
+        module's own globals -- where the facade's imports, ``logger`` included,
+        exist only under ``TYPE_CHECKING``.
+        """
+        from kiro_crew import session_ledger_emit
+        from kiro_crew.session_ledger_resolve import unit_for_session_key
+        from kiro_crew.subagent import logger as _logger
+
+        try:
+            if not session_ledger_emit.enabled():
+                return
+            if from_queue:
+                # Second pass for a drained member: already pinned.
+                return
+            if asked is not None:
+                sid, turn = asked
+            else:
+                sid = unit_for_session_key(self._manager._sessions, info.parent_session_key)
+                turn = session_ledger_emit.live_turn(sid) if sid else 0
+            if not sid:
+                return
+            session_ledger_emit.remember_child_origin(info.id, sid, turn)
+        except Exception:
+            _logger.debug("session ledger: pinning a subagent dispatch failed", exc_info=True)
+
+    def _record_ledger_spawn_started(self, info: SubagentInfo) -> None:
+        """Write *info*'s ``subagent/spawned`` into the PARENT session's ledger.
+
+        Called from ``_log_spawned``, which every path that actually starts a run
+        goes through and no rejection does -- including the approval gate, which
+        reaches it only after a human said yes.
+
+        The turn comes from the pin, never from the parent's live turn. This site
+        can be reached an unbounded human approval after the ask, by which point the
+        parent is very likely on a different turn; reading it here is exactly the
+        after-the-fact re-derivation the log may not contain. An unpinned child (the
+        flag came on mid-flight, or the parent could not be resolved) writes nothing.
+
+        No ``ref`` into the child's log. The schema describes one and a child that
+        had a ledger would deserve it, but no subagent path opens one, so the
+        citation would name a file that does not exist -- indistinguishable, to a
+        reader, from one that was deleted.
+        """
+        from kiro_crew import session_ledger_emit
+        from kiro_crew.subagent import logger as _logger
+
+        try:
+            if not session_ledger_emit.enabled():
+                return
+            sid, asked_turn = session_ledger_emit.open_child_origin(info.id)
+            if not sid:
+                return
+            session_ledger_emit.on_subagent_spawned(
+                sid,
+                asked_turn,
+                agent_id=info.id,
+                agent=info.agent,
+                model=info.model,
+                scope={
+                    "memory": info.include_memory,
+                    "lessons": info.include_lessons,
+                    "project": info.include_project,
+                },
+            )
+        except Exception:
+            _logger.debug("session ledger: recording a subagent spawn failed", exc_info=True)
 
     def _announce_rejection_impl(self, info: SubagentInfo) -> SubagentInfo:
         """Route a terminal spawn rejection through the done callback.
@@ -979,6 +1087,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         Args:
             info (SubagentInfo): The subagent metadata.
         """
+        self._record_ledger_spawn_started(info)
         # Persist agent folder to disk for orphan recovery
         try:
 
