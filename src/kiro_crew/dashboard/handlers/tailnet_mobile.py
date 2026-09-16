@@ -900,6 +900,17 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # cannot go stale while this handler waits.
     ttl = min(DEFAULT_QR_TTL_SECS, MAX_QR_TTL_SECS, MAX_SESSION_TTL_SECS)
 
+    # Drain the request body even though nothing here reads it. The caller's
+    # remaining-lifetime check below is deliberately taken AFTER this await: a
+    # client that trickles the body in byte by byte controls how long this
+    # handler waits, and a session in its last seconds must not stretch the mint
+    # past its own expiry while the body arrives. The awaited step is the point
+    # of the guard, not the payload -- so the read stays, the value is discarded.
+    try:
+        await request.json()
+    except Exception:
+        pass
+
     state_obj = request.app.get("state")
     owner_id = str(getattr(state_obj, "owner_id", "") or "")
     # Two session shapes; the operator picks which by configuration. Both bound
