@@ -1277,14 +1277,14 @@ async def _read_bundle_body(
     body's own first two bytes:
 
     * **gzip** — the file ``GET /api/chat/slots/{key}/export`` hands the user,
-      byte for byte. Before this existed the endpoint read ``request.json()``
-      and answered ``transfer_invalid_json`` on those bytes, so the one file the
-      product produces was the one file it would not take back; installing it
-      meant gunzipping by hand first.
+      byte for byte. Reading these bytes as ``request.json()`` answers
+      ``transfer_invalid_json``, so accepting the sniffed gzip is what lets the
+      product take back the one file it produces without the user gunzipping it
+      by hand first.
     * **plain JSON** — what the tunnel's server-to-server ``send_session_bundle``
-      posts. Unchanged, and deliberately so: the sending side is an
-      independently-updated install, so a receiver that demanded compression
-      would break every peer that has not shipped this yet.
+      posts. The sending side is an independently-updated install, so accepting
+      plain JSON keeps a peer that posts uncompressed working; demanding
+      compression would break any peer that posts this shape.
 
     Sniffing the magic rather than branching on ``Content-Type`` is what makes
     that work: a browser uploading a ``.gz`` off disk sends whatever its platform
