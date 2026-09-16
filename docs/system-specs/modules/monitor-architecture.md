@@ -424,12 +424,11 @@ leaves it enforced nowhere:
   green rows sitting under a still-pending aggregate must not conclude the round
   early. Worst-wins pending already answers it -- a pending aggregate is a
   pending row, so the monitor waits -- without letting a green one subtract a
-  failure. The two current implementations **disagree on this today**: the
-  structured provider reads the aggregate as an ordinary worst-wins row, while
-  the skill's status tool still lets a passed aggregate erase the failing rows.
-  A change to bring the status tool onto this rule is open at
-  [PR #10731](https://github.com/kirodotdev/KiroCrew/pull/10731); this note goes
-  away once it lands.
+  failure. Both current implementations now follow this rule: the structured
+  provider reads the aggregate as an ordinary worst-wins row, and the skill's
+  status tool was brought onto the same rule by
+  [PR #10731](https://github.com/kirodotdev/KiroCrew/pull/10731), merged
+  2026-09-14.
 - A stale reviewer stamp is an entry (`stale:<name>`), not a paragraph.
 - An un-dispositioned finding is an entry, so readiness cannot be declared over
   one.
