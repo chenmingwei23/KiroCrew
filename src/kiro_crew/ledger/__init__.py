@@ -21,10 +21,20 @@ a consumer can be added without this layer learning about it.
 
 from __future__ import annotations
 
+from kiro_crew.ledger.entry_types import (
+    ENTRY_TYPES,
+    SESSION_ENTRY_TYPES,
+    EntryType,
+    Field,
+    declaration_for,
+    render_markdown,
+    validate_data,
+)
 from kiro_crew.ledger.errors import (
     CODE_ALREADY_EXISTS,
     CODE_ALREADY_OWNED,
     CODE_BAD_DATA,
+    CODE_BAD_DATA_FIELD,
     CODE_BAD_HEADER,
     CODE_BAD_HEADER_FIELD,
     CODE_BAD_KIND,
@@ -84,6 +94,7 @@ __all__ = [
     "CODE_ALREADY_EXISTS",
     "CODE_ALREADY_OWNED",
     "CODE_BAD_DATA",
+    "CODE_BAD_DATA_FIELD",
     "CODE_BAD_HEADER",
     "CODE_BAD_HEADER_FIELD",
     "CODE_BAD_KIND",
@@ -102,6 +113,7 @@ __all__ = [
     "CODE_UNKNOWN_ENTRY_TYPE",
     "CODE_SEGMENT_GAP",
     "DEFAULT_PAGE_LIMIT",
+    "ENTRY_TYPES",
     "FIXED_SOURCES",
     "KINDS",
     "KIND_CREW",
@@ -111,6 +123,7 @@ __all__ = [
     "MAX_PAGE_LIMIT",
     "MAX_REF_SPAN",
     "SCHEMA_VERSION",
+    "SESSION_ENTRY_TYPES",
     "STATUS_CORRUPT",
     "STATUS_GONE",
     "STATUS_OK",
@@ -118,6 +131,8 @@ __all__ = [
     "TYPE_OWNERSHIP",
     "CrewHeader",
     "Entry",
+    "EntryType",
+    "Field",
     "Header",
     "Ledger",
     "IndeterminateAppend",
@@ -127,10 +142,13 @@ __all__ = [
     "Resolution",
     "SessionHeader",
     "SessionThread",
+    "declaration_for",
     "ledger_dir",
     "ledger_path",
+    "render_markdown",
     "segment_first_seqs",
     "segment_paths",
     "ledger_root",
     "now_ms",
+    "validate_data",
 ]
