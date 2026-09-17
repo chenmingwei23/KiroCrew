@@ -3995,7 +3995,7 @@ class GatewayOrchestrator:
                                     wrapped,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # CRON_NOTIFICATION_KIND, and this branch is
                                     # the same injector dispatching directly.
                                     _turn_actor="cron",
@@ -6704,7 +6704,7 @@ class GatewayOrchestrator:
         # session's durable work-ledger snapshot, so a Webex loop starts each cycle
         # from that state rather than from transcript memory. Calling the bare
         # template substitution instead would silently opt this channel out of the
-        # ledger — the one feature whose whole point is surviving context loss.
+        # crew log — the one feature whose whole point is surviving context loss.
         msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         # Imported HERE, not at module scope: this file is on the gateway boot
@@ -8866,7 +8866,7 @@ class GatewayOrchestrator:
                         # instead, through the same `_defer_queued_delivery`
                         # the queue branch uses: it records the debt (the
                         # completed member's own tombstone AND any held wave
-                        # siblings) in the slot's content-keyed ledger, keyed
+                        # siblings) in the slot's content-keyed crew log, keyed
                         # on this announce, and flags `_delivery_queued` — so
                         # the run loop's `mark_delivered` and its digest-hold
                         # settle both become no-ops for this route, and the
@@ -8914,7 +8914,7 @@ class GatewayOrchestrator:
                                     announce,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # SUBAGENT_COMPLETION_KIND, and this branch
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
@@ -8947,7 +8947,7 @@ class GatewayOrchestrator:
                             # Settle the owed tombstones only once the model has
                             # consumed this turn's prompt — the drain's own
                             # settlement path, reused verbatim. If the transfer
-                            # above fell back (stubbed slot), the ledger holds
+                            # above fell back (stubbed slot), the crew log holds
                             # no debt and the claim inside is an empty no-op.
                             _arm_queued_delivery_settlement(
                                 self.dashboard_state,
@@ -9845,7 +9845,7 @@ class GatewayOrchestrator:
                 self._subscribe_runner_admission(coordinator, admission)
                 if hasattr(mgr, "_runner_admission_tick"):
                     delattr(mgr, "_runner_admission_tick")
-                # A wait parked through the ledger between the coordinator's
+                # A wait parked through the crew log between the coordinator's
                 # own build and this handover is in neither schedule: the
                 # build-time rebuild ran before it, and an attached
                 # coordinator stops ``tick`` scanning the ledger. Re-reading
@@ -13108,7 +13108,7 @@ class GatewayOrchestrator:
         # session by this point, so the sweep is not racing a mapping publisher --
         # the same position the sweep already held here before this change.
         await asyncio.to_thread(cleanup_orphaned_sessions)
-        # The session ledger's buffered appends, for EVERY gateway mode. The
+        # The session's log's buffered appends, for EVERY gateway mode. The
         # dashboard registers its own cleanup hook, but a mode that builds no
         # dashboard app -- slack-only is the plain case -- never runs one, and
         # os._exit below skips atexit, so without this the buffer dies with the
@@ -13120,12 +13120,12 @@ class GatewayOrchestrator:
             # Imported HERE, not at module scope: AUTOSDE's
             # no-new-work-on-gateway-boot-path rule asks for an optional subsystem's
             # import to be gated, and a shutdown drain is the only use in this module.
-            from kiro_crew import session_ledger_emit
+            from kiro_crew.crew_log import emit as crew_log_emit
 
-            if not await asyncio.to_thread(session_ledger_emit.drain_for_shutdown):
-                logger.warning("session ledger did not fully drain before exit")
+            if not await asyncio.to_thread(crew_log_emit.drain_for_shutdown):
+                logger.warning("the session's log did not fully drain before exit")
         except Exception:  # noqa: BLE001 - shutdown must not raise
-            logger.debug("session ledger drain failed during shutdown", exc_info=True)
+            logger.debug("the session's log drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning

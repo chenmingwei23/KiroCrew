@@ -279,7 +279,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``whatsapp`` entry above is: an atomic write goes through a temporary in the
     # same directory and is then renamed, so fencing only the final name leaves a
     # writable path to the same bytes. Its siblings (the cost cache, the library
-    # ledger) have no legitimate file-tool reader either -- the app's own backend
+    # crew log) have no legitimate file-tool reader either -- the app's own backend
     # opens every one of them directly rather than through this gate, so the app
     # keeps working and future state files are covered without a new entry.
     "apps/aws-control/data",
@@ -348,8 +348,8 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
-    # Every append-only per-unit ledger, crew and session alike (ledger/store.py).
-    # Not credentials, but the design's whole premise is that the ledger is the
+    # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
+    # Not credentials, but the design's whole premise is that the crew log is the
     # AUTHORITY and the context window only a cache: a conductor reads a unit's
     # history as fact instead of re-deriving it. An agent's auto-approved file
     # tools reaching this subtree would let it forge an entry attributed to the
@@ -359,11 +359,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # library, so they bind only callers who go through it; this entry is what
     # keeps a file tool from going around it, and the sandbox mask on the same
     # leaf is what keeps a spawned subprocess from going around BOTH. Named at the
-    # shared ``ledgers`` root so every unit kind is fenced by one entry — session
-    # ledgers included, which is why they do not live under the ``sessions``
+    # shared ``crew-log`` root so every unit kind is fenced by one entry — session
+    # crew logs included, which is why they do not live under the ``sessions``
     # transcript root. The store opens these paths directly rather than through
     # this gate, so nothing breaks.
-    "ledgers",
+    "crew-log",
     # The optional Playwright extension token. It removes the browser-side approval
     # click for an attach, so a process that could read it could attach to the
     # operator's logged-in browser without them seeing a prompt. The gateway hands
@@ -859,7 +859,7 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
 _WRITE_PROTECTED_HOME_PATHS += [
     # The Ops Mission Control incident INDEX, for the same reason as the schedule above and
     # with the same read/write asymmetry: every teammate's instance reads it constantly (it is
-    # the claim ledger and the board), so classifying it sensitive would break the app, but it
+    # the claim crew log and the board), so classifying it sensitive would break the app, but it
     # is an INPUT TO AN AUTHORIZATION DECISION.
     #
     # ``/incident/action`` looks the incident up by id and hands ``incident.signal`` to
