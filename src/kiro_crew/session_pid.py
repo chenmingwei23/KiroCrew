@@ -1035,21 +1035,22 @@ def _reap_provider_root(pid: int, recorded_start: str | None, *, gated: bool) ->
     exit status. That loss is silent and nothing detects or repairs it, so this
     reads the identity here rather than trusting the one taken at entry.
 
-    WHAT THAT COSTS OFF LINUX, and why it is still the right answer. Linux keeps
-    ``/proc/<pid>/stat`` readable for a zombie, so an identity survives the exit and
-    the check passes for the case this exists to handle. macOS ``proc_pidinfo``
-    reports nothing once a process has exited, so the identity of the state this
-    teardown CREATES -- a killed root held unreaped to keep its pgid unambiguous --
-    cannot be read there at all, and the wait is refused.
+    WHY THE RE-READ IS ENOUGH, on every platform. Linux keeps ``/proc/<pid>/stat``
+    readable for a zombie. macOS ``proc_pidinfo`` refuses one, so
+    :func:`platform_compat.get_process_start_id` falls back to ``sysctl``, which
+    reads the same start instant from the kernel's zombie list. Either way the
+    identity of the state this teardown CREATES -- a killed root held unreaped to
+    keep its pgid unambiguous -- survives the exit and the check passes for the case
+    this exists to handle.
 
-    Refusing is deny-by-default working as designed, not a gap to route around. An
-    unreadable identity is exactly the case where a recycled pid cannot be told from
-    our own zombie: a freed pid can be taken by another child of THIS process that
-    is itself an unreaped zombie, and that occupant reads as unreadable too, so a
-    wait would steal its exit status and its own watcher would report a code that
-    never happened.
+    Where an identity cannot be read at all, refusing is deny-by-default working as
+    designed, not a gap to route around. An unreadable identity is exactly the case
+    where a recycled pid cannot be told from our own zombie: a freed pid can be taken
+    by another child of THIS process that is itself an unreaped zombie, and that
+    occupant reads as unreadable too, so a wait would steal its exit status and its
+    own watcher would report a code that never happened.
 
-    What the refusal leaves behind is a ZOMBIE, which has already released its
+    What such a refusal leaves behind is a ZOMBIE, which has already released its
     memory: one process-table entry and an exit status, bounded by pid space and
     gone when this process exits. That is not the leak this teardown exists to
     close -- that one is a RUNNING descendant holding hundreds of megabytes with no
