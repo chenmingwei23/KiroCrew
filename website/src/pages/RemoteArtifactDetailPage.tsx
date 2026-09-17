@@ -467,15 +467,17 @@ export default function RemoteArtifactDetailPage() {
                 {blobUrl && (failed || loadSilent) && (
                   <div className="absolute top-0 left-0 right-0 z-10 p-6 flex flex-wrap items-center gap-3 text-text bg-bg-elevated/95 border-b border-border">
                     {failed && !pending ? (
-                      // A rejected mint is a known read failure with nothing in
-                      // this subtree to lose (the frame it would replace is a
-                      // spent, never-loaded url), so the hand-off is on. Rendered
-                      // through ErrorNotice, not a hand-written status div, per
-                      // the errors-use-error-notice rule. The RotateCw + "Retry"
-                      // Btn below is the recovery.
+                      // A rejected mint is a known read failure, rendered through
+                      // ErrorNotice per the errors-use-error-notice rule. The
+                      // RotateCw + "Retry" Btn below is the recovery.
+                      // No hand-off: the comments sidebar's draft (and an open
+                      // anchored-comment popover) share this page - the hand-off
+                      // navigates to the chat and unmounts the whole page, not
+                      // just this frame, so it would discard an in-progress
+                      // comment. The three sibling ErrorNotices on this page keep
+                      // the hand-off off for the same reason.
                       <ErrorNotice
                         variant="inline"
-                        askAgent
                         testId="remote-artifact-silent-mint-error"
                         className="min-w-0"
                         message={i18nT('components.artifactBody.could_not_render')}
