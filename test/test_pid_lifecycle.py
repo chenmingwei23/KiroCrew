@@ -1572,17 +1572,31 @@ class TestSyncKillProvider:
 # escapes the provider's process group, and with nothing for the variant that
 # stays in it.
 _STUBBORN_GRANDCHILD = (
-    "import os, signal, time\n"
+    "import os, signal, sys, time\n"
     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
     "{setsid}"
+    # Announced only once SIG_IGN is installed. The pid exists from the fork, so a
+    # test that waits for the pid alone can send the group SIGTERM into the window
+    # where this process still has the DEFAULT disposition -- and a grandchild that
+    # dies to SIGTERM is not the stubborn descendant these tests are built on.
+    "sys.stdout.write('stubborn\\n')\n"
+    "sys.stdout.flush()\n"
     "time.sleep(300)\n"
 )
 # A provider root: forks one grandchild, then waits. Plain SIGTERM handling, so
 # the root itself dies on the first signal and the test measures what happens to
-# the tree BELOW it.
+# the tree BELOW it. Its own stdout carries the grandchild's pid, and it reports
+# that pid only after the grandchild says it is stubborn, so the caller's read of
+# this line is the barrier. The grandchild gets a pipe of its OWN rather than
+# inheriting this one, which would put its announcement in front of the pid the
+# caller reads. Reporting nothing when the announcement does not arrive keeps the
+# failure loud: the caller raises on the empty read rather than proceeding with an
+# unguarded tree.
 _PROVIDER_ROOT = (
     "import subprocess, sys, time\n"
-    "p = subprocess.Popen([sys.executable, '-c', {src!r}])\n"
+    "p = subprocess.Popen([sys.executable, '-c', {src!r}], stdout=subprocess.PIPE)\n"
+    "if not p.stdout.readline():\n"
+    "    raise SystemExit(1)\n"
     "print(p.pid, flush=True)\n"
     "time.sleep(300)\n"
 )
@@ -1623,6 +1637,13 @@ class TestSyncKillProviderTree:
         stdout. Cleanup then never depends on discovery: a walk that times out
         would otherwise leave the grandchild's 300-second sleep running, since the
         caller would have no pid to reap.
+
+        Returning is also the barrier for the grandchild being STUBBORN, not merely
+        alive: the root reports its pid only after the grandchild announces that it
+        installed ``SIG_IGN``. Every test here signals the group and then reads what
+        survived, so a grandchild still holding the default SIGTERM disposition
+        breaks the premise rather than the assertion -- the tree really is gone, and
+        the teardown is right to stop early.
         """
         grandchild = _STUBBORN_GRANDCHILD.format(setsid="os.setsid()\n" if escape_group else "")
         proc = subprocess.Popen(
@@ -1663,6 +1684,81 @@ class TestSyncKillProviderTree:
         return alive
 
     @staticmethod
+    def _our_child_exited(pid: int) -> bool:
+        """True when *pid*, a child of THIS process, has stopped running.
+
+        ``waitid`` with ``WNOWAIT`` reports an exited child WITHOUT consuming its
+        status, so a zombie stays a zombie and the code under test still has it to
+        find. That is what makes the question answerable off Linux, where there is no
+        ``/proc`` to read a state from: ``ChildProcessError`` means the status is
+        already collected, which is also "it exited".
+
+        Only valid for a child of this process. A live process that is NOT our child
+        raises the same ``ChildProcessError``, so asking this about one would read as
+        "exited" when it is running.
+        """
+        try:
+            peek = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except ChildProcessError:
+            return True
+        except OSError:
+            return False
+        return peek is not None
+
+    @staticmethod
+    def _status_still_collectable(pid: int) -> bool:
+        """True while this process's child *pid* has an UNCOLLECTED exit status.
+
+        The precise instrument for "did something wait on it": ``WNOWAIT`` peeks
+        without consuming, and ``ChildProcessError`` means the status is already
+        gone. Liveness cannot answer this -- a zombie and a live process both answer
+        a liveness probe as present -- and off Linux there is no zombie state to read
+        instead.
+        """
+        try:
+            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+        except (ChildProcessError, OSError):
+            return False
+
+    def _assert_tree_stopped(self, root: "subprocess.Popen", descendants: list[int]) -> None:
+        """Nothing of the tree is running, and none of its pids is still held.
+
+        Both halves are asserted on every platform. They are separated because they
+        fail for different reasons and one of them needs this process to act.
+
+        STOPPED is what the teardown promises: the root exited and every recorded
+        descendant is gone. The root is checked through this process's own child
+        status rather than through liveness, because a zombie answers a liveness probe
+        as present and off Linux there is no zombie state to read instead.
+
+        RELEASED needs someone who owns the handle to collect the status, and this
+        test does. Whether the TEARDOWN could collect it is platform-dependent -- off
+        Linux a killed root's identity is unreadable, so `_reap_provider_root`
+        correctly refuses and leaves the zombie -- but the pid is released either way
+        once the owner waits. `Popen.wait` treats a child already collected by someone
+        else as collected, so this is right whichever side got there first, and the
+        assertion keeps its full strength on every platform.
+        """
+        deadline = time.monotonic() + 10.0
+        running = [root.pid, *descendants]
+        while running and time.monotonic() < deadline:
+            running = [
+                pid
+                for pid in running
+                if (
+                    not self._our_child_exited(pid)
+                    if pid == root.pid
+                    else platform_compat.pid_exists(pid)
+                )
+            ]
+            if running:
+                time.sleep(0.05)
+        assert running == [], f"the teardown left part of the tree running: {running}"
+        root.wait(timeout=10)
+        left = self._await_gone([root.pid, *descendants])
+        assert left == [], f"pids still held after the tree was torn down: {left}"
+
+    @staticmethod
     def _reap(pids: list[int]) -> None:
         """Best-effort teardown so no test process survives the run."""
         for pid in pids:
@@ -1697,7 +1793,7 @@ class TestSyncKillProviderTree:
 
             _sync_kill_provider(self._provider(root.pid))
 
-            assert self._await_gone([root.pid, *grandchildren]) == []
+            self._assert_tree_stopped(root, grandchildren)
         finally:
             self._reap([root.pid, gc_pid, *grandchildren])
             root.wait(timeout=10)
@@ -1724,7 +1820,7 @@ class TestSyncKillProviderTree:
 
             _sync_kill_provider(self._provider(root.pid))
 
-            assert self._await_gone([root.pid, *grandchildren]) == []
+            self._assert_tree_stopped(root, grandchildren)
         finally:
             self._reap([root.pid, gc_pid, *grandchildren])
             root.wait(timeout=10)
@@ -1754,7 +1850,7 @@ class TestSyncKillProviderTree:
 
             _sync_kill_provider(provider)
 
-            assert self._await_gone([root.pid]) == []
+            self._assert_tree_stopped(root, [])
             # Popen.wait reaps: this stray is a direct child of the TEST process
             # (a real one hangs off the runtime), so without a wait it lingers as
             # a zombie and a pid probe still reads it as alive. A negative code
@@ -1787,7 +1883,7 @@ class TestSyncKillProviderTree:
 
             _sync_kill_provider(self._provider(root.pid))
 
-            assert self._await_gone([root.pid, *grandchildren]) == []
+            self._assert_tree_stopped(root, grandchildren)
         finally:
             self._reap([root.pid, gc_pid, *grandchildren])
             root.wait(timeout=10)
@@ -2122,42 +2218,120 @@ class TestSyncKillProviderTree:
             root.wait(timeout=10)
             bystander.wait(timeout=10)
 
+    def test_the_tree_stops_even_where_the_root_cannot_be_identified_after_it_exits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What the teardown promises off Linux: killed, not necessarily reaped.
+
+        Stands in for the macOS post-exit identity read -- `proc_pidinfo` reports
+        nothing once a process has exited, while a RUNNING process still answers -- so
+        the reaper cannot confirm the root it just killed and correctly refuses to wait
+        on it. The tree is still STOPPED, which is the portable promise; the root's pid
+        stays held by its zombie, which is why "the pid is gone" is asserted only on
+        Linux.
+
+        A zombie is not a survivor: its memory is released, it cannot run again, and
+        asyncio's child watcher may still collect it.
+
+        Mutation guard: permitting the wait when the live read is None -- reaping on an
+        unconfirmable identity -- consumes the status and reddens the last assertion.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        try:
+            grandchildren = self._await_descendants(root.pid)
+            provider = self._provider(root.pid)
+            real_start_id = platform_compat.get_process_start_id
+
+            def _unreadable_once_exited(probe_pid: int) -> "str | None":
+                if probe_pid == root.pid and self._our_child_exited(probe_pid):
+                    return None
+                return real_start_id(probe_pid)
+
+            monkeypatch.setattr(
+                "kiro_crew.session_pid.platform_compat.get_process_start_id",
+                _unreadable_once_exited,
+            )
+            _sync_kill_provider(provider)
+
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not self._our_child_exited(root.pid):
+                time.sleep(0.05)
+            assert self._our_child_exited(root.pid), "the root was not killed"
+            assert self._await_gone(grandchildren) == [], "a descendant kept running"
+            assert self._status_still_collectable(
+                root.pid
+            ), "the root was reaped on an identity the reaper could not confirm"
+        finally:
+            self._reap([root.pid, gc_pid])
+            root.wait(timeout=10)
+
     def test_reap_refuses_a_pid_whose_identity_changed(self) -> None:
         """A wait on a recycled pid consumes an unrelated child's exit status.
 
         Nothing detects or repairs that loss, so the reaper re-reads the identity
-        instead of trusting the one taken at entry. Uses a real zombie: the status
-        is either still there to collect or it is gone, which is the whole effect.
+        instead of trusting the one taken at entry. Uses a real zombie: the status is
+        either still there to collect or it is gone, which is the whole effect.
+
+        Two things here are platform-specific and are handled rather than assumed.
+        The identity is recorded while the child is still RUNNING, which every
+        platform can read -- reading it off the zombie instead only works on Linux,
+        where `/proc/<pid>/stat` outlives the exit. And whether a correctly identified
+        zombie can then be reaped at all is Linux-only for the same reason: off Linux
+        `proc_pidinfo` reports nothing once a process has exited, so the reaper cannot
+        confirm the identity and correctly refuses. The refusal arm -- the actual
+        subject of this test -- runs everywhere.
+
+        `_pid_exited_but_unreaped` is deliberately NOT the barrier: off Linux it falls
+        back to plain liveness, and a zombie answers a liveness probe as present, so it
+        never reports the state this constructs. `_our_child_exited` asks this
+        process's own child status instead, which is answerable anywhere.
         """
         from kiro_crew import session_pid as sp
 
-        child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(0)"])
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
-            deadline = time.monotonic() + 10
-            while not sp._pid_exited_but_unreaped(child.pid):
-                assert time.monotonic() < deadline, "the child never became a zombie"
-                time.sleep(0.01)
-            # Readable on a zombie: field 22 is set at fork and the /proc entry lives
-            # until the status is collected.
+            # Recorded while it RUNS, the way the ACP layer records it at spawn.
             recorded = platform_compat.get_process_start_id(child.pid)
-            assert recorded is not None
-            # A zombie still holds its pid, so pid_exists is what separates "status
-            # still there to collect" from "collected". _pid_exited_but_unreaped is
-            # true for a departed pid too, so it cannot tell those apart.
-            assert platform_compat.pid_exists(child.pid)
+            assert recorded is not None, "a running child's identity must be readable"
+            child.kill()
+            deadline = time.monotonic() + 10
+            while not self._our_child_exited(child.pid):
+                assert time.monotonic() < deadline, "the child never exited"
+                time.sleep(0.01)
+            assert self._status_still_collectable(child.pid), "the status must start uncollected"
 
             sp._reap_provider_root(child.pid, "0.000000", gated=True)
-            assert platform_compat.pid_exists(
+            assert self._status_still_collectable(
                 child.pid
             ), "the status was consumed despite an identity mismatch"
 
-            sp._reap_provider_root(child.pid, recorded, gated=True)
-            assert not platform_compat.pid_exists(child.pid), "the real zombie must be reaped"
+            if sys.platform == "linux":
+                # Read straight off the zombie, which only Linux keeps readable.
+                sp._reap_provider_root(child.pid, recorded, gated=True)
+            else:
+                # Elsewhere the READER is stood in for, because the property under test
+                # is "a CONFIRMED identity is waited on", not "this platform can confirm
+                # one after the process exits". Gating the assertion away instead would
+                # narrow a universal property to a platform allowlist.
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(sp.platform_compat, "get_process_start_id", lambda _pid: recorded)
+                    sp._reap_provider_root(child.pid, recorded, gated=True)
+            assert not self._status_still_collectable(
+                child.pid
+            ), "a zombie whose identity is confirmed must be reaped"
         finally:
-            # The status is collected above, so let Popen skip its own wait rather
-            # than raise ChildProcessError for a pid outside its ownership.
-            if child.returncode is None:
-                child.returncode = 0
+            # Unconditional: an assertion that fails BEFORE the kill above would
+            # otherwise leave a running sleeper behind, and fabricating a return code
+            # for it would hide that. Killing something already dead is a no-op, and
+            # `Popen.wait` treats a child collected elsewhere as collected.
+            try:
+                child.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            child.wait(timeout=10)
 
     def test_fresh_walk_is_discarded_when_the_root_goes_stale_across_the_rescan(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2302,7 +2476,7 @@ class TestSyncKillProviderTree:
 
             _sync_kill_provider(provider)
 
-            assert self._await_gone([root.pid]) == []
+            self._assert_tree_stopped(root, [])
             # Popen.poll reaps: a signalled direct child of the TEST process
             # would linger as a zombie that a pid probe still reads as alive, so
             # an exit status is what proves nothing was sent to it.
@@ -2631,6 +2805,70 @@ class TestSyncKillProviderTree:
         monkeypatch.setattr("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True)
 
         assert _group_from_witnessed_descendant(4242, "root", {4243: ("start", None)}) is None
+
+
+@_POSIX_ONLY
+class TestReapProviderRoot:
+    """An UNREADABLE identity refuses the wait, and that refusal is deliberate.
+
+    `_sync_kill_provider` kills the root and holds its zombie unreaped until every
+    group signal has gone out, so the reap runs against a process that has already
+    exited. Whether its recorded identity can still be read there is a PLATFORM
+    property: Linux keeps `/proc/<pid>/stat` readable for a zombie, macOS
+    `proc_pidinfo` reports nothing once a process has exited.
+
+    So off Linux the reap is refused, and that is deny-by-default working: an
+    unreadable identity is exactly the case where our own zombie cannot be told from
+    a pid already reaped by asyncio's watcher and recycled into another child of this
+    process that is itself an unreaped zombie -- which reads as unreadable too, and
+    whose status a wait would steal. What the refusal leaves is a zombie: memory
+    already released, one process-table entry, and the watcher may still collect it.
+
+    Simulating only the identity READ keeps this verifiable on any host.
+    """
+
+    @staticmethod
+    def _zombie() -> "tuple[subprocess.Popen, int]":
+        """A real unreaped zombie: exited, never waited on. Returns it and its pid."""
+        proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(0)"])
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            # Deliberately NOT poll()/wait() -- either would reap it and free the pid.
+            if TestSyncKillProviderTree._status_still_collectable(proc.pid):
+                return proc, proc.pid
+            time.sleep(0.02)
+        raise AssertionError(f"child {proc.pid} never became a zombie")
+
+    def _assert_refused(self, live_id: "str | None", monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc, pid = self._zombie()
+        try:
+            monkeypatch.setattr(sp.platform_compat, "get_process_start_id", lambda _pid: live_id)
+            sp._reap_provider_root(pid, "1758000000.000001", gated=True)
+            assert TestSyncKillProviderTree._status_still_collectable(
+                pid
+            ), "the status was consumed on an identity the reaper could not confirm"
+        finally:
+            try:
+                proc.wait(timeout=10)
+            except ChildProcessError:
+                pass
+
+    def test_an_unreadable_identity_refuses_the_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The macOS post-exit case: nothing readable, so nothing is waited on.
+
+        Mutation guard: permitting the wait when the live read is None -- which is
+        what "reap it anyway off Linux" would do -- consumes the status and reddens
+        this.
+        """
+        self._assert_refused(None, monkeypatch)
+
+    def test_a_readable_different_identity_refuses_the_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A recycled pid reads as a DIFFERENT id, and that refuses the wait too."""
+        self._assert_refused("999.000999", monkeypatch)
 
 
 class TestCleanupOrphanedMcpServersExtra:

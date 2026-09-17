@@ -1033,9 +1033,29 @@ def _reap_provider_root(pid: int, recorded_start: str | None, *, gated: bool) ->
     signal re-checks it: that watcher can reap the leader zombie on its own, which
     frees the pid, and ``waitpid`` on a recycled pid consumes an UNRELATED child's
     exit status. That loss is silent and nothing detects or repairs it, so this
-    reads the identity here rather than trusting the one taken at entry. A genuine
-    zombie of ours keeps a readable ``/proc`` entry, so the check passes for the
-    case this exists to handle.
+    reads the identity here rather than trusting the one taken at entry.
+
+    WHAT THAT COSTS OFF LINUX, and why it is still the right answer. Linux keeps
+    ``/proc/<pid>/stat`` readable for a zombie, so an identity survives the exit and
+    the check passes for the case this exists to handle. macOS ``proc_pidinfo``
+    reports nothing once a process has exited, so the identity of the state this
+    teardown CREATES -- a killed root held unreaped to keep its pgid unambiguous --
+    cannot be read there at all, and the wait is refused.
+
+    Refusing is deny-by-default working as designed, not a gap to route around. An
+    unreadable identity is exactly the case where a recycled pid cannot be told from
+    our own zombie: a freed pid can be taken by another child of THIS process that
+    is itself an unreaped zombie, and that occupant reads as unreadable too, so a
+    wait would steal its exit status and its own watcher would report a code that
+    never happened.
+
+    What the refusal leaves behind is a ZOMBIE, which has already released its
+    memory: one process-table entry and an exit status, bounded by pid space and
+    gone when this process exits. That is not the leak this teardown exists to
+    close -- that one is a RUNNING descendant holding hundreds of megabytes with no
+    tracking entry left to find it by. And the entry is not necessarily permanent:
+    asyncio's child watcher may still reap it afterwards, since the root is this
+    process's child. A benign bounded entry is the cheaper side of the trade.
     """
     if not _root_identity_holds(pid, recorded_start, gated=gated):
         logger.warning(
