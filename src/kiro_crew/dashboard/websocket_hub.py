@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 from aiohttp import web
 
+from kiro_crew.dashboard.ws_event_scope import channel_settings_for_app
+
 
 class WebSocketHubOwner(Protocol):
     """The mutable facade-owned state the hub operates on.
@@ -204,6 +206,15 @@ class WebSocketHub:
                 "_serialize_subagent_batch", self._serialize_subagent_batch
             )
             return serialize_batch(ws, msg_type, data, default_msg)
+        if msg_type == "notification_channel_settings":
+            # The stored row carries the owner's bridge route as well as the
+            # dashboard-local mute, and an app scoped to a channel receives this
+            # frame for it. The event rides the plain `notification` declaration,
+            # which decides only WHETHER the frame is delivered, so the
+            # withholding the settings GET does for an app token happens here.
+            return json.dumps(
+                {"type": msg_type, "data": channel_settings_for_app(data)},
+            )
         if msg_type != "slots":
             return default_msg
         if not isinstance(data, dict) or "slots" not in data:
