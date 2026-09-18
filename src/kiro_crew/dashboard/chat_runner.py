@@ -251,6 +251,7 @@ from kiro_crew.execution_context import (
     tighten_live_session_execution,
 )
 from kiro_crew.executors import run_in_embed_pool, subprocess_executor
+from kiro_crew.history import HUMAN_TURN_META_KEY
 from kiro_crew.hooks import (
     HOOK_EVENT_AGENT_SPAWN,
     HOOK_EVENT_POST_TOOL_USE,
@@ -8953,6 +8954,19 @@ async def _start_next_queued_turn(
         elif is_app_message:
             _inject_meta["appLabel"] = app_label or "app"
         _drained_meta.update(_inject_meta)
+    elif row_role == "user" and directive_user_origin:
+        # The direct-send path stamps HUMAN_TURN_META_KEY on a user row whenever
+        # the send is human-authored (chat_handlers: ``if not request_app``). A
+        # message that arrives while the slot is busy is QUEUED and later drained
+        # here instead, so without this it would write an UNMARKED user row and
+        # the last-human-turn ranking gate (chat_persistence, keyed on this
+        # marker) would skip it, staling ``last_user_at`` for a genuine human
+        # turn. ``directive_user_origin`` is that same ``not request_app`` signal
+        # carried on the queue entry (see ``_directive_user_origin``), so stamp
+        # it here on exactly the human-origin drain. It fails closed: a drain
+        # with any non-human (app) entry, or the ``inject`` branch above, never
+        # reaches here and stays unmarked.
+        _drained_meta[HUMAN_TURN_META_KEY] = True
     current_row = slot.append(
         row_role,
         next_msg,
