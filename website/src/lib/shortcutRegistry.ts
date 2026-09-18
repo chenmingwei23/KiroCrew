@@ -170,8 +170,11 @@ export const SHORTCUT_REGISTRY: readonly ShortcutEntry[] = [
   // PR #783). Ctrl+, is how a Chinese IME types a comma, so a Ctrl+, binding is a
   // full comma-input blocker for CJK users (#9824) — and this chord fires ahead
   // of the global enable/disable gate (so it stays reachable to re-enable
-  // shortcuts), meaning turning shortcuts off cannot even work around it. The
-  // desktop shell's menu owns Ctrl+, there; the in-page chord stays Alt-based.
+  // shortcuts), meaning turning shortcuts off cannot even work around it.
+  // Nothing claims Ctrl+, off macOS: electron/app-menu.js gives its File >
+  // Settings… item no accelerator there, keyed off the same `isMac` predicate,
+  // so the keystroke reaches the IME untouched. The item stays discoverable
+  // without an accelerator; the in-page chord stays Alt-based.
   { id: 'open-settings', group: 'actions', dispatch: 'registry',
     defaults: mac({ key: ',', mod: true }, { key: ',', alt: true }),
     aliases: { mac: [{ key: ',', alt: true }] } },
