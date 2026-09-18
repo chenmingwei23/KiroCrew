@@ -179,7 +179,9 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
             patch.object(AcpClient, "_prepare_spawn_workspace", return_value=None),
             patch.object(AcpClient, "_resolve_session_mcp_servers", return_value=[]),
             patch.object(client_mod, "_resolve_spawn_env", side_effect=lambda env, **_k: env),
-            patch.object(client_mod, "scrub_agent_subprocess_env", side_effect=lambda env: env),
+            patch.object(
+                client_mod, "scrub_agent_subprocess_env", side_effect=lambda env, **_k: env
+            ),
             patch.object(client_mod, "browser_session_env", return_value={}),
             patch.object(client_mod, "browser_socket_env", return_value={}),
             patch.object(client_mod, "inject_xdist_auto_cap", return_value=None),
