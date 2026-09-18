@@ -55,8 +55,9 @@ import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import { onTerminalReady, sendToTerminalSession, sendRawToTerminalSession, getTerminalShell, getTerminalFenceShells } from '../utils/terminalRegistry'
 import { runInTerminalText, RUN_IN_TERMINAL_READY_DEADLINE_MS, RUN_IN_TERMINAL_OPENING_GRACE_MS } from '../utils/fenceShell'
-import { addTab as addDockTerminal, removeTab as removeDockTerminal, hasTab as hasDockTerminal } from '../hooks/useBottomTerminal'
-import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
+import { addTab as addDockTerminal, removeTab as removeDockTerminal, hasTab as hasDockTerminal, reuseCurrentTab as reuseDockTerminal } from '../hooks/useBottomTerminal'
+import { isPopoutOpen as isTerminalPopoutOpen, focusPopout as focusTerminalPopout } from '../utils/terminalPopout'
+import { copyToClipboard } from '../utils/clipboard'
 import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
 import { triggerRefresh, updateSlot, slotIsRemoteBound, sseSlotTitle } from '../store/dashboardSlice'
@@ -2286,6 +2287,42 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // event time, so it is declared before the controller and refreshed every render.
   const currentProjectRef = useRef<string | undefined>(undefined)
   currentProjectRef.current = slots.find(s => s.key === activeSlot)?.project || undefined
+
+  // Opt-in "reuse the current terminal" for Run-in-terminal
+  // (dashboard.terminal.reuse_current, default off — the fresh-shell default is
+  // unchanged). Read from the shared kirocrewConfig query and mirrored onto a
+  // ref because the run-in-terminal handler below installs once ([]-deps) and
+  // reads it at event time, not at mount. Only a literal `true` turns it on —
+  // the same "one literal decides it" rule the completion toggle uses, so a
+  // hand-edited non-boolean cannot half-enable it.
+  const { data: terminalCfg, isError: terminalCfgIsError, isPending: terminalCfgIsPending } = useQuery<{ dashboard?: { terminal?: { reuse_current?: boolean } } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    staleTime: 30_000,
+  })
+  const terminalReuseRef = useRef(false)
+  terminalReuseRef.current = terminalCfg?.dashboard?.terminal?.reuse_current === true
+  // The handler installs once ([]-deps) and reads at event time, so the query's
+  // UNSETTLED state is mirrored onto a ref too. Until the initial read settles
+  // we cannot know whether reuse was saved on, and collapsing an unknown to the
+  // fresh-tab EXECUTE path would run a command a reuse-on user expected only to
+  // be copied — the exact harm this setting removes. So an unsettled read takes
+  // the copy-never-run path (benign if reuse was actually off: the user just
+  // pastes it themselves) rather than executing on a guess. `isPending` is true
+  // only before the first result (data or error) arrives.
+  const terminalCfgUnsettledRef = useRef(false)
+  terminalCfgUnsettledRef.current = terminalCfgIsPending === true
+  // The run-in-terminal handler installs once ([]-deps) and reads at event
+  // time, so the query's FAILED state is mirrored onto a ref too. A read
+  // failure is distinct from a legitimately-off setting: when the config could
+  // not be read we cannot know whether reuse was on, so the handler surfaces
+  // that read failure through ErrorNotice (errors-use-error-notice) rather than
+  // silently collapsing a saved reuse-on into the fresh-tab path with nothing
+  // on screen. `isError` only after the query has actually errored, so a
+  // pending first load still takes the silent-default branch, not a false alarm.
+  const terminalCfgReadFailedRef = useRef(false)
+  terminalCfgReadFailedRef.current = terminalCfgIsError === true
+
   const resources = useChatPageResourcesController({
     activeSlot,
     activeSlotRef,
@@ -4322,6 +4359,71 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       const reqId: string = detail.reqId
       const lang: string | undefined = typeof detail.lang === 'string' ? detail.lang : undefined
       if (typeof code !== 'string' || !code) return
+      // Opt-in reuse focuses the terminal tab the user selected and copies the
+      // command for a manual paste. Sending raw bytes into a live terminal is
+      // unsafe: a partially typed shell command or a foreground program owns
+      // stdin, so appending `text + "\\n"` could merge and execute unrelated
+      // input. The dashboard has no shell-prompt protocol that can prove an
+      // empty, idle prompt, so manual paste is the safe boundary. With no
+      // existing terminal to focus, fall through and mint a fresh tab, where
+      // this dispatch owns the entire input stream and can safely send.
+      if (terminalReuseRef.current || terminalCfgUnsettledRef.current) {
+        // Reuse-on ALWAYS copies — never runs. The confirm dialog it shows
+        // promises a copy for manual paste (RunInTerminalConfirm willCopy), and
+        // the action must match that promise unconditionally: a fall-through to
+        // minting a fresh tab and sending the bytes would EXECUTE a command the
+        // dialog said would only be copied. The same copy-never-run path also
+        // covers the UNSETTLED initial-read window: until the config query
+        // settles we cannot know whether reuse was saved on, and copying on an
+        // unknown is the non-destructive choice (a reuse-off user merely pastes
+        // it themselves), whereas executing on an unknown is the harm removed.
+        //
+        // Focusing an existing tab is a best-effort nicety, so try to reuse one
+        // and, if it lives in a popped-out window, raise that window — but the
+        // copy proceeds whether or not a reusable tab exists. `reuseCurrentTab`
+        // returns null when there is no settled tab to focus; that is not a
+        // reason to run, only a reason to skip the focus step.
+        const reusedId = reuseDockTerminal()
+        // Raise the popped-out window whenever a tab was reused: the main-window
+        // BroadcastChannel map (isTerminalPopoutOpen) is not synchronously
+        // correct across a main-window reload — in the beacon-only window it
+        // reads false though the popout is live — so gating the focus on it
+        // leaves the reused window behind. focusTerminalPopout is a no-op when
+        // no popout exists, so an unconditional call on a real reuse is safe.
+        if (reusedId) focusTerminalPopout()
+        // With a focused tab, fence-transform for that shell; with none, copy
+        // the command verbatim (no target shell to transform for).
+        const text = reusedId
+          ? runInTerminalText(code, lang, getTerminalShell(reusedId), getTerminalFenceShells(reusedId))
+          : code
+        void copyToClipboard(text).then(copied => {
+          // A refused copy is a user-facing failure, not a transient icon:
+          // route it through ErrorNotice (errors-use-error-notice) so the
+          // command the user asked to run is not silently lost.
+          if (!copied) {
+            showActionError(i18nT('pages.chatPage.run_in_terminal_copy_failed_error'))
+          }
+          window.dispatchEvent(new CustomEvent('mc:run-in-terminal-result', {
+            detail: { reqId, ok: copied, copied },
+          }))
+        })
+        return
+      }
+      // When reuse is off — whether the user set it off, or its config query is
+      // still loading so the saved value is not yet known — the command opens a
+      // fresh terminal. That fresh tab IS the shipped default, so no notice
+      // fires for the off/pending case: a reuse-downgrade notice there would
+      // assert a reuse preference the off-majority never set (a pending query is
+      // indistinguishable from a genuinely-off setting).
+      //
+      // A config-read FAILURE is different, and is the errors-use-error-notice
+      // case: the read errored, so a saved reuse-on is being silently ignored
+      // with nothing on screen. Surface that read failure through ErrorNotice
+      // (the query's isError reaching a user-facing notice), then still run in a
+      // fresh tab so the command the user asked for is not dropped.
+      if (terminalCfgReadFailedRef.current) {
+        showActionError(i18nT('pages.chatPage.run_in_terminal_config_read_failed_error'))
+      }
       const sessionId = addDockTerminal(currentProjectRef.current ?? undefined)
       let settled = false
       const emit = (ok: boolean) => {
@@ -4329,7 +4431,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         settled = true
         window.dispatchEvent(new CustomEvent('mc:run-in-terminal-result', { detail: { reqId, ok } }))
       }
-      if (!sessionId) { emit(false); return }
+      if (!sessionId) {
+        // F3: no fresh tab could be minted (the terminal cap is full). The
+        // command is neither copied nor run, so say so through ErrorNotice
+        // rather than leaving only the button's error glyph
+        // (errors-use-error-notice).
+        showActionError(i18nT('pages.chatPage.run_in_terminal_no_tab_error'))
+        emit(false); return
+      }
       // The shell is known only once `ready` has arrived, which is exactly when
       // this fires — so read it here, not at dispatch time.
       const unsub = onTerminalReady(sessionId, () => {

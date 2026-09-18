@@ -5084,13 +5084,16 @@
       "sent_to_terminal": "Sent to terminal"
     },
     "runInTerminalConfirm": {
+      "body_copy": "The command is copied for you to paste into the terminal.",
       "body_multi": "{{lines}} lines will run in a new terminal tab, in this chat's working directory.",
       "body_single": "This will run in a new terminal tab, in this chat's working directory.",
       "cancel": "Cancel",
+      "copy": "Copy",
       "flagged": "Flagged:",
       "run": "Run",
       "run_anyway": "Run anyway",
-      "title": "Run in terminal"
+      "title": "Run in terminal",
+      "title_copy": "Copy to terminal"
     },
     "searchBar": {
       "case_sensitive": "Case sensitive",

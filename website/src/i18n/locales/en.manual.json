@@ -3725,6 +3725,9 @@
       "open_schedule": "Open the Schedule page",
       "open_crewmates": "Open the Crew Members page",
       "cron_name": "{{name}}: standing job"
+    },
+    "runInTerminalBtn": {
+      "copied_paste_into_terminal": "Copied — paste it into the terminal"
     }
   },
   "hooks": {
@@ -4905,7 +4908,10 @@
       "run_in_terminal_liveness_probe_failed_error": "The command wasn't sent to the new terminal. Its shell may still be running, so the tab was left open.",
       "run_in_terminal_shell_alive_error": "The command wasn't sent to the new terminal, but its shell is running — the tab was left open so you can run the command there.",
       "run_in_terminal_dispatch_rolled_back_error": "The command wasn't sent to the new terminal, so that terminal was closed.",
-      "model_auto_jev_description": "Let Jev judge each turn and run it on the model for that tier"
+      "model_auto_jev_description": "Let Jev judge each turn and run it on the model for that tier",
+      "run_in_terminal_copy_failed_error": "The command couldn't be copied, so nothing was sent to the terminal. Copy it from the code block and paste it yourself.",
+      "run_in_terminal_no_tab_error": "The command couldn't run: no new terminal could be opened because too many are already open. Close one and try again.",
+      "run_in_terminal_config_read_failed_error": "Your terminal settings couldn't be read, so \"reuse the current terminal\" was skipped and the command opened a new terminal instead. Reload to try again."
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",
@@ -6772,6 +6778,9 @@
         "terminal_completion": "Command completion",
         "terminal_completion_desc": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
         "terminal_completion_save_failed": "Could not save the command completion setting",
+        "terminal_reuse_current": "Reuse the current terminal",
+        "terminal_reuse_current_desc": "Copies the command instead of running it: Run in terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell while keeping its working directory, environment, and any active login session. With no terminal open, it still copies the command for you to paste — it is never run for you.",
+        "terminal_reuse_current_save_failed": "Could not save the terminal reuse setting",
         "config_load_failed": "Could not load the saved display settings. The shell, recent-session and command completion settings are unavailable until it loads.",
         "installed_themes_load_failed": "Could not load the theme list; retrying automatically. Until it loads, an installed theme cannot be selected or applied.",
         "installed_themes_refresh_failed": "Could not refresh the theme list. It is out of date.",

@@ -8075,16 +8075,20 @@
       "couldn_t_run_in_terminal": "No se pudo ejecutar en el terminal",
       "run_anyway": "Ejecutar de todos modos",
       "run_in_terminal": "Ejecutar en el terminal",
-      "sent_to_terminal": "Enviado al terminal"
+      "sent_to_terminal": "Enviado al terminal",
+      "copied_paste_into_terminal": "Copiado: pégalo en el terminal"
     },
     "runInTerminalConfirm": {
+      "body_copy": "El comando se copia para que lo pegues en el terminal.",
       "body_multi": "Se ejecutarán {{lines}} líneas en una nueva pestaña de terminal, en el directorio de trabajo de este chat.",
       "body_single": "Se ejecutará en una nueva pestaña de terminal, en el directorio de trabajo de este chat.",
       "cancel": "Cancelar",
+      "copy": "Copiar",
       "flagged": "Marcado:",
       "run": "Ejecutar",
       "run_anyway": "Ejecutar de todos modos",
-      "title": "Ejecutar en el terminal"
+      "title": "Ejecutar en el terminal",
+      "title_copy": "Copiar al terminal"
     },
     "scheduleTemplateGallery": {
       "subtitle": "Empieza con una programación predefinida — tú la revisas y la guardas antes de que se ejecute nada.",
@@ -11451,7 +11455,10 @@
       "run_in_terminal_liveness_probe_failed_error": "El comando no se envió al nuevo terminal. Su shell puede seguir en ejecución, por lo que la pestaña se dejó abierta.",
       "run_in_terminal_shell_alive_error": "El comando no se envió al nuevo terminal, pero su shell está en ejecución: la pestaña se dejó abierta para que puedas ejecutar el comando allí.",
       "run_in_terminal_dispatch_rolled_back_error": "El comando no se envió al nuevo terminal, por lo que ese terminal se cerró.",
-      "model_auto_jev_description": "Deja que Jev evalúe cada turno y lo ejecute en el modelo de ese nivel"
+      "model_auto_jev_description": "Deja que Jev evalúe cada turno y lo ejecute en el modelo de ese nivel",
+      "run_in_terminal_copy_failed_error": "No se pudo copiar el comando, por lo que no se envió nada al terminal. Cópialo desde el bloque de código y pégalo tú mismo.",
+      "run_in_terminal_no_tab_error": "No se pudo ejecutar el comando: no se pudo abrir un terminal nuevo porque ya hay demasiados abiertos. Cierra uno e inténtalo de nuevo.",
+      "run_in_terminal_config_read_failed_error": "No se pudieron leer los ajustes del terminal, así que se omitió «reutilizar el terminal actual» y el comando se abrió en un terminal nuevo. Vuelve a cargar para intentarlo de nuevo."
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 omitida — seleccionada actualmente)",
@@ -15299,6 +15306,9 @@
         "terminal_completion": "Completado de comandos",
         "terminal_completion_desc": "Mostrar el menú de completado al escribir en el Terminal. Intro ejecuta la línea que escribiste; para aceptar una sugerencia, pulsa ↑/↓ y luego Intro, o Tab. Desactivado oculta el menú; el completado con Tab de tu shell sigue funcionando.",
         "terminal_completion_save_failed": "No se pudo guardar la configuración del completado de comandos",
+        "terminal_reuse_current": "Reutilizar el terminal actual",
+        "terminal_reuse_current_desc": "Copia el comando en lugar de ejecutarlo: «Ejecutar en el terminal» enfoca la pestaña de terminal que has seleccionado y copia el comando, para que puedas pegarlo en esa shell y conservar su directorio de trabajo, entorno y sesión iniciada. Si no hay ningún terminal abierto, el comando se copia igualmente para que lo pegues: nunca se ejecuta por ti.",
+        "terminal_reuse_current_save_failed": "No se pudo guardar la configuración de reutilización del terminal",
         "theme": "Tema",
         "theme_source": "Origen del tema",
         "theme_source_location": "Ubicación del origen del tema",
