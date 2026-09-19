@@ -56,8 +56,12 @@ const PROVIDER_LABEL_KEY = 'pages.chatSidebar.folders'
 
 /** Cache the folder list briefly so retyping the same query is free. Matches the
  *  staleTime the sessions provider uses for its own `['chat-folders']` reads, so
- *  the two share cache entries instead of invalidating each other. */
-const FOLDERS_STALE_MS = 30_000
+ *  the two share cache entries instead of invalidating each other.
+ *
+ *  Exported because a second host (the Command Bar's folders view) builds this
+ *  provider through {@link createFoldersProvider} with its own fetcher, and a
+ *  hand-copied window there would be a second answer that drifts. */
+export const FOLDERS_STALE_MS = 30_000
 
 /**
  * Score subtracted when the query matched only the ancestry PATH and not the

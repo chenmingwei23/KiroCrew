@@ -1,0 +1,186 @@
+/**
+ * Screenshot harness for the Command Bar's FOLDERS scope.
+ *
+ * Runs the REAL built SPA (website/dist) behind the shared `serveDist` server and
+ * answers every /api/** call from fixtures through `stubDashboardApi`. No gateway,
+ * no dashboard auth, no kiro-cli.
+ *
+ * What the frames evidence is one claim: a folder is reached the way a session is
+ * — press Enter on a row, then type — and NOT by folder rows spread through the
+ * first page. So the three frames are the three states of that path:
+ *   1. the root page, where Search Sessions and Search Folders sit as siblings
+ *      and no folder NAME appears
+ *   2. inside the folders scope with an empty query: the breadcrumb names it, the
+ *      placeholder changes, the whole corpus is listed in sidebar order
+ *   3. inside the scope with a query: narrowed rows, each with its ancestry path
+ *
+ * Frame 1 is the load-bearing one: it is the frame that fails if the flat folder
+ * group ever comes back.
+ *
+ * Usage: node scripts/capture-command-bar-folder-scope.mjs [outDir]
+ */
+import { chromium } from 'playwright'
+import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+
+import { json } from './lib/boot-api.mjs'
+import { serveDist } from './lib/serve-dist.mjs'
+import { stubDashboardApi } from './lib/stub-dashboard-api.mjs'
+
+const OUT = process.argv[2] || '/tmp/command-bar-folder-scope'
+
+mkdirSync(OUT, { recursive: true })
+
+const SLOT = 'chat-1'
+
+/**
+ * The launcher is a builtin so it claims the quick-search slot — without this the
+ * chord opens the old quick-search overlay and every frame is of the wrong surface.
+ */
+const APPS = [
+  {
+    name: 'command-bar',
+    displayName: 'Command Bar',
+    enabled: true,
+    origin: 'builtin',
+    source: 'builtin',
+    version: '0.1.0',
+    manifest: {
+      name: 'command-bar',
+      displayName: 'Command Bar',
+      version: '0.1.0',
+      ui: { overlays: [{ id: 'command-bar', replaces: 'quick-search' }] },
+    },
+  },
+]
+
+/**
+ * A NESTED tree, not a flat list: the breadcrumb under a row is the thing a flat
+ * fixture cannot photograph, and it is also what makes a name like "oss" readable
+ * when two parents both hold one.
+ */
+const FOLDERS = [
+  { id: 'f-kirocrew', name: 'kirocrew', order: 0, collapsed: false },
+  { id: 'f-oss', name: 'oss', order: 0, collapsed: false, parent_id: 'f-kirocrew' },
+  { id: 'f-reviews', name: 'reviews', order: 1, collapsed: false, parent_id: 'f-kirocrew' },
+  { id: 'f-personal', name: 'personal', order: 1, collapsed: false },
+  { id: 'f-finance', name: 'finance', order: 0, collapsed: false, parent_id: 'f-personal' },
+  { id: 'f-travel', name: 'travel', order: 1, collapsed: false, parent_id: 'f-personal' },
+]
+
+function assert(label, ok, detail = '') {
+  console.log(`${label}: ${ok ? 'OK' : 'FAIL'}${detail ? ` — ${detail}` : ''}`)
+  if (!ok) throw new Error(`${label} failed${detail ? `: ${detail}` : ''}`)
+}
+
+const { srv, base } = await serveDist()
+const browser = await chromium.launch()
+
+async function openBar() {
+  const context = await browser.newContext({ viewport: { width: 1500, height: 950 }, deviceScaleFactor: 1 })
+  const page = await context.newPage()
+
+  // `/api/apps` is what decides WHICH overlay the chord opens. Without it the stub
+  // answers an empty list, the launcher never claims `quick-search`, and Control+K
+  // opens the OLD Search Everywhere palette — whose rows look plausible enough that
+  // the frames would be of the wrong surface. The assertions below are what caught it.
+  const extra = async (path, route) => {
+    if (path === '/api/apps') {
+      await json(route, APPS)
+      return true
+    }
+    return false
+  }
+
+  await stubDashboardApi(page, {
+    folders: FOLDERS,
+    slots: [{ key: SLOT, messages: 0, running: false, agent: 'default', mode: '' }],
+    extra,
+  })
+
+  await page.goto(`${base}/chat`)
+  await page.waitForLoadState('networkidle')
+  await page.keyboard.press('Control+k')
+  await page.waitForSelector('[role="dialog"]', { timeout: 10_000 })
+  return { context, page }
+}
+
+/** The query field. Addressed by its attribute rather than its computed ARIA role:
+ *  the role is what the overlay sets, and matching the attribute cannot be thrown
+ *  off by how a browser build maps `combobox` on a text input. */
+const box = page => page.locator('[role="dialog"] input').first()
+
+/** Enter the folders scope the way the list binds activation: mousedown on the row. */
+async function enterFolders(page) {
+  await box(page).fill('folders')
+  const row = page.getByRole('option').filter({ hasText: 'Search Folders' }).first()
+  await row.dispatchEvent('mousedown')
+  // The breadcrumb is the scope's own proof: wait for it, not for a timeout.
+  await page.getByText('Search Folders', { exact: true }).first().waitFor({ timeout: 5_000 })
+}
+
+async function shot(page, name) {
+  await page.waitForTimeout(350)
+  const file = join(OUT, name)
+  await page.screenshot({ path: file })
+  console.log(`wrote ${file}`)
+}
+
+// ── 1. the root page: one row per corpus, zero folder names ────────────
+{
+  const { context, page } = await openBar()
+  // A query is required: with an empty box the root page is recents + New Session,
+  // and the Commands group (which BOTH corpus rows live in) is not listed at all.
+  // That is the same for Sessions and Folders, which is the point of the frame.
+  await box(page).fill('search')
+  await page.getByRole('option').filter({ hasText: 'Search Folders' }).first().waitFor({ timeout: 5_000 })
+  const rows = await page.getByRole('option').allTextContents()
+  const joined = rows.join(' | ')
+  assert('root offers Search Folders', /Search Folders/.test(joined), joined.slice(0, 200))
+  assert('root offers Search Sessions', /Search Sessions/.test(joined), joined.slice(0, 200))
+  await shot(page, '1-root-corpus-rows.png')
+
+  // The flat group is gone: typing a FOLDER's own name at the root must not put
+  // that folder in the list. Checked against the fixture's names so a renamed
+  // fixture cannot pass vacuously.
+  await box(page).fill('oss')
+  await page.waitForTimeout(400)
+  const afterName = await page.getByRole('option').allTextContents()
+  const leaked = FOLDERS.map(f => f.name).filter(n => afterName.some(r => r.trim().startsWith(n)))
+  assert('no folder row at root', leaked.length === 0, `leaked: ${leaked.join(', ')}`)
+  await context.close()
+}
+
+// ── 2. inside the scope, empty query: whole corpus, in sidebar order ────────
+{
+  const { context, page } = await openBar()
+  await enterFolders(page)
+  await box(page).fill('')
+  await page.getByRole('option').filter({ hasText: 'travel' }).first().waitFor({ timeout: 5_000 })
+  const placeholder = await box(page).getAttribute('placeholder')
+  assert('placeholder switched to folders', placeholder === 'Search all folders…', String(placeholder))
+  const rows = await page.getByRole('option').allTextContents()
+  assert('empty query lists the corpus', rows.length >= FOLDERS.length, `${rows.length} rows`)
+  await shot(page, '2-scope-empty-query.png')
+  await context.close()
+}
+
+// ── 3. inside the scope, a query: narrowed rows with their ancestry path ────
+{
+  const { context, page } = await openBar()
+  await enterFolders(page)
+  await box(page).fill('oss')
+  // Wait for the FILTER, not for a row that was already on screen: the query is
+  // debounced, so `oss` matches the stale `oss` row instantly and reading here
+  // returned the whole unfiltered corpus. A row that must LEAVE is the only wait
+  // that proves the new query was applied.
+  await page.getByRole('option').filter({ hasText: 'travel' }).first().waitFor({ state: 'detached', timeout: 5_000 })
+  const rows = await page.getByRole('option').allTextContents()
+  assert('query narrows the corpus', rows.length < FOLDERS.length, `${rows.length} rows`)
+  assert('row carries its parent path', /kirocrew/.test(rows.join(' | ')), rows.join(' | ').slice(0, 200))
+  await shot(page, '3-scope-query-narrowed.png')
+  await context.close()
+}
+
+await browser.close()
+srv.close()

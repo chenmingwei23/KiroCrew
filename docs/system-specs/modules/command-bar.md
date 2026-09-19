@@ -29,10 +29,20 @@ keystroke, so fast typing could stall unrelated streaming. Command Bar's root ca
 locally-known rows — commands, app destinations, system settings — and every corpus search is a
 view the reader ENTERS, so the expensive work is explicit and chosen.
 
-Two such views exist: session search, and artifact search. The artifacts view asks
-`GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the server
-matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored body.
-Searching what is INSIDE an artifact is a later change, and it is a change to that one request.
+Three such views exist: session search, artifact search, and folder search. The artifacts view
+asks `GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the
+server matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored
+body. Searching what is INSIDE an artifact is a later change, and it is a change to that one
+request.
+
+The folders view is the cheapest of the three, and its shape follows from that. Its corpus is
+the folder tree the sidebar already holds under `['chat-folders']`, so a keystroke costs a local
+filter rather than a request: it has no minimum query length, where the two views above each
+hold their first characters back, and no row cap, because the count is the reader's own filing
+rather than a corpus that grows on its own. Entering the view pays for at most one folder read,
+on a cold cache. The folder list used to be spread through the root as its own group instead —
+demoted and capped while the query was empty, so the feature read as missing, and competing with
+commands once it was not.
 
 ## Responsibilities
 
