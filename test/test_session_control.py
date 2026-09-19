@@ -998,6 +998,22 @@ class TestTheRoutesRequireTheInternalSecret:
         assert resp.status == 400
         assert self._body(resp)["code"] == "message_required"
 
+    def test_send_rejects_a_steer_that_is_not_a_boolean(self, tmp_path):
+        """`steer` decides whether the message cuts into a running turn, so the
+        route type-checks it instead of reading truthiness: the string "false" is
+        truthy, and coercing it would interrupt a turn for a caller that asked for
+        the queue."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/send")
+
+        async def _json():
+            return {"target": "chat-2", "message": "hello", "steer": "false"}
+
+        req.json = _json
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+
+        assert resp.status == 400
+        assert self._body(resp)["code"] == "invalid_steer"
+
     def test_send_renders_a_refusal_as_its_status_not_a_500(self, tmp_path, monkeypatch):
         """A SessionControlError from send comes back as its own refusal, the same
         contract create's route holds."""
@@ -1962,7 +1978,7 @@ def test_send_to_an_idle_target_starts_a_turn_with_provenance(tmp_path, monkeypa
 
     out = asyncio.run(_drive())
 
-    assert out == {"ok": True, "target": "chat-2", "started": True}
+    assert out == {"ok": True, "target": "chat-2", "started": True, "steered": False}
     assert ran["slot"] == "chat-2"
     assert ran["prompt"].startswith("[sent by session ")
     assert ran["prompt"].endswith("do the thing")
@@ -2062,6 +2078,213 @@ def test_send_to_a_busy_target_queues_instead_of_racing(tmp_path):
 
     assert out["started"] is False
     assert any("queued message" in q.get("content", "") for q in target._queue)
+
+
+# ── session_send: the mid-turn steer arm ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_steer_cuts_into_the_running_turn_instead_of_queueing(tmp_path):
+    """`steer=True` on a busy target delivers NOW, and delivers exactly once.
+
+    The real ``steer_into_running_turn`` runs here against a steer-capable client,
+    because the whole value of the arm is that the target reads the text during
+    the turn — a stubbed helper would assert the wiring and prove nothing about
+    the delivery. The queue must stay EMPTY: a steered message that is also queued
+    runs twice.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+    target._acp_client = _steerable(accepted=True)
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="stop, that file is already fixed",
+        steer=True,
+    )
+
+    assert out["steered"] is True
+    assert out["started"] is False
+    assert not target._queue, "a steered message must not ALSO be queued"
+    rows = [m for m in target.messages if "already fixed" in m.get("content", "")]
+    assert len(rows) == 1, "a steered delivery leaves exactly one transcript row"
+    # Provenance rides on the TEXT, so it reaches the target agent and the reader
+    # alike: this is what keeps an injected steer from posing as human typing.
+    injected = target._acp_client.steer.await_args.args[0]
+    assert injected.startswith("[sent by session ")
+    assert rows[0]["content"].startswith("[sent by session ")
+
+
+@pytest.mark.asyncio
+async def test_a_steer_the_client_cannot_take_falls_back_to_the_queue(tmp_path):
+    """Steering is best-effort; the message is not.
+
+    With no steer-capable client on the slot the helper answers UNAVAILABLE, and
+    the message must land on the queue rather than be dropped — the caller is told
+    it queued, so it never reads a silent loss as a delivery.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="check the other branch first",
+        steer=True,
+    )
+
+    assert out["steered"] is False
+    assert out["started"] is False
+    assert any("check the other branch first" in q.get("content", "") for q in target._queue)
+
+
+@pytest.mark.asyncio
+async def test_a_steer_requeued_by_the_teardown_is_not_queued_a_second_time(tmp_path):
+    """The turn ended during the steer RPC and its teardown requeued the text.
+
+    It WILL run, so taking the queue arm as well would deliver it twice. The
+    requeue is reproduced the way ``_requeue_unconsumed_steers`` does it: the
+    pending entry becomes a queue entry carrying the steer's delivery id.
+
+    Mutation guard: treating REQUEUED like UNAVAILABLE leaves two entries.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+
+    async def _teardown_requeues(msg):
+        target._pending_steers.remove(msg)
+        target._queue.append(
+            {
+                "id": "q-requeued",
+                "content": msg,
+                "meta": {"steer_delivery_id": target._steer_delivery_ids[msg]},
+            }
+        )
+        return True
+
+    client = MagicMock()
+    client.supports_steer = True
+    client.steer = AsyncMock(side_effect=_teardown_requeues)
+    target._acp_client = client
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="use the other fixture",
+        steer=True,
+    )
+
+    assert out["steered"] is False
+    assert out["started"] is False
+    assert len(target._queue) == 1, "the requeued entry is the delivery; do not add another"
+
+
+@pytest.mark.asyncio
+async def test_the_queue_fallback_re_runs_the_gate_after_the_steer_rpc(tmp_path):
+    """The steer RPC is a suspension, so the gate that admitted the send is stale.
+
+    The queue arm stamps the containment holding at APPEND time for the drain to
+    re-assert. If the target gains a channel link while the RPC is in flight, an
+    unchecked fallback would record that link as "held at admission" and the drain
+    would then read a widened audience as the authorized one. So the fallback
+    re-authorizes and the send is refused instead.
+
+    Mutation guard: drop the re-gate and this queues the message.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+
+    async def _link_then_fail(_msg):
+        # The window this test is about: the target becomes channel-linked while
+        # the steer RPC is suspended, and the RPC then fails to place the text.
+        target.linked_session_key = "telegram:9001"
+        return False
+
+    client = MagicMock()
+    client.supports_steer = True
+    client.steer = AsyncMock(side_effect=_link_then_fail)
+    target._acp_client = client
+
+    with pytest.raises(sc.SessionControlError) as err:
+        await sc.send_to_target(
+            state,
+            caller_session_key=_key(caller),
+            target="chat-2",
+            message="land it on the branch",
+            steer=True,
+        )
+
+    assert err.value.code == "linked_session_target"
+    assert not target._queue, "a target the gate now refuses must not hold the message"
+
+
+@pytest.mark.asyncio
+async def test_steer_on_an_idle_target_just_starts_the_turn(tmp_path, monkeypatch):
+    """An idle slot has no turn to cut into, so `steer` changes nothing.
+
+    The steer path is not merely unused here, it is never entered: on an idle slot
+    the turn-scoped client is already cleared, so entering it would hand the text
+    to nothing.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    entered: list[str] = []
+
+    async def _never(_state, _slot, message):
+        entered.append(message)
+        return cd.STEER_UNAVAILABLE
+
+    monkeypatch.setattr(cd, "steer_into_running_turn", _never)
+
+    async def _fake_run_chat(_state, _slot, _prompt):
+        return None
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+    out = await sc.send_to_target(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        message="pick this up",
+        steer=True,
+    )
+    await asyncio.sleep(0)
+
+    assert out["started"] is True
+    assert out["steered"] is False
+    assert entered == [], "an idle target must not reach the steer path"
+    assert not target._queue
+
+
+@pytest.mark.asyncio
+async def test_a_busy_target_still_queues_when_steer_is_not_asked_for(tmp_path):
+    """The default is unchanged: no `steer`, no injection, even with a live client.
+
+    Mutation guard: defaulting the flag on turns every existing caller's send into
+    a mid-turn interruption.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _busy(_peer_target(state, "chat-2", caller))
+    target._acp_client = _steerable(accepted=True)
+
+    out = await sc.send_to_target(
+        state, caller_session_key=_key(caller), target="chat-2", message="after this turn"
+    )
+
+    assert out["steered"] is False
+    assert out["started"] is False
+    assert target._acp_client.steer.await_count == 0
+    assert any("after this turn" in q.get("content", "") for q in target._queue)
 
 
 def test_send_to_a_remote_bound_target_is_refused_not_run_locally(tmp_path, monkeypatch):
