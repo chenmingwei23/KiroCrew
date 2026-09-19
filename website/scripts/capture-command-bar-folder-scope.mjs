@@ -7,15 +7,19 @@
  *
  * What the frames evidence is one claim: a folder is reached the way a session is
  * — press Enter on a row, then type — and NOT by folder rows spread through the
- * first page. So the three frames are the three states of that path:
+ * first page, and not from a second surface either. So the frames are the states of
+ * that path plus the surface it is NOT on:
  *   1. the root page, where Search Sessions and Search Folders sit as siblings
  *      and no folder NAME appears
  *   2. inside the folders scope with an empty query: the breadcrumb names it, the
  *      placeholder changes, the whole corpus is listed in sidebar order
  *   3. inside the scope with a query: narrowed rows, each with its ancestry path
+ *   4. the host quick-search palette, reached by turning the launcher OFF: typing
+ *      "fold" raises no Folders scope, and Tab adopts none
  *
  * Frame 1 is the load-bearing one: it is the frame that fails if the flat folder
- * group ever comes back.
+ * group ever comes back. Frame 4 is its counterpart for the other direction — it
+ * fails if a second folder search is added back to the surface underneath.
  *
  * Usage: node scripts/capture-command-bar-folder-scope.mjs [outDir]
  */
@@ -55,6 +59,14 @@ const APPS = [
 ]
 
 /**
+ * The same app, DISABLED, which is how frame 4 reaches the surface underneath: a
+ * disabled app claims no slot, so the chord opens the host's own quick-search.
+ * Deliberately not an empty list — the app being absent and the app being off must
+ * look the same to the slot resolver, and using the off case exercises that.
+ */
+const APPS_LAUNCHER_OFF = [{ ...APPS[0], enabled: false }]
+
+/**
  * A NESTED tree, not a flat list: the breadcrumb under a row is the thing a flat
  * fixture cannot photograph, and it is also what makes a name like "oss" readable
  * when two parents both hold one.
@@ -76,7 +88,7 @@ function assert(label, ok, detail = '') {
 const { srv, base } = await serveDist()
 const browser = await chromium.launch()
 
-async function openBar() {
+async function openBar(apps = APPS) {
   const context = await browser.newContext({ viewport: { width: 1500, height: 950 }, deviceScaleFactor: 1 })
   const page = await context.newPage()
 
@@ -86,7 +98,7 @@ async function openBar() {
   // the frames would be of the wrong surface. The assertions below are what caught it.
   const extra = async (path, route) => {
     if (path === '/api/apps') {
-      await json(route, APPS)
+      await json(route, apps)
       return true
     }
     return false
@@ -179,6 +191,40 @@ async function shot(page, name) {
   assert('query narrows the corpus', rows.length < FOLDERS.length, `${rows.length} rows`)
   assert('row carries its parent path', /kirocrew/.test(rows.join(' | ')), rows.join(' | ').slice(0, 200))
   await shot(page, '3-scope-query-narrowed.png')
+  await context.close()
+}
+
+// ── 4. the surface underneath: the host palette has no folders scope ────────
+{
+  const { context, page } = await openBar(APPS_LAUNCHER_OFF)
+  const input = box(page)
+  // Prove WHICH surface this is before asserting anything about it. The launcher's
+  // own field never carries this placeholder, so a frame of the wrong overlay fails
+  // here instead of photographing a vacuous pass.
+  assert(
+    'launcher off, host palette open',
+    (await input.getAttribute('placeholder')) === 'Search for anything',
+    String(await input.getAttribute('placeholder')),
+  )
+
+  // "fold" uniquely prefixes the Folders scope this host used to carry, so it is the
+  // query that would raise the Tab hint if the scope came back.
+  await input.fill('fold')
+  await page.waitForTimeout(500)
+  const dialog = await page.locator('[role="dialog"]').innerText()
+  assert('no folders scope hint', !/Folders/i.test(dialog), dialog.replace(/\n/g, ' | ').slice(0, 200))
+  await shot(page, '4-host-palette-no-folders-scope.png')
+
+  // Tab is what ADOPTS a hinted scope. With no folders provider there is nothing to
+  // adopt, so the placeholder must not narrow and the query must survive.
+  await page.keyboard.press('Tab')
+  await page.waitForTimeout(300)
+  assert(
+    'Tab adopts no folders scope',
+    (await input.getAttribute('placeholder')) === 'Search for anything',
+    String(await input.getAttribute('placeholder')),
+  )
+  assert('query survives the Tab', (await input.inputValue()) === 'fold', await input.inputValue())
   await context.close()
 }
 

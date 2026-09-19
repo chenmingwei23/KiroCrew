@@ -44,6 +44,15 @@ on a cold cache. The folder list used to be spread through the root as its own g
 demoted and capped while the query was empty, so the feature read as missing, and competing with
 commands once it was not.
 
+That corpus lives in THIS app (`apps/command-bar/foldersProvider.ts`), and the host palette
+carries no Folders tab. Reaching a folder by name is a launcher capability, so the launcher owns
+it: the alternative is two implementations of the same gesture, one in the app and one in the
+surface the app replaces, differing over ranking and reveal and answering to nobody. The corpus
+is hook-free for the same reason the session and artifact engines are — the React-Query fetch and
+the `usePaletteActions` route change are wired in `CommandBarOverlay`, which is the only thing
+holding this app's seams. It still renders the host's `Result` row contract, because forking the
+row shape would fork the Enter matrix with it.
+
 ## Responsibilities
 
 1. **Claim the slot** — declare `ui.overlays` in the manifest and take over the `quick-search`
@@ -52,8 +61,8 @@ commands once it was not.
    and cap each group
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
-4. **Scopes** — enter a sub-surface (today: session search, and artifact name search) as a
-   navigation state, with its own engine loaded on entry
+4. **Scopes** — enter a sub-surface (today: session search, artifact name search, and folder
+   search) as a navigation state, with its own engine loaded on entry
 5. **Fallback** — when the root cannot answer, offer the rows that carry the query into the
    sessions view and the artifacts view rather than reporting "no results"
 

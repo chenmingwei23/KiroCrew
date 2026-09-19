@@ -43,7 +43,7 @@ import { appIcon } from '../../components/commandPalette/providers/appsProvider'
 import { sessionStatus, useRecentsProvider } from '../../components/commandPalette/providers/recentsProvider'
 import { createArtifactsProvider } from '../../components/commandPalette/providers/artifactsProvider'
 import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
-import { createFoldersProvider, FOLDERS_STALE_MS } from '../../components/commandPalette/providers/foldersProvider'
+import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
 import { useSessionsProvider } from '../../components/commandPalette/providers/sessionsProvider'
 import type { Result } from '../../components/commandPalette/types'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
@@ -559,15 +559,16 @@ export default function CommandBarOverlay({
   )
 
   /**
-   * The folders view's engine — the palette's own Folders provider, wired to THIS
-   * surface's seams instead of through its `useFoldersProvider` hook.
+   * The folders view's engine — this app's own folders corpus
+   * (`./foldersProvider`), wired to THIS surface's seams.
    *
-   * Reused rather than reimplemented: the provider already owns the sidebar
-   * ordering, the ancestry breadcrumb, the rule that a name match beats a path
-   * match, and the reveal itself. What it must not bring with it is its own
-   * navigation: the hook reaches for `useNavigate` directly, while every route
-   * change in this overlay goes through `usePaletteActions`, and one component
-   * holding two navigation mechanisms is how one of them ends up unexercised.
+   * It lives beside this file rather than under the host palette's providers, and
+   * that is the point: the host carries no Folders tab, so there is one
+   * implementation of "find a folder and land on it" and the app owns it. The
+   * corpus itself is hook-free precisely so the wiring stays here — React-Query for
+   * the fetch, `usePaletteActions` for the route change. Every route change in this
+   * overlay goes through that hook, and one component holding two navigation
+   * mechanisms is how one of them ends up unexercised.
    *
    * Inert on construction, like the two engines above: the fetch runs from
    * `search()`, and the only call site is gated on the folders scope.
