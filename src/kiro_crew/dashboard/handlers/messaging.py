@@ -1917,19 +1917,22 @@ async def api_notification_channel_settings(request: web.Request) -> web.Respons
     # `entry` is the WHOLE stored row, so it carries the owner's routing whenever
     # a route is armed -- and the refusals above fire only when the request TRIED to
     # set routing, or named the display pair while a route was armed. A request that
-    # names neither reaches here, so without this strip the reply hands the app the
-    # two fields the channels GET deliberately withholds from it (`hide_delivery`).
+    # names neither reaches here, so without this strip the reply hands back the two
+    # fields the channels GET deliberately withholds (`hide_delivery`).
     # Withhold on the way out rather than refusing: the strip is response shaping,
-    # and refusing every app request would break the pre-existing contract on the
-    # unrouted channels where the display pair is still the app's to set.
+    # and refusing every such request would break the pre-existing contract on the
+    # unrouted channels where the display pair is still an app's to set.
     #
-    # The WS frame below keeps the full row: the owner's dashboard renders it,
-    # and an app-scoped client is stripped at the per-client WS chokepoint
-    # (`ws_event_scope.channel_settings_for_app`), which also covers the frame
-    # raised by an OWNER's own PUT -- a payload this handler cannot reach.
+    # The WS frame keeps the full row and is shaped per client at the WS chokepoint
+    # (`ws_event_scope.channel_settings_for_app`), which also covers the frame raised
+    # by an OWNER's own PUT -- a payload this handler cannot reach.
     state.broadcast_ws("notification_channel_settings", {"channel": channel, "settings": entry})
+    # The reply is the row's second carrier and takes the same owner question as the
+    # GET: a body naming only a channel is accepted, so a caller that sets nothing
+    # still reads back whatever is stored, and stripping only for an app hands the
+    # route to every other caller without routing authority.
     visible = entry
-    if app_name:
+    if not is_owner:
         visible = {k: v for k, v in entry.items() if k not in DELIVERY_SETTING_KEYS}
     return web.json_response({"ok": True, "channel": channel, "settings": visible})
 

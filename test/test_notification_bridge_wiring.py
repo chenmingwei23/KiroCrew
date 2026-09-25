@@ -727,6 +727,51 @@ class TestDeliveryRoutingIsOwnerOnly:
         ) == ("slack",)
 
     @pytest.mark.asyncio
+    async def test_a_non_owner_dashboard_session_does_not_read_the_route_back_from_its_put(
+        self, monkeypatch, tmp_path
+    ):
+        """The PUT's own reply is a carrier of the row, and it takes the owner question.
+
+        A body naming only a channel is accepted and sets nothing, so neither refusal
+        above sees it -- and the reply then hands back whatever is stored. Shaping that
+        reply for an app alone leaves every other caller without routing authority
+        reading the route it may not change.
+        """
+        state = _make_state(monkeypatch, tmp_path)
+        async with TestClient(TestServer(_make_app(state))) as owner:
+            assert (
+                await owner.put(
+                    "/api/notifications/channels/settings",
+                    json={"channel": "system.cron", "deliver_to": ["slack"]},
+                )
+            ).status == 200
+
+        app = _make_app(state, user=_NON_OWNER_SUBJECT)
+        async with TestClient(TestServer(app)) as other:
+            resp = await other.put(
+                "/api/notifications/channels/settings",
+                json={"channel": "system.cron"},
+            )
+            status, payload = resp.status, await resp.json()
+        assert status == 200, "the no-op PUT itself is not the thing being refused"
+        settings = payload["settings"]
+        assert (
+            "deliver_to" not in settings and "deliver_min_priority" not in settings
+        ), f"the reply handed a non-owner the owner's route: {settings}"
+
+        # Paired, so the strip cannot pass by blanking the owner's own reply.
+        async with TestClient(TestServer(_make_app(state))) as owner:
+            mine = (
+                await (
+                    await owner.put(
+                        "/api/notifications/channels/settings",
+                        json={"channel": "system.cron"},
+                    )
+                ).json()
+            )["settings"]
+        assert mine["deliver_to"] == ["slack"], f"the owner lost their own route: {mine}"
+
+    @pytest.mark.asyncio
     async def test_an_owner_write_takes_over_an_apps_pending_override(self, monkeypatch, tmp_path):
         # The marker describes WHO the pending value came from, so an owner who sets
         # the pair themselves takes ownership of it and arming then leaves it alone.
@@ -1033,9 +1078,56 @@ class TestTheWsFrameWithholdsRoutingFromApps:
         # Paired with the test above: a strip that applied to every client would
         # blank the Settings page's own route picker after any write.
         state = _make_state(monkeypatch, tmp_path)
-        frame = self._serialize(state, {"_is_dashboard_user": True})
+        frame = self._serialize(state, {"_is_owner": True, "_is_dashboard_user": True})
         assert frame["data"]["settings"]["deliver_to"] == ["slack"]
         assert frame["data"]["settings"]["deliver_min_priority"] == "all"
+
+    def test_a_non_owner_dashboard_socket_does_not_receive_the_owners_routing(
+        self, monkeypatch, tmp_path
+    ):
+        """The carrier no client has to ask for, and the widest way to reach it.
+
+        This socket holds no app scope and makes no request: it is simply open while
+        the owner edits a setting. Being a dashboard user is not being the owner --
+        that flag is set from the absence of an app claim, which an allow-listed
+        messaging user's session satisfies -- so keying the exemption on it hands the
+        route to a client that never asked for anything.
+        """
+        state = _make_state(monkeypatch, tmp_path)
+        frame = self._serialize(state, {"_is_dashboard_user": True})
+        settings = frame["data"]["settings"]
+        assert (
+            "deliver_to" not in settings and "deliver_min_priority" not in settings
+        ), f"a non-owner socket received the owner's routing: {settings}"
+        # Still the frame it is entitled to, so this is a withholding of two fields
+        # rather than a dropped event.
+        assert frame["type"] == self._FRAME
+        assert frame["data"]["channel"] == "tidy.build"
+        assert settings["muted"] is True
+
+    def test_the_socket_owner_flag_comes_from_the_owner_predicate(self):
+        """The flag the chokepoint reads is set from ownership, not re-derived.
+
+        Asserted structurally because the value is written in the websocket handler
+        and read three modules away: a flag assigned from anything but the predicate
+        already resolved there would satisfy every behavioural test above while
+        admitting the wrong principal in production.
+        """
+        import ast
+        import pathlib
+
+        source = pathlib.Path("src/kiro_crew/dashboard/ws.py").read_text(encoding="utf-8")
+        assert "owner_request = is_owner_dashboard_request(request)" in source
+        tree = ast.parse(source)
+        assigned = [
+            ast.unparse(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and ast.unparse(target).replace('"', "'") == "ws['_is_owner']"
+        ]
+        assert assigned == ["owner_request"], f"_is_owner is not the owner predicate: {assigned}"
 
     def test_an_unreadable_payload_yields_no_settings_rather_than_the_original(self):
         # The gate must not widen on a shape it cannot read. Returning the object

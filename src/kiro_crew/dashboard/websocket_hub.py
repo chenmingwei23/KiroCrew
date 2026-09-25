@@ -199,6 +199,16 @@ class WebSocketHub:
         default_msg: str,
     ) -> str:
         """Return a payload filtered for one dashboard or app client."""
+        if msg_type == "notification_channel_settings" and not ws.get("_is_owner", False):
+            # Ahead of the dashboard-user shortcut below, because this row carries the
+            # owner's bridge route and "a dashboard user" is a wider set than "the
+            # owner": token auth sets that flag from the absence of an app claim, so an
+            # allow-listed messaging user's own session satisfies it. The frame reaches
+            # such a client with no request of its own, whenever the owner edits any
+            # setting on a channel it can see, so ownership is asked for here.
+            return json.dumps(
+                {"type": msg_type, "data": channel_settings_for_app(data)},
+            )
         if ws.get("_is_dashboard_user", False):
             return default_msg
         if msg_type in ("subagent_batch_update", "subagent_batch_chunks"):
@@ -206,15 +216,6 @@ class WebSocketHub:
                 "_serialize_subagent_batch", self._serialize_subagent_batch
             )
             return serialize_batch(ws, msg_type, data, default_msg)
-        if msg_type == "notification_channel_settings":
-            # The stored row carries the owner's bridge route as well as the
-            # dashboard-local mute, and an app scoped to a channel receives this
-            # frame for it. The event rides the plain `notification` declaration,
-            # which decides only WHETHER the frame is delivered, so the
-            # withholding the settings GET does for an app token happens here.
-            return json.dumps(
-                {"type": msg_type, "data": channel_settings_for_app(data)},
-            )
         if msg_type != "slots":
             return default_msg
         if not isinstance(data, dict) or "slots" not in data:

@@ -355,14 +355,16 @@ def channel_settings_for_app(data: object) -> dict[str, Any]:
 
     The stored row carries the owner's bridge route (``deliver_to``,
     ``deliver_min_priority``) alongside the dashboard-local ``muted``/``priority``.
-    Those two say which chat surfaces the owner's notifications reach, so an app
-    may neither set them (the settings PUT refuses) nor read them (the channels
-    GET withholds them) -- and this frame is the third carrier of the same row,
-    reached whenever the OWNER changes a setting on a channel the app is scoped
-    to see.
+    Those two say which chat surfaces the owner's notifications reach, so a caller
+    without routing authority may neither set them (the settings PUT refuses) nor
+    read them (the channels GET withholds them) -- and this frame is the third
+    carrier of the same row, reached whenever the OWNER changes a setting on a
+    channel that client can see.
 
-    Owner dashboards never come here: the per-client chokepoint returns the
-    unfiltered message for ``_is_dashboard_user`` before calling this.
+    Only the OWNER's own sockets skip this: the per-client chokepoint returns the
+    unfiltered message for a socket carrying ``_is_owner``. A dashboard user is not
+    enough, because that flag is set from the absence of an app claim and an
+    allow-listed messaging user's session satisfies it.
     """
     if not isinstance(data, dict):
         # The gate must not widen on a shape it cannot read. An unexpected
