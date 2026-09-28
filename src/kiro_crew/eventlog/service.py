@@ -45,6 +45,24 @@ logger = logging.getLogger(__name__)
 
 Broadcast = Callable[[str, object], None]
 
+#: Per-append sink the contribution protocol's WebSocket hub attaches
+#: (`dashboard.eventlog_ws.EventLogHub.publish`): it is called once per committed
+#: event, INSIDE the per-slug lock and on the appending thread, so it must only
+#: enqueue and never block or raise. Distinct from ``Broadcast`` above, which
+#: carries a folded projection VALUE to dashboards; this carries the raw event
+#: envelope to log subscribers.
+EventSink = Callable[[str, str, "Event"], None]
+
+#: The unit kind a member log service serves, passed to the event sink so a
+#: subscriber can tell which kind an event belongs to.
+UNIT_KIND = "member"
+
+#: A zero-arg grant re-check the contribution append passes into ``append`` so
+#: the fence is asserted INSIDE the per-slug lock the commit holds, not before it
+#: (see ``eventlog.contrib.assert_grants_unchanged``). Raises to refuse; returns
+#: to proceed.
+FenceCheck = Callable[[], None]
+
 #: Events a prime must have folded past its savepoint before a new one is written.
 #: A savepoint is allowed to LAG -- resuming from an older one replays more tail and
 #: reaches the same value -- so a write is spent only when it saves a meaningful
@@ -461,6 +479,7 @@ class MemberEventLogService:
     def __init__(self, root: Path, broadcast: Broadcast | None = None) -> None:
         self._root = Path(root)
         self._broadcast = broadcast
+        self._event_sink: EventSink | None = None
         self._logs: dict[str, MemberLog] = {}
         self._slug_locks: dict[str, threading.Lock] = {}
         self._map_lock = threading.Lock()
@@ -478,6 +497,17 @@ class MemberEventLogService:
     def attach_broadcast(self, broadcast: Broadcast) -> None:
         self._broadcast = broadcast
 
+    def attach_event_sink(self, sink: "EventSink | None") -> None:
+        """Set the per-append sink that fans events to log subscribers.
+
+        Called once at dashboard startup with the contribution protocol's
+        WebSocket hub. The sink runs INSIDE the per-slug lock, on whatever thread
+        appended, so it must only enqueue -- see
+        ``dashboard.eventlog_ws.EventLogHub.publish``, which does exactly that and
+        never blocks or raises.
+        """
+        self._event_sink = sink
+
     @property
     def root(self) -> Path:
         """The ``member`` crew log root this service is bound to.
@@ -493,6 +523,11 @@ class MemberEventLogService:
     def broadcast(self) -> Broadcast | None:
         """The frame sink attached at dashboard startup, if any."""
         return self._broadcast
+
+    @property
+    def event_sink(self) -> "EventSink | None":
+        """The per-append fan-out sink attached at dashboard startup, if any."""
+        return self._event_sink
 
     def _on_change(self, slug: str, key: str, view: dict, seq: int) -> None:
         if key == types.PROJ_ROSTER:
@@ -1076,12 +1111,25 @@ class MemberEventLogService:
         return unit_ids(KIND_MEMBER)
 
     # ---- write ------------------------------------------------------------
-    def append(self, slug: str, type: str, data: dict) -> Event:
+    def append(
+        self, slug: str, type: str, data: dict, *, fence: "FenceCheck | None" = None
+    ) -> Event:
         lock = self._slug_lock(slug)
         with lock:
             log = self._get_log(slug)
             if log is None:
                 raise FileNotFoundError(f"no member log for {slug!r}; call ensure() first")
+            # Fence re-checked INSIDE the lock the commit holds, never merely
+            # before it: a contribution append offloads unit resolution before it
+            # reaches here, and a teardown landing in that window revokes the
+            # grant and deletes the app's rows -- so a check before the lock
+            # leaves the very window it was meant to close. The projection path
+            # (`contrib.ExternalProjectionStore.publish`) asserts the same fence
+            # inside its own per-unit lock for the same reason. `fence` is
+            # additive: a host-side or unfenced caller passes None and is
+            # unchanged.
+            if fence is not None:
+                fence()
             return self._append_locked(slug, log, type, data)
 
     def append_closer_if_still_applies(
@@ -1259,6 +1307,16 @@ class MemberEventLogService:
         # so replaying the range costs a cell nothing it has seen.
         self._fold_gap_locked(slug, log, below=event["seq"])
         self._registry.drive(slug, event)
+        sink = self._event_sink
+        if sink is not None:
+            try:
+                sink(UNIT_KIND, slug, event)
+            except Exception:
+                # The event is already durable and folded; a subscriber fan-out
+                # fault must not turn a committed append into a failed one. The
+                # subscriber detects the gap on its next seq check and heals with
+                # a catch-up read, which is the contract's own recovery path.
+                logger.debug("eventlog sink failed for %r/%r", slug, type, exc_info=True)
         return event
 
     # ---- read -------------------------------------------------------------
@@ -1307,6 +1365,34 @@ class MemberEventLogService:
                 return []
             return log.history(before, limit)
 
+    def events_after(self, slug: str, *, after: int = -1, limit: int = 200) -> list[Event]:
+        """Oldest-first page of events with ``seq > after`` (contribution protocol §3).
+
+        The catch-up half of the delta channel: a subscriber that lost frames, or
+        one starting cold, folds this page in order and then streams. Returns an
+        empty list for a slug with no log rather than raising -- a caller asking
+        about a unit that does not exist has already been answered 404 by the
+        route's own existence check.
+
+        Built on the log's oldest-first ``iter_events`` fold source rather than the
+        newest-first ``history`` read: a catch-up must see each event once in
+        append order, and the retained tail cannot serve one that started below its
+        floor. ``limit`` bounds the page so the cost is the page's size, not the
+        log's length.
+        """
+        lock = self._slug_lock(slug)
+        with lock:
+            log = self._get_log(slug)
+            if log is None:
+                return []
+            out: list[Event] = []
+            for event in log.iter_events():
+                if event.get("seq", -1) > after:
+                    out.append(event)
+                    if len(out) >= limit:
+                        break
+            return out
+
     def last_seq(self, slug: str) -> int:
         lock = self._slug_lock(slug)
         with lock:
@@ -1353,6 +1439,8 @@ def get_service() -> MemberEventLogService:
         if _singleton is None or _singleton.root != root:
             previous = _singleton
             _singleton = MemberEventLogService(root, previous.broadcast if previous else None)
+            if previous is not None and previous.event_sink is not None:
+                _singleton.attach_event_sink(previous.event_sink)
         return _singleton
 
 

@@ -74,6 +74,15 @@ ALL_EVENT_TYPES = frozenset(
 #: and a typo must be refused, not written as a foreign event nothing folds.
 RESERVED_EVENT_NAMESPACES = frozenset({"member", "activity", "slot", "patrol"})
 
+#: Maximum nesting depth of an event ``data`` or a projection ``value``.
+#:
+#: Lives here, with the vocabulary, because BOTH halves need the same number:
+#: ``eventlog.contrib`` refuses anything deeper at the door, and
+#: ``eventlog.service._redact_projection_value`` stops descending at it, so the
+#: recursive redaction pass every egress runs cannot raise ``RecursionError`` on
+#: a payload the door accepted -- nor on one an older release already stored.
+MAX_VALUE_DEPTH = 32
+
 
 def is_contributed_event_type(type_: str) -> bool:
     """Whether *type_* is a well-formed contributor event type.

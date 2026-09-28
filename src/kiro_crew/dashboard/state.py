@@ -5538,6 +5538,17 @@ class DashboardState:
             get_service().attach_broadcast(self.broadcast_ws)
         except Exception:
             logger.debug("eventlog attach_broadcast failed", exc_info=True)
+        # Wire the contribution protocol's delta channel: every append is
+        # enqueued for the app sockets subscribed to that unit. Separate from the
+        # broadcast sink above -- that one carries WHOLE PROJECTED VALUES to
+        # dashboards, this one carries raw envelopes to contributors, and the two
+        # have opposite client rules (higher-seq-wins vs no-folding-across-a-gap).
+        try:
+            from kiro_crew.dashboard.eventlog_ws import attach_to_service
+
+            attach_to_service()
+        except Exception:
+            logger.debug("eventlog subscription hub attach failed", exc_info=True)
         # Runtime services share the gateway's policy, never a model-supplied mode.
         from kiro_crew.dashboard.handlers._shared import (
             live_session_memory_mode,
@@ -9684,6 +9695,35 @@ def _notification_io_executor() -> concurrent.futures.ThreadPoolExecutor:
                     max_workers=1, thread_name_prefix="notif-io"
                 )
     return _notification_io_pool
+
+
+# One worker, for the same reason the notification pool has one: the per-member
+# event log is an ORDER-BEARING file, and the default executor has many threads.
+# Two appends for the same member handed to it race for the log's lock, so the
+# one submitted second can land first -- and a projection folded from that log
+# then regresses (an older message preview or an already-ended patrol wins).
+# Rapid messages and a patrol start/stop pair are exactly the traffic that hits
+# it. A single worker makes submission order the write order.
+_member_log_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_member_log_pool_lock = threading.Lock()
+
+
+def _member_log_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily create the single-worker executor for per-member log appends.
+
+    Creation is locked and double-checked for the reason spelled out on
+    ``_notification_io_executor``: an unlocked check-then-set lets two callers each
+    build a pool and proceed unserialised against each other, which is the one
+    guarantee this executor exists to give.
+    """
+    global _member_log_pool
+    if _member_log_pool is None:
+        with _member_log_pool_lock:
+            if _member_log_pool is None:
+                _member_log_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="member-log"
+                )
+    return _member_log_pool
 
 
 def _persist_notification(note: dict[str, str]) -> bool:

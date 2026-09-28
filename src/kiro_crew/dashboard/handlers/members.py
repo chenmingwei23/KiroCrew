@@ -86,14 +86,37 @@ def _roster_only(snap: dict) -> dict:
 
     values = snap.get("values", {}) if isinstance(snap, dict) else {}
     roster = values.get(eventlog_types.PROJ_ROSTER) if isinstance(values, dict) else None
-    return {
+    out_values: dict = {} if roster is None else {eventlog_types.PROJ_ROSTER: roster}
+    kept_seqs: dict = {}
+    kept_schemas: dict = {}
+    # Contributed rows (contribution protocol §5) are keyed `<app>/<key>` and are
+    # NOT built-in projection keys, so they are not one of the three drawer views
+    # the roster narrowing drops for cost -- they ARE roster-line content a client
+    # renders inline, so carry them (with their own seqs/schemas) through.
+    if isinstance(values, dict):
+        seqs = snap.get("seqs", {}) if isinstance(snap, dict) else {}
+        schemas = snap.get("schemas", {}) if isinstance(snap, dict) else {}
+        for key, value in values.items():
+            if key in eventlog_types.ALL_PROJECTION_KEYS:
+                continue
+            out_values[key] = value
+            if isinstance(seqs, dict) and key in seqs:
+                kept_seqs[key] = seqs[key]
+            if isinstance(schemas, dict) and key in schemas:
+                kept_schemas[key] = schemas[key]
+    result: dict = {
         "asOfSeq": (
             snap.get("asOfSeq", _SEQ_UNATTRIBUTABLE)
             if isinstance(snap, dict)
             else _SEQ_UNATTRIBUTABLE
         ),
-        "values": {} if roster is None else {eventlog_types.PROJ_ROSTER: roster},
+        "values": out_values,
     }
+    if kept_seqs:
+        result["seqs"] = kept_seqs
+    if kept_schemas:
+        result["schemas"] = kept_schemas
+    return result
 
 
 def _logged_slugs(svc) -> set[str]:
@@ -723,6 +746,51 @@ async def api_members(request: web.Request) -> web.Response:
         return out
 
     projections = await asyncio.to_thread(_project_rows)
+
+    # Contribution protocol §5: an installed app's published projection rows ride
+    # the SAME `values` map as the built-in keys, so a client needs no second code
+    # path. Their seqs go in a sibling `seqs` map because a contributed row's seq
+    # is its OWN fold position, not the response's `asOfSeq` -- seeding one at
+    # `asOfSeq` would make the store's higher-seq-wins rule drop the contributor's
+    # next live push. `store.values` does a lazy disk read (`_ensure_loaded`), so
+    # this runs in a worker thread alongside the roster fold, never on the serving
+    # loop. Best-effort and merged after the roster fold, so a store fault leaves
+    # the built-in roster untouched.
+    def _merge_contributed(blocks: dict) -> None:
+        try:
+            from kiro_crew.eventlog.contrib import get_store
+        except Exception:
+            return
+        try:
+            store = get_store()
+        except Exception:
+            return
+        for row in rows:
+            slug = row["slug"]
+            try:
+                external = store.values("member", slug)
+            except Exception:
+                logger.debug("contributed projections failed for %r", slug, exc_info=True)
+                continue
+            if not external:
+                continue
+            block = blocks.setdefault(slug, {"asOfSeq": _SEQ_UNATTRIBUTABLE, "values": {}})
+            block.setdefault("values", {})
+            seqs: dict = block.setdefault("seqs", {})
+            schemas: dict = block.setdefault("schemas", {})
+            for key, ext in external.items():
+                if ext.seq < 0 and ext.value is None:
+                    # A schema published before the first fold: nothing to render.
+                    continue
+                block["values"][key] = ext.value
+                seqs[key] = ext.seq
+                if ext.schema is not None:
+                    schemas[key] = ext.schema
+            if not schemas:
+                block.pop("schemas", None)
+
+    await asyncio.to_thread(_merge_contributed, projections)
+
     # Same network-boundary redaction as the /history read and the projection
     # WS push: a projection block carries agent-authored free-text (an activity
     # record's `project`, message previews) and `svc.snapshot()` returns it raw,
