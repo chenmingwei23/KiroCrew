@@ -871,22 +871,20 @@ class TestSubdirGates:
     def test_contained_join_degrades_to_none_on_a_symlink_loop(self, tmp_path):
         # A real loop, not a faked OSError. The callers that re-check containment
         # after a third-party script wrote to the checkout need a value, never a
-        # raise, and never a path outside the root. What that value is depends on
-        # the kernel: POSIX non-strict `Path.resolve` reports ELOOP as
-        # RuntimeError for the link and for anything under it, so both joins
-        # degrade to None. Windows raises on the self-pointing link ITSELF (the
-        # resolve's stat fails, so the join degrades to None) but resolves a child
-        # beneath it lexically, without an error, to a path under the root.
+        # raise, and never a path that a later read/write would follow THROUGH the
+        # loop. A self-pointing directory link must therefore fail closed to None,
+        # for the link itself and for anything named beneath it, on every
+        # platform. POSIX gets this for free: non-strict `Path.resolve` walks the
+        # link and raises ELOOP as RuntimeError. Windows does NOT -- non-strict
+        # resolve lexically collapses the reparse point and hands back a
+        # contained-LOOKING path -- so `_contained_join` resolves the target
+        # strictly, which forces the OS to walk it and raise on the loop on
+        # Windows too. This asserts that fail-closed result on both.
         root = tmp_path / "root"
         root.mkdir()
         os.symlink("pkg", str(root / "pkg"))
-        for subdir, windows_answers_a_path in (("pkg", False), ("pkg/app.json", True)):
-            joined = registry._contained_join(root, subdir)
-            if sys.platform == "win32" and windows_answers_a_path:
-                assert joined is not None
-                assert joined.is_relative_to(root.resolve())
-            else:
-                assert joined is None
+        for subdir in ("pkg", "pkg/app.json"):
+            assert registry._contained_join(root, subdir) is None
 
 
 # ---------------------------------------------------------------------------
