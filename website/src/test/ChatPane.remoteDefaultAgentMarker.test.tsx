@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { ReactNode } from 'react'
-import { render, waitFor } from '@testing-library/react'
+import { render, waitFor, screen, fireEvent, within } from '@testing-library/react'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -32,7 +32,15 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 }),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
-    models: vi.fn().mockResolvedValue([{ model_name: 'auto', description: 'Models chosen by task' }]),
+    models: vi.fn().mockResolvedValue([
+      { model_name: 'auto', description: 'Models chosen by task' },
+      { model_name: 'gpt-6-sol[low]', description: 'GPT low' },
+      { model_name: 'gpt-6-sol[medium]', description: 'GPT medium' },
+    ]),
+    chatSlotSelectionCapabilities: vi.fn().mockResolvedValue({ known: false }),
+    chatSlotReasoningEffort: vi.fn().mockImplementation(async (_slot: string, effort: string) => ({ reasoning_effort: effort, model: 'gpt-6-sol' })),
+    chatSlotModel: vi.fn().mockImplementation(async (_slot: string, model: string) => ({ model })),
+    effortLevels: vi.fn().mockResolvedValue(['low', 'medium', 'high']),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
     workspaces: vi.fn().mockResolvedValue({ workspaces: [] }),
@@ -57,6 +65,7 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatPane from '../components/ChatPane'
+import { api } from '../api/client'
 
 function makeStore(slotKey: string, slot: Record<string, unknown>) {
   return configureStore({
@@ -128,5 +137,115 @@ describe('ChatPane — inherited-default label resolves the peer default on a re
     renderPane('pane-remote-loading', { agent: '', executor: 'remote', instance_id: 'inst-2' })
     await waitFor(() => expect(document.querySelector('button svg.lucide-bot')).not.toBeNull())
     expect(agentChipText()).not.toContain('localboss')
+  })
+})
+
+// Model + effort are ONE control (docs/decisions/2026-06-14): the capability
+// read decides whether the model picker embeds the effort slider, and the
+// composer never grows a standalone effort button.
+describe('ChatPane — ACP model and effort controls', () => {
+  it('groups Codex pair IDs and embeds effort inside the model picker in a split pane', async () => {
+    vi.mocked(api.chatSlotSelectionCapabilities).mockResolvedValueOnce({
+      known: true, backend: 'codex', effort_supported: true,
+      effort_levels: ['low', 'medium', 'high'], model_effort_pair_ids: true,
+    })
+    renderPane('pane-codex', { model: 'gpt-6-sol[medium]', reasoning_effort: '' })
+    // The chip names the level in force; there is no second composer control.
+    // `aria-label` replaces the chip's content in its accessible name, so the
+    // level has to be IN it (and in the hover title) or it is announced nowhere.
+    const modelChip = await screen.findByTitle('Model: gpt-6-sol · Reasoning effort: Medium')
+    expect(modelChip.textContent).toContain('Medium')
+    expect(modelChip).toHaveAccessibleName('Model: gpt-6-sol · Reasoning effort: Medium')
+    expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+    fireEvent.click(modelChip)
+    const dialog = await screen.findByRole('dialog', { name: 'Model list' })
+    const modelList = within(dialog).getByRole('listbox', { name: 'Model list' })
+    expect(modelList.textContent).toContain('gpt-6-sol')
+    expect(modelList.textContent).not.toContain('gpt-6-sol[low]')
+    expect(modelList.textContent).not.toContain('gpt-6-sol[medium]')
+    // The slider renders INSIDE the picker dialog, over the advertised levels.
+    const slider = await within(dialog).findByRole('slider', { name: 'Reasoning effort' })
+    expect(slider).toHaveAttribute('aria-valuemax', '2')
+    expect(within(dialog).getByRole('switch', { name: 'Use default effort' })).toBeInTheDocument()
+    expect(api.effortLevels).not.toHaveBeenCalled()
+  })
+
+  it('keeps advertised model IDs and shows no effort row when the ACP backend reports none', async () => {
+    vi.mocked(api.chatSlotSelectionCapabilities).mockResolvedValueOnce({
+      known: true, backend: 'claude', effort_supported: false,
+      effort_levels: [], model_effort_pair_ids: false,
+    })
+    renderPane('pane-claude', { model: 'gpt-6-sol[medium]' })
+    await waitFor(() => expect(api.chatSlotSelectionCapabilities).toHaveBeenCalledWith('pane-claude'))
+    expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+    const modelChip = await screen.findByTitle('Model: gpt-6-sol[medium]')
+    fireEvent.click(modelChip)
+    const dialog = await screen.findByRole('dialog', { name: 'Model list' })
+    expect(within(dialog).queryByRole('slider', { name: 'Reasoning effort' })).toBeNull()
+  })
+
+  it('moves a legacy pair level into the slot before changing its model', async () => {
+    vi.mocked(api.chatSlotSelectionCapabilities).mockResolvedValueOnce({
+      known: true, backend: 'codex', effort_supported: true,
+      effort_levels: ['low', 'medium', 'high'], model_effort_pair_ids: true,
+    })
+    renderPane('pane-migration', { model: 'gpt-6-sol[medium]', reasoning_effort: '' })
+    const modelChip = await screen.findByTitle(/^Model: gpt-6-sol · /)
+    fireEvent.click(modelChip)
+    fireEvent.click(await screen.findByRole('option', { name: /gpt-6-sol/ }))
+    await waitFor(() => expect(api.chatSlotModel).toHaveBeenCalledWith('pane-migration', 'gpt-6-sol'))
+    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('pane-migration', 'medium')
+    expect(vi.mocked(api.chatSlotReasoningEffort).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(api.chatSlotModel).mock.invocationCallOrder[0])
+  })
+
+  it('keeps the model picker (and its embedded slider) inside a 320px viewport', async () => {
+    vi.mocked(api.chatSlotSelectionCapabilities).mockResolvedValueOnce({
+      known: true, backend: 'codex', effort_supported: true,
+      effort_levels: ['low', 'medium', 'high'], model_effort_pair_ids: true,
+    })
+    renderPane('pane-narrow', { model: 'gpt-6-sol[medium]' })
+    const modelChip = await screen.findByTitle(/^Model: gpt-6-sol · /)
+    modelChip.getBoundingClientRect = () => new DOMRect(280, 500, 24, 28)
+    vi.stubGlobal('innerWidth', 320)
+    try {
+      fireEvent.click(modelChip)
+      const dialog = await screen.findByRole('dialog', { name: 'Model list' })
+      await within(dialog).findByRole('slider', { name: 'Reasoning effort' })
+      // 320 - 348 < 8 -> clamped to the 8px gutter.
+      expect(dialog).toHaveStyle({ left: '8px' })
+      // Capped to the space above the chip (top 500 - 12), like
+      // ModelEffortDropdown: the effort block adds height, and only the model
+      // list may shrink to absorb it in a short split pane.
+      expect(dialog).toHaveStyle({ maxHeight: '488px' })
+      expect(dialog).toHaveClass('flex', 'flex-col', 'overflow-hidden')
+      expect(within(dialog).getByRole('listbox', { name: 'Model list' })).toHaveClass('min-h-[96px]', 'flex-1', 'overflow-y-auto')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps the picker cap at the space above a chip near the viewport top', async () => {
+    // Three stacked split-down panes on a 768px display put the chip ~120px
+    // from the top. The dialog is bottom-anchored, so a cap larger than that
+    // space would overhang the viewport top and hide the filter; instead the
+    // model list (the only child allowed to shrink) absorbs the overflow
+    // while the filter row keeps its height. Same cap as ModelEffortDropdown.
+    vi.mocked(api.chatSlotSelectionCapabilities).mockResolvedValueOnce({
+      known: true, backend: 'codex', effort_supported: true,
+      effort_levels: ['low', 'medium', 'high'], model_effort_pair_ids: true,
+    })
+    renderPane('pane-stacked', { model: 'gpt-6-sol[medium]' })
+    const modelChip = await screen.findByTitle(/^Model: gpt-6-sol · /)
+    modelChip.getBoundingClientRect = () => new DOMRect(280, 120, 24, 28)
+    fireEvent.click(modelChip)
+    const dialog = await screen.findByRole('dialog', { name: 'Model list' })
+    await within(dialog).findByRole('slider', { name: 'Reasoning effort' })
+    expect(dialog).toHaveStyle({ maxHeight: '108px' })
+    expect(within(dialog).getByPlaceholderText('Type to filter…').parentElement).toHaveClass('shrink-0')
+    expect(within(dialog).getByRole('listbox', { name: 'Model list' })).toHaveClass('min-h-[96px]', 'flex-1')
+    // Once the cap is smaller than the fixed rows themselves, the body column
+    // scrolls so the effort block stays reachable instead of being clipped.
+    expect(within(dialog).getByRole('listbox', { name: 'Model list' }).parentElement).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto')
   })
 })

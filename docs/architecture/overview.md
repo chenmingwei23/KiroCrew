@@ -447,12 +447,20 @@ Outer to inner:
    only as strong as the config, and the agent can write agent JSON. Rules are
    default-ON and user-configurable from Settings → Security; the governance
    `commands` scope is the force-pin a user cannot opt out of. Sensitive-path
-   blocking (`~/.aws`, `~/.ssh`, the trust-root files) runs here too.
+   blocking (`~/.aws`, `~/.ssh`, the trust-root files) runs here too — for the
+   **file tools' resolved paths**. A shell command's text is deliberately not
+   path-matched; what a spawned shell can `open()` is decided by the OS sandbox
+   tier below.
 4. **OS sandbox** (`sandbox.py`). `agent.sandbox` defaults to `auto`, engaging
    OS-level isolation (user namespaces on Linux, `sandbox-exec`/Seatbelt on
-   macOS). On macOS, when kiro-cli's own internal sandbox is enabled, Kiro Crew
-   delegates to it instead (the two are mutually exclusive because nested
-   Seatbelt profiles fail with EPERM). Set to `off` to skip Kiro Crew's sandbox.
+   macOS) at the **standard** tier, which masks `~/.gnupg`, `~/.docker`,
+   `~/.azure`, `~/.config/gcloud` and the crew vault but deliberately leaves
+   `~/.aws`, `~/.ssh` and `~/.kube` visible so the `aws` CLI,
+   `credential_process`, git-over-SSH and `kubectl` work inside the agent. Set
+   `strict` to also mask those (at the cost of those tools); set `off` to skip
+   Kiro Crew's sandbox. On macOS, when kiro-cli's own internal sandbox is
+   enabled, Kiro Crew delegates to it instead of applying either tier (the two
+   are mutually exclusive because nested Seatbelt profiles fail with EPERM).
 5. **Output redaction.** Credential shapes (AWS access key IDs, presigned-URL
    credential parameters, and more) are scrubbed before text reaches a user or
    an egress tool.
@@ -684,7 +692,7 @@ detail; this table is only an index.
 |---|---|---|
 | ACP client (JSON-RPC transport to kiro-cli) | `src/kiro_crew/acp/` | [acp-client.md](../system-specs/modules/acp-client.md) |
 | App Kit platform contracts | `src/kiro_crew/apps/` | [app-kit-platform.md](../system-specs/modules/app-kit-platform.md) |
-| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py` | [artifacts.md](../system-specs/modules/artifacts.md) |
+| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py`, `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
 | Browser automation auth layer | `src/kiro_crew/browser/` | [browser.md](../system-specs/modules/browser.md) |
 | Channel history buffer | `src/kiro_crew/channel_history.py` | [channel-history.md](../system-specs/modules/channel-history.md) |
 | CLI surface | `src/kiro_crew/cli.py` | [cli.md](../system-specs/modules/cli.md) |
@@ -706,7 +714,7 @@ detail; this table is only an index.
 | Messaging transport abstraction | `src/kiro_crew/messaging/` | [messaging.md](../system-specs/modules/messaging.md) |
 | Metrics telemetry (default off) | `src/kiro_crew/metrics/` | [metrics.md](../system-specs/modules/metrics.md) |
 | Mochi app (desktop pet) | `src/kiro_crew/apps/builtins/mochi/` | [mochi.md](../system-specs/modules/mochi.md) |
-| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
+| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py`, `onboarding_scan.py`, `onboarding_plan.py`, `onboarding_apply.py`, `onboarding_sources/` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
 | Papyrus app (LaTeX authoring) | `src/kiro_crew/apps/builtins/papyrus/` | [papyrus.md](../system-specs/modules/papyrus.md) |
 | Persistent agent channels | `src/kiro_crew/channel.py` | [persistent-agent-channels.md](../system-specs/modules/persistent-agent-channels.md) |
 | Platform context (CPP seam) | `src/kiro_crew/platform/` | [platform-context.md](../system-specs/modules/platform-context.md) |

@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Protocol
 
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS
 from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 MIN_MONITOR_CADENCE_SECS = 15
 MAX_MONITOR_CADENCE_SECS = 86_400
-MAX_MONITOR_RUNTIME_SECS = 604_800
+MAX_MONITOR_RUNTIME_SECS = MAX_RUNTIME_CEILING_SECS
 MAX_MONITOR_AGENT_TURNS = 8
 MAX_MONITOR_TOKENS = 1_000_000
 MAX_MONITOR_PROVIDER_ERRORS = 20
@@ -39,8 +40,6 @@ MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
 MAX_MONITOR_STOP_REASON_CHARS = 500
 MAX_MONITOR_CHECK_NAMES = 8
 MAX_MONITOR_PROVIDER_CONCURRENCY = 4
-MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET = 100
-MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 # The normal turn ceiling is two hours. One extra minute lets the raw completion
 # callback win the timeout race while keeping missing evidence restart-durable
 # and bounded.
@@ -417,6 +416,8 @@ class MonitorBudgets:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_runtime_secs > MAX_MONITOR_RUNTIME_SECS:
+            raise ValueError(f"max_runtime_secs must be at most {MAX_MONITOR_RUNTIME_SECS}")
         if self.max_agent_turns > DEFAULT_MONITOR_AGENT_TURNS:
             raise ValueError(f"max_agent_turns must be at most {DEFAULT_MONITOR_AGENT_TURNS}")
 
@@ -960,6 +961,26 @@ class MonitorState:
     #: anything was observed. Counted apart from wakes so the metering does not
     #: report a periodic delivery as a real signal.
     floor_ticks: int = 0
+    #: True from the tick that DECIDES a floor delivery until that delivery is
+    #: CONFIRMED.
+    #:
+    #: The decision publishes a reset ``quiet_streak`` durably, so the only record
+    #: that a turn was due is gone the moment the decision lands -- while the
+    #: in-process claim carrying the debt lives in memory. A gateway death in
+    #: between therefore keeps the half that suppresses and loses the half that
+    #: delivers: the next tick reads a subject that has not changed against a
+    #: baseline written for a turn nobody received, answers quiet, and the forced
+    #: delivery moves a whole floor away with nothing saying one was owed.
+    #: ``followup_ticks`` is not the backstop, because it answers a fire the slot
+    #: REFUSED and a process that stopped refuses nothing.
+    #:
+    #: So the debt is durable and outlives the fire. Finding it set on a later tick
+    #: means a floor delivery is still owed, and that tick fires WITHOUT observing:
+    #: re-observing would read the same unchanged subject and answer quiet again.
+    #: It is discharged at the one point delivery is confirmed -- the same point
+    #: that charges ``floor_ticks`` -- so a refusal and a death both leave it owed,
+    #: and a retried delivery is charged exactly once.
+    floor_fire_pending: bool = False
     #: True from just before a probe runs until its verdict has been consumed.
     #:
     #: The kernel commits its dedupe state BEFORE raising a wake, which is right
@@ -1052,6 +1073,12 @@ class MonitorState:
         # unreadable value becomes True and costs at most one turn.
         if not isinstance(self.poll_in_flight, bool):
             self.poll_in_flight = True
+        # Normalised toward doubt for the same reason, and the fail-safe runs the
+        # same way: an unreadable value here means a forced turn may be owed, and
+        # ``bool("")`` would clear that and suppress it. One turn spent beats one
+        # lost, and the flag clears itself on the delivery it asks for.
+        if not isinstance(self.floor_fire_pending, bool):
+            self.floor_fire_pending = True
         # The marker carries an outcome name, so an unreadable value cannot be
         # guessed. Keep it PENDING and record the cautious classification: a
         # delivery still happens, and a subject wrongly called blocked prompts a
@@ -1288,6 +1315,9 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         target=_identity("target"),
         objective=_identity("objective"),
         created_ts=created_ts,
+        # An inert quarantine must be constructible even below the ordinary
+        # default runtime. The original invalid budget remains in _raw_payload.
+        budgets=MonitorBudgets(max_runtime_secs=1),
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
         _raw_payload=raw_payload,

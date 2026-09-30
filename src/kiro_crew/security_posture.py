@@ -848,7 +848,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "Onboarding import",
-        "onboarding_import.py",
+        "onboarding_scan.py",
         "Imported foreign-agent history and config before it enters Kiro Crew.",
     ),
     (
@@ -876,7 +876,9 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
         "Outbound raster payloads",
         "messaging/outbound_files.py",
-        "Exact raster bytes pass both credential and exfiltration-URL scanners " "before upload.",
+        "Exact raster bytes go through platform.binary_content_is_flagged -- the "
+        "one binary-content scan every file-delivery gate shares -- before upload, "
+        "so this leg and those gates give one answer to one question.",
     ),
     (
         "Slack member-memory refusal",
@@ -1224,8 +1226,41 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "File cards broadcast to the browser",
         "dashboard/handlers/files.py",
         "The file-card JSON pushed over the chat WebSocket is redacted before "
-        "broadcast. (This module's other redact() calls are upload GATES — they "
-        "abort a send when redaction would alter the content — not egress.)",
+        "broadcast. (Apart from the owner's file read and diff on the next row, "
+        "this module's other redact() calls are upload GATES — they abort a send "
+        "when redaction would alter the content — not egress.)",
+    ),
+    (
+        "File viewer read and diff for the owner",
+        "dashboard/handlers/files.py",
+        "The file body returned by the dashboard's file read (api_file_read) — "
+        "the chat side panel's Files tab, and the Library and Artifacts session-"
+        "document previews and re-reads that use the same route — and the "
+        "original and diff bodies returned by the matching file diff "
+        "(api_file_diff), which the panel compares that buffer against. Both "
+        "scanners run for every caller EXCEPT the dashboard owner with the "
+        "credential-redaction switch turned off (Settings → Security → "
+        "Credential redaction in file views): then these two responses run the exfil-URL "
+        "pass alone, in the owner's own dashboard only, with one verdict per "
+        "request so neither side is raw while the other is masked. The switch "
+        "defaults to on, "
+        "is stored on the keystone floor the agent cannot write, and every flip "
+        "is audited.",
+    ),
+    (
+        "Slide-deck render screen and conversion diagnostic",
+        "dashboard/handlers/office_slides.py",
+        "The .pptx/.ppt slide renderer screens the deck's rendered text through "
+        "the credential redactor then the exfiltration-URL redactor BEFORE it "
+        "rasterizes any page (`_screen_rendered_text`): a slide PNG is a picture "
+        "of that text and cannot be redacted after the fact, so a deck whose "
+        "visible text either scanner would change is not rendered at all -- the "
+        "manifest answers `content_redacted` and the panel falls back to the "
+        "text outline, which the file-preview route redacts per slide. The same "
+        "credential-then-URL chain also scrubs the conversion child's stderr "
+        "tail before it is logged or returned as `detail`. Both scanners run "
+        "over the full text; a scanner that raises drops the field rather than "
+        "emitting it, and the render is refused rather than served unredacted.",
     ),
     (
         "MCP custom server specs",
@@ -1517,6 +1552,13 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "environment map is those four named keys and no others, and is omitted "
         "entirely unless a caller asks for it.",
     ),
+    (
+        "MCP launch approval display records",
+        "mcp_gateway/launch_approval.py",
+        "Command and argument display values persisted in the sealed approval store "
+        "and returned by dashboard status. Both shared redactors run before storage, "
+        "so raw launch values do not enter durable operator-facing state.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -1529,16 +1571,45 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
 # catches an omission.
 NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
     {
+        # The redaction cards' owner-only route (allowed hosts). It applies no
+        # redactor; the call-site scan matches its
+        # handler names (`api_redaction_allow_host`, ...).
+        "dashboard/handlers/redaction.py",
+        # Gate-side: the link-preview route runs both redactors on the URL it was
+        # asked to fetch only to REFUSE it (`400 blocked_url`) when either would
+        # change it, so a zero-click fetch never carries what redaction removes.
+        # Nothing it returns is redacted text, so it is a gate, not an egress sink.
+        "dashboard/handlers/link_meta.py",
         # Drives the backup redaction pass and reports what it did, but applies no
         # redactor itself: the outbound bytes are rewritten in `snapshot_redact.py`,
         # which is the registered sink. What matches the call-site scan here are the
         # orchestration and reporting names (`_redacted_upload_copy`,
         # `_report_redaction`, `_report_redacted_bundle`).
         "snapshot.py",
+        # Defines the shared external-text redactor used by output boundaries and
+        # creation guards. It emits nothing itself.
+        "external_text.py",
+        # Consumes that redactor as a yes/no predicate, not as a rewrite:
+        # `is_dispatchable_member_name` asks whether a stored Crew Member name
+        # WOULD need redaction and refuses the pin when it would. Nothing is
+        # emitted here; the chat routes that act on the answer are the sinks.
+        "members.py",
         # Inbound / gate-side: redacts what comes IN or what a gate logs, not what
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Capture-side, not egress: redacts a Slack thread's first message as it
+        # is READ from Slack, before the text is kept for the model's fenced
+        # thread-context block and for the transcript's display-only notice row.
+        # It owns no output of its own. The model prompt is built by context.py
+        # and the transcript is shown through the dashboard routes, which are the
+        # surfaces that carry the text onward.
+        "slack/thread_parent.py",
+        # Gate-side audit hygiene: the tool gate clips and redacts the tool labels
+        # and refusal reason of each permission decision before writing them to
+        # the SEL audit log. That is a local audit record, not an output bound for
+        # a human or a third party.
+        "permission_floor.py",
         # Transfer-side log hygiene: both redact a URL down to scheme+host before it
         # reaches a gateway log line ("Downloading %s from %s", a fetch failure, a
         # manifest that overran its byte bound). The url is operator- or
@@ -1625,6 +1696,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "subagent_manager/monitoring.py",
         "subagent_manager/run.py",
         "subagent_manager/terminal.py",
+        # Internal partitions behind the single registered
+        # ``apps/builtins/aws_control/backend/backup.py`` boundary, which keeps every
+        # outbound archive and label PUT. ``egress_text`` defines the redaction sequence
+        # the engine applies to exported conversation rows, published and foreign labels
+        # and the recorded nightly failure text; ``nightly`` applies it to that failure
+        # text, which the status route serves (the call-site scan matches its read of the
+        # outbound-redaction switch, ``_unattended_sessions_redaction_gap``);
+        # ``retention`` redacts only its gate-side log lines and SEL audit text. The split
+        # adds no transport or audience and therefore no posture row.
+        "apps/builtins/aws_control/backend/backup_parts/egress_text.py",
+        "apps/builtins/aws_control/backend/backup_parts/nightly.py",
+        "apps/builtins/aws_control/backend/backup_parts/retention.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
@@ -1702,6 +1785,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # no output of its own -- the registered sinks are the modules that call
         # it (slack/format.py, messaging/renderer.py).
         "messaging/display_safety.py",
+        # Also a caller-injected redactor, applied to DECIDE rather than to emit:
+        # the splitter grades the boundaries a length budget chose, so a key the
+        # cut would sever is not handed to a reader across two messages, and it
+        # redacts the text it hands back only when no budget cuts it safely. The
+        # chunks go to the module that asked for them, which is the registered
+        # sink (slack/format.py, messaging/renderer.py and the channel renderers).
+        "messaging/split.py",
         # ``autonudge.py``'s ``_load`` credential-scrubs a persisted ``banner`` in
         # memory and attempts to persist the masked value back, so a banner
         # written to the store out-of-band (a hand-edited file, or a direct
@@ -1714,6 +1804,21 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # read, not an egress pass.
         "autonudge.py",
         "autonudge_authz.py",
+        # Applies no redactor at all: the pipeline conductor's fleet probe BUILDS a
+        # command fragment for a `BANNED` line out of what can hold no secret -- a
+        # runner or launcher name drawn from a fixed vocabulary, and an option name
+        # with its value dropped, the cap flag's digits included -- and withholds
+        # every other token, counting it as `+<n>`. What matches the call-site scan
+        # here is the name of that builder (`_redacted_command`), not a call to a
+        # redactor: nothing is scrubbed, because nothing unrecognised is emitted in
+        # the first place. Registering it as a sink would make the panel claim this
+        # path is covered BY redaction, when what covers it is withholding -- the
+        # same overstatement the decision-seam entry above refuses for refusal.
+        "builtin_skills/pipeline-conductor/scripts/fleet_probe.py",
+        # The loop stop record: store-sourced ids and caller reasons are scrubbed
+        # before they are held in memory or written to the gateway log. Local
+        # diagnostics, not an egress pass.
+        "autonudge_stop_log.py",
         # Inbound structured-monitor target validation. A canonical provider URL
         # is rejected when its path contains credential-shaped text, before the
         # target reaches persistence, inspection, or a wake envelope.
@@ -1833,7 +1938,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # not an output bound for a human or a third party, and the value that DOES
         # reach a dashboard client (``GET /api/apps/registries``) is protected by
         # refusing a credential-bearing repo outright rather than by redacting it.
-        "apps/registry.py",
+        # The same owners reduce git output from a credentialed transport to fixed
+        # failure classes, which carry no text from that output.
+        "apps/registry_pipeline/checkout.py",
+        "apps/registry_pipeline/git_targets.py",
+        "apps/registry_pipeline/indexes.py",
+        "apps/registry_pipeline/sources.py",
         # Internal persistence / indexing (the on-disk or in-memory copy), whose
         # user-visible surface is already covered by a registered sink.
         "dashboard/chat_folders.py",
@@ -1859,6 +1969,16 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/notification_coordinator.py",
         "dashboard/slot_projection.py",
         "dashboard/websocket_hub.py",
+        # Owners extracted from dashboard/handlers/source_providers.py, which keeps
+        # the HTTP handlers. They redact provider data before it is cached or
+        # returned through those handlers, but they add no logical egress path:
+        # the same source-provider boundaries the handler entry covered, split by
+        # responsibility, so the decomposition leaves the posture items unchanged.
+        "dashboard/source_providers/adf.py",
+        "dashboard/source_providers/cache.py",
+        "dashboard/source_providers/chip_refresh.py",
+        "dashboard/source_providers/review.py",
+        "dashboard/source_providers/sanitize.py",
         # Pre-redacts follow-up items before handing to state.py's WS egress
         # (the registered sink); its own return string is re-redacted by
         # chat_runner before broadcast. Not itself an egress boundary.
@@ -1885,7 +2005,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/memory.py",
         "dashboard/handlers/optimizer.py",
         "dashboard/handlers/prompts.py",
-        "dashboard/handlers/source_providers.py",
         "dashboard/handlers/taskrunner.py",
         "dashboard/handlers/terminal.py",
         "dashboard/handlers/themes.py",
@@ -2074,6 +2193,16 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "deploy/scan.py",
         # Bundled app backends: each app's own surface, not core egress.
         "apps/builtins/auto_research/handlers.py",
+        # A behavior-preserving decomposition of the Research Lab backend. These
+        # modules feed the same app-owned HTTP/SSE surface as handlers.py; the
+        # split adds no transport or audience and therefore no posture sink.
+        "apps/builtins/auto_research/campaign/agent_mode.py",
+        "apps/builtins/auto_research/campaign/exploration.py",
+        "apps/builtins/auto_research/campaign/lifecycle.py",
+        "apps/builtins/auto_research/campaign/publication.py",
+        "apps/builtins/auto_research/campaign/storage.py",
+        "apps/builtins/auto_research/campaign/untrusted.py",
+        "apps/builtins/auto_research/campaign/workflow_mode.py",
         "apps/builtins/code_review_sage/sage_lib/learning.py",
         "apps/builtins/code_review_sage/sage_lib/pipeline.py",
         "apps/builtins/code_review_sage/sage_lib/report.py",
@@ -2124,7 +2253,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # electron-builder's stderr (a registry URL can carry a token) before
         # the bounded tail is printed. Same classification as cli_commands.py.
         "cli_setup.py",
-        "apps/builtins/issue_radar/backend/routes.py",
+        # Issue Radar's route layer: its AI routes redact the model's own output
+        # (summaries, label reasons, recommendation text) before caching or
+        # returning it. These three modules hold those calls.
+        "apps/builtins/issue_radar/backend/http_routes/ai.py",
+        "apps/builtins/issue_radar/backend/http_routes/recommendations.py",
+        "apps/builtins/issue_radar/backend/http_routes/tagging.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the
         # meeting's translations.json. The source line was already redacted at
@@ -2222,6 +2356,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # surface that eventually renders a Zoom connector error is the egress
         # boundary and is a registered sink there, not here.
         "connections/vendors/zoom/errors.py",
+        # Not a redactor call at all: the keystone path helper
+        # `credential_redaction_path()` merely NAMES the switch that governs the
+        # credential pass (its docstring and identifier match the scan). Nothing
+        # is redacted here and nothing leaves; the sink that honours the switch is
+        # `dashboard/handlers/files.py`, already registered.
+        "config/loader.py",
+        # Owner-gated GET/PUT for the credential-redaction switch. The identifiers
+        # (`api_credential_redaction_*`, `redaction_switch.set_enabled`) match the
+        # scan, but the handler redacts nothing: it reads and writes a boolean on
+        # the keystone and audits the change. The output it produces is that
+        # boolean, never agent-authored text, so it is not an egress boundary.
+        "dashboard/handlers/credential_redaction.py",
     }
 )
 
@@ -2611,7 +2757,8 @@ _CONTROLS: tuple[PostureControl, ...] = (
         summary=(
             "Every boundary where agent output reaches a human or an external "
             "service runs a redaction pass first. Most run both scanners; the few "
-            "that run only one say so on their own row."
+            "that run only one, or that the owner can narrow to one for their own "
+            "view, say so on their own row."
         ),
         source="src/kiro_crew/security/__init__.py",
         items_fn=_redaction_sink_items,

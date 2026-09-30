@@ -49,6 +49,26 @@ from kiro_crew.acp_backends import (
     effort_config_option_id,
     routing_for,
 )
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A client start here materialises the agent spec (``ensure_agent_materialized``
+    -> ``rebuild_agent_config`` -> ``_write_derived_permissions``), which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker starts first pays it against the HOST's install
+    with the checkout as the child's cwd. Pinned to the floor release, as
+    ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
+
 
 # ── Vocabulary ───────────────────────────────────────────────────────────────
 
@@ -1393,6 +1413,7 @@ def _deepseek_tripwire_client(monkeypatch):
     client._pi_gate_denied_ids = set()
     client._pi_gate_request_tool = {}
     client._permission_options = {}
+    client._permission_gate_events = {}
     client._session_id = "s1"
     client._session_key = "k1"
     killed: list = []
@@ -1406,6 +1427,20 @@ def _deepseek_tripwire_client(monkeypatch):
     monkeypatch.setattr(client, "_kill_process", _kill)
     monkeypatch.setattr(client, "_send_response", _send)
     return client, killed
+
+
+def _asked(client, frame) -> None:
+    """The frame was asked about: the tripwire noted it and the client recorded its event.
+
+    ``approve_tool`` approves only a request the client built an event for, so a
+    test that approves seeds the event the builder would have recorded.
+    """
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+    client._note_pi_gate_asked(frame)
+    client._permission_gate_events[frame.id] = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST, request_id=frame.id, title="notes.txt"
+    )
 
 
 def _deepseek_permission_frame(tool_call_id: str, request_id: int):
@@ -1456,7 +1491,7 @@ def test_a_re_asked_call_is_judged_on_its_fresh_verdict_not_the_stale_deny(monke
     assert "call_0" in client._pi_gate_denied_ids
 
     second = _deepseek_permission_frame("call_0", 2)
-    client._note_pi_gate_asked(second)
+    _asked(client, second)
     assert "call_0" not in client._pi_gate_denied_ids, "a fresh ask is a fresh verdict"
     asyncio.run(client.approve_tool(second.id))
 
@@ -1490,7 +1525,7 @@ def test_a_completed_call_consumes_its_ask_so_a_reused_id_must_be_asked_again(mo
 
     client, killed = _deepseek_tripwire_client(monkeypatch)
     asked = _deepseek_permission_frame("call_0", 1)
-    client._note_pi_gate_asked(asked)
+    _asked(client, asked)
     asyncio.run(client.approve_tool(asked.id))
     asyncio.run(client._tripwire_pi_gate(_deepseek_completed("call_0")))
     assert killed == [], "the asked-and-approved call completes without a kill"
@@ -1506,7 +1541,7 @@ def test_a_completed_call_consumes_its_ask_so_a_reused_id_must_be_asked_again(mo
     fresh, fresh_killed = _deepseek_tripwire_client(monkeypatch)
     for request_id in (1, 2):
         frame = _deepseek_permission_frame("call_0", request_id)
-        fresh._note_pi_gate_asked(frame)
+        _asked(fresh, frame)
         asyncio.run(fresh.approve_tool(frame.id))
         asyncio.run(fresh._tripwire_pi_gate(_deepseek_completed("call_0")))
     assert fresh_killed == []
@@ -2889,3 +2924,64 @@ def test_the_injection_is_inside_the_arm_and_the_probe_is_never_handed_a_key() -
     assert "_deepseek_vault_env)" not in arm
     assert "_deepseek_vault_env_names" in arm
     assert "resolve_secret_uris" not in arm
+
+
+# ── A harness with no provider key: the declared message, not the raw frame ──
+
+#: The ``session/prompt`` error dsh 0.1.5-rc.3 returns when no provider key
+#: reaches it, copied off the live wire. It carries no ``data`` field.
+_DSH_NO_KEY_ERROR = {
+    "code": -32603,
+    "message": (
+        'Internal error: turn failed: llm-deepseek: no API key for provider route "'
+        'deepseek-official"; store DEEPSEEK_API_KEY through the credentials service '
+        "(the web Models page writes it), or export DEEPSEEK_API_KEY in the launching "
+        "environment"
+    ),
+}
+
+
+def test_a_missing_provider_key_gets_the_declared_message() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    formatted = _format_acp_error(_DSH_NO_KEY_ERROR, backend=ACP_BACKEND_DEEPSEEK)
+    assert formatted == host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK)
+
+
+def test_the_request_id_survives_the_rewrite() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    error = dict(_DSH_NO_KEY_ERROR, data="request_id: 0f1e2d3c-4b5a")
+    formatted = _format_acp_error(error, backend=ACP_BACKEND_DEEPSEEK)
+    assert formatted == (
+        f"{host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK)} (request_id: 0f1e2d3c-4b5a)"
+    )
+
+
+def test_a_missing_provider_key_is_not_retried() -> None:
+    from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+    with pytest.raises(AcpError) as info:
+        _raise_acp_error(_DSH_NO_KEY_ERROR, backend=ACP_BACKEND_DEEPSEEK)
+    assert info.value.transient is False
+
+
+def test_the_deepseek_phrase_does_not_classify_another_harness() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    formatted = _format_acp_error(_DSH_NO_KEY_ERROR, backend="goose")
+    assert host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK) not in formatted
+    assert host_auth.signed_out_message("goose") not in formatted
+
+
+def test_a_blank_signed_out_signature_is_refused() -> None:
+    import dataclasses
+
+    from kiro_crew.agent_sdk import host_auth
+
+    declaration = host_auth.declaration_for(ACP_BACKEND_DEEPSEEK)
+    with pytest.raises(ValueError, match="blank signed-out signature"):
+        dataclasses.replace(declaration, signed_out_signature="  ")

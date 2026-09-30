@@ -61,7 +61,6 @@ src/components/AppIcon.tsx 51.1   # 24/47
 src/components/BottomTerminalPanel.tsx 55.1   # 49/89
 src/components/CommentThreadPopover.tsx 59.0   # 46/78
 src/components/ExecutionsView.tsx 48.8   # 20/41
-src/components/FileArtifactComments.tsx 52.0   # 52/100
 src/components/GitPanel.tsx 0.0   # 0/44
 src/components/InlineCommentOverlay.tsx 31.9   # 23/72
 src/components/LogEntry.tsx 0.0   # 0/16
@@ -80,7 +79,6 @@ src/pages/MigrationPage.tsx 0.0   # 0/38
 src/pages/chat/KnowledgePicker.tsx 0.0   # 0/23
 src/pages/chat/SidePanel.tsx 69.3   # 124/179
 src/pages/overview/MemoryGraphTab.tsx 68.3   # 97/142
-src/pages/overview/PortabilityTab.tsx 0.0   # 0/60
 src/pages/settings/InstancesPanel.tsx 63.3   # 88/139
 src/pages/settings/OverviewPanel.tsx 0.0   # 0/2
 src/pages/settings/WeixinPanel.tsx 54.0   # 47/87

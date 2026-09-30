@@ -25,9 +25,12 @@ A mirror is the fix for one backend. `agent_sdk/mcp_refs.py` is the detector, so
 fourth occurrence cannot be silent. At each point where the
 `session/new` / `session/load` `mcpServers` array is final — spec projection plus
 the gateway's broker stubs — `acp/mcp_ref_guard.py` compares the spec's `@server`
-refs against what the session is actually about to receive, and logs ONE structured
-warning naming the backend, the agent, the unresolved refs and whether the shared
-gateway is on. It also records them on the session's MCP report
+refs against Crew's projection for the session (the array it is about to send), and
+logs ONE structured warning naming the backend, the agent, the unresolved refs and
+whether the shared gateway is on. The line claims only what the wire proves: Crew's
+projection delivers none of those servers, and the harness may mount a same-named
+server from its own configuration, so a listed ref may still be served and the line
+cannot tell which. It also records them on the session's MCP report
 (`unresolved_refs`), beside the buckets saying what a configured server reported —
 a different claim, because a server nothing configured has no row there to be
 missing from.

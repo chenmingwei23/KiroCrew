@@ -1,11 +1,11 @@
 {
   "_comment": "Error responses without a machine-readable `code`, per file. Generated - regenerate with `python test/test_error_code_contract.py --update`. This is both the CI ratchet and the Track B worklist: drive `missing_code` to zero, one PR per file or per directory, moving each frontend consumer in the same PR. Never raise a number to make CI pass. See test/test_error_code_contract.py for what each bucket means and which false negatives it accepts.",
   "_totals": {
-    "missing_code": 1104,
+    "missing_code": 1092,
     "opaque_body": 18,
-    "dynamic_status": 39
+    "dynamic_status": 38
   },
-  "_compliant": 2333,
+  "_compliant": 2469,
   "files": {
     "apps/builtins/auto_research/handlers.py": {
       "dynamic_status": 1,
@@ -19,8 +19,29 @@
       "dynamic_status": 1,
       "missing_code": 17
     },
+    "apps/builtins/issue_radar/backend/http_routes/ai.py": {
+      "missing_code": 8
+    },
+    "apps/builtins/issue_radar/backend/http_routes/investigation.py": {
+      "missing_code": 9
+    },
+    "apps/builtins/issue_radar/backend/http_routes/issue_writes.py": {
+      "missing_code": 22
+    },
+    "apps/builtins/issue_radar/backend/http_routes/items.py": {
+      "missing_code": 21
+    },
+    "apps/builtins/issue_radar/backend/http_routes/recommendations.py": {
+      "missing_code": 16
+    },
+    "apps/builtins/issue_radar/backend/http_routes/repositories.py": {
+      "missing_code": 27
+    },
+    "apps/builtins/issue_radar/backend/http_routes/tagging.py": {
+      "missing_code": 24
+    },
     "apps/builtins/issue_radar/backend/routes.py": {
-      "missing_code": 136
+      "missing_code": 9
     },
     "apps/route_registry.py": {
       "missing_code": 3
@@ -88,10 +109,6 @@
       "dynamic_status": 1,
       "missing_code": 26
     },
-    "dashboard/handlers/mcp_apps.py": {
-      "dynamic_status": 1,
-      "missing_code": 11
-    },
     "dashboard/handlers/mcp_custom.py": {
       "missing_code": 18
     },
@@ -110,7 +127,7 @@
       "missing_code": 1
     },
     "dashboard/handlers/prompts.py": {
-      "missing_code": 28
+      "missing_code": 27
     },
     "dashboard/handlers/security.py": {
       "missing_code": 16

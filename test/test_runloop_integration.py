@@ -707,6 +707,50 @@ async def test_a_throttle_before_the_first_frame_waits_under_the_run_lease(monke
 
 
 @pytest.mark.asyncio
+async def test_a_throttle_before_the_first_frame_ends_startup_at_the_park():
+    """The same 429 on the first prompt, for a start with no runtime PID: the
+    provider has answered the prompt, so the run leaves startup at the park --
+    the step that takes its row out of ``starting`` -- and the wake it owes a
+    held spawn goes out then. Parked, it is neither in the in-startup bound nor
+    a start the watchdog may reap, however far past the startup deadline the
+    wait runs; the wait is bounded by its scope and ends in the scope's error."""
+    calls: list[str] = []
+
+    def factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) == 1:
+                raise AcpFakeThrottle("ThrottlingException: Rate exceeded")
+            yield _text("ok")
+            yield _complete(STOP_REASON_END_TURN)
+
+        return _gen()
+
+    mgr = await _ready_manager(_mock_sessions(factory))
+    coordinator = _fast_coordinator(mgr, backoff=backoff(_HELD_PARK_SECS, _HELD_PARK_SECS))
+    progress = MagicMock(wraps=mgr._note_startup_progress)
+    mgr._note_startup_progress = progress
+    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+        info = mgr.spawn("throttled start")
+        assert info is not None
+        await _await_parked(mgr, coordinator, "provider:acp", info.id)
+        assert info._pid is None and info.turns == 0
+        assert info._first_stream_started is not None
+        assert SubagentManager._in_startup(info) is False
+        assert mgr._startup_population() == 0
+        assert info._exec_started is not None
+        assert mgr._is_startup_stalled(info, info._exec_started + 3_600.0) is False
+        progress.assert_called_once_with(info)
+        assert coordinator.recovered("provider:acp")
+        mgr._taskq_pump()
+        await asyncio.wait_for(mgr._tasks[info.id], timeout=_LOST_RUN_CEILING_SECS)
+
+    assert info.outcome == "completed" and info.result == "ok"
+    progress.assert_called_once_with(info)
+
+
+@pytest.mark.asyncio
 async def test_the_throttle_park_and_wake_cycle_never_touches_the_store_on_the_loop(monkeypatch):
     """The whole wait/wake boundary under the STRICT on-loop guard.
 
@@ -1498,19 +1542,63 @@ def test_chat_runner_floors_transient_delay_by_the_shared_scope_schedule(monkeyp
 
 
 def test_pipe_death_and_stop_recovery_budgets_share_the_ladder_constant():
+    """The pipe-death budget is bounded by the ladder constant, never a literal.
+
+    The counter does not face the constant directly. A death is charged to the
+    slot only when the slot's own runtime died, so the limit is tested against
+    whichever of the two counts is further along, held in a local. The check
+    therefore traces the counter through every local that carries its value and
+    requires each comparison to name the shared constant, which is the claim --
+    one ladder limit for both budgets -- rather than one spelling of it.
+    """
+    import ast
     import inspect
 
     from kiro_crew.dashboard import chat_runner
 
     src = inspect.getsource(chat_runner)
-    for literal in (
-        "_acp_pipe_death_retries < 3",
-        "_acp_pipe_death_retries >= 3",
-        "_acp_pipe_death_retries <= 3",
-        "_acp_pipe_death_retries > 3",
-    ):
-        assert literal not in src, literal
-    assert "_acp_pipe_death_retries < SESSION_RECOVERY_MAX_ATTEMPTS" in src
+    tree = ast.parse(src)
+
+    # Locals carrying the counter's value: the attribute itself, plus the target
+    # of any assignment whose value reads it. An assignment whose value is a
+    # comparison yields a verdict, not a count, so it is not a carrier.
+    carriers = {"_acp_pipe_death_retries"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or isinstance(node.value, ast.Compare):
+            continue
+        if "_acp_pipe_death_retries" not in {
+            a.attr for a in ast.walk(node.value) if isinstance(a, ast.Attribute)
+        }:
+            continue
+        carriers |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    for carrier in sorted(carriers):
+        for op in ("<", ">=", "<=", ">"):
+            assert f"{carrier} {op} 3" not in src, f"{carrier} {op} 3"
+
+    compared = 0
+    ladder = {"SESSION_RECOVERY_MAX_ATTEMPTS", "STOP_RECOVERY_MAX_RETRIES"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        reached = {n.id for n in ast.walk(node.left) if isinstance(n, ast.Name)} | {
+            a.attr for a in ast.walk(node.left) if isinstance(a, ast.Attribute)
+        }
+        if not reached & carriers:
+            continue
+        compared += 1
+        for right in node.comparators:
+            # Either name is the ladder constant -- they are asserted below to be
+            # the same object -- so both satisfy the claim and neither spelling is
+            # required. A number, an arithmetic adjustment or any other name is a
+            # second limit, which is what this forbids.
+            assert (
+                isinstance(right, ast.Name) and right.id in ladder
+            ), f"line {node.lineno}: death budget bounded by {ast.unparse(right)}"
+    # Control: a scan that reaches no comparison would pass vacuously, which is
+    # the failure mode a source-reading test hides best.
+    assert compared >= 4, f"only {compared} death-budget comparisons found -- scan is broken"
+
     assert STOP_RECOVERY_MAX_RETRIES is SESSION_RECOVERY_MAX_ATTEMPTS
     assert SESSION_RECOVERY_MAX_ATTEMPTS == 3
 

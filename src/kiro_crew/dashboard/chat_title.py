@@ -16,11 +16,22 @@ from kiro_crew.context import ui_language_tag
 from kiro_crew.context_management import extract_plan_metadata, rephrase_plan
 from kiro_crew.dashboard.chat_folder_suggest import maybe_suggest_folder
 from kiro_crew.dashboard.chat_utils import (
+    apply_pending_slot_memory_mode,
     effective_session_key,
+    restore_replacement_if_handover_did_not_land,
     slot_history_key,
+    tighten_replacement_to_restricted_original,
 )
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, DashboardState, _ChatSlot
+from kiro_crew.execution_context import canonical_memory_mode, stricter_memory_mode
+from kiro_crew.history import is_incognito_transcript
+from kiro_crew.label_guard import (
+    is_verdict_reply,
+    looks_like_prose,
+    unspaced_script_chars,
+)
 from kiro_crew.llm_helpers import background_turn, run_bg_oneliner
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -42,11 +53,81 @@ _TITLE_ORIGINS = frozenset({_TITLE_ORIGIN_AUTO, _TITLE_ORIGIN_USER})
 # User-message counts at which an AUTO title is re-examined in the background.
 # The first title is generated from the very first message, before the real
 # task has emerged; by turn 8 the session's actual topic is visible, and 24
-# catches long sessions that pivoted. Two milestones cap the whole feature at
-# TWO extra background one-liner calls per session lifetime — attempt-counted
-# (a KEEP/SKIP/error consumes the milestone; see maybe_refresh_title), and the
-# consumed mark is persisted so restarts cannot re-spend it.
+# catches long sessions that pivoted. This built-in schedule spends at most TWO
+# extra background one-liner calls per session lifetime. The opt-in
+# ``dashboard.title_refresh_every_turns`` cadence replaces it with one call per
+# N user turns, bounded only by the turns the session holds (see
+# ``_title_refresh_due``). Either way a milestone is attempt-counted (a
+# KEEP/SKIP/error consumes it; see maybe_refresh_title), and the consumed mark
+# is persisted so restarts cannot re-spend it.
 _TITLE_REFRESH_MILESTONES: tuple[int, ...] = (8, 24)
+
+
+def _title_refresh_due(mark: int, user_count: int, every: int, milestones: tuple[int, ...]) -> bool:
+    """Whether an AUTO title is due a refresh at ``user_count`` user turns.
+
+    ``milestones`` is the fixed schedule for this slot: the built-in
+    ``_TITLE_REFRESH_MILESTONES``, plus the early milestone for a low-signal
+    title. ``every > 0`` is the ``dashboard.title_refresh_every_turns`` cadence,
+    which REPLACES the built-in milestones with N, 2N, 3N, ... while keeping the
+    early one: due when the latest multiple of N at or below ``user_count`` has
+    not been consumed yet. Like the milestones it is attempt-counted through
+    ``mark``, and a session that crossed several multiples since its last
+    attempt gets one refresh, not a catch-up burst.
+    """
+    if every > 0:
+        milestones = tuple(m for m in milestones if m not in _TITLE_REFRESH_MILESTONES)
+        if (user_count // every) * every > mark:
+            return True
+    return any(mark < m <= user_count for m in milestones)
+
+
+def _rehydrated_refresh_mark(mark: int, user_count: int) -> int:
+    """Re-base a persisted refresh mark against the user turns a reload holds.
+
+    A rehydrated slot holds only its latest rows (500 per loader), so its user
+    count restarts below the count the session had reached, while ``mark`` is
+    restored verbatim. Left alone, a cadence mark above the restored count
+    keeps ``_title_refresh_due`` silent until the count climbs past the mark
+    again, one turn at a time. Pulling the mark down to the restored count lets
+    the ``title_refresh_every_turns`` cadence continue from that count, at the
+    next multiple of N above it; when the floor below holds the mark above the
+    restored count, the cadence resumes after that fixed milestone instead, not
+    after the restored count.
+
+    The floor is the largest fixed milestone at or below ``mark``, including
+    the low-signal early milestone, or zero when none qualifies. It keeps every
+    fixed milestone covered by ``mark`` spent while allowing a cadence mark
+    between fixed milestones to follow the restored count. A mark at or below
+    the restored count is returned unchanged.
+
+    Applied once, at rehydrate, over the loaded window. Never re-applied lazily
+    from ``maybe_refresh_title``: ``_ChatSlot.append`` trims the live window one
+    row at a time at ``_MAX_SLOT_MESSAGES``, so a mark re-based against a count
+    that oscillates there would fire on every dip.
+    """
+    fixed_milestones = (_TITLE_EARLY_REFRESH_MILESTONE, *_TITLE_REFRESH_MILESTONES)
+    floor = max(
+        (milestone for milestone in fixed_milestones if milestone <= mark),
+        default=0,
+    )
+    return max(min(mark, user_count), floor)
+
+
+def _title_refresh_every() -> int:
+    """Read ``dashboard.title_refresh_every_turns``; 0 on any failure.
+
+    Read per turn (the load is mtime-cached) so a change in Settings applies to
+    the next turn without a restart. **Call this OFF the event loop**, for the
+    same reason as :func:`_ui_language`. A failed read falls back to the
+    built-in schedule, the bounded one, never to an unbounded cadence.
+    """
+    try:
+        return int(KiroCrewConfig.load().dashboard.title_refresh_every_turns)
+    except Exception:
+        logger.debug("title_refresh_every_turns lookup failed; using built-in milestones")
+        return 0
+
 
 # Extra refresh milestone for a title born LOW-SIGNAL (see
 # ``_is_low_signal_title``): a first message dominated by a pasted link or an
@@ -218,168 +299,18 @@ _TITLE_LANGUAGE_TEMPLATE = (
     "ASCII SKIP, never a translation of it.\n\n"
 )
 
-# A title is 3-6 words by contract. Anything materially longer is the model
-# answering instead of naming, so the ceiling sits above any plausible real
-# title and below a sentence.
-_TITLE_MAX_WORDS = 12
-
-#: Codepoint ranges of scripts written WITHOUT spaces between words: kana, Han
-#: (+ extension A and the compatibility block) and Thai. A title in one of them
-#: is a single whitespace token, so ``_TITLE_MAX_WORDS`` can never fire for it —
-#: it needs the character ceiling below instead. Hangul and Cyrillic are
-#: deliberately absent: Korean and Russian do space their words, so the word
-#: ceiling bounds a long sentence in them. A SHORT Korean refusal clears that
-#: ceiling, so it is caught by sentence shape instead -- see
-#: ``_TITLE_KO_SENTENCE_ENDINGS``.
-_UNSPACED_SCRIPT_RANGES = (
-    (0x0E00, 0x0E7F),  # Thai
-    (0x3040, 0x30FF),  # Hiragana + Katakana
-    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
-    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
-    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
-)
-
-#: Ceiling on characters of unspaced script in a title. The prompt asks for
-#: ~4-14 characters in those languages, so this leaves headroom for a long name
-#: while a refusal or an answer runs well past it. Counting only the unspaced
-#: characters (not the whole string) keeps latin identifiers free: "修复
-#: PrivacyPanel 的动态键" spends 8 against the budget, not 24.
-_TITLE_MAX_UNSPACED_CHARS = 24
-
-#: Sentence terminators that are NOT followed by a space in the scripts that use
-#: them, so the ASCII rule's whitespace requirement would never fire on them.
-_TITLE_WIDE_TERMINATORS = "。！？"
-
 #: Punctuation an LLM wraps a name in, or ends it with. The full-width and CJK
 #: quote forms matter because titles are generated in the UI language: a zh/ja
 #: reply wraps in 「」 or “” and ends with 。, none of which an ASCII-only strip
 #: removes, so those titles would reach the sidebar still quoted.
 _TITLE_WRAP_CHARS = "\"'“”‘’「」『』《》.。．"
 
-# Openers that mark the reply as prose about the model rather than a name. The
-# observed failure was a pasted URL producing "I cannot access external URLs
-# like Quip documents. Based solely on the message c…" as the session name.
-_TITLE_PROSE_OPENERS = (
-    "i cannot",
-    "i can not",
-    "i can't",
-    "i cant",
-    "i am unable",
-    "i'm unable",
-    "i am not able",
-    "i'm not able",
-    "i do not have",
-    "i don't have",
-    "i dont have",
-    "i was unable",
-    "i will not",
-    "i won't",
-    "i need ",
-    "i would need",
-    "unable to",
-    "cannot access",
-    "can't access",
-    "cannot fetch",
-    "can't fetch",
-    "sorry",
-    "apologies",
-    "unfortunately",
-    "as an ai",
-    "based solely",
-    "based on the",
-    "it seems",
-    "it looks like",
-    "here is",
-    "here's",
-    "the conversation",
-    "this conversation",
-    "note:",
-)
-
-#: Korean refusal/prose shape. Hangul spaces its words, so the word ceiling
-#: bounds a long Korean sentence -- but a refusal is SHORT (five words in the
-#: observed case), and ``_TITLE_PROSE_OPENERS`` is English-only, so a short
-#: Korean refusal clears every other check. Korean
-#: is SOV: the verb that marks a sentence as a sentence comes LAST, so prefix
-#: openers cannot catch it -- match the sentence-final conjugation instead.
-#: The polite declarative endings close the sentence forms a titling model
-#: actually emits: "-nida" (U+B2C8 U+B2E4, the hamnida/seumnida/imnida
-#: family) and the informal-polite "-eoyo"/"-ayo"/"-haeyo" (U+C5B4/U+C544/
-#: U+D574 + U+C694). A noun-phrase title carries none of them; a plain-form
-#: (banmal) refusal stays a documented false negative. The one useful prefix
-#: is "joesong" (U+C8C4 U+C1A1, "sorry"), the apology opener. Both signals
-#: trade deliberately toward rejection: a sentence-form Korean title ("the
-#: login does not work") loses to the fallback name, which is the cheaper
-#: failure -- a fallback name is still the user's own words, a refusal stored
-#: as the name is the bug. Escapes keep the source ASCII; the runtime values
-#: are the Hangul strings.
-_TITLE_KO_PROSE_OPENERS = ("\uc8c4\uc1a1",)
-_TITLE_KO_SENTENCE_ENDINGS = (
-    "\ub2c8\ub2e4",
-    "\uc5b4\uc694",
-    "\uc544\uc694",
-    "\ud574\uc694",
-)
-
-
-def _unspaced_script_chars(s: str) -> int:
-    """Count characters belonging to a script written without word spaces."""
-    return sum(1 for ch in s if any(lo <= ord(ch) <= hi for lo, hi in _UNSPACED_SCRIPT_RANGES))
-
-
-def _looks_like_prose(title: str) -> bool:
-    """True when an LLM title reply is a sentence about the task, not a name.
-
-    The titling call is tool-free by contract (``run_bg_oneliner`` rejects every
-    permission request), so a message containing a URL can make the model
-    narrate the denial instead of naming the chat — and that narration was being
-    persisted as the session title. Prompt wording alone cannot guarantee the
-    shape of a generation, so the reply is also validated here and treated as
-    SKIP when it fails, which routes to the existing fallback title.
-
-    Five signals, each independently sufficient:
-
-    - a refusal/narration opener (see ``_TITLE_PROSE_OPENERS``);
-    - more words than any real title carries;
-    - more unspaced-script characters than any real title carries. Chinese,
-      Japanese and Thai put no spaces between words, so a whole sentence in them
-      is ONE word by ``str.split`` and slips past the word ceiling entirely;
-    - sentence-terminating punctuation with text after it. The ASCII terminator
-      must be followed by whitespace so "Node.js upgrade plan" and "Ship v1.2 to
-      prod" stay valid; the full-width forms must not, because the scripts that
-      use them do not space after punctuation.
-    - Korean sentence shape (see ``_TITLE_KO_SENTENCE_ENDINGS``). Hangul spaces
-      its words, but a refusal is short enough to clear the word ceiling, and a
-      prefix opener cannot catch an SOV language whose refusal verb comes last
-      -- so the sentence-final polite conjugation is matched instead, a grammar
-      fact rather than a phrase list.
-
-    Known false negative: a SHORT refusal in an unspaced script with no
-    terminator ("无法访问该链接") clears every ceiling and lands as the title.
-    That class is inherent to matching prose by shape — the openers list is the
-    only signal that catches it, and maintaining one per shipped locale is
-    whack-a-mole. It fails to a wrong-but-short name, never to a paragraph.
-    """
-    stripped = title.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    if lowered.startswith(_TITLE_PROSE_OPENERS):
-        return True
-    if stripped.startswith(_TITLE_KO_PROSE_OPENERS):
-        return True
-    if stripped.endswith(_TITLE_KO_SENTENCE_ENDINGS):
-        return True
-    if len(stripped.split()) > _TITLE_MAX_WORDS:
-        return True
-    if _unspaced_script_chars(stripped) > _TITLE_MAX_UNSPACED_CHARS:
-        return True
-    for index, char in enumerate(stripped[:-1]):
-        if char in ".!?" and stripped[index + 1].isspace():
-            return True
-        if char in _TITLE_WIDE_TERMINATORS:
-            return True
-    return False
+# The refusal/prose and verdict checks are shared with every other label path
+# (Slack/Telegram title, nav link chips, session summary) so they cannot drift;
+# the private names are kept because the reveal and the tests use them.
+_unspaced_script_chars = unspaced_script_chars
+_looks_like_prose = looks_like_prose
+_is_verdict_reply = is_verdict_reply
 
 
 def _strip_markdown_images(content: str, *, drop_trailing_partial: bool = False) -> str:
@@ -899,48 +830,6 @@ async def _reveal_title(
         await asyncio.sleep(_TITLE_REVEAL_STEP_SECS)
 
 
-#: Characters that read as a verdict-reason separator right after a control
-#: word ("SKIP: too vague", "SKIP (too vague)"). Deliberately NOT every
-#: non-alphanumeric: "-" and "." separate only when spaced away from the next
-#: word, so identifier titles the prompt tells the model to keep verbatim
-#: ("KEEP-ALIVE header bug", "SKIP.md parser fix") survive, and "_" never
-#: separates ("SKIP_TESTS env var flag").
-_TITLE_VERDICT_TRAILERS = ":,;!?("
-
-
-def _is_verdict_reply(title: str, control_words: tuple[str, ...]) -> bool:
-    """True when *title* is a control word, alone or followed by a reason.
-
-    The word is matched case-insensitively on every shape: the words are
-    taught as literal ASCII, but a lowercased echo is still a verdict, with
-    or without a reason attached ("skip", "Skip: greetings only", "keep - the
-    title still fits"). What separates a verdict-plus-reason from a real
-    title OPENING with the word is the separator: punctuation (or a spaced
-    dash / spaced period) means verdict, while a plain following word or an
-    identifier joiner means title ("SKIP and KEEP handling", "Keep alive
-    timer bug", "SKIPPED frames in reveal", "KEEP-ALIVE header bug").
-    """
-    upper = title.upper()
-    if upper in control_words:
-        return True
-    for word in control_words:
-        if not upper.startswith(word):
-            continue
-        rest = title[len(word) :]
-        head = rest.lstrip()
-        spaced = len(head) != len(rest)
-        if not head:
-            return True
-        char = head[0]
-        if char in _TITLE_VERDICT_TRAILERS:
-            return True
-        if char == "-" and (spaced or len(head) < 2 or head[1].isspace()):
-            return True
-        if char == "." and (len(head) < 2 or head[1].isspace()):
-            return True
-    return False
-
-
 def _validate_title_reply(
     text: str, *, control_words: tuple[str, ...] = ("SKIP", "KEEP")
 ) -> str:
@@ -1081,7 +970,26 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
 
     if not state.conversation_log:
         return True
+    from kiro_crew.dashboard.chat_persistence import (
+        _record_pending_memory_mode,  # circular import: persistence imports channel_slots
+    )
+
     history_key = slot_history_key(slot)
+    pending_mode_slot = slot
+    current = state._slots.get(slot.key)
+    if current is not None and slot_history_key(current) == history_key:
+        pending_mode_slot = current
+    slot_mode = canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+    tightening = None
+    if is_incognito_transcript(slot_mode):
+        try:
+            tightening = tighten_replacement_to_restricted_original(state, slot.key, slot)
+        except UnknownMemoryStore:
+            logger.warning(
+                "Slot %s: replacement rebound twice during tightening; writing the tail "
+                "under the ratcheted line without tightening the live replacement",
+                slot.key,
+            )
     while True:
         epoch = slot._title_epoch
         fields: dict[str, Any] = {"title": slot.title}
@@ -1094,11 +1002,44 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
         # goes True -> False when the early refresh consumes it, and a stale
         # True on disk would re-arm the early milestone on every restart.
         fields["title_low_signal"] = slot._title_low_signal
+        # An upsert can be the FIRST write of this session's line: the on-send
+        # titling attempt runs before the turn-end save and before the periodic
+        # flush. A restricted slot's line must never exist without its mode, and
+        # a title update on an existing restricted line must not loosen its mode.
+        # Fold both values under the transcript lock; a persistent slot still
+        # leaves an ordinary line's mode to the transcript save.
+
+        def _fold_memory_mode(metadata: dict) -> bool:
+            retained_mode = stricter_memory_mode(
+                canonical_memory_mode(metadata.get("memory_mode")), slot_mode
+            )
+            if is_incognito_transcript(retained_mode):
+                fields["memory_mode"] = retained_mode
+            return True
+
         try:
-            await asyncio.to_thread(state.conversation_log.update_metadata, history_key, fields)
+            persisted = await asyncio.to_thread(
+                state.conversation_log.update_metadata_if,
+                history_key,
+                fields,
+                _fold_memory_mode,
+                after_commit_under_lock=lambda: _record_pending_memory_mode(
+                    pending_mode_slot, fields.get("memory_mode", "persistent")
+                ),
+            )
+            if not persisted:
+                logger.debug("Failed to persist title for slot %s", slot.key)
+                await restore_replacement_if_handover_did_not_land(
+                    state, slot.key, tightening, history_key
+                )
+                return False
+            apply_pending_slot_memory_mode(state, pending_mode_slot)
             logger.debug("Persisted title %r for slot %s", slot.title, slot.key)
         except Exception:
             logger.debug("Failed to persist title for slot %s", slot.key)
+            await restore_replacement_if_handover_did_not_land(
+                state, slot.key, tightening, history_key
+            )
             return False
         if slot._title_epoch == epoch:
             return True
@@ -1338,16 +1279,27 @@ async def title_then_refresh(state: DashboardState, slot: _ChatSlot) -> None:
     await maybe_refresh_title(state, slot)
 
 
+def _refresh_blocked(slot: _ChatSlot) -> bool:
+    """True when a background refresh must not start for ``slot``.
+
+    It needs an AUTO title (a manual rename locks it out) and no attempt already
+    in flight.
+    """
+    return not slot._titled or slot._title_origin != _TITLE_ORIGIN_AUTO or slot._title_in_flight
+
+
 async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     """Background task: re-examine an AUTO title as the conversation evolves.
 
     The initial title is generated from the first message, before the session's
-    real task has emerged — so a long session's name often describes its
+    real task has emerged, so a long session's name often describes its
     opening pleasantry, and a session that fell back to the truncated first
     message keeps that truncation forever. Fired from ``chat_done`` (same
     call site as the initial titling), this re-runs the background ``_bg``
-    one-liner at the ``_TITLE_REFRESH_MILESTONES`` user-turn marks and swaps
-    the sidebar title when the model says the old one no longer fits.
+    one-liner at the ``_TITLE_REFRESH_MILESTONES`` user-turn marks, or every
+    ``dashboard.title_refresh_every_turns`` user turns when that cadence is
+    set, and swaps the sidebar title when the model says the old one no
+    longer fits.
 
     Token discipline (the whole point of doing this in the background instead
     of exposing a title tool to every chat):
@@ -1356,11 +1308,14 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
       rename is final; legacy titles with no stored origin rehydrate as "user"
       and are equally final.
     - Each milestone fires at most ONCE, attempt-counted: a KEEP/SKIP/prose
-      reply or an error consumes it (no retries). Two ordinary milestones plus
-      the low-signal early milestone = at most three extra one-liner calls over
-      a session's whole lifetime, and the early one only exists for sessions
-      whose title locked as a URL/ticket-key echo or as the truncated
-      first-message fallback (see ``_is_low_signal_title``).
+      reply or an error consumes it (no retries). On the built-in schedule the
+      two ordinary milestones plus the low-signal early milestone are at most
+      three extra one-liner calls over a session's whole lifetime, and the
+      early one only exists for sessions whose title locked as a URL/ticket-key
+      echo or as the truncated first-message fallback (see
+      ``_is_low_signal_title``). The opt-in cadence has no such cap: it spends
+      one call per N user turns, attempt-counted the same way, for as many
+      turns as the session holds (see ``_title_refresh_due``).
     - The consumed mark is persisted (``title_refresh_mark``) so a gateway
       restart cannot re-spend it.
     - The prompt is bounded exactly like the initial titling prompt (ten
@@ -1371,11 +1326,18 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     manual rename landing mid-generation is detected via ``_title_epoch`` and
     the refresh stands down.
     """
-    if not slot._titled or slot._title_origin != _TITLE_ORIGIN_AUTO:
+    if _refresh_blocked(slot):
         return
-    if slot._title_in_flight:
-        return
+    # Count first: the config thread hop below yields to the event loop, and a
+    # queued follow-up that lands during it opens the NEXT turn, which this
+    # refresh must not count.
     user_count = sum(1 for m in slot.messages if m.get("role") == "user")
+    every = await asyncio.to_thread(_title_refresh_every)
+    # A manual rename or another turn's refresh may also have landed during the
+    # hop, and either must stand this attempt down BEFORE it consumes the
+    # milestone or spends the call.
+    if _refresh_blocked(slot):
+        return
     # A low-signal title (URL/ticket-key echo — see _is_low_signal_title) adds
     # the early milestone: the first turn's transcript is the FIRST moment the
     # session's real topic is visible, and a one-message "investigate this
@@ -1387,8 +1349,7 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     # below user_count (the mark jumps past them all). A session that first
     # becomes refresh-eligible at turn >= 24 — e.g. rehydrated mid-life — gets
     # ONE refresh, not a catch-up burst. The budget is a ceiling, not a quota.
-    due = any(slot._title_refresh_mark < m <= user_count for m in milestones)
-    if not due:
+    if not _title_refresh_due(slot._title_refresh_mark, user_count, every, milestones):
         return
     slot._title_in_flight = True
     # Consume the milestone up-front: a failed/KEEP attempt must not be retried
@@ -1550,7 +1511,10 @@ async def api_chat_slot_rename(request: web.Request) -> web.Response:
     slot._title_origin = _TITLE_ORIGIN_USER
     slot._title_epoch += 1
     await _persist_title(state, slot)
-    state.push_slot_title(slot.key, title)
+    # ``slot_title`` keeps every consumer's title current; the patch carries the
+    # projected (redacted) title to patch-capable tabs in place of a full list.
+    state.push_slot_title(slot.key, title, full=False)
+    state.push_slot_patch(slot.key, ("title",))
     sel().log_api_access(
         caller="dashboard",
         operation="chat.slot_rename",

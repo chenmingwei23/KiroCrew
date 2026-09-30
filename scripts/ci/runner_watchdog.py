@@ -80,11 +80,33 @@ would only add to the contention. The two are told apart by what the OTHER
 routed jobs are doing -- counting only starts AFTER the orphaned job queued,
 because a fleet that was dispatching before the orphan queued says nothing
 about the fleet it is waiting on (the onset of an outage looks exactly like
-that). When a CodeBuild job that did get a runner started in that window after
-waiting a long time (a third of the orphan threshold or more), CodeBuild is
+that).
+
+The orphaned job's OWN queue is asked first. A routed label is
+``codebuild-<project>-<run>-<attempt>``, optionally with an ``instance-size``
+override; the project and override pick the CodeBuild project and fleet, the run
+and attempt are only there because CodeBuild requires them (``dispatch_queue``
+strips them). A start served by that same project and fleet after the orphan
+queued is a job that stood in the same line and got out of it, so it decides the
+hold on its own: one that waited a third of the orphan threshold or more means
+that queue is saturated and the tick holds; prompt ones and nothing slow mean the
+queue is being served and a job that has waited a quarter of an hour in it is not
+in it at all, whatever another label's queue is doing. The typical carrier is the
+run's own sibling jobs: a fast-gate run queues fourteen jobs on one label within
+a second, and thirteen of them starting in under a minute while the fourteenth
+sits for an hour and a half is the dropped-dispatch shape exactly (a slow start on
+another label that afternoon held that orphan unhealed for six hours before this
+reading existed).
+
+Only when the orphan's own queue served nothing that qualifies -- a single-job
+run, or a run whose orphans span two queues -- is the fleet-wide, label-blind
+reading used. When a CodeBuild job that did get a runner started in that window
+after waiting a long time (a third of the orphan threshold or more), CodeBuild is
 dispatching slowly and every queued job is presumed alive; the tick reports the
-runs as ``saturated`` and heals nothing. When such starts were prompt -- the
-normal case, measured in seconds on this repository -- a job that has waited a
+runs as ``saturated`` and heals nothing. That line is deliberately low BECAUSE
+this reading is label-blind: a start served quickly on another label says nothing
+about the queue the orphan is in. When such starts were prompt -- the normal case,
+27s median and 47s at p90 over 404 measured starts here -- a job that has waited a
 quarter of an hour is not in any queue, and is healed. When NOTHING has started
 on CodeBuild since the orphan queued (live runs first, then the newest
 completed runs), the evidence is inconclusive: from the queued side a
@@ -138,13 +160,21 @@ which looks at recently *cancelled* runs (within ``Policy.recovery_window``,
 90 minutes), obeys the same saturation/outage hold as the live pass, recognises
 the orphan shape on their cancelled jobs (a ``codebuild-`` label, no runner
 name, queued past the threshold when cancelled), and re-runs them only when
-they are still the newest run of their branch. This makes the pass safe for a
-pull-request run superseded by a newer push.
+they still carry their branch's verdict: a push run when it is the newest run of
+its branch, a pull-request run when its head SHA is the head of an open pull
+request on its branch. A run superseded by a newer push, or of a closed pull
+request, is left cancelled.
 
 Guard rails
 -----------
-* A run younger than ``Policy.orphan_after`` is never actionable; its jobs are still
-  read, because a slow start inside it is saturation evidence (above).
+* A run younger than ``Policy.orphan_after`` is never actionable, and two age bands
+  decide what reads it. A run at least ``saturation_wait`` (= ``orphan_after`` / 3) old
+  is what the evidence reserve is spent on, since only it can hold a wait that crossed
+  the line. A younger one is not reserved a read while any run qualifies, and is read
+  only if a classify slot remains after the actionable-shaped and older runs, then only
+  because a prompt start inside it is dispatch evidence (above). The one exception is
+  the reserve's fallback: when NO run can carry a slow start the reserve takes the
+  newest runs regardless of age, because an empty reserve reads as an outage.
 * Immediately before every re-run, the run must still be the newest run of
   its branch and event; otherwise it is reported for a human.
 * The saturation/outage hold does NOT apply to a ``push`` run a newer push has
@@ -152,7 +182,13 @@ Guard rails
   wants, and that run's result is discarded by the branch moving on, while holding
   it keeps it alive in a ``cancel-in-progress: false`` concurrency group where it
   evicts every later commit's run (``supersession_clears_hold`` carries the measured
-  incident). Such a run is cancelled, and the rule above still declines to re-run it.
+  incident). At attempt 1 such a run is cancelled, and the rule above still declines
+  to re-run it. Past attempt 1 it is NOT cancelled either -- a later attempt may be
+  somebody's own ``gh run rerun``, and cancelling a superseded run is never followed
+  by a re-run, so the cancel would discard their work -- and the refusal is a FAILED
+  outcome (``rerun-attempt-superseded-left-untouched``) that names the run and the
+  ``gh run cancel`` a human must type to free the group
+  (``_rerun_attempt_may_be_cancelled``).
 * A run whose head repository is a fork is reported but never touched: forks
   are never routed to CodeBuild, and the workflow token could not re-run them.
 * A run at ``Policy.max_attempt`` (3) or beyond is reported but never touched. Every
@@ -185,7 +221,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
@@ -247,28 +283,48 @@ _WATCHED_SET = frozenset(WATCHED_WORKFLOWS)
 # declared workflow's content instead would expire the declaration on every edit
 # to ci.yml or fast-gate.yml, the most-edited files here.
 #
-# Every entry is REF-KEYED, and that is a requirement rather than a coincidence.
-# Healing is cancel plus a full re-run, whose only protection against cancelling a
-# live successor is the newest-of-branch check, and that check filters by head
-# branch, event and head repository -- never by pull-request number. Two pull
-# requests can share a head branch (different base branches), so for a PR-KEYED
-# concurrency group another PR's newer run would be read as this run's successor
-# and the cancelled verdict would be left unrestored. Scoping the check to the PR
-# number would need a fourth mechanism to decide which workflows are PR-keyed; the
-# gate that already exists answers it by declaring fewer workflows instead, so
-# code-review.yml, cross-platform.yml, dependency-review.yml, pr-scope.yml and
-# screenshot-evidence.yml are watched and classified but never auto-healed.
+# Every entry here is REF-KEYED, and that is a requirement rather than a
+# coincidence. Healing is cancel plus a full re-run, whose only protection against
+# cancelling a live successor is the successor check. For a PUSH run that check is
+# the newest-of-branch listing, which filters by head branch, event and head
+# repository -- never by pull-request number. Two pull requests can share a head
+# branch (different base branches), so for a PR-KEYED concurrency group another
+# PR's newer run would be read as a push run's successor. A push run of a PR-keyed
+# workflow has no group at all (`github.event.pull_request.number` is empty on a
+# push), so such a workflow can only ever be healed on its pull-request runs, and
+# it is declared in HEAL_SAFE_PULL_REQUEST_WORKFLOWS below instead.
 #
-# A declared entry must also have a trigger a heal can reach. Pull-request runs are
-# never healed (see SKIPPED_PULL_REQUEST), so a workflow triggered ONLY by
-# `pull_request` -- macos-on-demand.yml is one -- could be declared here and still
-# never produce a single healable run. Such an entry reads as coverage that does not
-# exist, so it stays out and a test enforces that.
+# `macos-on-demand.yml` is ref-keyed and triggered only by `pull_request`. Its
+# runs are pull-request runs, which are healed (see `current_or_successor_id`), so
+# the declaration is reachable; a test pins that every declared workflow has a
+# trigger a heal can act on.
 HEAL_SAFE_WORKFLOWS: frozenset[str] = frozenset(
     {
         "build.yml",
         "ci.yml",
         "fast-gate.yml",
+        "macos-on-demand.yml",
+    }
+)
+# Declared heal-safe for PULL-REQUEST runs only. Every entry is PR-KEYED
+# (`<name>-${{ github.event.pull_request.number }}`, `cancel-in-progress: true`)
+# and triggered only by `pull_request`, so no push run of these exists to judge by
+# branch name. A pull-request run's successor is judged by HEAD SHA against the
+# open pull requests on its head branch, then by the listing for a newer run AT
+# that SHA (`current_or_successor_id`): a check indifferent to how the group is
+# keyed, and one that two pull requests sharing a branch cannot confuse when the
+# payloads name their pull requests, and that fails closed when they do not.
+# The derived gate admits the PR-number key for a pull-request run and only then.
+# None of these publish, deploy or sign; a test pins each one PR-keyed and
+# pull-request-only so a workflow that grows a `push` trigger falls back to exempt
+# until somebody moves it.
+HEAL_SAFE_PULL_REQUEST_WORKFLOWS: frozenset[str] = frozenset(
+    {
+        "code-review.yml",
+        "cross-platform.yml",
+        "dependency-review.yml",
+        "pr-scope.yml",
+        "screenshot-evidence.yml",
     }
 )
 _PUBLISH_OR_DEPLOY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -286,13 +342,35 @@ _PUBLISH_OR_DEPLOY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:sign-and-notarize\.yml|notarytool\b|codesign\b|signtool\b|cosign\s+sign\b|aws\s+signer\b)",
     )
 )
-# A REF-keyed run-level concurrency group, and only that. A PR-keyed group is
-# deliberately not accepted: the successor check filters the runs listing by branch
-# NAME, so it cannot tell one pull request's run from another's on a shared head
-# branch, which is why pull-request runs are never healed and why every declared
-# heal-safe workflow must be ref-keyed. Admitting `event.pull_request.number` here
-# would let the derived gate bless a workflow the declaration's own test forbids.
+# A REF-keyed run-level concurrency group. This is what a PUSH run needs: its
+# successor check filters the runs listing by branch NAME, so a PR-keyed group
+# cannot tell one pull request's run from another's on a shared head branch.
 _BRANCH_GROUP_SIGNAL = re.compile(r"\bgithub\.(?:ref(?:_name)?|head_ref)\b")
+# A PR-keyed group. Admitted for a PULL-REQUEST run and only then: its successor is
+# judged by head SHA against the open pull requests on the branch, not by the
+# listing, so how the group is keyed does not enter that judgement. On a push the
+# PR number is empty and the group degenerates to a constant, which is why a push
+# run never gets this signal.
+_PULL_REQUEST_GROUP_SIGNAL = re.compile(r"\bgithub\.event\.(?:pull_request\.)?number\b")
+# The open pull requests on a head branch are read one page deep. A branch with
+# more open pull requests than this is not a shape this repository has, and a
+# full page is treated as "cannot tell" rather than trusted as complete.
+PULL_REQUEST_LISTING_DEPTH = 30
+# What `current_or_successor_id` answers for a pull-request run whose pull request
+# is CLOSED or merged: no open pull request has its branch as head. Negative, so it
+# never collides with a run id. A re-run that lands on this is cancelled again and
+# nothing is restored, because no run anyone wants exists for it to have displaced.
+SUPERSEDED_WITHOUT_SUCCESSOR = -2
+# A pull-request run whose head MOVED while its pull request stays open: either the
+# newer runs at the open head cannot be identified as the same pull request's (the
+# payloads name no pull request), or none is listed yet. Superseded for every
+# judgement made BEFORE a mutation -- nothing at the old head is worth re-running --
+# but never a successor anyone may restore: restoring a sibling's run would leave
+# the same pull request's run, cancelled through the group, unrestored and
+# unreported, and an unlisted run may exist and have been cancelled the same way.
+# A re-run that finds this AFTER it started is withdrawn and reported FAILED, naming
+# the head, since what its group displaced cannot be told.
+SUPERSEDED_SUCCESSOR_UNIDENTIFIED = -3
 # The watchdog's own workflow, never watched: its comment names the fleet label.
 WATCHDOG_WORKFLOW = "ci-runner-watchdog.yml"
 # A rate-limited call whose window resets within this many seconds, and inside
@@ -340,6 +418,7 @@ REPO_LISTING_RESULT_CEILING = 1000
 # could not be read in full has hidden nothing actionable, and failing a tick over
 # it would go red exactly during the saturation this script exists to survive.
 ACTIONABLE_CANDIDATE_STATUSES = ("in_progress", "queued")
+
 # The jobs of ONE run, so the page count is bounded by the run's own matrix rather
 # than by fleet load: the widest watched workflow expands to a few hundred jobs, so
 # six pages of 100 clear it several times over. Kept as a cap anyway, because the
@@ -364,8 +443,15 @@ RECOVERY_LISTING_MAX_PAGES = 10
 # A run is re-run whole so `changes` recomputes the per-attempt runner label.
 RERUN_ENDPOINT = "rerun"
 # A recent CodeBuild start that waited at least this fraction of the orphan
-# threshold means CodeBuild is saturated, not that a label is dead.
+# threshold means CodeBuild is saturated, not that a label is dead. Judged first
+# on starts from the orphaned job's own queue, then fleet-wide; see
+# ``Policy.saturation_wait`` for why the fleet-wide reading pins the line low.
 SATURATION_FRACTION = 3
+# What the orphaned job's own queue says (``DispatchEvidence.own_queue``).
+OWN_QUEUE_SATURATED = "saturated"
+OWN_QUEUE_DISPATCHING = "dispatching"
+OWN_QUEUE_SILENT = "silent"
+
 # When no live run shows a recent CodeBuild start, this many newest completed
 # runs are read for one before anything is healed.
 COMPLETED_SAMPLE = 10
@@ -373,11 +459,27 @@ COMPLETED_SAMPLE = 10
 # the shared installation quota the incident exhausted. Runs arrive oldest first,
 # so the head of the bound serves those nearest the orphan threshold.
 LIVE_CLASSIFY_READS = 50
-# Reserved out of that bound for the NEWEST runs. Their prompt CodeBuild starts
-# are the dispatch evidence a saturation hold is judged by, and a bound spent
-# purely oldest first would drop them at exactly backlog scale, leaving a sweep
-# that heals nothing because it cannot tell a dead fleet from a busy one.
+# Reserved out of that bound for dispatch evidence: the served CodeBuild starts a
+# saturation hold is judged by. Drawn from the NEWEST runs that could carry one (see
+# ``_can_carry_a_slow_start``), because a reserve taken from the newest runs outright
+# can only ever yield prompt starts and is blind to the one signal that holds.
+# Measured here with the line at five minutes: the newest ten live runs spanned 0.0
+# to 0.6 minutes, none of them able to carry a wait that crossed it, while 352 listed
+# runs could -- young enough to speak about the fleet now, old enough for a slow
+# start to show.
 LIVE_EVIDENCE_RESERVE = 10
+# A listed live run older than this is a GHOST: a record the runs index still
+# returns as queued, in progress or pending but that GitHub itself does not hold
+# as live. GitHub cancels any job that has not started within 24 hours and caps a
+# CodeBuild build at 8, so a run in a live status two days on has no job that will
+# ever run and nothing a heal could act on; the ones measured here (created five
+# weeks earlier, no job ever created) answer a cancel with 409 "completed" and a
+# direct read with 404. They are dropped before the read bound is drawn, for two
+# reasons. Read, they spend the classify budget: 16 of the 50 reads on the tick
+# measured, every tick, re-reading the same jobless records. Unread, they would be
+# worse: a queued run past the saturation line counts as a run that COULD hold a
+# slow start, so an unread ghost would hold the heal back on every tick, for ever.
+GHOST_AFTER = timedelta(days=2)
 # How many in-window cancelled runs the recovery pass reads the jobs of per tick.
 # Every `main` push cancels the run it supersedes, so this repo holds hundreds of
 # cancelled runs inside one recovery window (300 measured in a 90-minute window),
@@ -426,25 +528,26 @@ CANCELLED_ORPHAN = "cancelled-orphan"
 HEALTHY = "healthy"
 SKIPPED_YOUNG = "skipped-young"
 SKIPPED_FORK = "skipped-fork"
-# A pull-request run: reported, never automatically healed. The successor check
-# asks "is a NEWER run of this branch in flight?", and GitHub's runs listing can
-# only be filtered by branch name, so two pull requests open on the same head
-# branch make each other look like successors -- which would abandon a cancelled
-# orphan behind a green `skipped-superseded`. Matching by pull-request number
-# instead is not available: of 20 sampled same-repository `pull_request` runs only
-# 9 carried `pull_requests[].number`, so that path would fail closed on most PR
-# runs and red the schedule for a healthy repo. Reported like a fork run, and green
-# for the same reason: its owner is looking at their own pull request's checks,
-# unlike a `main` orphan, which is the blindness this watchdog exists to end.
-SKIPPED_PULL_REQUEST = "skipped-pull-request-successor-unknown"
+# Pull-request runs are healed like push runs. Their successor is judged by head
+# SHA against the open pull requests on the head branch, then by the listing for a
+# newer run at that same SHA (`current_or_successor_id`). The head question is
+# answered from the pulls API by branch, never from `pull_requests[].number` on the
+# run payload (of 20 sampled same-repository runs only 9 carried it); that field is
+# consulted only to tell a same-SHA newer run's pull request from the judged run's,
+# and its absence fails that one question closed.
 SKIPPED_ATTEMPT_CAP = "skipped-attempt-cap"
 SKIPPED_SUPERSEDED = "skipped-superseded"
 SKIPPED_SATURATED = "skipped-saturated"
 SKIPPED_NO_DISPATCH_EVIDENCE = "skipped-no-dispatch-evidence"
-# The live listing exceeded the per-tick read bound, so the jobs that would have
-# proved saturation may sit in the band that was never read. Holding is safe (the
-# queued work is left alone and the next tick sees a shorter listing); heal-on-partial
-# is not, because it cancels finished work on evidence known to be incomplete.
+# Runs old enough to carry a served start past the threshold went unread this sweep,
+# so saturation cannot be ruled out. Holding leaves the queued work alone; acting
+# cancels finished work and re-queues it into a fleet the sweep could not see. The
+# premise is the unread SATURATION-CAPABLE runs, not merely that the read bound was
+# reached: a bound spent entirely on runs that could not carry such a start leaves
+# nothing unseen. At this repository's listing size the premise is still met on most
+# ticks (about 302 unread capable runs against a 50-read bound), so this is a more
+# honest hold rather than a rarer one; raising the bound or narrowing the listing is
+# what lowers it, tracked at #13644.
 SKIPPED_PARTIAL_EVIDENCE = "skipped-partial-dispatch-evidence"
 LOOKUP_INCONCLUSIVE = "lookup-inconclusive"
 WAITING_ON_GROUP = "waiting-on-group"
@@ -473,6 +576,13 @@ OUTCOME_SUCCESSOR_LOST = "superseded-after-rerun-successor-lost"
 OUTCOME_SUCCESSOR_UNSETTLED = "superseded-after-rerun-successor-unsettled"
 OUTCOME_OWN_RERUN_UNCANCELLED = "superseded-after-rerun-own-rerun-still-running"
 OUTCOME_SUCCESSOR_SUPERSEDED = "superseded-after-rerun-successor-superseded-too"
+# A pull-request run re-run by this script and then found to belong to a CLOSED
+# pull request. The re-run is cancelled again (it serves a head nobody wants) and
+# nothing is restored: no open pull request has a run it could have displaced. Not
+# a failed outcome: no verdict is lost. A head that moved while the pull request
+# stays open is NOT this case; that is `OUTCOME_LOOKUP_FAILED`, since the re-run may
+# have displaced the run at the new head.
+OUTCOME_RERUN_WITHDRAWN = "superseded-after-rerun-pull-request-closed"
 OUTCOME_LOOKUP_FAILED = "branch-lookup-inconclusive"
 
 OUTCOME_CANCEL_FAILED = "cancel-failed"
@@ -481,6 +591,18 @@ OUTCOME_RERUN_DEFERRED = "rerun-deferred-out-of-time"
 OUTCOME_RERUN_REFUSED = "rerun-refused"
 OUTCOME_NOT_ATTEMPTED = "not-attempted-cap-reached"
 OUTCOME_EVIDENCE_REREAD_DEFERRED = "deferred-evidence-reread-failed"
+# An orphan past attempt 1 that a newer push supersedes (or whose supersession
+# cannot be told), left uncancelled: a later attempt may be somebody's own `gh run
+# rerun`, and cancelling a superseded run is never followed by a re-run, so the
+# cancel would discard their work with nothing left to show they did it. A FAILED
+# outcome: the run keeps its concurrency group's running slot, and on `main`
+# (`cancel-in-progress: false`) that evicts every later push's run from the
+# pending slot -- the measured 6-hour incident in `supersession_clears_hold`'s
+# docstring. The watchdog has decided it will never free that slot itself, so a
+# human must, and a `::warning::` inside a green scheduled run tells nobody; the
+# tick goes red and names the `gh run cancel` to type, for the same reason
+# `OUTCOME_HUMAN_REQUIRED` is a failed outcome.
+OUTCOME_RERUN_ATTEMPT_LEFT = "rerun-attempt-superseded-left-untouched"
 # A stuck run in a workflow this script will not heal, so only a human can move
 # it. A failed outcome: most of the watched set is heal-exempt,
 # `main-ratchet-audit.yml` among them, and it was one of the three workflows in
@@ -525,6 +647,7 @@ FAILED_OUTCOMES = frozenset(
         OUTCOME_LISTING_TRUNCATED,
         OUTCOME_HEAL_SAFETY_UNKNOWN,
         OUTCOME_HUMAN_REQUIRED,
+        OUTCOME_RERUN_ATTEMPT_LEFT,
     }
 )
 
@@ -775,6 +898,11 @@ class RunVerdict:
     verdict: str
     workflow: str
     head_sha: str = ""
+    # The pull requests the run payload names, when it names any. Carried only so a
+    # newer run at the SAME head SHA can be told to be the same pull request's (its
+    # successor) or a sibling's on a shared head branch; absent on most same-repo
+    # runs, in which case that question fails closed.
+    pull_request_numbers: tuple[int, ...] = ()
     revision_heal_safe: bool = False
     orphans: list[OrphanedJob] = field(default_factory=list)
     detail: str = ""
@@ -818,6 +946,21 @@ class Policy:
 
     @property
     def saturation_wait(self) -> timedelta:
+        """How long a served start must have waited to count as saturation evidence.
+
+        A third of the orphan threshold. Raising it to the threshold itself is
+        tempting -- measured over 404 CodeBuild starts here, queue wait is 27s
+        median and 47s at p90 but 429s at p99 and 709s at the slowest, so a third
+        of the threshold reads as saturated on 10 of those starts, and the hold it
+        takes is what keeps a stuck run stuck -- but the inference behind a raise
+        is unsound for the fleet-wide reading, which is label-blind. A start served
+        in seven minutes on ANOTHER label says nothing about the queue the orphan is
+        in, so raising the line there widens the window in which a queued-but-alive
+        job is cancelled. The same-queue reading (``DispatchEvidence.same_queue``)
+        is the comparison a raise would be safe against; the line is shared by both
+        readings and is left where the label-blind one needs it, and the raise for
+        the same-queue reading is tracked at #13644 rather than made here.
+        """
         return self.orphan_after / SATURATION_FRACTION
 
     @property
@@ -837,6 +980,33 @@ def is_codebuild_job(job: dict[str, Any]) -> bool:
     so match on the prefix of each label rather than on equality.
     """
     return any(str(label).startswith(CODEBUILD_LABEL_PREFIX) for label in job.get("labels") or [])
+
+
+_PER_RUN_LABEL_SUFFIX = re.compile(r"-\d+-\d+$")
+
+
+def dispatch_queue(labels: Iterable[str]) -> frozenset[str]:
+    """The CodeBuild queue a job's labels route it to, with the per-run suffix removed.
+
+    A routed job's label is ``codebuild-<project>-<run id>-<run attempt>``, optionally
+    followed by an override such as ``instance-size:large``. The project selects the
+    CodeBuild project and the override selects its fleet; the run id and attempt
+    only exist because CodeBuild requires them in the label and say nothing about
+    which queue serves the job. Stripping them makes two jobs in different runs
+    that wait on the same project and fleet compare equal, which is the comparison
+    the same-queue evidence below needs. Labels that are not CodeBuild-routed are
+    kept verbatim.
+    """
+    queue: set[str] = set()
+    for label in labels:
+        text = str(label)
+        if not text.startswith(CODEBUILD_LABEL_PREFIX):
+            queue.add(text)
+            continue
+        head, _, overrides = text.partition(" ")
+        head = _PER_RUN_LABEL_SUFFIX.sub("", head)
+        queue.add(f"{head} {overrides}".strip())
+    return frozenset(queue)
 
 
 def is_fork_run(run: dict[str, Any], repo: str) -> bool:
@@ -874,14 +1044,25 @@ def _workflow_without_full_line_comments(raw: str) -> str:
     return "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
 
 
-def workflow_has_ref_or_pr_concurrency(text: str) -> bool:
-    """Whether the run-level concurrency group names a ref or pull request."""
+def workflow_has_ref_or_pr_concurrency(text: str, *, event: str = "push") -> bool:
+    """Whether the run-level concurrency group names a ref, or -- for a pull-request
+    run -- a pull-request number.
+
+    The event decides which key is enough. A push run's successor is judged by the
+    branch listing, so its group must be ref-keyed. A pull-request run's successor is
+    judged by head SHA against the open pull requests on its branch, which does not
+    depend on the group at all, so the PR-number key is admitted for it; on a push
+    that key is empty and the group a constant, so it is never admitted there.
+    """
     groups = [
         value.partition("#")[0]
         for keys, value in _yaml_mapping_entries(text)
         if keys == ("concurrency", "group") or (keys == ("concurrency",) and value)
     ]
-    return any(_BRANCH_GROUP_SIGNAL.search(group) for group in groups)
+    signals: tuple[re.Pattern[str], ...] = (_BRANCH_GROUP_SIGNAL,)
+    if event == "pull_request":
+        signals = (_BRANCH_GROUP_SIGNAL, _PULL_REQUEST_GROUP_SIGNAL)
+    return any(signal.search(group) for group in groups for signal in signals)
 
 
 def workflow_text_has_publish_or_deploy_step(raw: str) -> bool:
@@ -906,19 +1087,32 @@ def workflow_text_has_publish_or_deploy_step(raw: str) -> bool:
     )
 
 
-def workflow_text_is_heal_safe(raw: str) -> bool:
-    """Whether workflow text is branch-scoped and free of durable side effects."""
+def workflow_text_is_heal_safe(raw: str, *, event: str = "push") -> bool:
+    """Whether workflow text is branch-scoped (for this event) and free of durable side effects."""
     text = _workflow_without_full_line_comments(raw)
     return workflow_has_ref_or_pr_concurrency(
-        text
+        text, event=event
     ) and not workflow_text_has_publish_or_deploy_step(text)
+
+
+def heal_safe_declared(workflow: str, event: str) -> bool:
+    """The DECLARED gate for one run: is this workflow declared heal-safe for this event.
+
+    A ref-keyed declaration covers every event, pull-request runs included. A
+    PR-keyed declaration covers pull-request runs only: on any other event the PR
+    number is empty, so the workflow has no concurrency group and nothing protects
+    a re-run of it from a live successor; such a run stays exempt.
+    """
+    if workflow in HEAL_SAFE_WORKFLOWS:
+        return True
+    return workflow in HEAL_SAFE_PULL_REQUEST_WORKFLOWS and event == "pull_request"
 
 
 def heal_exempt_workflows(
     workflows: tuple[str, ...] = WATCHED_WORKFLOWS,
-    heal_safe: frozenset[str] = HEAL_SAFE_WORKFLOWS,
+    heal_safe: frozenset[str] = HEAL_SAFE_WORKFLOWS | HEAL_SAFE_PULL_REQUEST_WORKFLOWS,
 ) -> frozenset[str]:
-    """Watched workflows that require human recovery: everything not declared heal-safe.
+    """Watched workflows that require human recovery: everything declared safe for NO event.
 
     Classification reads the declaration alone. The YAML itself is read at the
     RUN'S OWN revision, by ``workflow_is_heal_safe_at_revision``, immediately
@@ -926,14 +1120,18 @@ def heal_exempt_workflows(
     weaker subject: a branch can change a group or add publishing, and the
     checkout cannot see that. Anything the checkout read would have stopped, the
     revision read stops too, before a run is touched.
+
+    A workflow declared safe for pull-request runs only is NOT in this set; its
+    push runs are marked exempt per run by ``_mark_heal_exempt`` through
+    ``heal_safe_declared``, which sees the event.
     """
     return frozenset(workflow for workflow in workflows if workflow not in heal_safe)
 
 
 def workflow_is_heal_safe_at_revision(
-    api: Api, repo: str, workflow: str, head_sha: str
+    api: Api, repo: str, workflow: str, head_sha: str, *, event: str = "push"
 ) -> bool | None:
-    """Whether a workflow is heal-safe AT ONE RUN'S OWN revision.
+    """Whether a workflow is heal-safe AT ONE RUN'S OWN revision, for that run's event.
 
     Three answers, because a declared-unsafe workflow and one whose safety cannot
     be established are not the same fact and must not share an outcome. ``False``
@@ -945,7 +1143,7 @@ def workflow_is_heal_safe_at_revision(
 
     Either way nothing is cancelled or re-run: only ``True`` admits a mutation.
     """
-    if workflow not in HEAL_SAFE_WORKFLOWS:
+    if not heal_safe_declared(workflow, event):
         return False
     if not head_sha:
         return None
@@ -966,7 +1164,7 @@ def workflow_is_heal_safe_at_revision(
         raw = base64.b64decode(encoded, validate=True).decode("utf-8")
     except (UnicodeError, ValueError):
         return None
-    return workflow_text_is_heal_safe(raw)
+    return workflow_text_is_heal_safe(raw, event=event)
 
 
 def _mark_heal_exempt(verdict: RunVerdict, exempt_workflows: frozenset[str]) -> RunVerdict:
@@ -977,7 +1175,12 @@ def _mark_heal_exempt(verdict: RunVerdict, exempt_workflows: frozenset[str]) -> 
     # no outcome. The label the summary shows becomes `heal-exempt`; the attempt is
     # kept in the detail so the escalation reason is not lost. Forks are left alone:
     # nobody's token can re-run one, which is a more specific answer than exemption.
-    if verdict.workflow in exempt_workflows and verdict.verdict in (
+    # A workflow declared safe for pull-request runs only is exempt on its push runs
+    # (`heal_safe_declared`), so the event is consulted alongside the set.
+    exempt = verdict.workflow in exempt_workflows or not heal_safe_declared(
+        verdict.workflow, verdict.event
+    )
+    if exempt and verdict.verdict in (
         ORPHANED,
         CANCELLED_ORPHAN,
         SKIPPED_ATTEMPT_CAP,
@@ -1015,7 +1218,18 @@ def _base_verdict(run: dict[str, Any], now: datetime) -> RunVerdict:
         verdict=HEALTHY,
         workflow=workflow,
         head_sha=_safe_text(run.get("head_sha")),
+        pull_request_numbers=_pull_request_numbers(run),
     )
+
+
+def _pull_request_numbers(run: dict[str, Any]) -> tuple[int, ...]:
+    """The pull-request numbers a run payload names; empty when it names none."""
+    numbers: list[int] = []
+    for pull in run.get("pull_requests") or []:
+        number = (pull or {}).get("number") if isinstance(pull, dict) else None
+        if isinstance(number, int):
+            numbers.append(number)
+    return tuple(sorted(set(numbers)))
 
 
 def _guard(
@@ -1026,14 +1240,10 @@ def _guard(
         verdict.verdict = SKIPPED_FORK
         verdict.detail = "head repository is a fork; the workflow token cannot re-run it"
         return verdict
-    if verdict.event == "pull_request":
-        verdict.verdict = SKIPPED_PULL_REQUEST
-        verdict.detail = (
-            "a pull-request run: whether a listed run of this branch is really this run's "
-            "successor cannot be established, because the runs listing filters by branch name "
-            "and two pull requests can share one head branch; re-running is not attempted"
-        )
-        return verdict
+    # A pull-request run passes here like a push run. Its successor check is by
+    # head SHA against the open pull requests on its branch, then by the listing for
+    # a newer run at that SHA (`current_or_successor_id`), asked immediately before
+    # the cancel (`_supersession_is_answerable`) and again before the re-run.
     if verdict.run_attempt >= policy.max_attempt:
         verdict.verdict = SKIPPED_ATTEMPT_CAP
         verdict.detail = (
@@ -1093,9 +1303,10 @@ def classify_cancelled_run(
 
     A cancelled job that never had a runner keeps the orphan's fingerprint: a
     ``codebuild-`` label, an empty runner name, and a queue wait (creation to
-    completion) past the threshold. Only the newest run of its branch is worth
-    re-running: anything older has been superseded and, on a pull request,
-    re-running it would cancel its successor through the concurrency group.
+    completion) past the threshold. Only the run that still carries its branch's
+    verdict is worth re-running (``current_or_successor_id``): anything superseded
+    would, re-run, only cancel its successor through the concurrency group, and a
+    closed pull request's run has nobody left to want its result.
     """
     verdict = _base_verdict(run, policy.now)
     updated = parse_timestamp(str(run.get("updated_at") or run["created_at"]))
@@ -1131,7 +1342,8 @@ def classify_cancelled_run(
     if not newest:
         verdict.verdict = SKIPPED_SUPERSEDED
         verdict.detail = (
-            "a newer run exists for this branch; re-running this one would only cancel it"
+            "a newer run exists for this branch, or its pull request has closed; re-running "
+            "this one would only cancel a successor or serve a head nobody wants"
         )
         return verdict
     verdict = _guard(verdict, run, policy, CANCELLED_ORPHAN)
@@ -1160,20 +1372,44 @@ class DispatchEvidence:
 
     starts: list[tuple[datetime, timedelta, OrphanedJob]] = field(default_factory=list)
     completed_sampled: bool = False
-    # Set when the per-tick read bound dropped part of the live listing. The dropped
-    # band is the MIDDLE of the sweep, so a slow start living there was never read,
-    # and "no slow start seen" stops meaning "no slow start exists". Without this the
-    # sweep would authorize a heal on evidence it knows is partial, at exactly the
-    # backlog scale the bound's own docstring names.
-    partial: bool = False
+    # The runs that COULD carry a qualifying slow start and went unread this sweep,
+    # kept as run id -> creation time rather than as a count. A run at least
+    # ``saturation_wait`` old can hold a served start that waited that long; a younger
+    # one cannot. While any such run is unread, "no slow start was seen" does not mean
+    # none exists, and the completed-run sample cannot close the gap: it reads the
+    # newest completions, so a mixed fleet that serves some jobs promptly and queues
+    # others past the threshold can put a prompt start in the sample while the slow one
+    # sits in a live run nobody read. Cancelling on that re-queues finished work into
+    # the saturation it failed to see.
+    #
+    # The TIMES are retained, not the verdict they imply, because age is the half that
+    # grows while the sweep runs: a run 10 s under the line when the listing was read
+    # is over it by the time a later cancel is judged, and a frozen count calls it
+    # incapable for the whole phase. ``_since`` retains the starts for the same reason.
+    unread_candidates: dict[int, datetime] = field(default_factory=dict)
+
+    def unread_saturation_capable(self, policy: Policy) -> int:
+        """How many retained unread runs are old enough NOW to hold a slow start.
+
+        Judged against ``policy.now`` at every call, so a run that crossed
+        ``saturation_wait`` after the listing was read is counted from that moment on.
+        """
+        return sum(
+            1
+            for created in self.unread_candidates.values()
+            if policy.now - created >= policy.saturation_wait
+        )
 
     def absorb(self, jobs: list[dict[str, Any]], policy: Policy) -> None:
+        # Every served start is kept, whatever its age. The fleet-wide readings apply
+        # the lookback when they are asked (``_since``, ``slowest_served_wait``),
+        # because for them a start is evidence about the fleet NOW and ages out; the
+        # same-queue reading does not, because for it a start is evidence about
+        # whether the orphan ever stood in that line, and that does not age.
         for job in jobs:
             if not is_codebuild_job(job) or not job.get("runner_name") or not job.get("started_at"):
                 continue
             started = parse_timestamp(str(job["started_at"]))
-            if policy.now - started > policy.saturation_lookback:
-                continue
             waited = started - parse_timestamp(job["created_at"])
             if waited < timedelta(0):
                 # Carried over from an earlier attempt: (re-)created after it started.
@@ -1199,11 +1435,81 @@ class DispatchEvidence:
             return None
         return max(slow, key=lambda entry: entry[1])[2]
 
+    def same_queue(
+        self, since: datetime, policy: Policy, queue: frozenset[str], *, recent: bool
+    ) -> list[tuple[datetime, timedelta, OrphanedJob]]:
+        """The starts served by the orphaned job's OWN queue after it queued.
+
+        The label-blind evidence above answers "is the fleet dispatching"; this
+        answers the narrower question the hold actually needs, "was this job ever in
+        the line it is waiting on". A start on the same CodeBuild project and fleet
+        (``dispatch_queue``) after the orphan queued is a job that stood in the same
+        line and got out of it, so what it says about that line is not diluted by a
+        slow start on another label with its own capacity.
+
+        ``recent`` applies the lookback, as the fleet-wide readings do; without it every
+        start after ``since`` counts. ``own_queue`` says which is asked when.
+        """
+        floor = max(since, policy.now - policy.saturation_lookback) if recent else since
+        return [
+            entry
+            for entry in self.starts
+            if entry[0] >= floor and dispatch_queue(entry[2].labels) == queue
+        ]
+
+    def own_queue(
+        self, since: datetime, policy: Policy, queue: frozenset[str]
+    ) -> tuple[str, OrphanedJob | None]:
+        """What the orphan's own queue says: SATURATED, DISPATCHING, or nothing.
+
+        Recent starts (inside the lookback) are read first and read as the fleet-wide
+        rule reads them: one that waited ``saturation_wait`` or more means that queue is
+        saturated NOW and is returned with the verdict; prompt ones and nothing slow
+        mean it is dispatching. Only when the queue served nothing recently are the
+        older starts consulted, and they carry ONE conclusion: if every one of them was
+        prompt, the queue served jobs that stood in line with the orphan and the orphan
+        was never in that line -- a fact that does not age, unlike the state of the
+        fleet. An old slow start with nothing recent is not read as saturation (it says
+        nothing about the queue now) and not read as dispatching either; the label-blind
+        rules take over. Whether the fleet is up now is the outage hold's question, and
+        ``resolve_hold`` still asks it after a DISPATCHING reading.
+        """
+        recent = self.same_queue(since, policy, queue, recent=True)
+        if recent:
+            slow = [entry for entry in recent if entry[1] >= policy.saturation_wait]
+            if slow:
+                return OWN_QUEUE_SATURATED, max(slow, key=lambda entry: entry[1])[2]
+            return OWN_QUEUE_DISPATCHING, None
+        older = self.same_queue(since, policy, queue, recent=False)
+        if older and all(entry[1] < policy.saturation_wait for entry in older):
+            return OWN_QUEUE_DISPATCHING, None
+        return OWN_QUEUE_SILENT, None
+
     def saturated(self, since: datetime, policy: Policy) -> bool:
         return self.slowest(since, policy) is not None
 
     def inconclusive(self, since: datetime, policy: Policy) -> bool:
         return self.recent_starts(since, policy) == 0
+
+    def slowest_served_wait(self, policy: Policy) -> tuple[timedelta, str] | None:
+        """The longest queue wait among the starts inside the lookback, slow or not.
+
+        Reported whether or not it crosses ``saturation_wait``, because the margin
+        between the two is what says whether the line still discriminates. Measured
+        here the slowest served wait was 709s against a 300s line; a reading that
+        climbs toward the line means the hold is about to fire on ordinary traffic,
+        and one that sits far below it means the line could be raised. Either way it
+        is drift a reader should see in the tick's own log rather than have to
+        re-measure by hand. Bounded to the lookback like the fleet-wide readings it
+        calibrates: a start served hours ago is not the queue the line judges now.
+        """
+        recent = [
+            entry for entry in self.starts if policy.now - entry[0] <= policy.saturation_lookback
+        ]
+        if not recent:
+            return None
+        started, waited, job = max(recent, key=lambda entry: entry[1])
+        return waited, job.name
 
 
 def _orphan(job: dict[str, Any], queued_for: timedelta) -> OrphanedJob:
@@ -1408,69 +1714,234 @@ def list_all_candidate_runs(
     return runs
 
 
-def _heal_eligible_shape(run: dict[str, Any]) -> bool:
+def _heal_eligible_shape(run: dict[str, Any], repo: str) -> bool:
     """Whether a listed run has a SHAPE a heal could act on, from the listing alone.
 
     Priority only, never authorization. Every real gate still runs afterwards and
     can still refuse: the workflow's concurrency group read at the run's own
-    revision, the newest-of-branch check, the saturation hold. What this reads is
-    the pair those gates cannot reverse -- a ``push`` event, because the successor
-    check filters the runs listing by branch NAME and so a pull-request run is
-    never healed, and a declared heal-safe workflow.
+    revision, the successor check, the saturation hold. What this reads is what
+    those gates cannot reverse -- an event a heal can act on (``push`` or
+    ``pull_request``), a head repository that is this one (no token can re-run a
+    fork's run), and a workflow declared heal-safe for that event. All three are on
+    the listing row, so the ranking costs no read.
     """
-    return _safe_text(run.get("event")) == "push" and _workflow_of(run) in HEAL_SAFE_WORKFLOWS
+    event = _safe_text(run.get("event"))
+    workflow = _workflow_of(run)
+    return (
+        event in {"push", "pull_request"}
+        and not is_fork_run(run, repo)
+        and workflow is not None
+        and heal_safe_declared(workflow, event)
+    )
+
+
+def _can_carry_a_slow_start(run: dict[str, Any], policy: Policy) -> bool:
+    """Whether a run could hold a served start that waited past ``saturation_wait``.
+
+    Two conditions. The run must be in a status that has jobs at all -- a ``pending``
+    run is held by its concurrency group with none created, so it can carry no start
+    at any age. And it must be at least ``saturation_wait`` old, since a younger one
+    cannot contain a wait that long.
+
+    Deliberately NOT a third condition on ``updated_at``. A run untouched for longer
+    than ``saturation_lookback`` looks unable to hold a countable start, and excluding
+    those would cut the count materially: measured, 352 listed runs pass the two
+    conditions above and only 193 were touched inside the lookback. But a run is quiet
+    for exactly two reasons, and the API cannot tell them apart from the listing: it
+    is a zombie nothing will ever happen to, or ITS JOB HAS BEEN QUEUED THAT WHOLE
+    TIME -- the saturation this hold exists for. When such a job is finally served,
+    the listing that called its run incapable was a snapshot taken a moment before,
+    and the pre-cancel re-read narrows that window without closing it. So the price of
+    the two conditions is an over-hold on zombie runs, which costs a heal, against an
+    under-hold that cancels work the fleet was about to serve.
+    """
+    if not _may_hold_jobs(run):
+        return False
+    return policy.now - parse_timestamp(str(run["created_at"])) >= policy.saturation_wait
+
+
+def _may_hold_jobs(run: dict[str, Any]) -> bool:
+    """The age-free half of ``_can_carry_a_slow_start``: does this run have jobs at all.
+
+    Split out because the two halves age differently. A run's STATUS is a reading of
+    the listing and goes stale only when the listing is re-read; its AGE grows with
+    the wall clock, so a run just under the line at the sweep is over it minutes
+    later. The unread set is therefore retained by this half and re-judged on age at
+    each use, rather than collapsed to one integer at the sweep's clock.
+    """
+    # ACTIONABLE_CANDIDATE_STATUSES answers "may this run be healed"; the question
+    # here is "can this run carry a job at all". The two coincide because every status
+    # in which jobs exist is also one a heal can act on, and `pending` -- held by its
+    # concurrency group with no jobs created -- is in neither. A status added here for
+    # heal purposes must be checked against BOTH readings before it is added.
+    return _safe_text(run.get("status")) in ACTIONABLE_CANDIDATE_STATUSES
+
+
+def _evidence_reserve(runs: list[dict[str, Any]], policy: Policy) -> list[dict[str, Any]]:
+    """The reserve slice: newest runs that could hold a slow start.
+
+    ``runs`` arrives oldest first. A run that cannot carry a served start past the
+    line -- too young, or ``pending`` and so jobless -- can only ever show the fleet
+    dispatching, so reserving a read for it leaves the reserve unable to answer the
+    other way. Preferring the newest runs that CAN keeps the reserve current while
+    letting it answer both.
+    """
+    capable = [run for run in runs if _can_carry_a_slow_start(run, policy)]
+    # Falls back to the newest runs when none is capable: they still show the
+    # fleet dispatching, and an empty reserve would read as an outage.
+    source = capable or runs
+    return source[-LIVE_EVIDENCE_RESERVE:]
+
+
+def drop_ghost_runs(
+    runs: list[dict[str, Any]], policy: Policy, log: Callable[[str], None] = print
+) -> list[dict[str, Any]]:
+    """The listed live runs minus the ghosts: records past ``GHOST_AFTER`` in a live status.
+
+    Applied before the read bound is drawn, so a ghost is neither read nor counted as
+    an unread run able to hold a slow start (see ``GHOST_AFTER`` for why both matter).
+    Dropping is by AGE alone, from the listing: the reads that could tell more -- jobs,
+    or the run itself -- are the cost being saved. The age is taken from the NEWER of
+    ``created_at`` and ``run_started_at``. A re-run keeps the ``created_at`` of the run
+    it re-runs and moves ``run_started_at`` to the attempt, so an attempt an operator
+    (or this watchdog) started on a run two days old is as young as that attempt; a
+    ghost never started, and its two stamps agree. One line names how many were
+    dropped, so a tick that acted on a shorter set than it listed says so.
+    """
+    live: list[dict[str, Any]] = []
+    ghosts = 0
+    oldest: datetime | None = None
+    for run in runs:
+        created = parse_timestamp(str(run["created_at"]))
+        started_raw = run.get("run_started_at")
+        started = parse_timestamp(str(started_raw)) if started_raw else created
+        newest = max(created, started)
+        if policy.now - newest >= GHOST_AFTER:
+            ghosts += 1
+            oldest = newest if oldest is None or newest < oldest else oldest
+            continue
+        live.append(run)
+    if ghosts:
+        log(
+            f"::notice::{ghosts} listed run(s) older than {_fmt_delta(GHOST_AFTER)} dropped as "
+            f"ghosts (oldest last started {oldest.isoformat() if oldest else '?'}): GitHub "
+            "cancels a job that has not started within a day, so a run still listed live "
+            "past that has nothing a heal could act on, and reading it would only spend the bound"
+        )
+    return live
 
 
 def live_runs_within_read_bound(
-    runs: list[dict[str, Any]], log: Callable[[str], None] = print
-) -> tuple[list[dict[str, Any]], bool]:
-    """The live runs whose jobs this sweep may read: oldest first, newest reserved.
+    runs: list[dict[str, Any]], policy: Policy, log: Callable[[str], None] = print
+) -> tuple[list[dict[str, Any]], dict[int, datetime]]:
+    """The live runs whose jobs this sweep may read: oldest first, evidence reserved.
 
     The reads serve two purposes that pull opposite ways. Classifying an orphan
-    wants the OLDEST runs, the only ones that can be actionable. Proving the
-    fleet still dispatches wants a YOUNG run's prompt CodeBuild start, which is
-    the evidence ``resolve_hold`` judges saturation by. A bound spent purely
-    oldest first starves the second at exactly backlog scale, and a sweep with no
-    dispatch evidence heals nothing, which is safe but useless precisely when the
-    watchdog is needed. So the head of the bound goes to the oldest runs and its
-    tail is reserved for the newest.
+    wants the OLDEST runs, the only ones that can be actionable. Judging whether
+    the fleet still dispatches wants a run's served CodeBuild starts, which is the
+    evidence ``resolve_hold`` weighs. A bound spent purely oldest first starves
+    the second at exactly backlog scale, and a sweep with no dispatch evidence
+    heals nothing, which is safe but useless precisely when the watchdog is
+    needed. So the head of the bound goes to the oldest runs and its tail is
+    reserved for evidence.
 
-    Within the head, runs of ``_heal_eligible_shape`` go first. Oldest-first alone
+    The reserve takes the newest runs THAT ARE THEMSELVES at least
+    ``policy.saturation_wait`` old. A younger run cannot contain a start that
+    waited that long, so reserving the newest runs outright yields prompt starts
+    only and can never see the slow start that holds -- the reserve would answer
+    one of the hold's two questions and be structurally blind to the other. When
+    no run is old enough, the newest are taken anyway: they can still show the
+    fleet dispatching, and a sweep with nothing at all falls to the
+    completed-run sample instead.
+
+    Within the head, runs that could actually be acted on go first: the
+    ``_heal_eligible_shape`` pair AND an age past the orphan threshold. Oldest-first
+    alone
     ranks by age, and the oldest live runs at this repository are runs no heal can
     ever act on: measured on this repository, 220 watched live runs sit past the
-    orphan threshold and 18 past a day, the oldest 36 days, every one of them a
-    pull-request run that stays listed and therefore re-reads the same slots on
-    every tick. A ``push`` run of a heal-safe workflow -- the only kind that can
-    be cleared, and the kind that holds a branch's concurrency slot while it is
-    stuck -- ranked 30th of 40 slots at six hours old. That margin shrinks as
+    orphan threshold and 18 past a day, the oldest 36 days, runs that stay listed
+    and therefore re-read the same slots on every tick -- a fork's, which no token
+    can re-run, or a closed pull request's, which is cancelled and not re-read. A
+    same-repository run of a workflow declared heal-safe for its event -- the only
+    kind that can be cleared, and the kind that holds a branch's concurrency slot
+    while it is stuck -- ranked 30th of 40 slots at six hours old. That margin shrinks as
     zombies accumulate, so age is the ordering WITHIN each class rather than
     across them.
+
+    The age condition is what keeps the priority honest now that the reserve no
+    longer absorbs the youngest runs: every ``push`` run of a heal-safe workflow
+    carries the eligible shape, so shape alone would let this minute's pushes
+    outrank an orphan stuck for hours. They are still read, just not ahead of it.
     """
+    runs = drop_ghost_runs(runs, policy, log)
     if len(runs) <= LIVE_CLASSIFY_READS:
-        return runs, False
-    log(
-        f"reached the per-tick live job-read cap of {LIVE_CLASSIFY_READS}; the "
-        f"{LIVE_CLASSIFY_READS - LIVE_EVIDENCE_RESERVE} classified are drawn "
-        "heal-eligible first then oldest first, and the newest "
-        f"{LIVE_EVIDENCE_RESERVE} are read for dispatch evidence; the rest wait for the "
-        "next tick"
-    )
-    oldest = LIVE_CLASSIFY_READS - LIVE_EVIDENCE_RESERVE
+        return runs, {}
     # Disjoint by construction, so a run cannot be read twice: the reserve is cut
-    # off the tail before the classify pool is drawn from what remains.
-    reserved = runs[-LIVE_EVIDENCE_RESERVE:]
-    pool = runs[:-LIVE_EVIDENCE_RESERVE]
-    eligible = [run for run in pool if _heal_eligible_shape(run)]
-    rest = [run for run in pool if not _heal_eligible_shape(run)]
+    # out of the listing before the classify pool is drawn from what remains.
+    reserved = _evidence_reserve(runs, policy)
+    reserved_ids = {run["id"] for run in reserved}
+    pool = [run for run in runs if run["id"] not in reserved_ids]
+    # Sized off the reserve ACTUALLY taken, not off the constant. A short listing hands
+    # back fewer than LIVE_EVIDENCE_RESERVE slots, and subtracting the constant would
+    # leave that difference unspent -- reading fewer runs than the bound allows, which
+    # classifies fewer orphans and leaves more unread capable runs holding the heal.
+    oldest = LIVE_CLASSIFY_READS - len(reserved)
+    banded = sum(1 for run in reserved if _can_carry_a_slow_start(run, policy))
+    # One line, emitted here rather than before the reserve is computed: the split it
+    # names has to be the split this tick actually took. Interpolating the constants
+    # earlier printed 40/10 on a tick that then spent 47/3, so the read-budget
+    # diagnostic described a division no sweep performed.
+    log(
+        f"::notice::{len(runs)} live runs reached the per-tick live job-read cap of "
+        f"{LIVE_CLASSIFY_READS}; the {oldest} classified are drawn actionable-shaped "
+        "first (heal-eligible and past the orphan threshold) then oldest first, and "
+        f"{len(reserved)} reads are reserved for the newest runs able to hold a start "
+        f"that waited {_fmt_delta(policy.saturation_wait)} ({banded} of them can), whose "
+        "served CodeBuild starts are the dispatch evidence; the rest wait for the next "
+        "tick, and any unread run old enough to hold a slow start holds the heal back"
+        + (
+            ""
+            if banded == len(reserved)
+            else " -- the shortfall is the newest-runs fallback, which reports the fleet "
+            "dispatching but cannot show a slow start"
+        )
+    )
+
+    def actionable_shape(run: dict[str, Any]) -> bool:
+        # Shape AND age: a run younger than the orphan threshold is never actionable,
+        # and every run of a heal-safe workflow carries the heal-eligible shape, so
+        # shape alone would let the youngest pushes outrank an orphan that has been
+        # stuck for hours. They are still read, just not ahead of it.
+        return (
+            _heal_eligible_shape(run, policy.repo)
+            and policy.now - parse_timestamp(str(run["created_at"])) >= policy.orphan_after
+        )
+
+    eligible = [run for run in pool if actionable_shape(run)]
+    rest = [run for run in pool if not actionable_shape(run)]
     classified = (eligible + rest)[:oldest]
     # The caller reads jobs in the order given and the sweep's log is read
-    # chronologically, so the classify slice is handed back oldest first even
-    # though it was drawn by class.
-    classified.sort(key=lambda run: run["created_at"])
-    # The second value tells the caller its saturation evidence is PARTIAL. The band
-    # dropped here is the middle of the sweep, so a slow start living there is never
-    # read and "nothing slow was seen" no longer rules saturation out.
-    return classified + reserved, True
+    # chronologically, so the whole selection is sorted by age. Sorting the classify
+    # slice alone was enough only while the reserve was the newest runs outright; the
+    # reserve is now an age band in the middle, so it has to be sorted in with them.
+    selected = sorted(classified + reserved, key=lambda run: run["created_at"])
+    selected_ids = {run["id"] for run in selected}
+    # The second value is the premise the partial hold is judged on: the runs this
+    # sweep did not read that could hold a served start past the threshold, kept as
+    # id -> creation time so the judgement is re-made on the clock of each later use
+    # instead of frozen here. Retaining the runs that COULD have carried a start rather
+    # than reporting "the bound was reached" is what makes the hold's premise
+    # checkable: a sweep whose unread band could not have held one may act. It does not
+    # make the hold rare here -- about 302 unread capable runs against a 50-read bound
+    # -- it makes it exact: a bound spent entirely on runs too young, or on jobless
+    # `pending` runs, leaves nothing unseen and releases the heal, where keying on the
+    # bound alone never did.
+    unread_candidates = {
+        int(run["id"]): parse_timestamp(str(run["created_at"]))
+        for run in runs
+        if run["id"] not in selected_ids and _may_hold_jobs(run)
+    }
+    return selected, unread_candidates
 
 
 def list_recent_cancelled_runs(
@@ -1538,7 +2009,15 @@ def list_jobs(api: Api, repo: str, run_id: int) -> list[dict[str, Any]]:
 
 
 class LookupInconclusive(Exception):
-    """The branch listing did not reach the run being judged, so "newest" is unknown."""
+    """The successor question could not be answered, so no mutation may rest on it.
+
+    For a push run: the branch listing did not reach the run being judged, so
+    "newest" is unknown. For a pull-request run also: a newer run at the judged
+    run's own head SHA whose pull request neither payload identifies, so successor
+    (the same pull request's; a re-run of the judged run would cancel it through the
+    group) and sibling (another pull request on a shared head branch) cannot be told
+    apart. Both fail closed: the run is left as it is, the tick reds and names it.
+    """
 
 
 def newest_run_id_for_branch(api: Api, repo: str, verdict: RunVerdict) -> int:
@@ -1601,10 +2080,181 @@ def newest_run_id_for_branch(api: Api, repo: str, verdict: RunVerdict) -> int:
     )
 
 
-def is_newest_for_branch(api: Api, repo: str, verdict: RunVerdict) -> bool:
+def _open_pull_request_heads(api: Api, repo: str, verdict: RunVerdict) -> set[str]:
+    """The head SHAs of every OPEN pull request whose head is this run's branch.
+
+    Read from the pulls API by ``head=<owner>:<branch>``, which is exact on the
+    branch name within one head repository -- a fork's same-named branch is a
+    different owner and is not listed. Two pull requests open on the same head
+    branch return the same SHA twice; the set is what matters. One page, and a full
+    page is refused: it may have a tail, and "current" must never be answered from
+    a listing that might not contain the run's pull request.
+    """
+    owner = verdict.head_repo.partition("/")[0] or repo.partition("/")[0]
+    query = urllib.parse.urlencode(
+        {
+            "head": f"{owner}:{verdict.head_branch}",
+            "state": "open",
+            "per_page": PULL_REQUEST_LISTING_DEPTH,
+        }
+    )
+    try:
+        pulls = api.get(f"repos/{repo}/pulls?{query}")
+    except ApiError as exc:
+        raise LookupInconclusive(
+            f"the open pull requests on {verdict.head_repo}:{verdict.head_branch} could not be read: {exc}"
+        ) from exc
+    if not isinstance(pulls, list):
+        raise LookupInconclusive(
+            f"the open pull requests on {verdict.head_repo}:{verdict.head_branch} came back malformed"
+        )
+    if len(pulls) >= PULL_REQUEST_LISTING_DEPTH:
+        raise LookupInconclusive(
+            f"{verdict.head_repo}:{verdict.head_branch} has {len(pulls)} or more open pull requests, "
+            f"more than one page; whether run {verdict.run_id} is current cannot be told"
+        )
+    return {
+        str(((pull or {}).get("head") or {}).get("sha") or "").lower()
+        for pull in pulls
+        if isinstance(pull, dict)
+    } - {""}
+
+
+def _current_or_successor_for_pull_request(api: Api, repo: str, verdict: RunVerdict) -> int:
+    """The pull-request analogue of ``newest_run_id_for_branch``: judged by HEAD SHA,
+    then by the listing for a newer run AT that SHA.
+
+    Two reads. The pulls API says which head SHAs the open pull requests on the
+    branch have; the runs listing (this branch, this event, same head repository,
+    paged newest-first until the judged run is seen, as the push path does) says
+    which newer runs exist. Neither alone is enough.
+
+    The SHA answers supersession by PUSH, and answers it without the ambiguity a
+    branch-name listing has: two pull requests sharing a head branch carry the same
+    head SHA, so a run at that SHA is current for both, and nothing here needs
+    ``pull_requests[].number`` for that. No open pull request has the branch: the
+    request closed or merged, ``SUPERSEDED_WITHOUT_SUCCESSOR``. The head moved: the
+    successor is the newest listed run at an open head that the payloads identify as
+    the same pull request's.
+
+    The listing answers supersession WITHOUT a push. `labeled`, `unlabeled`,
+    `edited` and `reopened` each start a new run at the SAME head SHA, and every
+    declared pull-request workflow cancels the run in progress when one arrives. A
+    re-run of the older run would cancel that newer one through the group and
+    stand in its place -- with no successor named, nothing would restore it. So a
+    newer same-repository run at the judged run's own SHA is read as this run's
+    successor when the two payloads name a common pull request, ignored as a sibling
+    pull request's run (a shared head branch) when they name disjoint ones, and
+    otherwise -- most same-repository runs carry no ``pull_requests[]`` at all --
+    the answer is ``LookupInconclusive``, naming the runs, because "current" is what
+    licenses a cancel through the other run's group and is never assumed. That is
+    deliberately not resolved by observing the group's own cancel: every orphan this
+    script meets exists during a fleet outage, where the run to observe stays queued
+    and observation cannot settle, and a green outcome resting on an unobserved
+    provider behaviour is the false green this script must never produce.
+
+    A successor is named only when identified as the same pull request's. When the
+    head moved while the pull request stays open, the answer is
+    ``SUPERSEDED_SUCCESSOR_UNIDENTIFIED`` whether a newer run at the new head is
+    listed and unidentified or not listed yet: superseded for every judgement made
+    before a mutation, never a run to restore -- restoring a sibling's run would
+    leave the same pull request's run, cancelled through the group, unreported.
+    """
+    open_heads = _open_pull_request_heads(api, repo, verdict)
+    if not open_heads:
+        return SUPERSEDED_WITHOUT_SUCCESSOR
+    own_sha = verdict.head_sha.lower()
+    at_open_head = own_sha in open_heads
+    successor: int | None = None
+    ambiguous: list[int] = []
+    page = 1
+    while page <= BRANCH_LISTING_MAX_PAGES:
+        query = urllib.parse.urlencode(
+            {
+                "branch": verdict.head_branch,
+                "event": verdict.event,
+                "per_page": BRANCH_LISTING_DEPTH,
+                "page": page,
+            }
+        )
+        try:
+            payload = api.get(f"{_runs_path(repo, verdict.workflow)}?{query}")
+        except ApiError as exc:
+            raise LookupInconclusive(
+                f"the branch listing for {verdict.head_repo}:{verdict.head_branch} could not be read: {exc}"
+            ) from exc
+        runs = (payload or {}).get("workflow_runs") or []
+        for run in runs:
+            run_id = int(run["id"])
+            if run_id == verdict.run_id:
+                # The judged run is in view, so every newer run of the branch has
+                # been seen and the answer is settled. An identified same-pull-request
+                # successor decides it whatever else was seen.
+                if successor is not None:
+                    return successor
+                if ambiguous:
+                    raise LookupInconclusive(
+                        f"run(s) {', '.join(str(r) for r in ambiguous)} are newer {verdict.event} "
+                        f"runs of {verdict.head_repo}:{verdict.head_branch} at the same head SHA "
+                        f"{own_sha[:12]} as run {verdict.run_id}, and whether each belongs to the "
+                        f"same pull request (its successor, from a label or edit) or to another pull "
+                        f"request sharing the branch cannot be told from the payloads; re-running "
+                        f"{verdict.run_id} could cancel a successor, so neither is assumed"
+                    )
+                if at_open_head:
+                    return verdict.run_id
+                # The head moved past this run while its pull request stays open. Whether
+                # a newer run at the new head is listed and unidentified, or not listed
+                # yet, the answer is the same: superseded, with no run to restore.
+                return SUPERSEDED_SUCCESSOR_UNIDENTIFIED
+            head_repo = str((run.get("head_repository") or {}).get("full_name") or "")
+            if head_repo.lower() != verdict.head_repo.lower():
+                continue
+            head_sha = str(run.get("head_sha") or "").lower()
+            if head_sha not in open_heads:
+                continue
+            theirs = _pull_request_numbers(run)
+            same_pull_request = bool(set(theirs) & set(verdict.pull_request_numbers))
+            if same_pull_request:
+                if successor is None:
+                    successor = run_id
+                continue
+            if theirs and verdict.pull_request_numbers:
+                # Disjoint, both known: a sibling pull request's run on a shared head
+                # branch, in its own concurrency group. Neither successor nor threat.
+                continue
+            if head_sha == own_sha:
+                ambiguous.append(run_id)
+        if not runs:
+            break
+        page += 1
+    raise LookupInconclusive(
+        f"run {verdict.run_id} of {verdict.head_repo}:{verdict.head_branch} ({verdict.event}) is not "
+        f"within the {BRANCH_LISTING_MAX_PAGES * BRANCH_LISTING_DEPTH} newest listed runs, so which "
+        f"run succeeded it cannot be told"
+    )
+
+
+def current_or_successor_id(api: Api, repo: str, verdict: RunVerdict) -> int:
+    """The run that carries this branch's verdict now: this run, its successor, or
+    ``SUPERSEDED_WITHOUT_SUCCESSOR``.
+
+    Dispatches on the event. A push run is judged by the branch listing
+    (``newest_run_id_for_branch``); a pull-request run by head SHA against the open
+    pull requests on the branch and by the listing for a newer run at that SHA
+    (``_current_or_successor_for_pull_request``). Every
+    caller asks this, never one shape's function directly, so the two shapes cannot
+    drift apart at one call site and not another.
+    """
+    if verdict.event == "pull_request":
+        return _current_or_successor_for_pull_request(api, repo, verdict)
+    return newest_run_id_for_branch(api, repo, verdict)
+
+
+def is_current_run(api: Api, repo: str, verdict: RunVerdict) -> bool:
     """Re-running a run that a newer push has superseded would cancel the newer run
     through the workflow's own concurrency group, so every re-run checks this first."""
-    return newest_run_id_for_branch(api, repo, verdict) == verdict.run_id
+    return current_or_successor_id(api, repo, verdict) == verdict.run_id
 
 
 def supersession_clears_hold(
@@ -1629,19 +2279,30 @@ def supersession_clears_hold(
     zero verdicts.
 
     Asked ONLY when a hold would otherwise apply, so the ordinary orphan pays no extra
-    listing. Restricted to ``push``: on a pull request two open requests can share one
-    head branch, so a newer run of that branch does not establish that THIS run was
-    superseded -- the same reason ``_guard`` refuses the pull-request shape. The head
-    repository is compared too; a fork cannot push to this repository's branches, so
-    that test is belt-and-braces rather than the fork boundary itself.
+    listing. Push and pull-request runs alike, through ``current_or_successor_id``: a
+    pull-request run is judged by head SHA against its branch's open pull requests
+    and by the listing for a newer run at that SHA.
+    The head repository must be this repository; a fork cannot push to its branches,
+    so that test is belt-and-braces rather than the fork boundary itself.
 
     A lookup that cannot answer leaves the hold standing: cancelling needs
     supersession ESTABLISHED, never assumed from a failed read.
+
+    Releasing the hold does not by itself cancel anything. The run stays an orphan
+    and reaches ``heal_runs``, which for any attempt past the first asks
+    ``_rerun_attempt_may_be_cancelled`` immediately before its cancel: a
+    superseded later attempt may be somebody's own ``gh run rerun``, so it is left
+    untouched under a FAILED outcome that names the run. That guard sits at the
+    cancel rather than here so that a held run and an unheld one end the same
+    way -- reported red, not held green with no outcome -- and so the answer is
+    given once, where the irreversible step is.
     """
-    if verdict.event != "push" or verdict.head_repo.lower() != policy.repo.lower():
+    if verdict.event not in {"push", "pull_request"}:
+        return False
+    if verdict.head_repo.lower() != policy.repo.lower():
         return False
     try:
-        if is_newest_for_branch(api, policy.repo, verdict):
+        if is_current_run(api, policy.repo, verdict):
             return False
     except LookupInconclusive as exc:
         log(
@@ -1652,8 +2313,90 @@ def supersession_clears_hold(
     log(
         f"{_label(verdict)}: a newer push supersedes it, so the fleet hold has no result "
         f"to protect and is not applied; freeing its concurrency group is what a cancel "
-        f"would then buy, and the re-run check still declines to re-run it"
+        f"would then buy, the re-run check still declines to re-run it, and past attempt 1 "
+        f"the heal path declines even the cancel"
     )
+    return True
+
+
+def _rerun_attempt_may_be_cancelled(
+    api: Api, policy: Policy, verdict: RunVerdict, log: Callable[[str], None]
+) -> bool:
+    """Whether cancelling an orphan past attempt 1 can still end in a re-run.
+
+    Cancelling a superseded orphan is never followed by a re-run: ``_rerun``
+    declines a superseded run, and the ``superseded-before-cancel`` outcome is not
+    a failed one. For attempt 1 that is the intended trade -- nobody re-ran it, so
+    nothing anyone did is lost, and the cancel frees its concurrency group. A later
+    attempt may BE somebody's ``gh run rerun`` of the stuck run, the operator
+    response this script's own logs ask for, and cancelling it ends in silent loss:
+    the recovery pass will not restore it either, because ``classify_cancelled_run``
+    classifies a superseded cancelled run out of ``CANCELLED_ORPHAN``. So the
+    question is asked HERE, immediately before the cancel and on every route to it
+    (a fleet hold released by ``supersession_clears_hold`` lands here too): a run
+    that is still its branch's newest is cancelled and re-run like any orphan; a
+    superseded one, or one whose supersession cannot be told, is left untouched --
+    and reported as a FAILED outcome, because the run then holds its concurrency
+    group until a human frees it, and nothing else will tell them.
+    """
+    try:
+        if is_current_run(api, policy.repo, verdict):
+            return True
+    except LookupInconclusive as exc:
+        log(
+            f"::error::{_label(verdict)}: left untouched, because this is attempt "
+            f"{verdict.run_attempt} and whether a newer push supersedes it cannot be told "
+            f"({exc}); cancelling a re-run attempt that turns out superseded would discard "
+            f"somebody's work irrecoverably. It holds its concurrency group until a human "
+            f"decides: `gh run cancel {verdict.run_id}` if the branch has moved on, "
+            f"`gh run rerun {verdict.run_id}` if its result is still wanted."
+        )
+        return False
+    log(
+        f"::error::{_label(verdict)}: left untouched, because this is attempt "
+        f"{verdict.run_attempt} and a newer push supersedes it: the cancel would not be "
+        f"followed by a re-run, and a re-run attempt may be somebody's own, so cancelling "
+        f"it could discard their work irrecoverably. It holds its concurrency group, and "
+        f"every later push's run is evicted behind it, until a human frees it: "
+        f"`gh run cancel {verdict.run_id}`."
+    )
+    return False
+
+
+def _supersession_is_answerable(
+    api: Api, policy: Policy, verdict: RunVerdict, log: Callable[[str], None]
+) -> bool:
+    """Whether the successor question for a first-attempt PULL-REQUEST orphan can be
+    answered, asked immediately before its cancel.
+
+    The cancel comes first and the re-run second, and only the re-run asks whether a
+    newer run supersedes this one. For a first attempt a superseded answer is the
+    intended trade (the cancel frees the group; nothing anyone did is lost), so the
+    answer itself is not needed here. An UNANSWERABLE lookup is another matter: after
+    the cancel it leaves the run cancelled with nobody to re-run it, the lost verdict
+    this script exists to prevent. On a push run that takes a failed listing read,
+    rare enough that the push path keeps its one-listing budget and reports it after
+    the fact. On a pull-request run it is an ordinary shape: a newer run at the same
+    head SHA whose pull request neither payload names, so successor or sibling cannot
+    be told, and cancelling THIS run on that uncertainty would destroy a verdict that
+    may be the current one. So for a pull-request run the lookup is made here, before
+    anything irreversible, and an inconclusive answer leaves the run untouched under
+    the same failed outcome the re-run would have reported, naming the run and the
+    command. The answer is not cached: the re-run asks again on the state after the
+    cancel, which is the state that matters for it, and a same-SHA run that appears in
+    between is met there the same way (withdrawn, failed, named).
+    """
+    try:
+        current_or_successor_id(api, policy.repo, verdict)
+    except LookupInconclusive as exc:
+        log(
+            f"::error::{_label(verdict)}: left untouched, because whether a newer run supersedes "
+            f"it cannot be told ({exc}); cancelling it first would leave it cancelled with nobody "
+            f"able to re-run it. Decide by hand: `gh run cancel {verdict.run_id}` if the branch "
+            f"or pull request has moved on, `gh run rerun {verdict.run_id}` if its result is still "
+            f"wanted."
+        )
+        return False
     return True
 
 
@@ -1771,6 +2514,18 @@ def heal_runs(
                 outcomes[verdict.run_id] = hold_outcome
             log(f"::warning::{_label(verdict)}: {verdict.detail} (re-checked before the cancel)")
             continue
+        if verdict.run_attempt != 1 and not _rerun_attempt_may_be_cancelled(
+            api, policy, verdict, log
+        ):
+            outcomes[verdict.run_id] = OUTCOME_RERUN_ATTEMPT_LEFT
+            continue
+        if (
+            verdict.run_attempt == 1
+            and verdict.event == "pull_request"
+            and not _supersession_is_answerable(api, policy, verdict, log)
+        ):
+            outcomes[verdict.run_id] = OUTCOME_LOOKUP_FAILED
+            continue
         if tick.remaining() < RERUN_RESERVE_SECONDS:
             # A cancel is only worth posting if its re-run can still be started
             # and verified inside this tick; otherwise it would discard the
@@ -1783,7 +2538,7 @@ def heal_runs(
             outcomes[verdict.run_id] = OUTCOME_NOT_ATTEMPTED
             continue
         revision_safe = workflow_is_heal_safe_at_revision(
-            api, policy.repo, verdict.workflow, verdict.head_sha
+            api, policy.repo, verdict.workflow, verdict.head_sha, event=verdict.event
         )
         if revision_safe is None:
             log(
@@ -1920,7 +2675,12 @@ def sample_completed_runs(api: Api, policy: Policy, evidence: DispatchEvidence) 
 
 
 def resolve_hold(
-    api: Api, policy: Policy, evidence: DispatchEvidence, since: datetime
+    api: Api,
+    policy: Policy,
+    evidence: DispatchEvidence,
+    since: datetime,
+    *,
+    queue: frozenset[str] | None = None,
 ) -> tuple[str, str] | None:
     """Whether the fleet's state forbids acting on an orphan that queued at ``since``.
 
@@ -1928,15 +2688,40 @@ def resolve_hold(
     recovery pass alike, so both obey the same hold: re-running into saturation
     or an outage is as wrong for a cancelled orphan as for a live one. Only
     starts after ``since`` count -- a fleet that was dispatching before the
-    orphan queued says nothing about the fleet it is waiting on. The
-    completed-run sample is taken at most once per tick.
+    orphan queued says nothing about the fleet it is waiting on.
+
+    ``queue`` is the orphaned job's own CodeBuild queue (``dispatch_queue`` of its
+    labels), and ``DispatchEvidence.own_queue`` is asked first. SATURATED holds:
+    that queue is slow now, whatever the rest of the fleet did. DISPATCHING rules
+    the label-blind saturation hold out for this queue, and only that: it does NOT
+    settle whether the fleet is up now, so the outage question below is still asked
+    of the fleet-wide starts, and a fleet that has served nothing lately still holds;
+    and it does not lift the partial-evidence hold, because it is read off the starts
+    this sweep read while a slow start on this same queue may sit in a run that went
+    unread. SILENT (the queue served nothing usable after the orphan queued) leaves
+    every label-blind rule in force, because a slow start on ANOTHER label is a fact
+    about that label's capacity, not this queue's. The completed-run sample is taken
+    at most once per tick, and only when no recent start was seen at all: it cannot
+    settle an unread-listing case, which the ``unread_saturation_capable`` branch
+    below holds on instead.
     """
+    own_queue_prompt = False
+    if queue is not None:
+        reading, slow = evidence.own_queue(since, policy, queue)
+        if reading == OWN_QUEUE_SATURATED and slow is not None:
+            return (
+                SKIPPED_SATURATED,
+                f"the orphaned job's own CodeBuild queue is dispatching slowly ({slow.name} "
+                f"started after waiting {_fmt_delta(slow.queued_for)}); queued jobs are presumed "
+                f"alive, nothing healed",
+            )
+        own_queue_prompt = reading == OWN_QUEUE_DISPATCHING
     if evidence.inconclusive(since, policy) and not evidence.completed_sampled:
         # Nothing live has started on CodeBuild lately. Before treating that as
         # an outage, read the newest completed runs: a fleet that finished jobs
         # promptly in the last half hour is dispatching, even if quietly.
         sample_completed_runs(api, policy, evidence)
-    slowest = evidence.slowest(since, policy)
+    slowest = None if own_queue_prompt else evidence.slowest(since, policy)
     if slowest is not None:
         return (
             SKIPPED_SATURATED,
@@ -1951,16 +2736,35 @@ def resolve_hold(
             f"nothing healed. If this persists, the documented rollback (route the Linux jobs back to "
             f"ubuntu-latest) is the response",
         )
-    if evidence.partial:
+    unread = evidence.unread_saturation_capable(policy)
+    if unread:
         # Reached only when the evidence read as DISPATCHING: prompt starts, nothing
         # slow. That verdict authorizes cancelling finished work, and it is not
-        # established while part of the sweep went unread, since a slow start in the
-        # dropped middle band would have held instead. Hold rather than guess.
+        # established while a run old enough to hold a slow start went unread. The
+        # completed-run sample does not settle it either: it reads the newest
+        # completions, so a fleet serving some jobs promptly and queueing others past
+        # the threshold can show a prompt start there while the slow one sits in a
+        # live run this sweep never read. Hold rather than guess.
+        #
+        # An own-queue DISPATCHING reading does not lift this hold. It is derived from
+        # the starts this sweep READ, and a slow start on the orphan's own queue would
+        # turn it into SATURATED; an unread run can hold exactly that start, and the
+        # retained candidates carry no queue attribution that could rule it out. So
+        # the reading rules out the label-blind saturation hold above (a slow start on
+        # another label is not about this queue) and nothing more.
+        #
+        # Counted at THIS call's clock, so a retained unread run that was under the
+        # line when the listing was read and has since crossed it turns the hold on
+        # from that moment. The cancel phase re-reads the listing once and then judges
+        # several cancels against it, so a count frozen at the read would let the
+        # last cancel of the phase act on a premise minutes out of date.
         return (
             SKIPPED_PARTIAL_EVIDENCE,
-            "the live listing exceeded this tick's job-read bound, so a slow CodeBuild start "
-            "may sit in the band that was not read and saturation cannot be ruled out; "
-            "nothing healed, and the next tick reads a shorter listing",
+            f"{unread} live run(s) that could hold a slow CodeBuild "
+            f"start went unread against this tick's job-read bound of {LIVE_CLASSIFY_READS}, so "
+            f"saturation cannot be ruled out; nothing healed. Raising that bound or narrowing the "
+            f"listing is the response -- it is a job-read budget against the shared installation "
+            f"quota, not the API's reachable window",
         )
     return None
 
@@ -1975,6 +2779,20 @@ def _latest_queue(verdict: RunVerdict) -> datetime:
     may be about to be picked up.
     """
     return max(orphan.queued_at for orphan in verdict.orphans)
+
+
+def _orphan_queue(verdict: RunVerdict) -> frozenset[str] | None:
+    """The one CodeBuild queue every orphaned job of the run waits in, or None.
+
+    Same-queue evidence speaks for one queue. A matrix run whose orphans span two
+    (a Linux shard and a Windows shard, say) gets no same-queue reading: a served
+    start on one of them says nothing about the other, and the hold is judged for
+    the run as a whole, so it falls back to the label-blind rules.
+    """
+    queues = {dispatch_queue(orphan.labels) for orphan in verdict.orphans}
+    if len(queues) != 1:
+        return None
+    return next(iter(queues))
 
 
 def _out_of_time(
@@ -2040,7 +2858,7 @@ def _rerun(
     """
     if not verdict.revision_heal_safe:
         revision_safe = workflow_is_heal_safe_at_revision(
-            api, policy.repo, verdict.workflow, verdict.head_sha
+            api, policy.repo, verdict.workflow, verdict.head_sha, event=verdict.event
         )
         if revision_safe is None:
             log(
@@ -2054,12 +2872,16 @@ def _rerun(
             return OUTCOME_HUMAN_REQUIRED
         verdict.revision_heal_safe = True
     try:
-        if not is_newest_for_branch(api, policy.repo, verdict):
-            log(f"{_label(verdict)} was superseded by a newer run of its branch; not re-running it")
+        if not is_current_run(api, policy.repo, verdict):
+            log(
+                f"{_label(verdict)} was superseded (a newer run of its branch, or its pull request "
+                f"closed); not re-running it"
+            )
             return OUTCOME_SUPERSEDED
     except LookupInconclusive as exc:
         log(
-            f"::error::{_label(verdict)} is cancelled and NOT re-run: {exc}. Run `gh run rerun {verdict.run_id}` by hand."
+            f"::error::{_label(verdict)} is cancelled and NOT re-run: {exc}. Run `gh run rerun "
+            f"{verdict.run_id}` by hand."
         )
         return OUTCOME_LOOKUP_FAILED
     # Checked HERE, after the lookup and immediately before the POST: the lookup
@@ -2109,8 +2931,21 @@ def _rerun(
         log(f"re-ran {_label(verdict)}")
     for attempt in range(2):
         try:
-            newest = newest_run_id_for_branch(api, policy.repo, verdict)
+            newest = current_or_successor_id(api, policy.repo, verdict)
         except LookupInconclusive as exc:
+            if verdict.event == "pull_request":
+                # A same-SHA run whose pull request cannot be identified appeared in the
+                # settle window. If it is this pull request's, the re-run has displaced
+                # it through the group and nothing can restore it on a guess; if it is
+                # a sibling's, the re-run is harmless but its heal cannot be called done.
+                # Withdraw the re-run so nothing runs on the uncertainty, and fail loudly.
+                log(
+                    f"::error::{_label(verdict)} was re-run, but {exc}. The re-run is cancelled; "
+                    f"if a run at this head ends cancelled, `gh run rerun` it by hand -- a group "
+                    f"cancel leaves no orphan fingerprint, so the recovery pass will not find it."
+                )
+                _withdraw(api, run_path, verdict, log)
+                return OUTCOME_LOOKUP_FAILED
             log(
                 f"::error::{_label(verdict)} was re-run, but whether a newer run superseded it cannot be told: {exc}"
             )
@@ -2120,10 +2955,41 @@ def _rerun(
                 tick.sleep(POST_RERUN_SETTLE_SECONDS)
                 continue
             return OUTCOME_HEALED
+        if newest == SUPERSEDED_SUCCESSOR_UNIDENTIFIED:
+            # The head moved during the settle window while the pull request stays
+            # open. A run at the new head -- listed and unidentified, or not listed
+            # yet -- may have been cancelled by this re-run through the group, and
+            # restoring a sibling's would hide that. Withdraw the re-run and fail loudly.
+            log(
+                f"::error::{_label(verdict)} was re-run, but its pull request's head has since "
+                f"moved and the run at the new head cannot be identified as this pull request's; "
+                f"the re-run is cancelled, and if that newer run ends cancelled it was displaced "
+                f"by this one: `gh run rerun` it by hand."
+            )
+            _withdraw(api, run_path, verdict, log)
+            return OUTCOME_LOOKUP_FAILED
+        if newest == SUPERSEDED_WITHOUT_SUCCESSOR:
+            # The pull request closed between the pre-check and here. The re-run
+            # serves a head nobody wants, so it is withdrawn; no open pull request has
+            # a run it could have displaced, so nothing is restored.
+            log(
+                f"{_label(verdict)} was re-run, but its pull request has since closed; cancelling "
+                f"the re-run, nothing to restore"
+            )
+            _withdraw(api, run_path, verdict, log)
+            return OUTCOME_RERUN_WITHDRAWN
         return _restore_successor(
             api, run_path, verdict, newest, policy, log, tick=tick, depth=depth
         )
     return OUTCOME_HEALED
+
+
+def _withdraw(api: Api, run_path: str, verdict: RunVerdict, log: Callable[[str], None]) -> None:
+    """Cancel this script's own re-run; a refused cancel is logged, never fatal."""
+    try:
+        api.post(f"{run_path}/cancel")
+    except ApiError as exc:
+        log(f"could not cancel the withdrawn re-run of {_label(verdict)}: {exc}")
 
 
 def _status_or_unknown(api: Api, run_path: str, log: Callable[[str], None]) -> str:
@@ -2439,7 +3305,7 @@ def recover_cancelled_runs(
         def is_newest(run: dict[str, Any] = run) -> bool:
             # Only asked once the orphan fingerprint matched, so a tick that finds
             # nothing costs one listing per cancelled run, not two.
-            return is_newest_for_branch(api, policy.repo, _base_verdict(run, policy.now))
+            return is_current_run(api, policy.repo, _base_verdict(run, policy.now))
 
         verdict = _mark_heal_exempt(
             classify_cancelled_run(run, jobs, policy, newest_check=is_newest),
@@ -2532,7 +3398,6 @@ def render_summary(verdicts: list[RunVerdict], outcomes: dict[int, str], policy:
         if v.verdict
         in (
             SKIPPED_FORK,
-            SKIPPED_PULL_REQUEST,
             SKIPPED_ATTEMPT_CAP,
             SKIPPED_SUPERSEDED,
             SKIPPED_SATURATED,
@@ -2627,13 +3492,17 @@ def run_watchdog(
             get=lambda path: cheap_retry(lambda: api.get(path)),
             log=log,
         )
-        bounded_runs, evidence_partial = live_runs_within_read_bound(candidate_runs, log)
-        evidence.partial = evidence.partial or evidence_partial
+        bounded_runs, unread_candidates = live_runs_within_read_bound(candidate_runs, policy, log)
+        # Merged by run id rather than taking the larger count: the union is what the
+        # later re-judgement needs, and two listings of the same run agree on its
+        # creation time, so an update cannot lose an unread run either listing saw.
+        evidence.unread_candidates.update(unread_candidates)
         for run in bounded_runs:
             # Jobs are read for every run the bound admits, young ones included: a
-            # young run is never actionable, but a recent slow CodeBuild start inside
-            # it is exactly the saturation evidence that must hold the watchdog back
-            # from older runs, which is why the bound reserves a slice for them.
+            # young run is never actionable, but a prompt CodeBuild start inside it is
+            # dispatch evidence. A run younger than the threshold cannot hold a start
+            # that waited that long, which is why the bound's reserved reads go to the
+            # newest runs that ARE at least that old.
             def read_jobs(run: dict[str, Any] = run) -> list[dict[str, Any]]:
                 return list_jobs(api, policy.repo, int(run["id"]))
 
@@ -2656,12 +3525,46 @@ def run_watchdog(
         for verdict in verdicts:
             if verdict.verdict != ORPHANED:
                 continue
-            hold = resolve_hold(api, policy, evidence, _latest_queue(verdict))
+            hold = resolve_hold(
+                api, policy, evidence, _latest_queue(verdict), queue=_orphan_queue(verdict)
+            )
             if hold is not None and supersession_clears_hold(api, policy, verdict, log):
                 hold = None
             if hold is not None:
                 verdict.verdict, verdict.detail = hold
                 log(f"::warning::{_label(verdict)}: {verdict.detail}")
+
+        # Logged AFTER the holds are resolved, because the completed-run sample is
+        # taken while resolving and a sweep whose live runs were all quiet has nothing
+        # to measure before it. A tick that observed no served start at all -- no live
+        # one, and no orphan to trigger the sample -- reports nothing rather than a
+        # zero, since absent evidence is not a fast queue. The margin between this and
+        # `saturation_wait` is what says whether the line still separates a slow queue
+        # from a dead label, so it belongs in the tick's own log rather than in a hand
+        # measurement taken after the hold misbehaves.
+        slowest_seen = evidence.slowest_served_wait(policy)
+        if slowest_seen is not None:
+            waited, name = slowest_seen
+            # Seconds, not `_fmt_delta`: it floors to whole minutes, and the waits this
+            # reading exists to watch are 27s median and 47s at p90 here, so every normal
+            # one would print as "0 min" -- indistinguishable from the absent reading the
+            # block above refuses to invent, and blind to drift across the whole
+            # sub-minute range.
+            # Two ways this is a SAMPLE rather than the tick's true maximum, both
+            # deliberate and both named in the label. It spans every start this sweep
+            # read, not the subset any one verdict judged (a hold counts only starts
+            # after its own orphan queued), so it can exceed the line on a tick that
+            # healed -- the reading calibrates what waits this fleet produces (#13644),
+            # a question about the fleet and not about one orphan. And it is taken from
+            # the bounded classify sweep only: the pre-cancel re-read below absorbs
+            # further starts after this point, and they are not in this number.
+            log(
+                "slowest served CodeBuild wait observed this tick (initial bounded "
+                "sample: every start this sweep read, not only those a hold counted, "
+                f"and not the later pre-cancel re-read): {int(waited.total_seconds())}s "
+                f"({name}), against a saturation line of "
+                f"{int(policy.saturation_wait.total_seconds())}s"
+            )
     except ApiError as exc:
         # A rate limit stops gathering rather than losing the whole tick: the
         # runs classified ahead of it are acted on below (heal_runs re-reads the
@@ -2730,7 +3633,9 @@ def run_watchdog(
         try:
             latest = DispatchEvidence()
             fresh_runs = list_all_candidate_runs(api, policy.repo, log=log)
-            bounded_fresh, latest.partial = live_runs_within_read_bound(fresh_runs, log)
+            bounded_fresh, latest.unread_candidates = live_runs_within_read_bound(
+                fresh_runs, read_at, log
+            )
             for run in bounded_fresh:
                 latest.absorb(list_jobs(api, policy.repo, int(run["id"])), read_at)
             sample_completed_runs(api, read_at, latest)
@@ -2760,7 +3665,11 @@ def run_watchdog(
         # already taken, so this is a pure judgement -- no read, no delay
         # between the run's own re-read and its cancel.
         hold = resolve_hold(
-            api, replace(policy, now=tick.now()), fresh["evidence"], _latest_queue(verdict)
+            api,
+            replace(policy, now=tick.now()),
+            fresh["evidence"],
+            _latest_queue(verdict),
+            queue=_orphan_queue(verdict),
         )
         if hold is not None and supersession_clears_hold(
             api, replace(policy, now=tick.now()), verdict, log

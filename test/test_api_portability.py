@@ -103,6 +103,32 @@ async def test_export_failure_is_coded_and_stays_opaque(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("templates", "header"),
+    [
+        ((["a", "b\nX-Injected: 1"], 0), '["a", "b\\nX-Injected: 1"]'),
+        ((["a"], 3), '["a", "+3"]'),
+        (([], 0), None),
+    ],
+)
+async def test_export_names_the_unbundled_templates_in_a_header(
+    monkeypatch, templates, header
+) -> None:
+    """The body is the archive, so the warning rides a header -- JSON-escaped."""
+    module = _handler_module()
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(module, "create_export_zip", lambda: (b"PK", {"created_at": "t"}))
+    monkeypatch.setattr(module, "unbundled_agent_templates", lambda: templates)
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.get("/api/portability/export", headers={"X-Test-User": "owner"})
+
+    assert response.status == 200
+    assert response.headers.get(module.UNBUNDLED_TEMPLATES_HEADER) == header
+    assert "X-Injected" not in response.headers
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["", "merge_all", "REPLACE", "delete"])
 async def test_an_unrecognized_import_mode_is_coded(mode: str) -> None:
     module = _handler_module()

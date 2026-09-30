@@ -115,7 +115,7 @@ logger = logging.getLogger("kiro_crew.config.loader")
 _ENUM_FIELDS: list[tuple[str, str, list[str]]] = [
     ("agent", "approval_mode", ["auto", "interactive"]),
     ("agent", "provider", ["acp"]),
-    ("agent", "sandbox", ["auto", "off"]),
+    ("agent", "sandbox", ["auto", "strict", "off"]),
     ("agent", "log_level", ["DEBUG", "INFO", "WARNING", "ERROR"]),
     ("memory", "embedding_provider", ["llama_cpp"]),
 ]
@@ -295,6 +295,15 @@ def test_ssh_auth_sock_forward_is_not_an_agent_config_field() -> None:
     # builds AgentConfig field-by-field and never reads it.
     cfg = _load_from_dict({"agent": {"sandbox_forward_ssh_auth_sock": True}})
     assert not hasattr(cfg.agent, "sandbox_forward_ssh_auth_sock")
+
+
+def test_episodic_max_count_is_floored_at_one() -> None:
+    """A zero or negative V1 episodic cap would refuse every merge-only write, even
+    on an empty store, so the loader clamps it to 1. A positive value is kept as
+    written."""
+    assert _load_from_dict({"memory": {"episodic_max_count": 0}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": -5}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": 7}}).memory.episodic_max_count == 7
 
 
 def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
@@ -2037,6 +2046,24 @@ class TestEdgeCases:
         """recent_tint_count defaults to 0 (off) when not in config."""
         cfg = _load_from_dict({})
         assert cfg.dashboard.recent_tint_count == 0
+
+    def test_folder_sort_loaded_from_config(self) -> None:
+        for mode in ("custom", "name", "created"):
+            cfg = _load_from_dict({"dashboard": {"folder_sort": mode}})
+            assert cfg.dashboard.folder_sort == mode
+
+    def test_folder_sort_defaults_to_custom(self) -> None:
+        """Absent = the stored-order sidebar every earlier build drew, so an
+        upgrade changes nothing the person sees."""
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.folder_sort == "custom"
+
+    def test_folder_sort_unknown_value_reads_as_custom(self) -> None:
+        """A hand-edited or downgraded value must not fail open into a mode the
+        sidebar's reader would not recognise either; both fall back the same way."""
+        for junk in ("alphabetical", "", None, 3, ["name"], "Name"):
+            cfg = _load_from_dict({"dashboard": {"folder_sort": junk}})
+            assert cfg.dashboard.folder_sort == "custom", junk
 
     def test_update_nudge_loaded_from_config(self) -> None:
         """The popup's snooze/skip record round-trips through load, so a GET

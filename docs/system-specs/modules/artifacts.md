@@ -43,7 +43,7 @@ Loading, empty results, filtering, and read errors therefore keep the same mode.
         └── …
 ```
 
-`meta.json` schema:
+`meta.json` schema (serialized by `kiro_crew.artifact_store.records`):
 
 | Field | Type | Notes |
 |---|---|---|
@@ -82,6 +82,74 @@ The store is thread-safe. A module-level singleton is available via
 `get_default_store()`; pass an explicit `root` to `ArtifactStore(root=...)`
 for isolated test instances.
 
+#### Code ownership
+
+`kiro_crew.artifacts` is the facade every caller imports. It owns the store and
+keeps its whole import surface, re-exporting each moved name with one identity:
+`kiro_crew.artifacts.ArtifactFolderStore` and
+`kiro_crew.artifact_store.folders.ArtifactFolderStore` are the same class. Its
+`__all__` lists that complete public surface, the moved names included, so a
+star import exposes them. The `records` and `comments` helpers the store calls
+are internal to it and are imported from their owner.
+
+| Owner | Responsibility |
+|---|---|
+| `kiro_crew.artifacts` | `ArtifactStore`: the shared per-root lock, the directory layout, the fenced file IO (`_read_text` / `_write_text` / `_read_bytes` / `_write_bytes`), versions and pruning, the live `source_path` pointer and its allowed roots, publication-record reads and writes, comment and retention orchestration, the change listener and the `kirocrew.artifact.created` counter. Also the caps (`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`, `MAX_EVENTS_PER_ARTIFACT`, `MAX_AUTO_WIDGET_ARTIFACTS`), the clock (`_now_iso`), the `slug_is_well_formed` predicate and the `get_default_store` / `get_default_folder_store` singletons |
+| `kiro_crew.artifact_store.model` | The error hierarchy, the `EXPECT_ABSENT` generation sentinel and the record dataclasses (`Artifact`, `ArtifactPublication`, `ForkMetadata`, `ArtifactComment`, `ImageMetadata`) |
+| `kiro_crew.artifact_store.rules` | Field limits and grammar (slug, tag, name, description, `source_path`), `slugify`, the kind policy (`_infer_kind`, `detect_editor_kind`, `USER_SELECTABLE_KINDS`), the theme-colour lint, the document-path test and session-scope matching |
+| `kiro_crew.artifact_store.images` | The raster mime allowlist and the standard-library header sniffers |
+| `kiro_crew.artifact_store.records` | The persisted formats: `meta.json` and its tolerant load, the lifecycle event entries (`ALLOWED_EVENT_TYPES`), `comments.json`, and the publication and fork-metadata field allowlists |
+| `kiro_crew.artifact_store.comments` | The comment-thread rules: the forwarding filter, whole-thread cap pruning, the provider merge, the anchor rescan and root-cascade removal |
+| `kiro_crew.artifact_store.folders` | `ArtifactFolderStore` and `artifact_folders.json` |
+| `dashboard/handlers/artifacts.py` | The HTTP projection: request parsing, the restricted-session gate, SEL audit, response redaction (`_serialize`), the publish governance gates and the live-refresh broadcast |
+| `kiro_crew.mcp_tools.artifacts` | The MCP projection: tool schemas and handlers, which reach the artifact store only through the HTTP API |
+
+No module under `kiro_crew.artifact_store` imports `kiro_crew.artifacts` at import
+time (`folders` names `ArtifactStore` for type checking only), and none performs
+networking or redaction or touches the filesystem except `ArtifactFolderStore` on
+its own file. `rules` imports `kiro_crew.history` and `kiro_crew.messaging.link`
+inside `_strip_session_scope` because both import the facade back. The moved
+classes keep `kiro_crew.artifacts` as their `__module__`, so tracebacks and type
+names in logs are unchanged.
+
+The store's seams belong to the facade, which hands them to the owners at call
+time, so they are patched on `kiro_crew.artifacts`: `config_dir`, `_now_iso`,
+`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`,
+`MAX_EVENTS_PER_ARTIFACT`, the fence helpers (`_open_pinned_for_read`,
+`canonical_path_refusal`, `sensitive_path_refusal`, `is_sensitive_path`) and the
+`_default_store` / `_default_folder_store` singletons. `get_default_folder_store`
+builds its store on the facade's `config_dir`, so the default
+`artifact_folders.json` follows the same patch as the default store's root.
+
+The store calls every owner helper through its facade name, so rebinding one on
+`kiro_crew.artifacts` steers the store: `slugify`, `_validate_slug`,
+`_validate_name`, `_validate_description`, `_validate_tags`, `_validate_kind`,
+`_validate_source`, `_validate_source_path`, `_infer_kind`, `detect_editor_kind`,
+`_markdown_misclassification_reason`, `_session_touched` and
+`_sniff_image_dimensions`. `slug_is_well_formed` lives in the facade on the same
+`_validate_slug` binding, so it cannot disagree with the store. A call a helper
+makes inside its owner module resolves there: `_session_touched` calls `rules`'
+`_strip_session_scope`, `slugify` calls `rules`' `slug_hash_fallback`, and
+`_sniff_image_dimensions` calls `images`' per-format sniffers
+(`_sniff_jpeg_dimensions`, `_sniff_webp_dimensions`). Owner modules bind their
+own imports too: a directly constructed `ArtifactFolderStore` takes its default
+path from `folders`' `config_dir` and logs through `folders`' `logger`, which is
+the same `kiro_crew.artifacts` logger object.
+
+Rule data an owner's own code reads has one live binding, in the owner, and the
+store reads it through the owner module too (`create_image` truncates to
+`MAX_NAME_LEN` / `MAX_DESCRIPTION_LEN`, and `update` pre-checks
+`ALLOWED_EVENT_TYPES`). That covers the field limits and grammar
+(`MAX_NAME_LEN`, `MAX_DESCRIPTION_LEN`, `MAX_TAGS`, `MAX_SOURCE_PATH_LEN`,
+`_SLUG_RE`, `_TAG_RE`), the kind sets and inference maps (`ALLOWED_KINDS`,
+`ALLOWED_SOURCES`, `_EXT_KIND_MAP`, `_HTML_SNIFF_MARKERS`) in `rules`, the
+event-type vocabulary (`ALLOWED_EVENT_TYPES`) in `records`, and the folder path
+limits (`FOLDER_PATH_SEP`, `MAX_FOLDER_DEPTH`) in `folders`. The facade copy of
+such a name is an import-compatible re-export that steers nothing, so patch the
+owner module. `_IMAGE_MIME_EXT` is read only by the store, so its facade binding
+is the live one. `MAX_AUTO_WIDGET_ARTIFACTS` is the default argument of
+`prune_auto_widgets`, bound when the class is defined.
+
 `list()` returns newest first on a TOTAL order, `(updated_at, slug)` descending.
 The tie-break is load-bearing, not cosmetic: `updated_at` is microsecond ISO, so
 two artifacts written inside one microsecond carry the identical stamp, and
@@ -94,8 +162,8 @@ artifact is newest on otherwise identical data.
 
 `store.create()` (and every path that funnels through it — the HTTP create
 route, the `artifact_save` MCP tool, the `kirocrew artifact save` CLI) infers
-`kind` when the caller omits it (`kind=None`), via `_infer_kind(content,
-source_path, explicit)`:
+`kind` when the caller omits it (`kind=None`), via
+`_infer_kind(content, source_path, explicit)` in `kiro_crew.artifact_store.rules`:
 
 1. **Explicit wins** — a non-empty `kind` argument is used as-is (back-compat).
 2. **Extension** — for file-backed artifacts (`source_path` set): `.md` /
@@ -209,7 +277,7 @@ whose first `kiro_crew` import reached `artifacts` before `validation`;
 rename-safe membership id, tolerant-loaded for legacy meta.json.
 `ArtifactStore.set_folder()` is a metadata-only move (NO version bump);
 `list(folder=)` filters (None = all, `""` = unfiled, id = that folder).
-`ArtifactFolderStore` keeps a flat `parent_id` tree in
+`ArtifactFolderStore` (`kiro_crew.artifact_store.folders`) keeps a flat `parent_id` tree in
 `~/.kiro/crew/artifact_folders.json` — create/rename/reparent (cycle- and
 depth-guarded, `MAX_FOLDER_DEPTH` 20)/reorder/delete, breadcrumb, item counts,
 and id-or-path resolution with mkdir -p semantics (`resolve_path`, all-or-nothing
@@ -716,6 +784,9 @@ every write-side unit test still green — so test the round-trip
 
 ## Validation & Limits
 
+The field limits and grammar are `kiro_crew.artifact_store.rules`; the content,
+version and auto-widget caps are the store's, in `kiro_crew.artifacts`.
+
 | Field | Limit |
 |---|---|
 | `slug` | regex `^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$`, ≤ 80 chars |
@@ -735,9 +806,10 @@ every write-side unit test still green — so test the round-trip
 - **Sensitive paths** — every read and write goes through
   the sensitive-path fence. The store's own file helpers (`_read_text` /
   `_write_text` / `_read_bytes` / `_write_bytes`) canonicalise the path with
-  `os.path.realpath` and ask `security.is_sensitive_canonical_path()` (through
-  `_fence_refuses`), the shared entry point for a caller-canonicalised path: it
-  answers with `security.is_sensitive_path()` on the event loop and with
+  `os.path.realpath` and ask `security.canonical_path_refusal()` (through
+  `_fence_refusal`), the reason-or-None form of the shared entry point for a
+  caller-canonicalised path: it answers with `security.sensitive_path_refusal()`
+  on the event loop and with
   `security.is_sensitive_resolved_path()` off it, so a caller earns the
   off-pool gate by offloading, never by declaring anything; `GET
   /api/artifacts` runs `store.list()` on a worker for that reason. The two read
@@ -745,9 +817,11 @@ every write-side unit test still green — so test the round-trip
   `_open_pinned_for_read`): a link at the final name is refused, the inode must
   be a regular file with one link, and the fence judges the kernel's path for
   the opened inode whenever it differs from the path already judged. The root
-  check and the file-backed `source_path` pointers stay on
-  `security.is_sensitive_path()` unconditionally; the store refuses to
-  instantiate at any sensitive root.
+  check asks `security.sensitive_path_refusal()`: the store refuses to
+  instantiate at any sensitive root, and a resolver stall is refused like a
+  match but raised with the producer's own "could not be verified" wording.
+  The file-backed `source_path` pointers stay on the bounded
+  `security.is_sensitive_path()` and fall back to the snapshot silently.
 - **Relocate root confinement** — `PATCH /api/artifacts/{slug}/relocate`
   points a file-backed artifact at a `source_path`; a later GET reads
   that file, so an unconfined relocate would be an agent-reachable
@@ -771,9 +845,10 @@ every write-side unit test still green — so test the round-trip
   loaded companion's extra credential/cookie regexes apply to the audit trail.
 - **Atomic writes** — `_write_text()` writes to a `.tmp` sibling and renames,
   so a crash mid-write cannot corrupt `current.html` or `meta.json`.
-- **Tolerant load** — `_read_meta_file()` ignores unknown keys and supplies
-  defaults for missing keys, so future schema additions don't break existing
-  files.
+- **Tolerant load** — `ArtifactStore._read_meta_file()` hands the parsed file to
+  `decode_meta` in `kiro_crew.artifact_store.records`, which ignores unknown keys
+  and supplies defaults for missing keys, so future schema additions don't break
+  existing files.
 - **Frontend rendering** — artifact bodies are rendered in the same sandboxed
   iframe that powers `<mcwidget>`, and that frame loads a **real document** from
   `GET /sandbox-doc/{doc_id}/{tok}` rather than a browser-built `blob:` URL. A
@@ -857,7 +932,11 @@ out-of-range versions.
 
 Comments live in a per-artifact `comments.json` sidecar (`ArtifactComment`
 dataclass; threads are one level deep — replies carry the root's id as
-`thread_id`). `status` is `open | review | resolved`; `sync_state` tracks
+`thread_id`). The file format is `kiro_crew.artifact_store.records`
+(`decode_comments` / `encode_comments`); the thread rules — the forwarding filter,
+the whole-thread retention cap, the provider merge, the anchor rescan and the
+root-cascade delete — are `kiro_crew.artifact_store.comments`; `ArtifactStore`
+holds the lock and does the IO. `status` is `open | review | resolved`; `sync_state` tracks
 provider push status (`local_only | pending_push | synced | push_failed`).
 Provider push/reconcile itself is companion-edition-only behavior behind the
 CPP publish seam — the open-source core carries the `sync_state` field and
@@ -977,11 +1056,13 @@ adding a parallel watcher (see `kiro_crew.knowledge.artifact_ingest`):
   `ensure_artifact_source`, `refresh_artifact_name`, `ingest_artifact`'s
   `_get_state` read and `release_stale_claim` write, the per-job
   `get_job_status` read in `reconcile_artifacts`, and `remove_artifact` (a
-  `delete_items_batch` → graph rebuild). The one take still on the loop is
-  `ingest_artifact`'s post-ingest `get_job_status` read: it sits between the
-  commit and the fallback ownership write, so offloading it belongs with the
-  ownership-write change that keeps those two from being separated by a
-  cancellation point. The ordering the handler describes is preserved across
+  `delete_items_batch` → graph rebuild). `ingest_artifact`'s post-ingest
+  `get_job_status` read travels with the fallback ownership write as one
+  `run_to_completion` unit, so no cancellation point separates them. That
+  fallback, and the in-hop retry of a failed ownership write, go through
+  `_write_ownership_if_intact`: under `BEGIN IMMEDIATE` it names the group only
+  while every committed id still exists, so a concurrent dedup verdict on the
+  row is never overwritten. The ordering the handler describes is preserved across
   the hops — name refresh before ingest, the kind-change reconcile before the
   ingest — and the deduped/ownership finalizers still run on the pipeline's own
   worker hop, not the loop.
@@ -1340,7 +1421,8 @@ agent-authored SVG as an image would reintroduce a same-origin script vector.
 ```
 
 The sidecar's extension is derived **from the allowlisted mime**, never from the
-stored `ext` field, on every read (see [Security](#security)). `delete` removes
+stored `ext` field, on every read (see [Security](#security)). The allowlist and
+the header sniffers live in `kiro_crew.artifact_store.images`. `delete` removes
 the whole artifact directory, so the sidecar needs no separate cleanup.
 
 ### `image` metadata schema

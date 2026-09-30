@@ -104,7 +104,10 @@ def test_the_forwarded_model_comes_from_the_deployment_not_the_caller() -> None:
     """
     payload: dict[str, Any] = {"model": " acme-support ", "messages": [], "id": "s"}
     body, slot_id, stream = _forward_body(payload, "acme-support")
-    assert body["model"] == "acme-support"
+    # The crew's AGENT ID, derived from the deployed name rather than from the payload.
+    # The namespace matters because the bare name resolves to whatever else declares
+    # it, which for the crew this deployment ships is Kiro Crew's own worker mirror.
+    assert body["model"] == "crew-acme-support"
     assert slot_id == "s"
     assert stream is False
 

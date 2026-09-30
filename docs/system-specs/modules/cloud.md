@@ -188,6 +188,7 @@ operator writes it by hand.
 | `secrets` | list of `[canonical name, ARN]` pairs; one must be named for the model credential |
 | `cpu_architecture` | `X86_64` or `ARM64`; defaults to `X86_64` |
 | `assign_public_ip` | JSON boolean; defaults to `false` |
+| `internal_only` | JSON boolean; defaults to `false`. The operator's claim that this lane runs their OWN crews and that they bear the risk of what those crews read. With it the container starts the model subprocess **unsandboxed**, which is what lets it run on Fargate at all. It does NOT mean "no untrusted input reaches this task" — see the security model for the exposure it accepts |
 | `task_ttl_seconds` | how long one task may run before the launcher stops it; JSON integer above zero; omitted takes the engine's own default |
 
 `task_ttl_seconds` is the operator-reachable half of `TaskBounds`. Before it the
@@ -263,9 +264,16 @@ block without it would register a lane that rejects every launch through it. The
 whole secret **set** is judged, by calling the engine's own `secret_destinations`
 and `sole_binding`: a valid credential reference sitting beside a malformed one, or
 beside one belonging to a different crew, voids the block rather than registering a
-lane whose every launch then fails. A present-but-non-boolean `assign_public_ip`
-voids the whole block rather than being coerced, because coercion would read the
-string `"false"` as true on the one field that decides network exposure. For the
+lane whose every launch then fails. A present-but-non-boolean value in ANY boolean
+field voids the whole block rather than being coerced, because coercion would read the
+string `"false"` as true — on `assign_public_ip`, which decides network exposure, and on
+`internal_only`, which decides the trust boundary. That rejection is written once over
+the dataclass's boolean fields for the same reason the string one is: a hand-written
+branch per field is exactly what let `cluster` keep coercing after `assign_public_ip`
+was fixed one field over. `internal_only` is deliberately NOT part of the completeness
+judgement — a lane that does not claim it is a complete, usable lane that simply cannot
+run where there is no user namespace, which is every lane's behaviour before the key
+existed. For the
 same reason **no** string-typed field is coerced: `str()` would turn JSON `false`
 into the non-empty string `"False"` and register a lane against a cluster that does
 not exist. The rejection is written once over the dataclass's string fields, so a
@@ -316,6 +324,37 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
 
 ## Security model
 
+- **The Fargate lane is internal-only, and that is a claim the operator makes.**
+  The crew container is sandboxed-only and Fargate cannot be sandboxed: kiro-cli
+  sandboxes the model subprocess in an unprivileged user namespace, Fargate's default
+  seccomp profile denies one, and no task-definition field supplies it (no
+  `privileged`, no `dockerSecurityOptions`, `linuxParameters` admits only
+  `CAP_SYS_PTRACE`). Measured on a real task, which exited 1 at the sandbox check with
+  every step before it succeeding. `cloud.json`'s `fargate.internal_only` is where the
+  operator states that this lane runs their OWN crews and that they bear the risk of
+  what those crews read; the launcher derives `SMC_INTERNAL_ONLY` from it, and with that
+  set the container starts with the model subprocess unsandboxed.
+  What claiming it ACCEPTS: that subprocess auto-approves every tool it calls and can
+  reach the model credential in the crew's vault. Reachability, not residency, is the
+  operative property — the backend answers the engine's token request from that vault so
+  the backend's uid must be able to decrypt it, and the worker is a child of the backend
+  under that same uid (measured: a uid-1000 process reads and decrypts it directly). So
+  moving the credential out of the worker's environment does not close it.
+  The accepted exposure is NOT limited to a prompt an outsider types, and the setting
+  must not be read that way. An internal crew consumes untrusted CONTENT as a matter of
+  course — tool output, fetched web pages, connector and API payloads, repository and
+  ticket text — any of which can carry an injection, and all of which reach the
+  unsandboxed worker regardless of who sent the prompt. With the flag on, a worker
+  injected through any of those routes can read the vault. What the operator accepts is
+  that whole exposure on their own crews, where the credential at risk and the account
+  it belongs to are theirs. It is a judgement about who bears the risk, not a claim that
+  injection cannot happen.
+  The setting names the BOUNDARY and not the consequence, deliberately: an operator
+  cannot ask for "allow unsandboxed", only state whose crews these are. Absent means
+  not claimed, so a lane that says nothing keeps refusing, and no other lane and no
+  local host is affected. It is not the multi-tenant answer — a user namespace is the
+  real containment, and a Firecracker-based runtime is the answer for external or
+  shared callers.
 - **No stored credentials.** `cloud.json` holds profile name + region + tag, plus
   the `fargate` block's placement and its secret **names and ARNs** -- identifiers,
   never values. The task's execution role fetches each secret's value from Secrets
@@ -338,8 +377,13 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   A rewritten block therefore produces a **refused launch the operator sees**
   rather than a silent substitution. The confirmation does not come from the file
   and is not persisted, so nothing here depends on a filesystem property; one
-  renderer serves both sides, so the shown value and the launched value cannot be
-  spelled differently. A launch job resumed after a gateway restart carries no
+  renderer serves both sides, so the confirmed value and the launched value cannot
+  be spelled differently. What the gate rests on is that COMPARISON, not on the
+  dashboard printing the pair: a client sends back the string the descriptor
+  published (`RemoteProvisioner.confirm_before_launch`), and a surface that decides
+  the ARN and digest are not worth a paragraph in front of every launch still
+  passes exactly the value this lane's own renderer produced. A launch job resumed
+  after a gateway restart carries no
   confirmation and is refused, because persisting one would put the answer on disk
   beside the file it is meant to be independent of.
 - **Nothing in the product writes `cloud.json`.** The launch path's own profile,
@@ -755,10 +799,10 @@ so the only way to put a credential in a `RunTask` request is `environment`, in
 plain text, where it is written to the CloudTrail record of the request and can
 be read back out of `DescribeTasks`. The value is a long-lived model credential.
 
-Nothing downstream can tell a wrong credential from a right one. The container's
-`require_api_key` proves a key was supplied, not that it is this crew's key, so a
-definition naming another crew's secret produces a task that starts, answers, and
-serves turns under the wrong identity, silently at both ends.
+Nothing downstream can tell a wrong identity from a right one. The container's
+`require_model_identity` proves an identity was stored in the crew's vault, not that
+it is this crew's, so a definition naming another crew's secret produces a task that
+starts, answers, and serves turns under the wrong identity, silently at both ends.
 
 **IAM is the primary control.** Each crew's execution role is derived per crew
 (`kirocrew-crew-<crew>-exec`), so it can be granted that crew's secret and no
@@ -799,12 +843,22 @@ The refusals, each stated as a property rather than as the case that prompted it
   task is**, which the spec's secrets fix through the crew they name, it
   decides **who may reach it**, which is the credential set and the trust-domain
   declaration, or it decides **what it may cost**, which is the lifetime the
-  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL` and
-  `SMC_TASK_TTL_SECONDS` are derived and written
-  here; `SMC_CONTROL_SECRET`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
+  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL`,
+  `SMC_INTERNAL_ONLY` and
+  `SMC_TASK_TTL_SECONDS` are derived and written here; `SMC_CONTROL_SECRET`,
+  `KIRO_IDENTITY`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
   `SMC_FRONT_PORT` are refused and never written. Everything else stays the
   caller's: a bucket cannot contradict the spec, because the spec says nothing
   about buckets.
+- `SMC_INTERNAL_ONLY` is the one derived name that LOOSENS a posture, so it is
+  derived for a sharper reason than the others. With it the container starts the model
+  subprocess unsandboxed, and it is the operator's `fargate.internal_only` claim that
+  says so — a caller who could supply the variable could grant that posture to a lane
+  whose operator never made the claim, which is the entire property the setting
+  carries. It sits on the "who may reach it" limb: the claim is precisely that nobody
+  outside the operator does. It is written as `"0"` or `"1"` and always present, for
+  the reason the lifetime is — so the container never has to tell a launcher that did
+  not claim the boundary apart from one that forgot the variable.
 - `SMC_TASK_TTL_SECONDS` is derived rather than accepted because a caller who could
   raise it could keep a task past the bound the sweep enforces, which is opting out
   of a cost cap rather than configuring it. `0` is written when no lifetime is asked
@@ -844,8 +898,8 @@ than a claim about how the pattern backtracks.
 
 `parse_secret_arn` cannot be verified the same way, because Secrets Manager's
 six-character suffix is chosen by the service and nothing here can reproduce it. A
-secret named `.../KIRO_API_KEY-AbCdEf` has the complete ARN
-`.../KIRO_API_KEY-AbCdEf-XyZ123`, and the string `.../KIRO_API_KEY-AbCdEf` is both
+secret named `.../KIRO_IDENTITY-AbCdEf` has the complete ARN
+`.../KIRO_IDENTITY-AbCdEf-XyZ123`, and the string `.../KIRO_IDENTITY-AbCdEf` is both
 that secret's partial ARN and a well-formed complete ARN for a different secret.
 So the reader takes a `SecretRef` carrying the canonical name, verifies the ARN is
 that name plus exactly one suffix, and reads the destination from the verified
@@ -997,7 +1051,7 @@ of the account at task-start time, not of the document, so no pure function
 decides it and a check would be a read that can go stale before the launch. More
 to the point, the two failures are not the same shape. A nonexistent secret fails
 the execution-role fetch before the container starts, so the task never runs,
-`require_api_key` never executes, no turn is served, and the operator sees
+`require_model_identity` never executes, no turn is served, and the operator sees
 `ResourceInitializationError`. A crew disagreement succeeds. Only the silent
 failure has to be unrepresentable; the loud one can be left to fail loudly.
 

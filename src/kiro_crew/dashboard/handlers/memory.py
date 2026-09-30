@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from kiro_crew import memory_schema
+from kiro_crew.apps.registry import minimal_env
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -50,11 +51,12 @@ from kiro_crew.embeddings import (
     validate_custom_model_path,
 )
 from kiro_crew.executors import embed_executor, run_in_embed_pool, run_with_recall_deadline
-from kiro_crew.history import is_incognito_transcript
+from kiro_crew.history import is_incognito_transcript, transcript_privacy_mode
 from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.memory import normalize_projects_document
 from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.platform_compat import isolated_python_argv, kill_and_reap
 from kiro_crew.sandbox import (
@@ -65,6 +67,7 @@ from kiro_crew.sandbox import (
     wrap_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls, redact_local_paths
+from kiro_crew.workflow_memory import WorkflowMemoryError
 
 from ._shared import (
     _get_memory,
@@ -73,8 +76,10 @@ from ._shared import (
     _redact_memory_field,
     markdown_memory_for_store,
     read_bounded_json,
+    require_owner_dashboard_request,
     resolve_lesson_memory_store,
     resolve_requested_memory_store,
+    resolve_session_memory_mode,
     vector_memory_for_store,
 )
 from .cron import _recognize_session
@@ -213,6 +218,12 @@ async def _memory_write_gate(
     ``blocks_persisted_mode=is_incognito_transcript`` because every caller mutates
     durable memory: writes block every private persisted mode.
     """
+    # Owner first: every caller of this gate writes the owner's durable memory,
+    # and the store resolution below only asks for the owner when ``?store=``
+    # is present.
+    owner_denied = await require_owner_dashboard_request(request, operation)
+    if owner_denied is not None:
+        return owner_denied
     if operation != "memory.consolidate":
         _, refusal = await resolve_requested_memory_store(request, state, operation)
         if refusal is not None:
@@ -678,11 +689,7 @@ def _get_vector_store(state: DashboardState):
         from kiro_crew.vector_memory import VectorMemoryStore  # noqa: F811
 
         cfg = KiroCrewConfig.load()
-        store = VectorMemoryStore(
-            embedding_dim=cfg.memory.embedding_dim,
-            decay_rates=cfg.memory.decay_rates or None,
-            dedup_threshold=cfg.memory.episodic_dedup_threshold,
-        )
+        store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
         store.init()
         state._standalone_vector = store  # type: ignore[attr-defined]
         mem.vector_store = store
@@ -1288,7 +1295,13 @@ async def api_memory_embedding_model(request: web.Request) -> web.Response:
 
     The dimension is NOT taken from the caller: it is read off the loaded model
     (``n_embd``), so the user cannot get it wrong and the UI needs no dim field.
+
+    Owner-gated first: an apply rewrites the owner's config and re-embeds the
+    owner's whole vector store.
     """
+    owner_denied = await require_owner_dashboard_request(request, "memory.embedding_model")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if _is_restricted_session(state, request):
         sk = request.headers.get("X-Session-Key", "")
@@ -1597,6 +1610,12 @@ async def _ensure_pip_available() -> tuple[bool, str]:
             *sandboxed_argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # don't leak secrets to pip subprocesses (same reason and same
+            # helper as the sibling pip spawn in apps/backend.py): `standard`
+            # mode scrubs only _SENSITIVE_ENV_PREFIXES, and on a host where no
+            # launcher runs at all nothing else strips the gateway's channel
+            # tokens or owner id from a child that executes packaging code.
+            env=minimal_env(),
         )
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -1619,8 +1638,16 @@ async def _ensure_pip_available() -> tuple[bool, str]:
 
 
 async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
-    """POST /api/memory/enable-embeddings — trigger/retry model download and wire embeddings."""
+    """POST /api/memory/enable-embeddings — trigger/retry model download and wire embeddings.
+
+    Owner-gated first: setup downloads a model onto the owner's host, installs
+    ``faiss-cpu`` into the gateway interpreter and rewrites the owner's config.
+    """
     global _embedding_setup_status
+
+    owner_denied = await require_owner_dashboard_request(request, "memory.enable_embeddings")
+    if owner_denied is not None:
+        return owner_denied
 
     # Allow retry — reset any previous error state
     if _embedding_setup_status["step"] == "error":
@@ -1746,6 +1773,15 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                         *sandboxed_argv,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        # don't leak secrets to pip subprocesses. The allowlist
+                        # keeps what an install needs (PATH, HOME, TMPDIR,
+                        # PYTHONPATH, VIRTUAL_ENV, XDG_CACHE_HOME) and drops
+                        # proxy/CA/PIP_* hints, so a host that reaches PyPI only
+                        # through an env-configured proxy installs faiss from
+                        # pip.conf (HOME is kept) or by hand -- faiss is an
+                        # accelerator and recall falls back to the stdlib cosine
+                        # path, which is the cheaper side of this trade.
+                        env=minimal_env(),
                     )
                     try:
                         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -2156,6 +2192,86 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
     )
     if refusal is not None:
         return refusal
+    # The write gate above tests the CALLER's mode; ``key`` names the TARGET.
+    # Without this check a persistent caller consolidating a temporary or
+    # incognito session persists semantic keys and episodic fragments for a
+    # conversation the memory modes promise leaves no durable trace.
+    # The target's mode is resolved the way the other routes resolve a key that
+    # is not the request's own (``_headless_mode_refusal``): the live slot
+    # first -- the authoritative record for an open dashboard tab, which the
+    # consolidator cannot see -- then the persisted execution record and
+    # transcript header for a closed session. Refused BEFORE the running claim,
+    # the message-count read and the retry probe, so a refused target costs no
+    # message-count or retry-probe read and never occupies the key.
+    #
+    # An UNRESOLVABLE mode proceeds. A live session always resolves, and for a
+    # persisted one ``_consolidate`` re-reads the execution record and header of
+    # the exact transcript it consolidates and refuses on either -- and every
+    # durable write of the pass runs under the transcript's publication hold,
+    # which re-validates the header -- so proceeding leaves no write path
+    # unguarded -- while refusing here would turn a key
+    # with no transcript at all (a harmless no-op today) or a stem the probe
+    # finds ambiguous into a 403 on every "Consolidate all".
+    #
+    # A channel transcript reaches this route as its filename stem
+    # (``slack_<ts>``: ``list_sessions`` hands out stems), while the thread's
+    # durable incognito/temporary flag is keyed by its live ``slack:<ts>`` key
+    # in the session map. Resolve the stem to that key first, or the flag is
+    # invisible and the thread reads as persistent. Only the session map can
+    # unfold a stem (the ``:``-to-``_`` fold is not reversible); it answers ""
+    # for a stem it does not hold, which keeps the original key. The transcript
+    # itself is still read under ``key``, the name the caller supplied.
+    mode_key = key
+    if is_channel_session_key(key) and state.sessions is not None:
+        unfolded = state.sessions.channel_key_for_stem(key)
+        if isinstance(unfolded, str) and is_channel_session_key(unfolded):
+            mode_key = unfolded
+    try:
+        target_mode: str | None = await resolve_session_memory_mode(state, mode_key)
+    except (OSError, ValueError, WorkflowMemoryError):
+        target_mode = None
+    if target_mode is None or not is_incognito_transcript(target_mode):
+        # The live resolution above covers what only the gateway knows (a
+        # dashboard slot's mode, an inherited subagent mode) and, for a channel
+        # key, answers off the session map alone -- ``persistent`` for every
+        # thread the map does not flag, without probing the transcript. The
+        # transcript header is then read under ``key`` exactly as
+        # ``_consolidate`` reads it (the same ``get_metadata``, the same
+        # predicate): a thread whose stem the map could not unfold, or whose
+        # entry the map does not hold, is refused on its header here and not
+        # passed to a consolidator that refuses it -- the 200-for-a-refusal
+        # the Memory tab would count as summarized. Read NORMALIZED, so the
+        # body names the mode the header records rather than its spelling.
+        log = state.conversation_log
+        if log is not None:
+            metadata = await asyncio.to_thread(log.get_metadata, key)
+            if isinstance(metadata, dict):
+                header_mode = transcript_privacy_mode(metadata.get("memory_mode"))
+                if header_mode:
+                    target_mode = header_mode
+    if target_mode is not None and is_incognito_transcript(target_mode):
+        # ``_read_session_key``, not the raw header: the audit record carries the
+        # same canonical caller as the write gate's records.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="memory.consolidate",
+            outcome="denied",
+            source="dashboard",
+            resources=f"restricted_target_session:{target_mode}",
+        )
+        return web.json_response(
+            {
+                "error": f"Consolidation is not allowed for a {target_mode} session: "
+                "it leaves no durable memory.",
+                "code": "restricted_target_session",
+                # The mode as a field, not only inside the sentence: the Memory
+                # tab's tally names the mode a skipped session was in, and must
+                # not parse English prose to learn it. Nothing new is disclosed;
+                # the sentence already carries the word.
+                "mode": target_mode,
+            },
+            status=403,
+        )
     include_history = body.get("include_history", True)
     # Claim the key before the eligibility probe below, which awaits. Testing
     # membership and adding must happen with no yield between them: the probe

@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlencode
 
@@ -30,20 +30,15 @@ from kiro_crew import resource_status as host_status
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
+from kiro_crew.execution_context import read_session_execution
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.solo_spawn import (
-    SOLO_SPAWN_REASON_GLOSS,
-    SOLO_SPAWN_REASONS,
-    SOLO_SPAWN_REFUSED_CODE,
-    delegation_refusal,
-    solo_spawn_note,
-    solo_spawn_question,
-    solo_spawn_refusal,
-)
 from kiro_crew.subagent import (
+    AGENT_NOT_AVAILABLE_CODE,
     AGENT_NOT_FOUND_CODE,
+    agent_matches_allowlist,
+    parent_spawn_allowlists,
     resolve_max_subagents,
     visible_agent_names,
 )
@@ -96,6 +91,45 @@ def _audit_owner(parent_session: str) -> str:
     return f"{_OWNER_UNRESOLVED_PREFIX}{os.getpid()}"
 
 
+def _parent_template_for_roster() -> str:
+    """The kiro agent template THIS tool server's session runs as, or ``""``.
+
+    Advisory input to the roster only: the session key comes from the ordinary
+    resolver (token, env, PID map), and its execution record names the template.
+    A pool process that has not been rekeyed yet, a caller with no session, or a
+    record this process cannot read all answer ``""`` -- and an empty answer means
+    "filter nothing", the roster's pre-existing shape. The gateway's gate does its
+    own resolution and is the decision; this only stops the description from
+    advertising names that gate would refuse.
+    """
+    try:
+        session_key = mcp_core._resolve_session_key()
+        if not session_key:
+            return ""
+        execution = read_session_execution(session_key)
+    except Exception:
+        return ""
+    return execution.template_id if execution is not None else ""
+
+
+def _parent_allowlist_filter(names: Iterable[str]) -> tuple[list[str], bool]:
+    """Keep the *names* the parent agent's spec allows spawning.
+
+    Returns ``(kept, restricted)``: ``restricted`` is True only when the parent's
+    spec DECLARES ``toolsSettings.subagent.availableAgents``; an omitted key, an
+    unresolvable parent, or a spec the gate will refuse as unreadable (``None``
+    from the resolver -- the gate's own denial names that, and this roster is
+    advisory) keeps every name and reports False, so the roster a session without
+    a declaration sees is the one it always saw. Bare-name aliasing is not
+    applied here: this process has no verified app identity, and the roster
+    lists installed names as the gate will see them.
+    """
+    allowlists = parent_spawn_allowlists(_parent_template_for_roster())
+    if not allowlists:
+        return list(names), False
+    return [n for n in names if all(agent_matches_allowlist(n, al) for al in allowlists)], True
+
+
 def _agent_roster_hint() -> str:
     """Valid agent names, for the ``agent``/``agents`` parameter descriptions.
 
@@ -139,18 +173,30 @@ def _agent_roster_hint() -> str:
     try:
         # Sorted by DECLARED name, before redaction, so the order matches the
         # refusal roster's and a credential-shaped name is rewritten in place
-        # rather than re-sorted into a different slot.
-        shown, withheld = visible_agent_names(
-            sorted(a.name for a in mcp_core.list_agents() if a.name),
-            limit=_MAX_ROSTER_NAMES,
+        # rather than re-sorted into a different slot. Names the parent agent's
+        # spec forbids spawning are dropped FIRST: advertising them would send
+        # the model straight into the gate's refusal.
+        names, restricted = _parent_allowlist_filter(
+            sorted(a.name for a in mcp_core.list_agents() if a.name)
         )
+        shown, withheld = visible_agent_names(names, limit=_MAX_ROSTER_NAMES)
     except Exception:
         return ""  # never let a directory read break the tool advertisement
     if not shown:
-        return ""
+        # A declared allowlist that admits no installed agent is still a fact the
+        # caller needs: naming any agent will be refused, so say so rather than
+        # advertising nothing and letting it guess.
+        return (
+            " This agent's toolsSettings.subagent.availableAgents allows none of the "
+            "installed agents, so every spawn is refused; ask the operator to widen the list."
+            if restricted
+            else ""
+        )
     hint = f" Valid names right now: {', '.join(shown)}"
     if withheld:
         hint += f" (+{withheld} more)"
+    if restricted:
+        hint += " (restricted by this agent's toolsSettings.subagent.availableAgents)"
     return hint + "."
 
 
@@ -231,39 +277,13 @@ def schemas() -> list[dict[str, Any]]:
             ),
         },
     }
-    # The solo-spawn reason, shared by both spawn tools. The vocabulary and the
-    # gloss come from ``solo_spawn`` so the enforced gate and this
-    # advertisement cannot drift apart.
-    _solo_reason_prop = {
-        "type": "string",
-        "enum": sorted(r for r in SOLO_SPAWN_REASONS if r),
-        "description": (
-            "REQUIRED for one task without a different model/agent/crew. "
-            + "; ".join(f"'{reason}': {gloss}" for reason, gloss in SOLO_SPAWN_REASON_GLOSS.items())
-            + ". Reasons are model claims, not proof of value or authorization. "
-            "Do not invent work or change models to pass this gate."
-        ),
-    }
-    _solo_details_prop = {
-        "type": "string",
-        "description": (
-            "Concrete benefit and task contract: ready inputs, ownership, verifiable output "
-            "and stop conditions. Required for parent_parallel (describe your separate work), "
-            "specialist (needed capability), and user_requested (quote the user's request). "
-            "Optional for legacy reasons; recorded as model-declared evidence."
-        ),
-    }
     return [
         {
             "name": "spawn_run",
             "description": (
-                "Do focused work directly. Delegate bounded, ready assignments only for "
-                "concrete parallel, bulk-data, independent-verification or specialist value, "
-                "or an explicit user request. Parent plus one child can be parallel work. "
-                "Complexity, task count, idle slots and a different model alone prove no benefit. "
-                "ENFORCED: an unexplained equivalent solo spawn is refused; do it yourself "
-                "or supply a genuine solo_reason and its required solo_details. "
                 "Spawn subagent(s) to run tasks in the background. "
+                "One task is almost always faster done yourself: spawn for two or more "
+                "independent tasks, or when a step would flood your context with bulk output. "
                 "Returns immediately — results arrive as [Subagent completion event] "
                 "messages in your conversation. For parallel work, use 'tasks' array. "
                 "Tasks are automatically batched if they exceed the concurrency limit."
@@ -285,8 +305,6 @@ def schemas() -> list[dict[str, Any]]:
                             "request to an equivalent worker merely to wait and relay."
                         ),
                     },
-                    "solo_reason": _solo_reason_prop,
-                    "solo_details": _solo_details_prop,
                     "tasks": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -491,12 +509,16 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_status",
             "description": (
-                "Retrieve a completed subagent's full transcript by agent ID (from a "
-                "completion event). The completion event gives a summary plus this "
-                "transcript on disk — use this tool (or the read/grep tools on the path) "
-                "to read the rest instead of re-running the subagent. For large "
-                "transcripts, page with offset/limit (line-based, like reading code) or "
-                "filter with grep (regex) rather than pulling the whole thing into context."
+                "Retrieve a subagent's live status and partial transcript while it runs, "
+                "or its full retained transcript after completion. The completion event "
+                "gives a summary plus the transcript path — use this tool (or the read/grep "
+                "tools on the path) to read the rest instead of re-running the subagent. "
+                "For large transcripts, page with offset/limit (line-based, like reading "
+                "code) or filter with grep (regex) rather than pulling the whole thing into "
+                "context. While a run is still going the partial transcript is a live view "
+                "that grows (and past the manager's bound is truncated from the front), so "
+                "line offsets can shift between polls and offset/limit paging is best-effort "
+                "until completion."
             ),
             "inputSchema": {
                 "type": "object",
@@ -530,10 +552,6 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_sub_agents",
             "description": (
-                "Do focused work directly; delegate only for concrete value or an explicit "
-                "user request. ENFORCED: an unexplained equivalent solo spawn is refused. "
-                "Supply a genuine solo_reason and required solo_details. This BLOCKING tool "
-                "cannot support parent_parallel; use asynchronous spawn_run for that. "
                 "Spawn one or more sub-agents to run tasks in parallel. Each sub-agent "
                 "gets its own session with full tool access. BLOCKS until all sub-agents "
                 "complete, then returns their collected results. Use for delegating "
@@ -562,8 +580,6 @@ def schemas() -> list[dict[str, Any]]:
                         },
                         "description": "Array of sub-agents to spawn in parallel",
                     },
-                    "solo_reason": _solo_reason_prop,
-                    "solo_details": _solo_details_prop,
                     "cwd": {
                         "type": "string",
                         "description": (
@@ -598,10 +614,11 @@ def schemas() -> list[dict[str, Any]]:
 
 
 def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
-    """True when *resp* is the gateway refusing *agent* as a name it cannot load.
+    """True when *resp* is the gateway refusing *agent* as a name this wave cannot use.
 
-    Reads the response's machine-readable ``code`` (``AGENT_NOT_FOUND_CODE``,
-    spelled once in ``subagent`` and imported by both sides), not its prose. The
+    Reads the response's machine-readable ``code`` (``AGENT_NOT_FOUND_CODE`` for a
+    name it cannot load, ``AGENT_NOT_AVAILABLE_CODE`` for one the parent agent's
+    spec forbids -- both spelled once in ``subagent`` and imported here), not its prose. The
     refusal text is advisory and free to be reworded; before this it WAS the
     contract, so any rewording silently disabled the wave short-circuit until a
     test caught it.
@@ -617,7 +634,7 @@ def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
     client newer than the gateway simply loses the short-circuit -- while using it
     to REJECT a spawn would not be.
     """
-    return bool(agent) and resp.get("code") == AGENT_NOT_FOUND_CODE
+    return bool(agent) and resp.get("code") in (AGENT_NOT_FOUND_CODE, AGENT_NOT_AVAILABLE_CODE)
 
 
 def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -654,6 +671,18 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
 
     # Read parent session key so completions inject back into this session.
     parent_session = mcp_core._resolve_session_key()
+    if len(task_list) == 1:
+        # One-line allowed-only audit: the task count is already known here,
+        # and this is the only place a one-task spawn_run call is visible at
+        # all now that the solo gate is gone. Kept so a one-task rate can
+        # still be measured/re-audited without reviving the removed gate.
+        mcp_core.sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="allowed",
+            source="spawn_run",
+            resources=parent_session or "",
+        )
 
     # Fire-and-forget — gateway's SubagentManager queues excess tasks
     # and auto-spawns them as slots free up.
@@ -680,42 +709,6 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         return (
             f"Error: agents length ({len(agents_list)}) must match tasks length ({len(task_list)})"
         )
-    # THE SOLO GATE. One task, no reason, nothing named that could differ from
-    # this session: refuse with the question instead of spawning. This is the
-    # only place the task COUNT is known -- the gateway sees one POST per task
-    # -- so the count half lives here; the "is that model/agent/crew really
-    # not your own" half lives in api_spawn, which knows the parent.
-    solo_reason = args.get("solo_reason") or ""
-    solo_details = args.get("solo_details") or ""
-    reason_error = delegation_refusal(solo_reason, solo_details)
-    if solo_reason == "parent_parallel" and not parent_session:
-        reason_error = "Error: parent_parallel requires a parent session with completion delivery."
-    solo = len(task_list) == 1
-    refusal = reason_error or solo_spawn_refusal(
-        len(task_list),
-        solo_reason,
-        model=model,
-        agent=agent or (agents_list[0] if agents_list else ""),
-        crew=crew,
-    )
-    if refusal:
-        mcp_core.sel().log_tool_invocation(
-            session_key=_audit_owner(parent_session),
-            source="mcp_core",
-            tool_name="spawn_run",
-            outcome="refused",
-            error=reason_error or "solo spawn without a reason",
-        )
-        mcp_core.sel().log_api_access(
-            caller="internal",
-            operation="spawn.solo",
-            outcome="denied",
-            source="solo_gate",
-            resources=parent_session or "",
-            error=reason_error or "one task, no reason, nothing named",
-        )
-        return refusal
-
     agent_ids: list[str] = []
     can_work = True
     agent_names: list[str] = []
@@ -727,6 +720,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # the family settings key a requested effort is delivered under.
     effort_applies: list[tuple[str, str]] = []
     agent_tasks: list[str] = []
+    # subagent id -> the gate's reason, for members the gateway accepted but
+    # answered ``status: "queued"`` (deferred, not started).
+    queued_reasons: dict[str, str] = {}
     errors: list[str] = []
     transport_errors: list[str] = []
     # Forward this session's own approval_mode (set as an env var at
@@ -800,15 +796,6 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["reasoning_effort"] = reasoning_effort
         if keep:
             body["keep"] = True
-        if solo:
-            # Marks a one-task call so api_spawn runs the roster check; the
-            # SDK and apps never send it and are never gated.
-            body["solo"] = True
-            if solo_reason:
-                body["solo_reason"] = solo_reason
-        if solo_reason or solo_details:
-            body["solo_reason"] = solo_reason
-            body["solo_details"] = solo_details
         if not inc_memory:
             body["include_memory"] = False
         if not inc_lessons:
@@ -819,10 +806,6 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["approval_mode"] = approval_mode
         d = mcp_core._post("/api/spawn", body)
         can_work = can_work and d.get("parent_work_supported") is True
-        if solo and d.get("code") == SOLO_SPAWN_REFUSED_CODE:
-            # The roster check refused the one task there was: the question IS
-            # the result. No batch to reconcile (a solo call has no batch_id).
-            return str(d.get("error") or solo_spawn_question())
         if d.get("error"):
             error_line = f"{t[:60]}: {d['error']}"
             if d.get("transport_error"):
@@ -850,6 +833,16 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         agent_ids.append(d.get("id", "?"))
         agent_names.append(a)
         agent_tasks.append(t)
+        if d.get("status") == "queued":
+            # Accepted but DEFERRED by the gate (memory floor, critical posture,
+            # adaptive cap at 0): keyed and counted like a started member, but
+            # not running, and re-checked only every admit wait. Reported apart
+            # below so the caller does not wait for a completion event as if
+            # it had started. An older gateway sends no ``status``; a row
+            # waiting merely for a slot or the stagger tick sends ``spawned``.
+            queued_reasons[str(d.get("id", "?"))] = str(
+                d.get("reason_detail") or d.get("reason") or "deferred by the spawn gate"
+            )
         if d.get("effort_dropped"):
             effort_drops.append((str(d.get("id", "?")), str(d["effort_dropped"])))
         if d.get("effort_applied"):
@@ -887,22 +880,42 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             "session_pid / claim-push.)"
         )
     if agent_ids:
-        if parent_session:
+        members = list(zip(agent_ids, agent_names, agent_tasks))
+        started = [m for m in members if m[0] not in queued_reasons]
+        deferred = [m for m in members if m[0] in queued_reasons]
+        if started:
+            if parent_session:
+                spawn_lines.append(
+                    f"Spawned {len(started)} subagent(s). Results will arrive as completion events:"
+                )
+            else:
+                # Orphaned (warning above): completion events cannot be
+                # delivered — do not promise them in the same breath.
+                spawn_lines.append(
+                    f"Spawned {len(started)} subagent(s). Monitor results via polling:"
+                )
+            for aid, a, t in started:
+                label = f"{aid} ({a})" if a else aid
+                spawn_lines.append(f"  {label}: {t[:80]}")
+        if deferred:
+            # One gate verdict covers the wave (memory is host-wide), so the
+            # first member's reason heads the block; a member whose reason
+            # differs is annotated on its own line. The header keeps the
+            # ``N subagent(s).`` shape of the Spawned line on purpose: the
+            # dashboard's inline run card recognises a launch by that marker
+            # and reads the ``  <id> (<agent>): <task>`` lines that follow, so
+            # a queued-only wave still gets its card (which is what shows the
+            # queued count and, with the event's reason, why it waits).
+            head_reason = queued_reasons[deferred[0][0]]
             spawn_lines.append(
-                f"Spawned {len(agent_ids)} subagent(s). Results will arrive as completion events:"
+                f"Queued {len(deferred)} subagent(s). Not started yet: {head_reason}. "
+                "The gateway re-checks every admit wait and starts each one once the "
+                "condition clears; only then does its result arrive:"
             )
-        else:
-            # Orphaned (warning above): completion events cannot be
-            # delivered — do not promise them in the same breath.
-            spawn_lines.append(
-                f"Spawned {len(agent_ids)} subagent(s). Monitor results via polling:"
-            )
-        for aid, a, t in zip(agent_ids, agent_names, agent_tasks):
-            label = f"{aid} ({a})" if a else aid
-            spawn_lines.append(f"  {label}: {t[:80]}")
-        if solo:
-            # The reason, or a pointer to the gateway's roster-check audit.
-            spawn_lines.append(solo_spawn_note(solo_reason))
+            for aid, a, t in deferred:
+                label = f"{aid} ({a})" if a else aid
+                note = "" if queued_reasons[aid] == head_reason else f" [{queued_reasons[aid]}]"
+                spawn_lines.append(f"  {label}: {t[:80]}{note}")
         if keep:
             spawn_lines.append(
                 "These conversations have GUARANTEED continuability: after "
@@ -1081,9 +1094,16 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
     # elsewhere because it is reached by omitting ``agent`` -- but it is still a
     # name the gateway accepts, so a full listing shows it.
     try:
-        names, _ = visible_agent_names((a.name or "" for a in mcp_core.list_agents()), exclude=())
+        names, restricted = _parent_allowlist_filter(a.name or "" for a in mcp_core.list_agents())
+        names, _ = visible_agent_names(names, exclude=())
         if names:
             lines.append(f"\nAvailable agents: {', '.join(names)}")
+        if restricted:
+            lines.append(
+                "(restricted to this agent's toolsSettings.subagent.availableAgents; "
+                + ("other installed agents are" if names else "every installed agent is")
+                + " refused at spawn)"
+            )
     except Exception:
         pass  # list_agents failure is non-critical
     return "\n".join(lines)
@@ -1115,7 +1135,33 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
     if isinstance(meta, dict) and meta.get("grep_error"):
         return f"Error: {meta['grep_error']}"
 
-    result = d.get("result") or "_No result._"
+    running = d.get("done") is False
+    # Present-only, and api_spawn_status sets it ONLY while the run is parked on
+    # the SPAWN-approval gate (never entered execution): no process, no turn.
+    # spawn_list renders that "awaiting-approval" and the CLI waiter says
+    # "approve it ... to start this run", so this tool must not report work
+    # under way for it either.
+    awaiting = running and d.get("awaiting_approval") is True
+    result = d.get("result") or ""
+    if running and not result:
+        turns = d.get("turns", 0)
+        if awaiting:
+            result = (
+                "(not started — waiting for spawn approval; approve it in the "
+                "dashboard (Approvals) to start this run)"
+            )
+        elif isinstance(meta, dict) and meta.get("total_lines", 0) > 0:
+            result = (
+                f"(no partial transcript lines in this view — {turns} turns so far; "
+                "adjust offset/grep to inspect the running transcript)"
+            )
+        else:
+            result = (
+                f"(no streamed text yet — {turns} turns so far; "
+                "transcript arrives with the completion event)"
+            )
+    elif not result:
+        result = "_No result._"
     result, _ = redact_exfiltration_urls(result)
     result, _ = redact_credentials(result)
 
@@ -1131,7 +1177,20 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         hdr.append(f"showing lines {start}-{start + returned} of {total}")
         if meta.get("has_more"):
             hdr.append(f"more available — call again with offset={start + returned}")
-        return f"[{' | '.join(hdr)}]\n{result}"
+        result = f"[{' | '.join(hdr)}]\n{result}"
+
+    if running:
+        status = ["AWAITING-APPROVAL" if awaiting else "RUNNING"]
+        if "elapsed" in d:
+            status.append(f"{d['elapsed']}s")
+        if "turns" in d:
+            status.append(f"{d['turns']} turns")
+        if d.get("last_tool"):
+            status.append(f"last tool: {d['last_tool']}")
+        header = f"[{' · '.join(status)}]"
+        header, _ = redact_exfiltration_urls(header)
+        header, _ = redact_credentials(header)
+        return f"{header}\n{result}"
     return result
 
 
@@ -1213,35 +1272,17 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         if len(a) > MAX_SHORT_STRING:
             entry["agent_or_mode"] = a[:MAX_SHORT_STRING]
 
-    # THE SOLO GATE, as on spawn_run: one entry, no reason, no agent named.
-    live_entries = [e for e in agents_input if str(e.get("prompt", "")).strip()]
-    solo_reason = args.get("solo_reason") or ""
-    solo_details = args.get("solo_details") or ""
-    reason_error = delegation_refusal(solo_reason, solo_details, blocking=True)
-    solo = len(live_entries) == 1
-    refusal = reason_error or solo_spawn_refusal(
-        len(live_entries),
-        solo_reason,
-        agent=str(live_entries[0].get("agent_or_mode") or "") if solo else "",
-        tool="spawn_sub_agents",
-    )
-    if refusal:
-        mcp_core.sel().log_tool_invocation(
-            session_key=_audit_owner(parent_session),
-            source="mcp_core",
-            tool_name="spawn_sub_agents",
-            outcome="refused",
-            error=reason_error or "solo spawn without a reason",
-        )
+    # One-line allowed-only audit, mirroring spawn_run: a one-task call is only
+    # visible here now that the solo gate is gone, so log it to keep the
+    # one-task rate measurable without reviving the removed gate.
+    if sum(1 for e in agents_input if e.get("prompt", "").strip()) == 1:
         mcp_core.sel().log_api_access(
             caller="internal",
             operation="spawn.solo",
-            outcome="denied",
-            source="solo_gate",
+            outcome="allowed",
+            source="spawn_sub_agents",
             resources=parent_session or "",
-            error=reason_error or "one task, no reason, nothing named",
         )
-        return refusal
 
     mcp_core.sel().log_tool_invocation(
         session_key=_audit_owner(parent_session),
@@ -1253,6 +1294,8 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
 
     sa_ids: list[str] = []
     sa_errors: list[str] = []
+    # subagent id -> the gate's reason, for members accepted as ``queued``.
+    sa_deferred: dict[str, str] = {}
     for entry in agents_input:
         prompt = entry.get("prompt", "").strip()
         if not prompt:
@@ -1266,22 +1309,23 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         }
         if cwd:
             sa_body["cwd"] = cwd
-        if solo:
-            sa_body["solo"] = True
-            if solo_reason:
-                sa_body["solo_reason"] = solo_reason
-        if solo_reason or solo_details:
-            sa_body["solo_reason"] = solo_reason
-            sa_body["solo_details"] = solo_details
         d = mcp_core._post("/api/spawn", sa_body)
-        if solo and d.get("code") == SOLO_SPAWN_REFUSED_CODE:
-            return str(d.get("error") or solo_spawn_question(tool="spawn_sub_agents"))
         if d.get("error"):
             sa_errors.append(f"{_redact_sa(prompt)[:60]}: {_redact_sa(d['error'])}")
         else:
             aid = d.get("id", "")
             if aid:
                 sa_ids.append(aid)
+                if d.get("status") == "queued":
+                    # Deferred by the gate, not started; reported under its
+                    # own ``queued`` line if the wait outlives this call.
+                    sa_deferred[aid] = _redact_sa(
+                        str(
+                            d.get("reason_detail")
+                            or d.get("reason")
+                            or "deferred by the spawn gate"
+                        )
+                    )
             else:
                 sa_errors.append(f"{_redact_sa(prompt)[:60]}: spawn returned no agent id")
 
@@ -1418,6 +1462,27 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                         "keep running on their own budget. Their [Subagent completion "
                         "event] messages still arrive; poll spawn_list or spawn_status "
                         "for progress."
+                    ),
+                }
+            )
+        )
+    # Members the gate DEFERRED at accept time (memory floor, critical posture,
+    # adaptive cap at 0) that never reached a settled state within the wait. A
+    # deferred row is not registered as a run, so the per-id poll above cannot
+    # see it; without this line the caller's only trace of it is a bare error
+    # entry, and the reason -- the one fact that says what to change -- stays
+    # in the gateway log.
+    never_started = {aid: why for aid, why in sa_deferred.items() if aid not in _settled_ids}
+    if never_started:
+        sa_results.append(
+            json.dumps(
+                {
+                    "status": "queued",
+                    "agents": never_started,
+                    "note": (
+                        "Queued, not started: the spawn gate deferred these at accept "
+                        "time for the reason given and re-checks every admit wait. They "
+                        "start once the condition clears; nothing was cancelled."
                     ),
                 }
             )

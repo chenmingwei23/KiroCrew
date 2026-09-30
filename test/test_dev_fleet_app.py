@@ -5994,8 +5994,17 @@ def test_trusted_bin_dirs_cover_homebrew_prefixes():
 def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_path):
     """Homebrew's `bin/gh` is a user-writable symlink into `Cellar/`. Caching the
     LINK would let it be repointed between validation and execution, so the
-    vetted real path is what gets cached and spawned."""
+    vetted real path is what gets cached and spawned.
+
+    ``_trusted_bin`` refuses any resolved target under ``Path.home()``. Whether
+    ``tmp_path`` is inside HOME is a property of the HOST (a ``TMPDIR`` under
+    ``~`` puts it there; CI and macOS keep it outside), so the home root is
+    pinned to a sibling directory that is NOT an ancestor of the fake Cellar.
+    """
     mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     cellar = tmp_path / "Cellar" / "gh" / "1.0" / "bin"
     cellar.mkdir(parents=True)
     target = cellar / "gh"
@@ -6007,6 +6016,30 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
     monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
 
     assert mod._trusted_bin("gh") == str(target.resolve())
+    mod._TRUSTED_BIN_CACHE.clear()
+
+
+def test_trusted_bin_refuses_target_under_home(monkeypatch, tmp_path):
+    """The HOME refusal is the guard the test above pins around: an otherwise
+    system-shaped target (0o555, not writable by us) whose resolved path lies
+    under ``Path.home()`` is never selected, because anything under the user's
+    home is the agent's to replace. Every platform: the refusal is decided on
+    the resolved path before any POSIX mode check, so the candidate is placed
+    directly in the trusted dir (no symlink) and the test runs on Windows too.
+    """
+    mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    bin_dir = home / "Cellar" / "gh" / "1.0" / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = "gh.exe" if platform_compat.IS_WINDOWS else "gh"
+    target = bin_dir / exe
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o555)
+    monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
+
+    assert mod._trusted_bin("gh") is None
     mod._TRUSTED_BIN_CACHE.clear()
 
 
@@ -7190,6 +7223,8 @@ async def test_pod_up_fails_closed_when_not_active():
     with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "{}", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
+         patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/repo/kirocrew-wt-x"}, None)), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
          patch.object(runtime_mod.rt, "active_names", return_value=set()):
         result = await mod._pod_up("kirocrew-wt-x")
@@ -7199,15 +7234,32 @@ async def test_pod_up_fails_closed_when_not_active():
 
 @pytest.mark.asyncio
 async def test_pod_up_ok_when_active():
-    """rc==0 AND the unit active -> success, parsed JSON merged in."""
+    """rc==0 AND the unit active -> success, parsed JSON merged in.
+
+    The token is minted IN THIS GATEWAY PROCESS (not by the sandboxed `pod up`
+    child, whose foreign namespace the pod refuses to certify), so the child is
+    launched with --no-token and the handle's token is the gateway's mint.
+    """
+    run_cmd = AsyncMock(return_value=(0, '{"port": 7999, "token": ""}', ""))
     with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
-         patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, '{"port": 7999}', "")), \
+         patch.object(runtime_mod, "_run_cmd", run_cmd), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
+         patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/repo/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_read_pin_strict",
+                      return_value=(True, "/repo/kirocrew-wt-x")), \
+         patch.object(runtime_mod.rt, "pod_name_mutex", return_value=MagicMock()), \
+         patch.object(runtime_mod.rt, "derive_port", return_value=7999), \
+         patch.object(runtime_mod, "_sel", return_value=MagicMock()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
-         patch.object(runtime_mod.rt, "active_names", return_value={"kirocrew-wt-x"}):
+         patch.object(runtime_mod.rt, "active_names", return_value={"kirocrew-wt-x"}), \
+         patch.object(runtime_mod.rt, "mint_token", return_value="tok-gw"):
         result = await mod._pod_up("kirocrew-wt-x")
     assert result["ok"] is True
     assert result["port"] == 7999
+    assert result["token"] == "tok-gw"
+    # The boot child never mints: it is told --no-token.
+    assert "--no-token" in run_cmd.await_args.args[0]
 
 
 @pytest.mark.asyncio

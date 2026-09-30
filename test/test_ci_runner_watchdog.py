@@ -77,9 +77,13 @@ def _run(
     event: str = "push",
     workflow: str = "ci.yml",
     head_sha: str | None = None,
+    pr_numbers: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     head_repo = {"fork": fork, "full_name": "someone/example-repo" if fork else REPO}
     return {
+        # Most real same-repository runs carry an EMPTY `pull_requests`; a test that
+        # wants the same-SHA judgement to be decidable names the numbers explicitly.
+        "pull_requests": [{"number": number} for number in pr_numbers],
         "id": run_id,
         "run_attempt": attempt,
         "status": status,
@@ -189,6 +193,7 @@ class FakeApi:
         newest_after_rerun_sequence: dict[str, list[int]] | None = None,
         ambiguous: dict[str, int] | None = None,
         workflow_contents: dict[tuple[str, str], Any] | None = None,
+        open_pull_heads: dict[str, list[str] | BaseException] | None = None,
     ) -> None:
         self._runs_by_status = dict(runs_by_status)
         self._jobs_by_run = dict(jobs_by_run)
@@ -210,6 +215,11 @@ class FakeApi:
         self._newest_sequence = {k: list(v) for k, v in (newest_after_rerun_sequence or {}).items()}
         self._flip_after_reads = flip_after_reads or {}
         self._workflow_contents = workflow_contents or {}
+        # ``open_pull_heads`` maps a head branch to the head SHAs of its OPEN pull
+        # requests, the way `GET /pulls?head=owner:branch&state=open` answers; a
+        # branch not listed has no open pull request. An exception value is raised
+        # from the read, so a test can make the pulls API fail.
+        self._open_pull_heads = open_pull_heads or {}
         self._reads: dict[int, int] = {}
         self._rerun_seen = False
         self.posts: list[str] = []
@@ -229,12 +239,26 @@ class FakeApi:
                 known.setdefault(int(run["id"]), run)
         matching = [r for r in known.values() if r.get("head_branch") == branch]
         matching.sort(key=lambda r: r["created_at"], reverse=True)
-        return [{"id": r["id"], "head_repository": r.get("head_repository")} for r in matching]
+        return [
+            {
+                "id": r["id"],
+                "head_repository": r.get("head_repository"),
+                "head_sha": r.get("head_sha"),
+                "pull_requests": r.get("pull_requests") or [],
+            }
+            for r in matching
+        ]
 
     def _listing_headed_by(self, newest: int, branch: str) -> list[dict[str, Any]]:
         """A listing whose newest same-repo run is `newest`, followed by every other run
         known on the branch (the judged run included), as GitHub would show them."""
-        head = {"id": newest, "head_repository": {"full_name": REPO}}
+        newest_run = self._run_by_id(newest)
+        head = {
+            "id": newest,
+            "head_repository": {"full_name": REPO},
+            "head_sha": newest_run.get("head_sha", f"sha-{newest}"),
+            "pull_requests": newest_run.get("pull_requests") or [],
+        }
         rest = [e for e in self._listing_for(branch) if e["id"] != newest]
         for run_id, run in self.run_overrides.items():
             if (
@@ -242,7 +266,14 @@ class FakeApi:
                 and run_id != newest
                 and all(e["id"] != run_id for e in rest)
             ):
-                rest.append({"id": run_id, "head_repository": run.get("head_repository")})
+                rest.append(
+                    {
+                        "id": run_id,
+                        "head_repository": run.get("head_repository"),
+                        "head_sha": run.get("head_sha"),
+                        "pull_requests": run.get("pull_requests") or [],
+                    }
+                )
         return [head] + rest
 
     def _run_by_id(self, run_id: int) -> dict[str, Any]:
@@ -272,6 +303,17 @@ class FakeApi:
                 "encoding": "base64",
                 "content": base64.b64encode(str(value).encode("utf-8")).decode("ascii"),
             }
+        if base.endswith("/pulls"):
+            assert params.get("state") == "open", path
+            owner, _, branch = params["head"].partition(":")
+            assert owner == REPO.partition("/")[0], path
+            heads = self._open_pull_heads.get(branch, [])
+            if isinstance(heads, BaseException):
+                raise heads
+            return [
+                {"number": 100 + index, "head": {"sha": sha, "ref": branch}}
+                for index, sha in enumerate(heads)
+            ]
         if base.endswith("/runs") and "/workflows/" in base:
             if "branch" in params:
                 table = self._newest_by_branch
@@ -481,7 +523,12 @@ def test_a_recent_slow_codebuild_start_means_saturation_and_nothing_is_healed() 
 
 
 def test_saturation_evidence_inside_a_young_run_still_counts() -> None:
-    """A 6-minute wait on a job that started 2 minutes ago, in a run created 9 minutes ago."""
+    """A 6-minute wait on a job that started 2 minutes ago, in a run created 9 minutes ago.
+
+    The run is younger than the orphan threshold, so nothing will be done to it, but
+    it is older than the saturation line, so it CAN hold a served start that crossed
+    it -- and that start holds the watchdog back from run 1.
+    """
     young = _run(2, minutes_ago=9, branch="other")
     slow = _job(
         21, status="in_progress", minutes_ago=8, started_minutes_ago=2, runner_name="r", run_id=2
@@ -492,6 +539,283 @@ def test_saturation_evidence_inside_a_young_run_still_counts() -> None:
     assert _verdict_of(verdicts, 2).verdict == wd.SKIPPED_YOUNG
     assert outcomes == {}
     assert api.posts == []
+
+
+# ── the orphan's own queue decides before the fleet does ────────────────────
+
+
+def test_dispatch_queue_strips_the_per_run_suffix_and_keeps_the_fleet_override() -> None:
+    """Two runs' jobs on the same project and fleet compare equal; a fleet override does not."""
+    linux_a = wd.dispatch_queue([CODEBUILD.format(run=1, attempt=1)])
+    linux_b = wd.dispatch_queue([CODEBUILD.format(run=98765, attempt=3)])
+    large = wd.dispatch_queue([CODEBUILD.format(run=1, attempt=1) + " instance-size:large"])
+    windows = wd.dispatch_queue(["codebuild-example-gha-windows-1-1"])
+    assert linux_a == linux_b == frozenset({"codebuild-example-gha-linux"})
+    assert large == frozenset({"codebuild-example-gha-linux instance-size:large"})
+    assert windows != linux_a
+    # Hosted labels are kept verbatim; the suffix rule is for routed labels only.
+    assert wd.dispatch_queue(["ubuntu-latest"]) == frozenset({"ubuntu-latest"})
+    assert wd.dispatch_queue(["windows-2022-1-1"]) == frozenset({"windows-2022-1-1"})
+
+
+def _incident_siblings(*, queued_minutes_ago: float = 94) -> list[dict[str, Any]]:
+    """The measured shape: fourteen fast-gate jobs queued together, thirteen started in 23 s."""
+    started = queued_minutes_ago - 23 / 60
+    return [
+        _job(
+            100 + i,
+            status="completed",
+            conclusion="success",
+            minutes_ago=queued_minutes_ago,
+            started_minutes_ago=started,
+            completed_minutes_ago=started - 1,
+            runner_name=f"r{i}",
+        )
+        for i in range(13)
+    ]
+
+
+def test_prompt_sibling_starts_on_the_orphans_own_queue_clear_a_slow_start_elsewhere() -> None:
+    """The measured incident: thirteen siblings on the orphan's label started in 23 s,
+    the fourteenth sat for an hour and a half, and a 7-minute start on ANOTHER fleet
+    held it unhealed for six hours.
+
+    The orphan's own queue served thirteen jobs promptly after it queued, so the
+    reading for that queue is DISPATCHING and the run is healed. The slow start on the
+    large fleet is a fact about that fleet's capacity, not this queue's.
+
+    Negative control: judged without the queue, the fleet-wide reading sees the slow
+    start and holds; that is the hold that kept the run stuck.
+    """
+    orphan = _job(11, minutes_ago=94)
+    slow_elsewhere = _job(
+        21,
+        status="in_progress",
+        minutes_ago=10,
+        started_minutes_ago=3,
+        runner_name="r",
+        run_id=2,
+        large=True,
+    )
+    api = FakeApi(
+        {"in_progress": [_run(1, minutes_ago=94), _run(2, minutes_ago=12, branch="other")]},
+        {1: [orphan] + _incident_siblings(), 2: [slow_elsewhere]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED
+    assert outcomes == {1: wd.OUTCOME_HEALED}
+
+    # The control: the same evidence, read label-blind, is the old hold.
+    evidence = wd.DispatchEvidence()
+    evidence.absorb([orphan] + _incident_siblings() + [slow_elsewhere], _policy())
+    since = _verdict_of(verdicts, 1).orphans[0].queued_at
+    blind = wd.resolve_hold(FakeApi({}, {}), _policy(), evidence, since)
+    assert blind is not None and blind[0] == wd.SKIPPED_SATURATED
+    scoped = wd.resolve_hold(
+        FakeApi({}, {}), _policy(), evidence, since, queue=wd.dispatch_queue(orphan["labels"])
+    )
+    assert scoped is None
+
+
+def test_a_slow_start_on_the_orphans_own_queue_holds_though_the_rest_of_the_fleet_is_prompt() -> (
+    None
+):
+    """Scoping cuts both ways: a saturated own queue holds even when other fleets are quick.
+
+    Run 2 shares the orphan's queue and served a job after a 6-minute wait; run 3 on
+    the large fleet served one in seconds. Label-blind, the slow start would hold
+    anyway, so the test also pins that the detail NAMES the own-queue reading -- the
+    difference a reader of the tick log needs.
+    """
+    slow_same_queue = _job(
+        21, status="in_progress", minutes_ago=8, started_minutes_ago=2, runner_name="r", run_id=2
+    )
+    prompt_elsewhere = _job(
+        31,
+        status="in_progress",
+        minutes_ago=3,
+        started_minutes_ago=2.8,
+        runner_name="r",
+        run_id=3,
+        large=True,
+    )
+    api = FakeApi(
+        {
+            "in_progress": [
+                _run(1),
+                _run(2, minutes_ago=40, branch="other"),
+                _run(3, minutes_ago=5, branch="third"),
+            ]
+        },
+        {1: [_job(11)], 2: [slow_same_queue], 3: [prompt_elsewhere]},
+    )
+    verdicts, outcomes = _sweep(api)
+    verdict = _verdict_of(verdicts, 1)
+    assert verdict.verdict == wd.SKIPPED_SATURATED
+    assert "own CodeBuild queue" in verdict.detail and "job-21" in verdict.detail
+    assert outcomes == {}
+    assert api.posts == []
+
+
+def test_a_same_queue_prompt_start_does_not_lift_the_partial_evidence_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unread-run hold guards against a slow start nobody read, and a same-queue
+    prompt start does not rule one out.
+
+    Same listing as the partial-hold pin, except the prompt start is on the orphan's
+    own queue. The own-queue reading is derived from the starts this sweep read; a
+    slow start on that same queue would turn it into SATURATED, and an unread
+    30-minute run can hold exactly that start. The retained candidates carry no queue
+    attribution that could rule it out, so the sweep holds either way and posts
+    nothing. Negative control: the same listing with the unread run gone heals, so the
+    hold is the unread run's, not the start's.
+    """
+    monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 2)
+    monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
+    older = _run(500, minutes_ago=30, status="queued", branch="older")
+
+    same_queue = _job(
+        21, status="in_progress", minutes_ago=20, started_minutes_ago=19, runner_name="r", run_id=2
+    )
+    held = FakeApi(
+        {"in_progress": [_run(1), older, _run(2, minutes_ago=20, branch="other")]},
+        {1: [_job(11)], 2: [same_queue], 500: []},
+    )
+    verdicts, outcomes = _sweep(held)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_PARTIAL_EVIDENCE
+    assert outcomes == {} and held.posts == []
+
+    other_fleet = dict(same_queue, labels=[same_queue["labels"][0] + " instance-size:large"])
+    held_elsewhere = FakeApi(
+        {"in_progress": [_run(1), older, _run(2, minutes_ago=20, branch="other")]},
+        {1: [_job(11)], 2: [other_fleet], 500: []},
+    )
+    elsewhere_verdicts, elsewhere_outcomes = _sweep(held_elsewhere)
+    assert _verdict_of(elsewhere_verdicts, 1).verdict == wd.SKIPPED_PARTIAL_EVIDENCE
+    assert elsewhere_outcomes == {} and held_elsewhere.posts == []
+
+    read_in_full = FakeApi(
+        {"in_progress": [_run(1), _run(2, minutes_ago=20, branch="other")]},
+        {1: [_job(11)], 2: [same_queue]},
+    )
+    full_verdicts, full_outcomes = _sweep(read_in_full)
+    assert _verdict_of(full_verdicts, 1).verdict == wd.ORPHANED
+    assert full_outcomes == {1: wd.OUTCOME_HEALED}
+
+
+def test_a_prompt_own_queue_does_not_clear_the_outage_hold() -> None:
+    """The own-queue reading settles the orphan's place in line, not whether the fleet is up.
+
+    Thirteen siblings started 94 minutes ago and nothing on CodeBuild has started in
+    the half hour since: the orphan was never in line, but re-running it now would
+    queue finished work into what may be a total outage. The outage hold still holds,
+    and the tick says so.
+    """
+    orphan = _job(11, minutes_ago=94)
+    api = FakeApi(
+        {"in_progress": [_run(1, minutes_ago=94)]},
+        {1: [orphan] + _incident_siblings()},
+        evidence=False,
+    )
+    verdicts, outcomes = _sweep(api)
+    verdict = _verdict_of(verdicts, 1)
+    assert verdict.verdict == wd.SKIPPED_NO_DISPATCH_EVIDENCE
+    assert outcomes == {} and api.posts == []
+
+
+def test_the_own_queue_reading_prefers_recent_starts_and_reads_old_ones_one_way() -> None:
+    """Recent starts are read like the fleet-wide rule; old ones only say "dispatching".
+
+    An old slow start with nothing recent is SILENT: it does not say the queue is slow
+    now, and it does not say the orphan was never in line either, so the label-blind
+    rules keep the decision. Old prompt starts alone say DISPATCHING; a recent slow
+    start says SATURATED whatever the old ones said.
+    """
+    policy = _policy()
+    since = NOW - timedelta(minutes=94)
+    queue = wd.dispatch_queue(_job(11)["labels"])
+
+    old_slow = _job(
+        21, status="completed", minutes_ago=90, started_minutes_ago=80, runner_name="r", run_id=2
+    )
+    evidence = wd.DispatchEvidence()
+    evidence.absorb([old_slow], policy)
+    assert evidence.own_queue(since, policy, queue) == (wd.OWN_QUEUE_SILENT, None)
+
+    old_prompt = wd.DispatchEvidence()
+    old_prompt.absorb(_incident_siblings(), policy)
+    assert old_prompt.own_queue(since, policy, queue) == (wd.OWN_QUEUE_DISPATCHING, None)
+
+    recent_slow = _job(
+        31, status="in_progress", minutes_ago=9, started_minutes_ago=3, runner_name="r", run_id=3
+    )
+    old_prompt.absorb([recent_slow], policy)
+    reading, slow = old_prompt.own_queue(since, policy, queue)
+    assert reading == wd.OWN_QUEUE_SATURATED and slow is not None and slow.job_id == 31
+
+    # Another fleet's starts are not this queue's, however recent or prompt.
+    elsewhere = wd.DispatchEvidence()
+    elsewhere.absorb(
+        [
+            _job(
+                41,
+                status="in_progress",
+                minutes_ago=2,
+                started_minutes_ago=1.9,
+                runner_name="r",
+                run_id=4,
+                large=True,
+            )
+        ],
+        policy,
+    )
+    assert elsewhere.own_queue(since, policy, queue) == (wd.OWN_QUEUE_SILENT, None)
+
+
+def test_orphans_spanning_two_queues_get_the_label_blind_reading() -> None:
+    """A run with a Linux orphan and a Windows orphan has no one own queue.
+
+    A prompt start on the Linux queue says nothing about the Windows one, and the hold
+    is judged for the run as a whole, so a slow start elsewhere holds it as before.
+    """
+    windows_orphan = dict(_job(12), labels=["codebuild-example-gha-windows-1-1"])
+    slow_elsewhere = _job(
+        21,
+        status="in_progress",
+        minutes_ago=10,
+        started_minutes_ago=3,
+        runner_name="r",
+        run_id=2,
+        large=True,
+    )
+    api = FakeApi(
+        {"in_progress": [_run(1, minutes_ago=94), _run(2, minutes_ago=12, branch="other")]},
+        {1: [_job(11, minutes_ago=94), windows_orphan] + _incident_siblings(), 2: [slow_elsewhere]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_SATURATED
+    assert outcomes == {} and api.posts == []
+
+
+def test_a_young_runs_start_still_counts_as_evidence_though_the_run_is_not_actionable() -> None:
+    """A run the classifier refuses to act on still feeds the evidence set.
+
+    Run 2 is 3 minutes old, so it is SKIPPED_YOUNG and nothing will be done to it,
+    but its served start is what the hold on run 1 is judged against. It is also
+    younger than the saturation line, so it cannot hold a wait that crossed it and can
+    only ever report the fleet dispatching -- which is why the evidence reserve
+    prefers runs old enough to report the other way.
+    """
+    young = _run(2, minutes_ago=3, branch="other")
+    prompt = _job(
+        21, status="in_progress", minutes_ago=3, started_minutes_ago=2.8, runner_name="r", run_id=2
+    )
+    api = FakeApi({"in_progress": [_run(1), young]}, {1: [_job(11)], 2: [prompt]})
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED
+    assert _verdict_of(verdicts, 2).verdict == wd.SKIPPED_YOUNG
+    assert outcomes == {1: wd.OUTCOME_HEALED}
 
 
 def _jobs_change_on_later_reads(api: FakeApi, run_id: int, later: list[dict[str, Any]]) -> None:
@@ -1959,13 +2283,13 @@ def test_a_chain_of_superseding_pushes_is_not_chased_past_the_depth_cap() -> Non
 def _saturation_band_api() -> FakeApi:
     """An orphan, a MIDDLE run holding the only slow start, and a young prompt start.
 
-    Under a narrow bound the middle run is the band that gets dropped, so the sweep
-    sees prompt starts and nothing slow. Under a wide bound it reads the slow start
-    and holds as saturated, which is what proves the fixture really does contain
-    saturation and the narrow-bound hold is not an artefact of an empty fixture.
+    The middle run is 20 minutes old and its routed job waited 8 for a runner, so it
+    is both old enough to be reserved for evidence and slow enough to hold. The young
+    run is 3 minutes old, under the 5-minute saturation line, so it cannot contain a
+    wait that crossed it and can only ever show the fleet dispatching.
     """
     middle = _run(2, minutes_ago=20, branch="middle")
-    young = _run(3, minutes_ago=9, branch="young")
+    young = _run(3, minutes_ago=3, branch="young")
     slow = _job(
         21, status="in_progress", minutes_ago=8, started_minutes_ago=2, runner_name="r", run_id=2
     )
@@ -2019,20 +2343,23 @@ def test_a_successor_we_cancelled_and_will_not_restore_is_lost_not_a_clean_hando
     assert any("::error::" in line and "gh run rerun 2" in line for line in logged)
 
 
-def test_partial_dispatch_evidence_holds_instead_of_authorizing_a_heal(
+def test_a_narrow_bound_still_reads_the_slow_start_because_the_reserve_is_age_aware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A sweep that read only part of its listing must not rule saturation out.
+    """A bound too small to read everything must still be able to see saturation.
 
-    The bound drops the MIDDLE band, so the slow CodeBuild start there is never read
-    and "prompt starts, nothing slow" is not established. The paired wide bound reads
-    it and holds as saturated, proving the saturation is really in the fixture.
+    The reserve takes the newest run at least ``saturation_wait`` old, so under a
+    one-slot reserve it takes the 20-minute middle run holding the slow start and
+    holds. The reverted rule -- reserve the newest run outright -- would take the
+    3-minute young run, which is too young to contain a wait past the threshold and
+    so can only report the fleet dispatching. Both bounds reach the same verdict
+    here, which is the point: the hold now rests on evidence that was read.
     """
     monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 2)
     monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
     narrow = _saturation_band_api()
     verdicts, outcomes = _sweep(narrow)
-    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_PARTIAL_EVIDENCE
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_SATURATED
     assert narrow.posts == []
 
     monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 50)
@@ -2042,6 +2369,35 @@ def test_partial_dispatch_evidence_holds_instead_of_authorizing_a_heal(
     assert _verdict_of(wide_verdicts, 1).verdict == wd.SKIPPED_SATURATED
     assert wide.posts == []
     assert outcomes is not None
+
+
+def test_the_evidence_reserve_prefers_runs_old_enough_to_show_a_slow_start() -> None:
+    """The reserve slice, and the negative control that the reverted rule fails.
+
+    A run younger than ``saturation_wait`` cannot hold a start that waited that
+    long, so reserving the newest runs outright is blind to the one signal that
+    holds. Measured on this repository the newest ten live runs spanned 0.0 to 0.6
+    minutes while 352 runs could carry one, so this is the normal shape, not an
+    edge case.
+
+    The straddling pair is what pins the line at ``saturation_wait`` and not at
+    ``orphan_after``: 8 minutes is in, 4 minutes is out, so swapping the constant
+    reds this test.
+    """
+    policy = _policy()
+    assert policy.saturation_wait == timedelta(minutes=5)
+    runs = [_run(i, minutes_ago=age) for i, age in enumerate([25, 20, 8, 6, 4, 1], start=1)]
+    reserve = [run["id"] for run in wd._evidence_reserve(runs, policy)]
+    # Every run at or past 5 minutes, newest last; the 4- and 1-minute runs are out.
+    assert reserve == [1, 2, 3, 4]
+    assert wd._can_carry_a_slow_start(runs[2], policy) is True  # 8 min, over the line
+    assert wd._can_carry_a_slow_start(runs[4], policy) is False  # 4 min, under it
+    # The reverted rule takes the tail outright, so its newest slot is the 1-minute
+    # run, which cannot carry a wait that crossed the line: that reserve can only ever
+    # answer "dispatching" and is blind to the signal that holds.
+    assert runs[-wd.LIVE_EVIDENCE_RESERVE :][-1]["id"] == 6
+    young_only = [_run(7, minutes_ago=3), _run(8, minutes_ago=1)]
+    assert [run["id"] for run in wd._evidence_reserve(young_only, policy)] == [7, 8]
 
 
 def test_the_successor_is_not_judged_while_our_own_rerun_is_still_cancelling() -> None:
@@ -3181,19 +3537,11 @@ def test_recovery_itself_is_bounded_by_the_per_tick_cap() -> None:
     assert sum(1 for o in outcomes.values() if o == wd.OUTCOME_NOT_ATTEMPTED) == 2
 
 
-def test_a_pull_request_run_is_reported_and_never_healed() -> None:
-    """Replaces an earlier contract that recovered PR runs too. That was wrong.
-
-    The successor check asks whether a NEWER run of this branch is in flight, and
-    GitHub's runs listing can only be filtered by branch NAME, so two pull requests
-    open on one head branch read as each other's successor — abandoning a cancelled
-    orphan behind a green `skipped-superseded`. Matching by pull-request number is
-    not available: of 20 sampled same-repository `pull_request` runs only 9 carried
-    `pull_requests[].number`, so that route fails closed on most PR runs.
-
-    So a pull-request run is reported and left alone, like a fork run, and green for
-    the same reason: its owner is reading their own pull request's checks. `main`
-    orphans, which nobody watches and which the incident was made of, still heal.
+def test_a_pull_request_run_at_its_open_head_is_healed() -> None:
+    """A pull-request run is judged by HEAD SHA against the open pull requests on
+    its branch, not by the branch-name listing (which two pull requests sharing one
+    head branch defeat). At an open head it is current, so a cancelled orphan is
+    re-run and a live orphan is cancelled and re-run, exactly like a `main` push.
     """
     cancelled = _run(
         1,
@@ -3202,40 +3550,435 @@ def test_a_pull_request_run_is_reported_and_never_healed() -> None:
         conclusion="cancelled",
         updated_minutes_ago=5,
         event="pull_request",
+        branch="pr",
     )
     api = FakeApi(
-        {"cancelled": [cancelled]}, {1: [_cancelled_orphan_job(11)]}, newest_by_branch={"main": 1}
+        {"cancelled": [cancelled]},
+        {1: [_cancelled_orphan_job(11)]},
+        newest_by_branch={"pr": 1},
+        open_pull_heads={"pr": ["sha-1"]},
     )
     verdicts, outcomes = _sweep(api)
-    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_PULL_REQUEST
+    assert _verdict_of(verdicts, 1).verdict == wd.CANCELLED_ORPHAN
+    assert outcomes == {1: wd.OUTCOME_RECOVERED}
+    assert api.posts == [f"repos/{REPO}/actions/runs/1/rerun"]
+    # The judgement read the pulls API, not `pull_requests[]` on the run payload.
+    assert any(path.startswith(f"repos/{REPO}/pulls?") for path in api.gets)
+
+    live = FakeApi(
+        {"in_progress": [_run(2, event="pull_request", branch="pr")]},
+        {2: [_job(21)]},
+        newest_by_branch={"pr": 2},
+        open_pull_heads={"pr": ["sha-2"]},
+    )
+    live_verdicts, live_outcomes = _sweep(live)
+    assert _verdict_of(live_verdicts, 2).verdict == wd.ORPHANED
+    assert live_outcomes == {2: wd.OUTCOME_HEALED}
+    assert live.posts == [
+        f"repos/{REPO}/actions/runs/2/cancel",
+        f"repos/{REPO}/actions/runs/2/rerun",
+    ]
+
+
+def test_a_pr_keyed_workflow_orphan_is_healed_on_its_pull_request_run() -> None:
+    """`code-review.yml` is PR-keyed and declared safe for pull-request runs only.
+
+    Both orphan shapes are healed on a pull-request run, and the revision gate --
+    read from the real workflow file, whose group is
+    `code-review-${{ github.event.pull_request.number }}` -- admits it because the
+    run's EVENT reaches that read. A push-shaped orphan of the same workflow is
+    exempt: there the PR number is empty and the group a constant.
+    """
+    cancelled = _run(
+        1,
+        minutes_ago=70,
+        status="completed",
+        conclusion="cancelled",
+        updated_minutes_ago=5,
+        event="pull_request",
+        branch="pr",
+        workflow="code-review.yml",
+    )
+    live = _run(2, event="pull_request", branch="pr2", workflow="code-review.yml")
+    api = FakeApi(
+        {"cancelled": [cancelled], "in_progress": [live]},
+        {1: [_cancelled_orphan_job(11)], 2: [_job(21)]},
+        newest_by_branch={"pr": 1, "pr2": 2},
+        open_pull_heads={"pr": ["sha-1"], "pr2": ["sha-2"]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_RECOVERED, 2: wd.OUTCOME_HEALED}
+    assert _verdict_of(verdicts, 1).verdict == wd.CANCELLED_ORPHAN
+    assert _verdict_of(verdicts, 2).verdict == wd.ORPHANED
+
+    pushed = FakeApi(
+        {"in_progress": [_run(3, event="push", branch="main", workflow="code-review.yml")]},
+        {3: [_job(31)]},
+        newest_by_branch={"main": 3},
+    )
+    push_verdicts, push_outcomes = _sweep(pushed)
+    assert _verdict_of(push_verdicts, 3).verdict == wd.HEAL_EXEMPT
+    assert push_outcomes == {3: wd.OUTCOME_HUMAN_REQUIRED}
+    assert pushed.posts == []
+
+
+def test_two_pull_requests_sharing_a_head_branch_do_not_supersede_each_other() -> None:
+    """The case a branch-name successor check cannot handle.
+
+    Two pull requests open on `shared` (different bases) both have head SHA `sha-1`.
+    Each carries its own run at that SHA, and the branch listing shows the OTHER
+    request's run as newer. By branch name run 1 would read superseded and its
+    cancelled orphan left behind a green `skipped-superseded`; by head SHA it is
+    current -- the SHA is an open head -- and, the two payloads naming disjoint
+    pull requests, the newer run is a sibling's and not a successor: run 1 is re-run.
+    """
+    mine = _run(
+        1,
+        minutes_ago=70,
+        status="completed",
+        conclusion="cancelled",
+        updated_minutes_ago=5,
+        event="pull_request",
+        branch="shared",
+        head_sha="sha-1",
+        pr_numbers=(101,),
+    )
+    theirs = _run(
+        2,
+        minutes_ago=69,
+        event="pull_request",
+        branch="shared",
+        head_sha="sha-1",
+        pr_numbers=(102,),
+    )
+    api = FakeApi(
+        {"cancelled": [mine], "in_progress": [theirs]},
+        {1: [_cancelled_orphan_job(11)], 2: []},
+        newest_by_branch={"shared": 2},
+        open_pull_heads={"shared": ["sha-1", "sha-1"]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.CANCELLED_ORPHAN
+    assert outcomes[1] == wd.OUTCOME_RECOVERED
+    assert f"repos/{REPO}/actions/runs/1/rerun" in api.posts
+
+
+def test_a_newer_run_at_the_same_sha_from_the_same_pull_request_supersedes() -> None:
+    """`labeled`, `unlabeled`, `edited` and `reopened` start a new run at the SAME head
+    SHA, and the group cancels the older one. Re-running the older run would cancel
+    the newer through the same group and stand in its place. When both payloads name
+    the same pull request, the newer run IS the successor: the older is superseded,
+    not re-run, and the successor is what a post-re-run check would restore."""
+    older = _run(
+        1,
+        minutes_ago=70,
+        status="completed",
+        conclusion="cancelled",
+        updated_minutes_ago=5,
+        event="pull_request",
+        branch="pr",
+        head_sha="sha-1",
+        pr_numbers=(101,),
+    )
+    labeled = _run(
+        2, minutes_ago=10, event="pull_request", branch="pr", head_sha="sha-1", pr_numbers=(101,)
+    )
+    api = FakeApi(
+        {"cancelled": [older], "in_progress": [labeled]},
+        {1: [_cancelled_orphan_job(11)], 2: []},
+        newest_by_branch={"pr": 2},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_SUPERSEDED
     assert outcomes == {}
     assert api.posts == []
-    assert wd.render_summary(verdicts, outcomes, _policy()).count(wd.SKIPPED_PULL_REQUEST) == 1
+    judged = wd._base_verdict(older, _policy().now)
+    assert wd.current_or_successor_id(api, REPO, judged) == 2
 
-    live = FakeApi({"in_progress": [_run(2, event="pull_request", branch="pr")]}, {2: [_job(21)]})
-    live_verdicts, live_outcomes = _sweep(live)
-    assert _verdict_of(live_verdicts, 2).verdict == wd.SKIPPED_PULL_REQUEST
-    assert live_outcomes == {} and live.posts == []
 
-    # The push path is untouched: that is where the incident's orphans were.
-    push = FakeApi(
-        {
-            "cancelled": [
-                _run(
-                    3,
-                    minutes_ago=70,
-                    status="completed",
-                    conclusion="cancelled",
-                    updated_minutes_ago=5,
-                    branch="pushed",
-                )
-            ]
-        },
-        {3: [_cancelled_orphan_job(31, run_id=3)]},
-        newest_by_branch={"pushed": 3},
+def test_a_newer_run_at_the_same_sha_of_unknown_pull_request_fails_closed() -> None:
+    """Same SHA, newer run, and at least one payload names no pull request (most
+    same-repository runs name none): successor or sibling cannot be told, and
+    "current" would license a cancel through the other run's group. Fail closed:
+    `lookup-inconclusive`, a failed outcome that names both runs, nothing posted.
+    Not resolved by watching the group's cancel either -- during the fleet outage
+    every orphan lives in, the run to watch stays queued and nothing settles."""
+    older = _run(
+        1,
+        minutes_ago=70,
+        status="completed",
+        conclusion="cancelled",
+        updated_minutes_ago=5,
+        event="pull_request",
+        branch="pr",
+        head_sha="sha-1",
     )
-    _, push_outcomes = _sweep(push)
-    assert push_outcomes == {3: wd.OUTCOME_RECOVERED}
+    newer = _run(2, minutes_ago=10, event="pull_request", branch="pr", head_sha="sha-1")
+    api = FakeApi(
+        {"cancelled": [older], "in_progress": [newer]},
+        {1: [_cancelled_orphan_job(11)], 2: []},
+        newest_by_branch={"pr": 2},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    verdicts, outcomes = _sweep(api)
+    verdict = _verdict_of(verdicts, 1)
+    assert verdict.verdict == wd.LOOKUP_INCONCLUSIVE
+    assert "run(s) 2" in verdict.detail and "same head SHA" in verdict.detail
+    assert outcomes == {1: wd.OUTCOME_LOOKUP_FAILED}
+    assert wd.OUTCOME_LOOKUP_FAILED in wd.FAILED_OUTCOMES
+    assert api.posts == []
+    # The newer run itself is the newest at the SHA, so IT is current and healable
+    # (aged past the orphan threshold here; above it was young only to be newer).
+    live = FakeApi(
+        {"in_progress": [{**newer, "created_at": _ts(60)}]},
+        {2: [_job(21)]},
+        newest_by_branch={"pr": 2},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    _, live_outcomes = _sweep(live)
+    assert live_outcomes == {2: wd.OUTCOME_HEALED}
+
+
+def test_a_same_sha_run_that_appears_after_the_re_run_withdraws_it_and_fails() -> None:
+    """The pre-check found the run current; a same-SHA run of unknown pull request
+    appears in the settle window. The re-run may have displaced it through the group,
+    and nothing can restore it on a guess: the re-run is cancelled and the outcome is
+    a failed one naming the situation, never `cancelled-and-rerun`."""
+    run = _run(1, event="pull_request", branch="pr", head_sha="sha-1")
+    late = _run(2, minutes_ago=1, event="pull_request", branch="pr", head_sha="sha-1")
+    api = FakeApi(
+        {"in_progress": [run]},
+        {1: [_job(11)]},
+        newest_by_branch={"pr": 1},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    original_get = api.get
+
+    def appearing_get(path: str) -> Any:
+        if api._rerun_seen and "branch=pr" in path:
+            api.gets.append(path)
+            return {"workflow_runs": [late, run]}
+        return original_get(path)
+
+    api.get = appearing_get  # type: ignore[method-assign]
+    _, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_LOOKUP_FAILED}
+    assert api.posts == [
+        f"repos/{REPO}/actions/runs/1/cancel",
+        f"repos/{REPO}/actions/runs/1/rerun",
+        f"repos/{REPO}/actions/runs/1/cancel",
+    ]
+
+
+def test_a_live_pull_request_orphan_with_an_ambiguous_same_sha_run_is_not_cancelled() -> None:
+    """The cancel comes before the re-run's successor check. A live pull-request
+    orphan whose same-SHA newer run cannot be told from a sibling's is therefore
+    judged BEFORE the cancel: an inconclusive answer leaves it untouched (no POST at
+    all) under the failed outcome that names it, instead of cancelling it and then
+    discovering nobody can re-run it. A failed pulls read is held the same way."""
+    older = _run(1, minutes_ago=70, event="pull_request", branch="pr", head_sha="sha-1")
+    newer = _run(2, minutes_ago=10, event="pull_request", branch="pr", head_sha="sha-1")
+    api = FakeApi(
+        {"in_progress": [older, newer]},
+        {1: [_job(11)], 2: []},
+        newest_by_branch={"pr": 2},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED
+    assert outcomes == {1: wd.OUTCOME_LOOKUP_FAILED}
+    assert api.posts == []
+
+    unreadable = FakeApi(
+        {"in_progress": [older]},
+        {1: [_job(11)]},
+        newest_by_branch={"pr": 1},
+        open_pull_heads={"pr": wd.ApiError(500, "boom")},
+    )
+    _, held_outcomes = _sweep(unreadable)
+    assert held_outcomes == {1: wd.OUTCOME_LOOKUP_FAILED}
+    assert unreadable.posts == []
+    # A push orphan keeps its one-listing budget: no pre-cancel lookup, cancel then re-run.
+    pushed = FakeApi(
+        {"in_progress": [_run(3, minutes_ago=70)]}, {3: [_job(31)]}, newest_by_branch={"main": 3}
+    )
+    _, push_outcomes = _sweep(pushed)
+    assert push_outcomes == {3: wd.OUTCOME_HEALED}
+    assert pushed.posts == [
+        f"repos/{REPO}/actions/runs/3/cancel",
+        f"repos/{REPO}/actions/runs/3/rerun",
+    ]
+
+
+def test_a_pull_request_run_whose_head_moved_is_superseded_and_its_successor_named() -> None:
+    """A newer push moved the head: the old run is superseded. Its successor is named
+    only when the payloads identify a newer run at the open head as the SAME pull
+    request's; an unidentified one is `SUPERSEDED_SUCCESSOR_UNIDENTIFIED` -- superseded
+    for every judgement before a mutation, never a run to restore."""
+    old = wd.RunVerdict(
+        run_id=1,
+        run_attempt=1,
+        head_branch="pr",
+        head_repo=REPO,
+        event="pull_request",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="ci.yml",
+        head_sha="sha-1",
+        pull_request_numbers=(101,),
+    )
+    stale_newer = _run(3, minutes_ago=30, event="pull_request", branch="pr", head_sha="sha-old")
+    successor = _run(
+        2, minutes_ago=40, event="pull_request", branch="pr", head_sha="sha-2", pr_numbers=(101,)
+    )
+    judged = _run(
+        1, minutes_ago=60, event="pull_request", branch="pr", head_sha="sha-1", pr_numbers=(101,)
+    )
+    api = FakeApi(
+        {"in_progress": [stale_newer, successor, judged]},
+        {},
+        newest_by_branch={"pr": 3},
+        open_pull_heads={"pr": ["sha-2"]},
+    )
+    assert wd.current_or_successor_id(api, REPO, old) == 2
+    assert not wd.is_current_run(api, REPO, old)
+
+    unidentified = _run(2, minutes_ago=40, event="pull_request", branch="pr", head_sha="sha-2")
+    anonymous = FakeApi(
+        {"in_progress": [stale_newer, unidentified, judged]},
+        {},
+        newest_by_branch={"pr": 3},
+        open_pull_heads={"pr": ["sha-2"]},
+    )
+    assert wd.current_or_successor_id(anonymous, REPO, old) == wd.SUPERSEDED_SUCCESSOR_UNIDENTIFIED
+    assert not wd.is_current_run(anonymous, REPO, old)
+    # Head moved and the new head's run is not listed yet: the same answer, since an
+    # unlisted run may exist and be the one a re-run would displace.
+    unlisted = FakeApi(
+        {"in_progress": [stale_newer, judged]},
+        {},
+        newest_by_branch={"pr": 3},
+        open_pull_heads={"pr": ["sha-2"]},
+    )
+    assert wd.current_or_successor_id(unlisted, REPO, old) == wd.SUPERSEDED_SUCCESSOR_UNIDENTIFIED
+
+
+def test_a_pull_request_run_whose_pull_request_closed_has_no_successor() -> None:
+    """No open pull request has the branch as head: superseded, nothing to restore.
+
+    A cancelled orphan of a closed pull request is not re-run (the cancel already
+    happened; nobody wants the result), and a live one is cancelled only -- freeing
+    the queue -- with the `superseded-before-cancel` outcome, which is not a failure.
+    """
+    cancelled = _run(
+        1,
+        minutes_ago=70,
+        status="completed",
+        conclusion="cancelled",
+        updated_minutes_ago=5,
+        event="pull_request",
+        branch="closed-pr",
+    )
+    api = FakeApi(
+        {"cancelled": [cancelled]},
+        {1: [_cancelled_orphan_job(11)]},
+        newest_by_branch={"closed-pr": 1},
+        open_pull_heads={},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_SUPERSEDED
+    assert outcomes == {}
+    assert api.posts == []
+
+
+def test_a_pull_request_re_run_that_lands_on_a_closed_pull_request_is_withdrawn() -> None:
+    """The pull request closes between the pre-check and the post-check: the re-run
+    is cancelled again and nothing is restored, under a non-failed outcome."""
+    run = _run(1, event="pull_request", branch="pr", head_sha="sha-1")
+    api = FakeApi(
+        {"in_progress": [run]},
+        {1: [_job(11)]},
+        newest_by_branch={"pr": 1},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    original_get = api.get
+
+    def closing_get(path: str) -> Any:
+        if path.startswith(f"repos/{REPO}/pulls?") and api._rerun_seen:
+            api.gets.append(path)
+            return []
+        return original_get(path)
+
+    api.get = closing_get  # type: ignore[method-assign]
+    verdicts, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_RERUN_WITHDRAWN}
+    assert wd.OUTCOME_RERUN_WITHDRAWN not in wd.FAILED_OUTCOMES
+    assert api.posts == [
+        f"repos/{REPO}/actions/runs/1/cancel",
+        f"repos/{REPO}/actions/runs/1/rerun",
+        f"repos/{REPO}/actions/runs/1/cancel",
+    ]
+
+
+def test_a_re_run_overtaken_by_an_unidentified_head_move_is_withdrawn_and_reported() -> None:
+    """The head moves during the settle window and the newer run at it names no pull
+    request: the re-run may have displaced this pull request's run through the group,
+    and restoring a sibling's would hide that. The re-run is cancelled and the outcome
+    is a failed one that names the situation; nothing is restored on a guess."""
+    run = _run(1, event="pull_request", branch="pr", head_sha="sha-1")
+    moved = _run(2, minutes_ago=1, event="pull_request", branch="pr", head_sha="sha-2")
+    api = FakeApi(
+        {"in_progress": [run]},
+        {1: [_job(11)]},
+        newest_by_branch={"pr": 1},
+        open_pull_heads={"pr": ["sha-1"]},
+    )
+    original_get = api.get
+
+    def moving_get(path: str) -> Any:
+        if api._rerun_seen and path.startswith(f"repos/{REPO}/pulls?"):
+            api.gets.append(path)
+            return [{"number": 101, "head": {"sha": "sha-2", "ref": "pr"}}]
+        if api._rerun_seen and "branch=pr" in path:
+            api.gets.append(path)
+            return {"workflow_runs": [moved, run]}
+        return original_get(path)
+
+    api.get = moving_get  # type: ignore[method-assign]
+    _, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_LOOKUP_FAILED}
+    assert api.posts == [
+        f"repos/{REPO}/actions/runs/1/cancel",
+        f"repos/{REPO}/actions/runs/1/rerun",
+        f"repos/{REPO}/actions/runs/1/cancel",
+    ]
+
+
+def test_an_unreadable_pulls_listing_is_inconclusive_never_current() -> None:
+    """The pulls read is the whole judgement for a pull-request run, so a failed read
+    is `LookupInconclusive`, and so is a full page (it may have a tail)."""
+    verdict = wd.RunVerdict(
+        run_id=1,
+        run_attempt=1,
+        head_branch="pr",
+        head_repo=REPO,
+        event="pull_request",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="ci.yml",
+        head_sha="sha-1",
+    )
+    failing = FakeApi({}, {}, open_pull_heads={"pr": wd.ApiError(500, "boom")})
+    with pytest.raises(wd.LookupInconclusive):
+        wd.current_or_successor_id(failing, REPO, verdict)
+    full_page = FakeApi({}, {}, open_pull_heads={"pr": ["sha-1"] * wd.PULL_REQUEST_LISTING_DEPTH})
+    with pytest.raises(wd.LookupInconclusive):
+        wd.current_or_successor_id(full_page, REPO, verdict)
 
 
 def test_a_human_cancel_of_a_healthy_run_never_matches_the_recovery_fingerprint() -> None:
@@ -3440,12 +4183,54 @@ def test_the_summary_reports_a_saturated_hold() -> None:
 
 
 def test_the_summary_reports_a_partial_evidence_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The partial hold must reach the summary, or a held tick renders "Nothing stuck.".
+
+    This is the only path that renders SKIPPED_PARTIAL_EVIDENCE through
+    `render_summary`, so without it dropping the verdict from that function's
+    `reported` tuple reds nothing and a tick that deliberately held reports itself as
+    quiet -- the regression this pins.
+    """
+    monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 2)
+    monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
+    # On another fleet (`instance-size:large`): this test pins the label-blind path, and
+    # a prompt start on the orphan's OWN queue would take the saturation question
+    # (though not this hold) down the own-queue path instead.
+    prompt = _job(
+        21,
+        status="in_progress",
+        minutes_ago=20,
+        started_minutes_ago=19,
+        runner_name="r",
+        run_id=2,
+        large=True,
+    )
+    api = FakeApi(
+        {
+            "in_progress": [
+                _run(1),
+                _run(500, minutes_ago=30, status="queued", branch="older"),
+                _run(2, minutes_ago=20, branch="other"),
+            ]
+        },
+        {1: [_job(11)], 2: [prompt], 500: []},
+    )
+    verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_PARTIAL_EVIDENCE
+    summary = wd.render_summary(verdicts, outcomes, _policy())
+    assert wd.SKIPPED_PARTIAL_EVIDENCE in summary
+    assert "Nothing stuck." not in summary
+    assert api.posts == []
+
+
+def test_the_summary_reports_a_hold_taken_under_a_narrow_read_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A hold the watchdog deliberately took must not read as "Nothing stuck."."""
     monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 2)
     monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
     verdicts, outcomes = _sweep(_saturation_band_api())
     summary = wd.render_summary(verdicts, outcomes, _policy())
-    assert wd.SKIPPED_PARTIAL_EVIDENCE in summary
+    assert wd.SKIPPED_SATURATED in summary
     assert "Nothing stuck." not in summary
 
 
@@ -3842,6 +4627,18 @@ def test_heal_safe_and_exempt_workflows_form_the_exact_partition() -> None:
             "build.yml",
             "ci.yml",
             "fast-gate.yml",
+            # Ref-keyed, publishes nothing, triggered only by `pull_request`; those
+            # runs are healed, so the declaration is reachable.
+            "macos-on-demand.yml",
+        }
+    )
+    pull_request_only = frozenset(
+        {
+            "code-review.yml",
+            "cross-platform.yml",
+            "dependency-review.yml",
+            "pr-scope.yml",
+            "screenshot-evidence.yml",
         }
     )
     exempt = frozenset(
@@ -3852,73 +4649,124 @@ def test_heal_safe_and_exempt_workflows_form_the_exact_partition() -> None:
             "build-wheel.yml",
             "dependency-vulnerability.yml",
             "pr-merge-conflict-label.yml",
-            "code-review.yml",
-            "cross-platform.yml",
-            "dependency-review.yml",
-            "pr-scope.yml",
-            "screenshot-evidence.yml",
-            # Ref-keyed and publishes nothing, but triggered ONLY by `pull_request`,
-            # and pull-request runs are never healed -- so declaring it heal-safe
-            # would read as coverage no run could ever use.
-            "macos-on-demand.yml",
         }
     )
     assert wd.HEAL_SAFE_WORKFLOWS == heal_safe
+    assert wd.HEAL_SAFE_PULL_REQUEST_WORKFLOWS == pull_request_only
     assert wd.heal_exempt_workflows() == exempt
-    assert heal_safe | exempt == frozenset(wd.WATCHED_WORKFLOWS)
-    assert not heal_safe & exempt
+    assert heal_safe | pull_request_only | exempt == frozenset(wd.WATCHED_WORKFLOWS)
+    assert not heal_safe & pull_request_only
+    assert not (heal_safe | pull_request_only) & exempt
 
 
-def test_every_declared_heal_safe_workflow_is_ref_keyed_not_pr_keyed() -> None:
-    """The successor guard filters by head branch, never by pull-request number.
+def test_heal_safe_declared_is_per_event_for_pr_keyed_workflows() -> None:
+    """A PR-keyed workflow is declared safe for pull-request runs only: on any other
+    event its group is a constant, so nothing protects a re-run from a successor."""
+    assert wd.heal_safe_declared("code-review.yml", "pull_request")
+    assert not wd.heal_safe_declared("code-review.yml", "push")
+    assert not wd.heal_safe_declared("code-review.yml", "workflow_dispatch")
+    # A ref-keyed declaration covers every event, as it always did.
+    assert wd.heal_safe_declared("ci.yml", "push")
+    assert wd.heal_safe_declared("ci.yml", "pull_request")
+    assert wd.heal_safe_declared("ci.yml", "workflow_dispatch")
+    assert not wd.heal_safe_declared("release.yml", "pull_request")
+    # And `_mark_heal_exempt` consults it, so a push-shaped orphan of a PR-keyed
+    # workflow is exempt even though the workflow is not in the exempt SET.
+    orphan = wd.RunVerdict(
+        run_id=1,
+        run_attempt=1,
+        head_branch="main",
+        head_repo=REPO,
+        event="push",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="code-review.yml",
+        orphans=[
+            wd.OrphanedJob(
+                "j", 1, ("codebuild-x",), timedelta(minutes=20), datetime.now(timezone.utc)
+            )
+        ],
+    )
+    assert wd._mark_heal_exempt(orphan, wd.heal_exempt_workflows()).verdict == wd.HEAL_EXEMPT
 
-    Two pull requests can share a head branch, so for a PR-keyed concurrency group
-    another PR's newer run reads as this run's successor and the cancelled verdict is
-    left unrestored. Declaring a PR-keyed workflow heal-safe would therefore break the
-    one protection healing has, and this fails if someone adds one back.
-    """
-    pr_keyed = []
+
+def test_the_two_declared_sets_are_keyed_the_way_their_successor_check_needs() -> None:
+    """HEAL_SAFE_WORKFLOWS is ref-keyed: a push run's successor is judged by the
+    branch listing. HEAL_SAFE_PULL_REQUEST_WORKFLOWS is PR-keyed and pull-request-only:
+    its runs are judged by head SHA, and no push run exists to judge by branch."""
+    pr_keyed_in_ref_set = []
     for name in sorted(wd.HEAL_SAFE_WORKFLOWS):
         text = (WORKFLOWS_DIR / name).read_text(encoding="utf-8")
-        if "pull_request.number" in text.split("jobs:", 1)[0]:
-            pr_keyed.append(name)
-    assert pr_keyed == [], f"PR-keyed workflows cannot be auto-healed: {pr_keyed}"
-    # The exempt tier really does hold the PR-keyed ones, so the assertion above is
-    # not passing merely because the repo has none.
-    assert "code-review.yml" in wd.heal_exempt_workflows()
+        head = text.split("jobs:", 1)[0]
+        if "pull_request.number" in head:
+            pr_keyed_in_ref_set.append(name)
+    assert (
+        pr_keyed_in_ref_set == []
+    ), f"PR-keyed workflows belong in the PR-only set: {pr_keyed_in_ref_set}"
+    for name in sorted(wd.HEAL_SAFE_PULL_REQUEST_WORKFLOWS):
+        text = (WORKFLOWS_DIR / name).read_text(encoding="utf-8")
+        head = text.split("jobs:", 1)[0]
+        assert "pull_request.number" in head, f"{name} is declared PR-keyed but is not"
+        triggers = {
+            keys[1]
+            for keys, _ in wd._yaml_mapping_entries(text)
+            if len(keys) >= 2 and keys[0] == "on"
+        }
+        assert triggers == {"pull_request"}, (
+            f"{name} is declared safe for pull-request runs only but also triggers on "
+            f"{sorted(triggers - {'pull_request'})}; those runs would have no concurrency group"
+        )
+        assert not wd.workflow_text_has_publish_or_deploy_step(text), name
+    # The exempt tier excludes the PR-keyed ones, so the set above is not passing
+    # merely because nothing PR-keyed is declared anywhere.
+    assert "code-review.yml" not in wd.heal_exempt_workflows()
+
+
+def test_the_watchdog_workflow_grants_the_pulls_read_its_pull_request_judgement_needs() -> None:
+    """`_open_pull_request_heads` reads `GET /repos/{repo}/pulls`, which a workflow
+    token sees only with `pull-requests: read`. Without it every pull-request orphan
+    would be cancelled, its pulls read would 403, and the re-run would never follow:
+    a cancelled run and a red tick where a heal was meant."""
+    text = (WORKFLOWS_DIR / wd.WATCHDOG_WORKFLOW).read_text(encoding="utf-8")
+    permissions = {
+        keys[1]: value.partition("#")[0].strip()
+        for keys, value in wd._yaml_mapping_entries(text)
+        if len(keys) == 2 and keys[0] == "permissions"
+    }
+    assert permissions.get("pull-requests") == "read", permissions
+    assert permissions.get("actions") == "write", permissions
 
 
 def test_every_declared_heal_safe_workflow_has_a_trigger_a_heal_can_reach() -> None:
     """A declaration that can never act reads as coverage that does not exist.
 
-    Pull-request runs are never healed, so a workflow triggered ONLY by
-    `pull_request` can sit in `HEAL_SAFE_WORKFLOWS` and never produce one healable
-    run -- `macos-on-demand.yml` was exactly that until it was removed. This fails if
-    such an entry is added back, or if a declared workflow's triggers narrow to
-    pull-request only.
+    A heal acts on `push` and `pull_request` runs, so a declared workflow must have
+    at least one of those triggers. `macos-on-demand.yml` is pull-request only and
+    is declared, which this pins: a pull-request-only workflow is reachable exactly
+    because pull-request runs are healed.
     """
     unreachable = []
-    for name in sorted(wd.HEAL_SAFE_WORKFLOWS):
+    for name in sorted(wd.HEAL_SAFE_WORKFLOWS | wd.HEAL_SAFE_PULL_REQUEST_WORKFLOWS):
         text = (WORKFLOWS_DIR / name).read_text(encoding="utf-8")
         triggers = {
             keys[1]
             for keys, _ in wd._yaml_mapping_entries(text)
             if len(keys) >= 2 and keys[0] == "on"
         }
-        if triggers and triggers <= {"pull_request", "pull_request_target"}:
+        if triggers and not triggers & {"push", "pull_request"}:
             unreachable.append(name)
     assert unreachable == [], (
-        "these workflows are declared heal-safe but only pull-request runs can "
-        f"trigger them, and those are never healed: {unreachable}"
+        f"these workflows are declared heal-safe but no push or pull-request run can "
+        f"trigger them: {unreachable}"
     )
-    # macos-on-demand.yml really is pull-request only, so the check above is not
-    # vacuous -- it is the case that motivated it.
     macos = (WORKFLOWS_DIR / "macos-on-demand.yml").read_text(encoding="utf-8")
     macos_triggers = {
         keys[1] for keys, _ in wd._yaml_mapping_entries(macos) if len(keys) >= 2 and keys[0] == "on"
     }
     assert macos_triggers == {"pull_request"}
-    assert "macos-on-demand.yml" in wd.heal_exempt_workflows()
+    assert "macos-on-demand.yml" in wd.HEAL_SAFE_WORKFLOWS
 
 
 def test_every_declared_heal_safe_workflow_passes_the_derived_gate_on_its_real_yaml() -> None:
@@ -4035,10 +4883,10 @@ def test_a_newly_watched_workflow_is_heal_exempt_until_declared_safe() -> None:
         ("${{ github.workflow }}-${{ github.ref }}", True),
         ("${{ github.ref_name }}", True),
         ("${{ github.head_ref }}", True),
-        # A PR-keyed group is NOT heal-safe, and that is the point: the successor
-        # check filters the runs listing by branch NAME, so it cannot tell one pull
-        # request's run from another's on a shared head branch. Admitting this here
-        # would let the derived gate bless a workflow the declaration test forbids.
+        # A PR-keyed group is NOT heal-safe for a PUSH run: the push successor check
+        # filters the runs listing by branch NAME, so it cannot tell one pull request's
+        # run from another's on a shared head branch, and on a push the PR number is
+        # empty anyway. The pull-request event admits it -- the case below.
         ("code-review-${{ github.event.pull_request.number }}", False),
         ("a-constant-group", False),
         ("audit-${{ github.sha }}", False),
@@ -4048,6 +4896,25 @@ def test_a_newly_watched_workflow_is_heal_exempt_until_declared_safe() -> None:
 def test_heal_safety_requires_a_ref_keyed_group(group: str, safe: bool) -> None:
     text = "on: push\nconcurrency:\n  group: " + group + "\n  cancel-in-progress: true\n"
     assert wd.workflow_text_is_heal_safe(text) is safe
+
+
+@pytest.mark.parametrize(
+    ("group", "safe"),
+    [
+        ("code-review-${{ github.event.pull_request.number }}", True),
+        ("pr-${{ github.event.number }}", True),
+        ("${{ github.workflow }}-${{ github.ref }}", True),
+        # Still not a run-scoped key on any event.
+        ("a-constant-group", False),
+        ("audit-${{ github.sha }}", False),
+    ],
+)
+def test_a_pull_request_run_admits_a_pr_keyed_group(group: str, safe: bool) -> None:
+    """A pull-request run's successor is judged by head SHA, not by the listing, so
+    the PR-number key is enough for it; the derived gate says so only for that event."""
+    text = "on: pull_request\nconcurrency:\n  group: " + group + "\n  cancel-in-progress: true\n"
+    assert wd.workflow_text_is_heal_safe(text, event="pull_request") is safe
+    assert wd.workflow_text_is_heal_safe(text, event="push") is (safe and "github.ref" in group)
 
 
 def test_a_workflow_with_no_concurrency_group_is_heal_exempt() -> None:
@@ -4255,6 +5122,355 @@ def test_live_job_read_bound_keeps_the_oldest_and_the_newest(
     assert any("live job-read cap of 3" in line for line in logged)
 
 
+def test_a_short_reserve_does_not_leave_the_read_bound_unspent() -> None:
+    """The classify slice is sized off the reserve taken, not off the constant.
+
+    `_evidence_reserve` returns `source[-LIVE_EVIDENCE_RESERVE:]` where `source` is the
+    CAPABLE runs, so a listing far over the bound still yields a short reserve whenever
+    few of its runs are old enough -- a burst of fresh pushes is exactly that shape.
+    Subtracting the constant would then leave the difference unspent: the sweep reads
+    fewer runs than the bound allows, classifies fewer orphans, and leaves more unread
+    capable runs holding the heal back, which is the opposite of the bound's purpose.
+
+    Negative control below: sizing off the constant reads 7 fewer runs on this fixture.
+    """
+    policy = _policy()
+    # Over the bound so the whole-listing early return cannot apply, but with only
+    # three runs old enough to be capable.
+    capable = [_run(i, minutes_ago=30 + i) for i in range(1, 4)]
+    young = [_run(100 + i, minutes_ago=1) for i in range(wd.LIVE_CLASSIFY_READS + 10)]
+    runs = capable + young
+    assert len(runs) > wd.LIVE_CLASSIFY_READS
+
+    logged: list[str] = []
+    bounded, _ = wd.live_runs_within_read_bound(runs, policy, logged.append)
+
+    # Three reserved plus a classify slice of 47 spends the bound exactly. Sizing off
+    # the constant would have given 3 + 40 = 43.
+    assert len(bounded) == wd.LIVE_CLASSIFY_READS, (
+        f"the bound allows {wd.LIVE_CLASSIFY_READS} reads and a short reserve must not "
+        f"shrink that; got {len(bounded)}"
+    )
+
+    # The budget line must name the split this tick actually took -- 47/3, not the
+    # constants' 40/10 -- and it is emitted once, after the reserve is computed.
+    cap_lines = [line for line in logged if "live job-read cap" in line]
+    assert len(cap_lines) == 1, "the read budget must be reported exactly once"
+    assert f"the {wd.LIVE_CLASSIFY_READS - 3} classified" in cap_lines[0]
+    assert "3 reads are reserved" in cap_lines[0]
+    assert "(3 of them can)" in cap_lines[0]
+    assert "shortfall" not in cap_lines[0]
+    assert str(wd.LIVE_EVIDENCE_RESERVE) + " reads are reserved" not in cap_lines[0]
+
+
+def test_a_run_listed_live_for_days_is_a_ghost_neither_read_nor_holding_the_heal() -> None:
+    """The runs index keeps returning records GitHub itself does not hold as live:
+    measured here, sixteen queued runs created five weeks earlier with no job ever
+    created, answering a cancel with 409 "completed". Read, each spends one of the
+    fifty classify reads on every tick; unread, a queued run past the saturation line
+    is a run that COULD hold a slow start, so it would hold the heal back for ever.
+    So a ghost is dropped before the bound is drawn: not read, not unread-capable.
+
+    Negative control below: with the age line lifted, the same ghosts are read and the
+    freshest live run is displaced from the bound."""
+    policy = _policy()
+    ghosts = [
+        _run(i, minutes_ago=5 * 24 * 60 + i, status="queued", event="pull_request")
+        for i in range(1, 17)
+    ]
+    live = [
+        _run(100 + i, minutes_ago=30 + i, status="queued") for i in range(wd.LIVE_CLASSIFY_READS)
+    ]
+    runs = ghosts + live
+    logged: list[str] = []
+
+    bounded, unread = wd.live_runs_within_read_bound(runs, policy, logged.append)
+
+    bounded_ids = {run["id"] for run in bounded}
+    assert not bounded_ids & {g["id"] for g in ghosts}, "a ghost must not be read"
+    assert not set(unread) & {g["id"] for g in ghosts}, "a ghost must not hold the heal as unread"
+    assert bounded_ids == {
+        run["id"] for run in live
+    }, "every live run fits once the ghosts are gone"
+    ghost_lines = [line for line in logged if "dropped as ghosts" in line]
+    assert len(ghost_lines) == 1
+    assert "16 listed run(s) older than" in ghost_lines[0]
+
+    # A ghost two days old to the second is dropped; one a second younger is live.
+    at_line = _run(7, minutes_ago=2 * 24 * 60, status="queued")
+    under_line = _run(8, minutes_ago=2 * 24 * 60 - 1 / 60, status="queued")
+    kept = wd.drop_ghost_runs([at_line, under_line], policy, lambda _l: None)
+    assert [run["id"] for run in kept] == [8]
+
+
+def test_a_re_run_of_an_old_run_ages_from_its_attempt_not_its_creation() -> None:
+    """A re-run keeps the ``created_at`` of the run it re-runs and moves
+    ``run_started_at`` to the attempt. The watchdog's own heals are re-runs, and an
+    operator re-runs old runs too, so a stuck attempt on a five-day-old run is exactly
+    what the classify pass exists to see; aged by creation it would be dropped before
+    any verdict and lost silently. A ghost never started, so its two stamps agree.
+
+    Negative control: the same run with ``run_started_at`` back at creation is a ghost."""
+    policy = _policy()
+    rerun = _run(9, minutes_ago=5 * 24 * 60, status="queued", attempt=2)
+    rerun["run_started_at"] = _ts(30)
+    ghost = _run(10, minutes_ago=5 * 24 * 60, status="queued")
+    ghost["run_started_at"] = ghost["created_at"]
+    unstamped = _run(11, minutes_ago=5 * 24 * 60, status="queued")
+    unstamped.pop("run_started_at", None)
+    kept = wd.drop_ghost_runs([rerun, ghost, unstamped], policy, lambda _l: None)
+    assert [run["id"] for run in kept] == [9]
+
+
+def test_without_the_ghost_line_the_same_ghosts_displace_live_runs_from_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above: the line is what protects the bound."""
+    monkeypatch.setattr(wd, "GHOST_AFTER", timedelta(days=3650))
+    policy = _policy()
+    # Heal-eligible in shape, so that once they are not dropped they rank FIRST in the
+    # bound, exactly as the oldest ci.yml ghosts measured here did.
+    ghosts = [_run(i, minutes_ago=5 * 24 * 60 + i, status="queued") for i in range(1, 17)]
+    live = [
+        _run(100 + i, minutes_ago=30 + i, status="queued") for i in range(wd.LIVE_CLASSIFY_READS)
+    ]
+    bounded, unread = wd.live_runs_within_read_bound(ghosts + live, policy, lambda _l: None)
+    bounded_ids = {run["id"] for run in bounded}
+    assert bounded_ids & {g["id"] for g in ghosts}, "ghosts are read once the line is lifted"
+    assert (set(unread) | bounded_ids) & {g["id"] for g in ghosts}
+    assert {run["id"] for run in live} - bounded_ids, "and a live run is displaced"
+
+
+def test_the_reserve_log_names_the_fallback_when_no_run_can_carry_a_slow_start() -> None:
+    """The log must not claim an age band it did not get.
+
+    With nothing old enough, `_evidence_reserve` falls back to the newest runs. Those
+    report the fleet dispatching but cannot show a slow start, and a line asserting the
+    age band unconditionally would misdescribe exactly the case an operator reading it
+    needs to tell apart.
+    """
+    policy = _policy()
+    young = [_run(i, minutes_ago=1) for i in range(1, wd.LIVE_CLASSIFY_READS + 12)]
+    logged: list[str] = []
+    wd.live_runs_within_read_bound(young, policy, logged.append)
+
+    cap_lines = [line for line in logged if "live job-read cap" in line]
+    assert cap_lines
+    assert "(0 of them can)" in cap_lines[0]
+    assert "shortfall" in cap_lines[0]
+
+
+def test_a_pending_run_is_not_saturation_capable_however_old_it_is() -> None:
+    """A jobless run can hold no start, so it must not hold a heal back.
+
+    A ``pending`` run is held by its concurrency group with no jobs created, so it
+    can carry no served start at any age. Counting it as capable would hold the heal
+    over a run that could never have held the evidence, and `pending` is exactly what
+    grows during the saturation this hold exists for.
+
+    Negative control: age alone admits it, both into the reserve and into the unread
+    count that the partial hold turns on.
+    """
+    policy = _policy()
+    pending = _run(9, minutes_ago=90, status="pending")
+    live = _run(8, minutes_ago=20, status="queued")
+    assert wd._can_carry_a_slow_start(live, policy) is True
+    assert wd._can_carry_a_slow_start(pending, policy) is False
+    # Age alone -- the reverted rule -- would call the 90-minute pending run capable.
+    assert policy.now - wd.parse_timestamp(pending["created_at"]) >= policy.saturation_wait
+
+    # The reserve prefers the live run even though the pending one is older, and with
+    # only the pending run present it falls back rather than reserving nothing.
+    assert [int(run["id"]) for run in wd._evidence_reserve([pending, live], policy)] == [8]
+    assert [int(run["id"]) for run in wd._evidence_reserve([pending], policy)] == [9]
+
+
+def test_the_tick_logs_the_slowest_served_wait_against_the_saturation_line() -> None:
+    """Drift toward the line has to be visible without re-measuring by hand.
+
+    The reading is reported whether or not it crosses the line, because the MARGIN is
+    the signal: a wait climbing toward it means the hold is about to fire on ordinary
+    traffic, one far below it means the line could be raised. Here the slowest served
+    wait is 2 minutes against a 5-minute line, so no hold is taken and the reading is
+    logged anyway. It reads in SECONDS: the waits this exists to watch are 27s median
+    and 47s at p90 here, and whole minutes would print every one of them as zero.
+    """
+    sibling = _job(
+        21, status="in_progress", minutes_ago=4, started_minutes_ago=2, runner_name="r", run_id=2
+    )
+    api = FakeApi(
+        {"in_progress": [_run(1), _run(2, minutes_ago=40, branch="other")]},
+        {1: [_job(11)], 2: [sibling]},
+    )
+    logged: list[str] = []
+    clock = _Clock()
+    verdicts, _ = wd.run_watchdog(
+        api, _policy(), clock=clock.now, sleep=clock.sleep, log=logged.append
+    )
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED  # 2 min is under the line
+    line = next(line for line in logged if "slowest served CodeBuild wait" in line)
+    assert "120s" in line and "300s" in line
+
+    # A sub-minute wait -- the normal case here -- prints a real number, not zero.
+    brief = _job(
+        31, status="in_progress", minutes_ago=2.5, started_minutes_ago=2, runner_name="r", run_id=2
+    )
+    api2 = FakeApi(
+        {"in_progress": [_run(1), _run(2, minutes_ago=40, branch="other")]},
+        {1: [_job(11)], 2: [brief]},
+    )
+    brief_log: list[str] = []
+    clock2 = _Clock()
+    wd.run_watchdog(api2, _policy(), clock=clock2.now, sleep=clock2.sleep, log=brief_log.append)
+    brief_line = next(line for line in brief_log if "slowest served CodeBuild wait" in line)
+    assert "30s" in brief_line and "0 min" not in brief_line
+
+    # Nothing served at all: no reading is invented.
+    quiet = wd.DispatchEvidence()
+    assert quiet.slowest_served_wait(_policy()) is None
+
+
+def test_a_tick_that_saw_no_served_start_logs_no_calibration_reading() -> None:
+    """Absent evidence is not a fast queue, so a quiet tick reports nothing.
+
+    The one run here is young with a job that never got a runner, so nothing was
+    served and no orphan exists to trigger the completed-run sample. A zero reading
+    would read as an instantly-dispatching fleet, which is the opposite of what the
+    tick knows.
+    """
+    api = FakeApi({"in_progress": [_run(1, minutes_ago=2)]}, {1: [_job(11, minutes_ago=2)]})
+    logged: list[str] = []
+    clock = _Clock()
+    wd.run_watchdog(api, _policy(), clock=clock.now, sleep=clock.sleep, log=logged.append)
+    assert not any("slowest served CodeBuild wait" in line for line in logged)
+
+
+def test_an_unread_run_that_crosses_the_line_mid_sweep_turns_the_hold_on() -> None:
+    """The unread premise is re-judged on each call's clock, not frozen at the listing.
+
+    The cancel phase re-reads the listing ONCE and then judges every cancel in the
+    phase against it, so an unread run 10 s under ``saturation_wait`` when the listing
+    was read is over it by the time a later cancel is judged. Retaining the run's
+    creation time and re-judging age is what lets the hold engage from that moment;
+    a count computed at the listing's clock calls it incapable for the whole phase
+    and authorizes the cancel on a premise minutes out of date.
+
+    Negative control: freezing the count at the listing's clock leaves the later
+    judgement at zero, so the hold never engages.
+    """
+    policy = _policy()
+    just_under = policy.now - policy.saturation_wait + timedelta(seconds=10)
+    evidence = wd.DispatchEvidence(unread_candidates={900: just_under})
+
+    # At the listing's clock the run cannot hold a qualifying wait, so nothing holds.
+    assert evidence.unread_saturation_capable(policy) == 0
+
+    # A minute later -- ordinary wall-clock advance across a multi-cancel phase -- the
+    # same retained run is over the line and the hold engages.
+    later = _policy(now=policy.now + timedelta(seconds=60))
+    assert evidence.unread_saturation_capable(later) == 1
+
+    prompt_start = policy.now - timedelta(minutes=2)
+    evidence.starts.append(
+        (prompt_start, timedelta(seconds=5), wd._orphan(_job(31), timedelta(seconds=5)))
+    )
+    since = policy.now - timedelta(minutes=20)
+    assert wd.resolve_hold(FakeApi({}, {}), policy, evidence, since) is None
+    held = wd.resolve_hold(FakeApi({}, {}), later, evidence, since)
+    assert held is not None and held[0] == wd.SKIPPED_PARTIAL_EVIDENCE
+
+    # The control: a count frozen at the listing's clock answers zero at both.
+    frozen = sum(
+        1
+        for created in evidence.unread_candidates.values()
+        if policy.now - created >= policy.saturation_wait
+    )
+    assert frozen == 0
+
+
+def test_the_partial_hold_turns_on_unread_saturation_capable_runs_not_on_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hold's premise is what went unread, not that the bound was reached.
+
+    A run at least ``saturation_wait`` old can hold a served start that waited that
+    long; a younger one cannot. So a sweep whose unread runs are all too young has
+    seen every run that could have held it and may act, while one unread run old
+    enough to carry such a start holds -- the completed-run sample cannot close that
+    gap, since it reads the newest completions and a fleet serving some jobs promptly
+    while queueing others past the threshold puts a prompt start there.
+
+    Negative control: keying the hold on the bound alone holds in both halves, which
+    at this repository's listing size is every tick.
+    """
+    # On another fleet (`instance-size:large`): this test pins the label-blind path, and
+    # a prompt start on the orphan's OWN queue would take the saturation question
+    # (though not this hold) down the own-queue path instead.
+    prompt = _job(
+        21,
+        status="in_progress",
+        minutes_ago=20,
+        started_minutes_ago=19,
+        runner_name="r",
+        run_id=2,
+        large=True,
+    )
+    monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 2)
+    monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
+
+    # Unread: two runs of 3 and 2 minutes. Neither can hold a 15-minute wait.
+    young = [_run(400 + i, minutes_ago=3 - i, status="queued", branch=f"y{i}") for i in range(2)]
+    cleared = FakeApi(
+        {"in_progress": [_run(1), _run(2, minutes_ago=20, branch="other")] + young},
+        {1: [_job(11)], 2: [prompt], 400: [], 401: []},
+    )
+    verdicts, outcomes = _sweep(cleared)
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED
+    assert outcomes == {1: wd.OUTCOME_HEALED}
+
+    # Unread: one 30-minute run, which could have held a served 15-minute wait.
+    older = _run(500, minutes_ago=30, status="queued", branch="older")
+    held = FakeApi(
+        {"in_progress": [_run(1), older, _run(2, minutes_ago=20, branch="other")]},
+        {1: [_job(11)], 2: [prompt], 500: []},
+    )
+    held_verdicts, held_outcomes = _sweep(held)
+    assert _verdict_of(held_verdicts, 1).verdict == wd.SKIPPED_PARTIAL_EVIDENCE
+    assert held_outcomes == {}
+    assert held.posts == []
+
+
+def test_the_reserve_takes_the_age_band_not_this_minutes_pushes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reserved read goes to a run that could report saturation, not the newest.
+
+    Three pushes landed in the last three minutes. None of them can hold a wait past
+    the orphan threshold, so reserving a slot for one answers only "dispatching".
+    The 20-minute run can answer either way, so it takes the slot; the six-hour
+    orphan still takes its classify slot, and the selection stays chronological.
+
+    Negative control: the reverted rule -- reserve the newest runs outright -- takes
+    a 3-minute run and leaves the 20-minute one unread.
+    """
+    stuck = _run(7, minutes_ago=360, status="queued", event="push", workflow="fast-gate.yml")
+    fresh = [
+        _run(300 + i, minutes_ago=3 - i * 0.1, status="queued", event="push", workflow="ci.yml")
+        for i in range(3)
+    ]
+    mid = _run(50, minutes_ago=20, status="queued", event="pull_request", branch="pr")
+    candidates = sorted([stuck, mid] + fresh, key=lambda run: run["created_at"])
+    monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 3)
+    monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
+    bounded, _ = wd.live_runs_within_read_bound(candidates, _policy(), lambda _line: None)
+    ids = [int(run["id"]) for run in bounded]
+    assert 7 in ids and 50 in ids
+    assert [run["created_at"] for run in bounded] == sorted(run["created_at"] for run in bounded)
+
+    reverted = [int(run["id"]) for run in candidates[-wd.LIVE_EVIDENCE_RESERVE :]]
+    assert reverted == [302] and 50 not in reverted
+
+
 def test_the_classify_bound_prefers_a_healable_run_over_older_unhealable_ones(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4262,32 +5478,55 @@ def test_the_classify_bound_prefers_a_healable_run_over_older_unhealable_ones(
 
     Measured on this repository: 220 watched live runs sit past the orphan
     threshold and 18 past a day, the oldest 36 days, and every one of those is a
-    pull-request run -- listed forever, so oldest-first re-reads the same slots on
-    every tick. The run that actually blocks a branch is a `push` run of a
-    heal-safe workflow, and one six hours old ranks 30th of 40 slots.
+    fork's pull-request run -- listed forever, and no token can re-run it, so
+    oldest-first re-reads the same slots on every tick. The run that actually
+    blocks a branch is a same-repository run of a heal-safe workflow, and one six
+    hours old ranks 30th of 40 slots.
 
     Negative control: the reverted rule (`runs[:oldest]`, pure oldest-first) over
     the same candidates drops the healable run.
     """
+    # Under the ghost line on purpose: a run past GHOST_AFTER is dropped before the
+    # bound is drawn at all (its own test below), so the priority rule is exercised
+    # here on unhealable runs that ARE still live -- old, but under two days.
     zombies = [
-        _run(100 + i, minutes_ago=50_000 - i, status="queued", event="pull_request", branch="pr")
+        _run(
+            100 + i,
+            minutes_ago=2_800 - i,
+            status="queued",
+            event="pull_request",
+            branch="pr",
+            fork=True,
+        )
         for i in range(4)
     ]
     healable = _run(7, minutes_ago=360, status="queued", event="push", workflow="fast-gate.yml")
+    # Old enough to be reserved for evidence, so the healable run must win a classify
+    # slot on priority rather than riding in on the reserve.
+    mid = _run(50, minutes_ago=20, status="queued", event="pull_request", branch="pr")
     young = [_run(200 + i, minutes_ago=2 - i * 0.1, status="queued") for i in range(2)]
-    candidates = zombies + [healable] + young  # oldest first, as the gather returns them
+    candidates = zombies + [healable, mid] + young  # oldest first, as the gather returns them
     monkeypatch.setattr(wd, "LIVE_CLASSIFY_READS", 4)
     monkeypatch.setattr(wd, "LIVE_EVIDENCE_RESERVE", 1)
     logged: list[str] = []
-    bounded, partial = wd.live_runs_within_read_bound(candidates, logged.append)
-    assert partial is True
+    bounded, unread_candidates = wd.live_runs_within_read_bound(
+        candidates, _policy(), logged.append
+    )
+    # The unread zombies are retained: they are `queued` and far past the line, so the
+    # listing cannot tell them from a run whose job has been queued that whole time.
+    # The two young runs are retained too -- they bear jobs -- but the age half is
+    # judged later, so they add nothing to the count until they cross the line.
+    evidence = wd.DispatchEvidence(unread_candidates=unread_candidates)
+    assert evidence.unread_saturation_capable(_policy()) == 2
     assert 7 in {int(run["id"]) for run in bounded}
     # Still oldest first, so the sweep's log stays chronological.
     assert [run["created_at"] for run in bounded] == sorted(run["created_at"] for run in bounded)
-    # The newest run keeps its reserved slot: dispatch evidence is not sacrificed
-    # to make room for the healable one.
-    assert int(bounded[-1]["id"]) == int(candidates[-1]["id"])
-    assert any("heal-eligible first" in line for line in logged)
+    # The reserved slot goes to the newest run old enough to hold a wait past the
+    # threshold, not to the newest run outright: a 2-minute run could only report
+    # the fleet dispatching.
+    assert int(bounded[-1]["id"]) == 50
+    assert not {int(run["id"]) for run in young} & {int(run["id"]) for run in bounded}
+    assert any("actionable-shaped first" in line for line in logged)
 
     oldest = wd.LIVE_CLASSIFY_READS - wd.LIVE_EVIDENCE_RESERVE
     control = candidates[:oldest] + candidates[-wd.LIVE_EVIDENCE_RESERVE :]  # the reverted rule
@@ -4295,20 +5534,26 @@ def test_the_classify_bound_prefers_a_healable_run_over_older_unhealable_ones(
 
 
 def test_heal_eligible_shape_reads_only_what_the_later_gates_cannot_reverse() -> None:
-    """A `push` run of a declared heal-safe workflow, and nothing else.
+    """A same-repository `push` or `pull_request` run of a workflow declared heal-safe
+    for that event, and nothing else.
 
-    It is a priority signal, so it must not admit what the real gates refuse: a
-    pull-request run is never healed (the successor check filters by branch NAME),
-    and a workflow outside the declared heal-safe set is never healed either.
+    It is a priority signal, so it must not admit what the real gates refuse: a fork's
+    run (no token can re-run it), a push run of a PR-keyed workflow (no group on a
+    push), a workflow outside both declared sets, an event a heal cannot act on.
     """
-    assert wd._heal_eligible_shape(_run(1, event="push", workflow="fast-gate.yml"))
-    assert not wd._heal_eligible_shape(_run(2, event="pull_request", workflow="fast-gate.yml"))
-    assert not wd._heal_eligible_shape(_run(3, event="push", workflow="macos-on-demand.yml"))
-    assert not wd._heal_eligible_shape(_run(4, event="schedule", workflow="ci.yml"))
+    assert wd._heal_eligible_shape(_run(1, event="push", workflow="fast-gate.yml"), REPO)
+    assert wd._heal_eligible_shape(_run(2, event="pull_request", workflow="fast-gate.yml"), REPO)
+    assert wd._heal_eligible_shape(_run(3, event="pull_request", workflow="code-review.yml"), REPO)
+    assert not wd._heal_eligible_shape(_run(4, event="push", workflow="code-review.yml"), REPO)
+    assert not wd._heal_eligible_shape(
+        _run(5, event="pull_request", workflow="fast-gate.yml", fork=True), REPO
+    )
+    assert not wd._heal_eligible_shape(_run(6, event="push", workflow="release.yml"), REPO)
+    assert not wd._heal_eligible_shape(_run(7, event="schedule", workflow="ci.yml"), REPO)
     # A run whose payload carries no event at all is not promoted on a guess.
-    pathless = _run(5, event="push", workflow="ci.yml")
+    pathless = _run(8, event="push", workflow="ci.yml")
     del pathless["event"]
-    assert not wd._heal_eligible_shape(pathless)
+    assert not wd._heal_eligible_shape(pathless, REPO)
 
 
 def test_the_scheduled_tick_is_armed() -> None:
@@ -4767,9 +6012,10 @@ def test_the_cleared_hold_is_logged_as_a_decision_not_as_a_cancel() -> None:
     assert "it is cancelled" not in line
 
 
-def test_a_pull_request_orphan_is_never_read_as_superseded() -> None:
-    """Two open pull requests can share one head branch, so a newer run of that branch
-    does not establish that THIS run was superseded."""
+def test_a_pull_request_orphan_is_judged_by_head_sha_not_by_branch_listing() -> None:
+    """Two open pull requests can share one head branch, so a newer run of that
+    branch NAME does not establish that THIS run was superseded. At an open head the
+    hold stands (the run is current); once the head moves, it is released."""
     verdict = wd.RunVerdict(
         run_id=1,
         run_attempt=1,
@@ -4781,9 +6027,27 @@ def test_a_pull_request_orphan_is_never_read_as_superseded() -> None:
         age=timedelta(minutes=60),
         verdict=wd.ORPHANED,
         workflow="ci.yml",
+        head_sha="sha-1",
     )
-    api = FakeApi({}, {}, newest_by_branch={"feature": 2})
-    assert not wd.supersession_clears_hold(api, _policy(), verdict, lambda _l: None)
+    listed = {
+        "in_progress": [
+            _run(2, minutes_ago=30, event="pull_request", branch="feature", head_sha="sha-2"),
+            _run(1, minutes_ago=60, event="pull_request", branch="feature", head_sha="sha-1"),
+        ]
+    }
+    current = FakeApi(
+        listed, {}, newest_by_branch={"feature": 2}, open_pull_heads={"feature": ["sha-1"]}
+    )
+    assert not wd.supersession_clears_hold(current, _policy(), verdict, lambda _l: None)
+    # Both reads happen: the pulls API for the head, the listing for a same-SHA successor.
+    assert any(path.startswith(f"repos/{REPO}/pulls?") for path in current.gets)
+    assert any("branch=feature" in path for path in current.gets)
+    moved = FakeApi(
+        listed, {}, newest_by_branch={"feature": 2}, open_pull_heads={"feature": ["sha-2"]}
+    )
+    assert wd.supersession_clears_hold(moved, _policy(), verdict, lambda _l: None)
+    closed = FakeApi(listed, {}, newest_by_branch={"feature": 2}, open_pull_heads={})
+    assert wd.supersession_clears_hold(closed, _policy(), verdict, lambda _l: None)
 
 
 def test_a_fork_orphan_is_never_read_as_superseded() -> None:
@@ -4824,5 +6088,136 @@ def test_an_unanswerable_supersession_lookup_leaves_the_hold_standing() -> None:
     import unittest.mock as _mock
 
     api = FakeApi({}, {})
-    with _mock.patch.object(wd, "is_newest_for_branch", explode):
+    with _mock.patch.object(wd, "is_current_run", explode):
         assert not wd.supersession_clears_hold(api, _policy(), verdict, lambda _l: None)
+
+
+# ── somebody's own re-run is never cancelled, whichever route reaches the cancel ──
+
+
+def _orphan_at_attempt(attempt: int) -> Any:
+    return wd.RunVerdict(
+        run_id=1,
+        run_attempt=attempt,
+        head_branch="main",
+        head_repo=REPO,
+        event="push",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="ci.yml",
+    )
+
+
+def test_a_rerun_attempt_released_from_the_hold_is_still_not_cancelled() -> None:
+    """The hold route ends the same way as the no-hold route: red, run named, no cancel.
+
+    A later attempt may BE the operator response this script's logs ask for. The
+    supersession check releases the hold (the hold protects a result the branch has
+    moved past), so the run stays an orphan and reaches the heal path -- where the
+    attempt guard refuses the cancel and records the FAILED outcome. Holding it green
+    instead would recreate the 6-hour block with nobody told; cancelling it would
+    discard a person's work with nothing left to show they did it.
+    """
+    api = FakeApi(
+        {"in_progress": [_run(1, minutes_ago=90, attempt=2)]},
+        {1: [_job(11, minutes_ago=60, attempt=2)]},
+        evidence=False,
+        newest_by_branch={"main": 2},
+    )
+    logged: list[str] = []
+    clock = _Clock()
+    verdicts, outcomes = wd.run_watchdog(
+        api, _policy(), clock=clock.now, sleep=clock.sleep, log=logged.append
+    )
+    assert _verdict_of(verdicts, 1).verdict == wd.ORPHANED  # the hold was released
+    assert outcomes == {1: wd.OUTCOME_RERUN_ATTEMPT_LEFT}
+    assert outcomes[1] in wd.FAILED_OUTCOMES
+    assert api.posts == []
+    said = " ".join(logged)
+    assert "::error::" in said and "attempt 2" in said and "gh run cancel 1" in said
+
+
+def test_attempt_one_is_still_released_by_supersession() -> None:
+    """Positive control: the 6-hour block this escape exists for was a stuck
+    attempt-1 run, so narrowing must not take the escape away from it."""
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    assert wd.supersession_clears_hold(api, _policy(), _orphan_at_attempt(1), lambda _l: None)
+
+
+# ── ...and the no-hold route ends the same way ──────────────────────────────────
+
+
+def test_a_superseded_rerun_attempt_is_not_cancelled_when_no_hold_applies() -> None:
+    """Healthy dispatch evidence means no hold, so the hold guard is never consulted;
+    the heal path must ask the same question itself before its cancel. Without this
+    the run is cancelled, `_rerun` declines it as superseded, and the tick goes green
+    over somebody's discarded `gh run rerun`."""
+    api = FakeApi(
+        {"in_progress": [_run(1, branch="pr", attempt=2)]},
+        {1: [_job(11, attempt=2)]},
+        newest_by_branch={"pr": 2},
+    )
+    logged: list[str] = []
+    clock = _Clock()
+    _, outcomes = wd.run_watchdog(
+        api, _policy(), clock=clock.now, sleep=clock.sleep, log=logged.append
+    )
+    assert outcomes == {1: wd.OUTCOME_RERUN_ATTEMPT_LEFT}
+    assert _posts(api, "/cancel") == []
+    assert _posts(api, "/rerun") == []
+    # A failed outcome: the run keeps its concurrency group's running slot and the
+    # watchdog will never free it, so the tick must go red and name the command.
+    assert wd.OUTCOME_RERUN_ATTEMPT_LEFT in wd.FAILED_OUTCOMES
+    said = " ".join(logged)
+    assert "attempt 2" in said and "left untouched" in said and "discard" in said
+    assert "::error::" in said and "gh run cancel 1" in said
+
+
+def test_an_undecidable_supersession_leaves_a_rerun_attempt_uncancelled() -> None:
+    """A lookup that cannot answer is treated like supersession: nothing is
+    cancelled on a guess, since the cancel is the irreversible half."""
+    api = FakeApi(
+        {"in_progress": [_run(1, branch="pr", attempt=2)]},
+        {1: [_job(11, attempt=2)]},
+        newest_by_branch={"pr": []},
+    )
+    logged: list[str] = []
+    clock = _Clock()
+    _, outcomes = wd.run_watchdog(
+        api, _policy(), clock=clock.now, sleep=clock.sleep, log=logged.append
+    )
+    assert outcomes == {1: wd.OUTCOME_RERUN_ATTEMPT_LEFT}
+    assert _posts(api, "/cancel") == []
+    said = " ".join(logged)
+    assert "::error::" in said and "cannot be told" in said
+    assert "gh run cancel 1" in said and "gh run rerun 1" in said
+
+
+def test_a_rerun_attempt_that_is_still_newest_is_healed_like_any_orphan() -> None:
+    """Positive control: the guard is about supersession, not about attempt 2 as
+    such. A stuck hand re-run that IS its branch's head loses nothing by a cancel
+    that its re-run follows."""
+    api = FakeApi(
+        {"in_progress": [_run(1, branch="pr", attempt=2)]},
+        {1: [_job(11, attempt=2)]},
+        newest_by_branch={"pr": 1},
+        cancel_lands_after=1,
+    )
+    _, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_HEALED}
+    assert _posts(api, "/cancel") == [f"repos/{REPO}/actions/runs/1/cancel"]
+    assert len(_posts(api, "/rerun")) == 1
+
+
+def test_attempt_one_superseded_with_no_hold_is_still_cancelled() -> None:
+    """Positive control for the heal path: attempt 1 is nobody's re-run, so the
+    pre-existing cancel-then-decline outcome for a superseded attempt-1 orphan is
+    kept as it was (see the superseded-between-cancel-and-rerun test above)."""
+    api = FakeApi(
+        {"in_progress": [_run(1, branch="pr")]}, {1: [_job(11)]}, newest_by_branch={"pr": 2}
+    )
+    _, outcomes = _sweep(api)
+    assert outcomes == {1: wd.OUTCOME_SUPERSEDED}
+    assert _posts(api, "/cancel") == [f"repos/{REPO}/actions/runs/1/cancel"]

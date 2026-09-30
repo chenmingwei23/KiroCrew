@@ -11,14 +11,85 @@ type-validated before they are written, and the CLI converts typed values before
 writing.
 
 The config package loads runtime configuration from `~/.kiro/crew/config.json`
-using stdlib dataclasses with sensible defaults. Responsibilities are split in
-one direction: `config/sections.py` owns section DTOs, field defaults, and their
-coercion/normalization rules; `config/resolution.py` owns raw overlay merging,
-top-level section classification, and degraded-input tracking; and
-`config/loader.py` owns the compatibility facade plus persistence, validation
-orchestration, cache fingerprinting, migration, and runtime binding resolution.
-`loader.py` re-exports the historical DTO, helper, and constant names so existing
-callers keep the same import surface.
+using stdlib dataclasses with sensible defaults. `config/sections.py` and
+`config/loader.py` are the two facades callers import. Each composes the owner
+modules below and re-exports their names as the same objects, so an existing
+`config.loader.X` or `config.sections.X` import keeps resolving.
+
+A patch reaches the code that looks the name up in the patched module, and only
+that code. Names read by code that stays in `loader.py` are call-time seams on
+the loader: `config_path`, `config_dir`, `config_local_path`, `env_path`,
+`workspace_root`, `_default_workspace_base`, `write_config_atomically`,
+`update_config_locked`, `atomic_write`, `_config_write_lock`,
+`_config_fingerprint`, `_validate_config_data`, `_persist_config_migration`,
+`_apply_document_migrations`, `_log_config_clamp_event`,
+`_DEFAULT_CHAT_TURN_TIMEOUT_SECS`, `DEFAULT_POOL_SIZE`, `unsandboxed_exec_declared`,
+`publish_config_timezone`, `record_adoptions` (the loader passes it to the
+migration transform at call time), each `_build_*` name as `_load_resolved`
+calls it, and the published-snapshot globals. A helper or constant read INSIDE a
+relocated builder or migration rule is patched on the module that reads it:
+`config.section_builders` for the value coercers, the STT, computer-use and
+instance bounds, `coerce_runtime_ceiling` (which reads the monitoring bounds in
+`monitoring.limits`), the `_resolve_stub_*` roster
+readers and the section DTO classes a builder constructs; `config.migration` for
+`auto_adoptable`, `drop_drifted_keys`, `stored_value_or_none`,
+`superseded_default_drift` and `drift_summary`. The loader facade and
+`config.migration` hold the same warn-once set `_REPORTED_SUPERSEDED_KEYS`: clear
+it with `.clear()`, never rebind it. `test_config_refactor_contract.py` pins
+representative seams of each kind.
+
+| Owner | Owns |
+|---|---|
+| `config/fields.py` | `_meta` field metadata and the `_safe_*` value coercers every section shares. A leaf: it imports nothing from `kiro_crew`. |
+| `config/sections.py` | The DTOs other specs and tests anchor here: agent, crew record, workspace, session, dashboard (with `TailscaleConfig` and its parser), the messaging channels, `wakatime`, speech-to-text and its degradation rules, telemetry, decisions, resource limits, and the bounds constants. It is also the facade for the three section owners below. |
+| `config/memory_sections.py` | `memory`, `knowledge`, `skills`, `session_summary` and the named `memory_stores` records. |
+| `config/integration_sections.py` | `mcp`, `mcp_gateway` (with the MCP stub roster readers the gateway seed shares), `instances`, `tunnel`, `publish`, `computer_use` and the external app `registries`. |
+| `config/service_sections.py` | `taskrunner`, `orchestrator`, `messaging`, `cron_history`, `monitoring`, `heartbeat` and `watchdog`. |
+| `config/section_builders.py` | The `_build_*` helper of 28 sections, grouped by the module that owns each section's DTO. Four `_build_*` helpers stay in the loader (agent, session, telemetry, dashboard). Sections with no helper are built inline in `KiroCrewConfig._load_resolved` (`heartbeat`, the external app `registries`, `memory_stores`, the `agents` crew roster, `workspaces`) or by their DTO (`DecisionsConfig.from_raw`, `ResourceLimitsConfig.from_raw`, `ChannelConfig.from_dict` for `slack_channels`). |
+| `config/migration.py` | The write-back migration ids, the document transform `apply_document_migrations`, the one-shot `connections_ui` marker name, superseded-default reporting, and the in-memory half of an adoption. |
+| `config/resolution.py` | Raw overlay merging, top-level section classification, and degraded-input tracking. |
+| `config/validation.py`, `config/schema.py` | Schema validation with the validated-data cache, and the JSON schema and restart registry built from the DTOs. |
+| `config/paths.py`, `config/live.py`, `config/superseded_defaults.py` | Pure path primitives, the one live-config watcher and applier registry, and the superseded-default registry with its acknowledgment ledger. |
+| `config/loader.py` | `KiroCrewConfig` (load, serialize, save, model and provider resolution) and the residual core below. |
+
+Imports run one way: `fields`, then the three section owners, then `sections`,
+then `section_builders` and `migration`, then `loader`. Each module imports only
+modules earlier in that order plus the existing leaves (`sections` imports
+`resolution`, `migration` imports `superseded_defaults`, and neither leaf imports
+back), and none of the owners imports `loader`, `schema` or `validation`;
+`test_config_module_boundaries.py` pins the graph. Every module
+split out of the loader logs as `kiro_crew.config.loader`, so a relocated warning
+keeps the record name operators filter on.
+
+`sections.py` keeps its DTOs because other specs name the file for them:
+[messaging](messaging.md) (the channel restart flags), [slack-gateway](slack-gateway.md),
+[crew-mode](crew-mode.md), [history](history.md), [stt-streaming](stt-streaming.md),
+[metrics](metrics.md), [decisions](decisions.md), [security](security.md),
+[model-selection](../common/model-selection.md), [model-fallback](model-fallback.md),
+[subagent](subagent.md), [acp-client](acp-client.md) and
+[crew-log-projection](crew-log-projection.md). Four source scans also allow a construct
+only in that file: `ResourceLimitsConfig.from_raw`, `_tailscale_config_from`, the
+`_AVATAR_MOTIONS` literal and the `AgentConfig.acp_backend` declaration.
+
+`loader.py` groups each residual responsibility into one bannered section. Each
+stays in that file because something outside this package names the file, or
+because its readers look up a name the loader's callers and tests patch there:
+
+| Kept in `loader.py` | Held there by |
+|---|---|
+| Credential keys, the `.env` reader, the dashboard port | [code-style](../common/code-style.md) names `config/loader.py` for `CRED_*` and `_DEFAULT_PORT`. |
+| Data-home and workspace path helpers | Tests and callers patch `config_path`, `config_dir`, `env_path`, `workspace_root` and `_default_workspace_base` on this module. The instance-pairing and redactor-registry scans key `read_local_secret` and `credential_redaction_path` to this file. |
+| The unsandboxed-exec platform policy | [security](security.md) places that resolution in the loader, where the raw document is read. `unsandboxed_exec_declared` reads the patched `config_path`/`config_local_path` and is itself patched on this module. |
+| Document I/O: `_raw_config`, `read_config_for_update`, `write_config_atomically`, `update_config_locked`, the meta stamp | The config-writer scans in `test_config_rmw_preserves_settings.py` exempt only `loader.py`, and the writers read this module's patched path and `atomic_write` names. |
+| Write-back persistence (`_persist_config_migration`, the backup) and the `_apply_document_migrations` seam | It rewrites `config.json` under the same writer exemption, and passes this module's `record_adoptions` to the transform as the adoption-ledger writer. |
+| The validated-document cache fingerprint, its overlay sidecar and invalidation | `_config_fingerprint` reads the patched `config_path`/`config_local_path` and is itself patched on this module; `save()` and the write-back call `_invalidate_config_cache` beside it. |
+| `KiroCrewConfig.load`, `_load_resolved` and `save` | They read `config_path`, `config_local_path`, `_config_fingerprint`, `_validate_config_data`, `_persist_config_migration` and `write_config_atomically` by name, all patched on this module. `test_config_section_construction.py` pins `_load_resolved`'s assembly shape. |
+| The security clamp and its SEL event | [security](security.md), [sel](sel.md) and [resource-protection](../../architecture/resource-protection.md) name the loader. |
+| The loop-stall and managed-launch readers | `load_loop_stall_exit_after` reads the loader's patchable `KiroCrewConfig`; `resolve_loop_stall_exit_after` and `consume_managed_service_launch_environment` are its two halves, and the dashboard server imports all three from here. |
+| The agent, session, telemetry and dashboard builders | The harness-parity review scope and a source check on the `session_control` read; the patchable `DEFAULT_POOL_SIZE` fallback; [metrics](metrics.md) naming the loader as the telemetry parser; the feature map naming the loader's `folder_sort` read. |
+| Published snapshots: materialized agents, the alias table, the compaction threshold, the timezone | Tests rebind this module's snapshot state, and the second-boot witness in `test/integration/test_boot_smoke.py` keys the counters to `kiro_crew.config.loader`. |
+| Agent resolution and the provider factory | [crew-mode](crew-mode.md) and [context-management](../../architecture/context-management.md) name the loader for `resolve_agent_bindings` and `resolve_effective_model`. The agent-spec read inventory keys its call sites to this file, the ACP import is a baselined agent-SDK edge, and the blocking harness-parity and memory-store review rules cover `config/loader.py`. |
+
 New section constants, including local speech's automatic-language default, are
 read from `config.sections` directly; they do not expand that historical facade.
 
@@ -225,7 +296,7 @@ handlers.
 `workspace_root()` returns the base directory for all LLM working directories (kiro-cli cwd, task runner output, etc.):
 
 Resolution order:
-1. `KIROCREW_WORKSPACE` env var — used as-is (no `kirocrew-workspace` subdirectory appended)
+1. `KIROCREW_WORKSPACE` env var — no `kirocrew-workspace` subdirectory appended
 2. Saved path in `~/.kiro/crew/workspace_dir` (written by `kirocrew setup`; re-running setup preserves the existing value as the prompt default)
 3. Platform default:
 
@@ -234,6 +305,8 @@ Resolution order:
 | macOS | `/Volumes/workplace/kirocrew-workspace` (falls back to `~/workplace/kirocrew-workspace` if `/Volumes/workplace` doesn't exist) |
 | Linux | `~/workplace/kirocrew-workspace` |
 | Windows | `~/workplace/kirocrew-workspace` |
+
+Values from (1) and (2) lose one surrounding quote pair and have `~` expanded; a non-absolute result is logged and replaced by (3).
 
 Each session/task gets an isolated subdirectory under this root via `_session_work_dir(key)`:
 - Chat sessions: `kirocrew-workspace/cli_chat`, `kirocrew-workspace/{thread_ts}`
@@ -996,8 +1069,32 @@ runtime edit is reflected on the next `load()`; `save()` also invalidates it
 eagerly via `_invalidate_config_cache()`. The defaults-only path (neither file
 present) is not cached.
 
+**Content provenance on the cache entry.** Beside the `data` dict and its sidecar, each
+cache entry carries a third fact: the digest of the bytes that data was parsed from.
+`load_config_with_content_stamp()` returns a config together with that digest, and
+`config_content_stamp()` reads the live files' digest on its own. The pair lets a caller
+that holds a config across other I/O and later writes something derived from it tell
+"my copy is still current" from "a save landed while I was working".
+
+The digest must be bound **inside** the load, which is why it lives on the entry rather
+than being read around the call. The fingerprint above is stat metadata, and a
+replacement presenting the same `(st_mtime_ns, st_size, st_mode)` returns the earlier
+cached object — so hashing the files on both sides of `load()` would pair the cached
+data with foreign bytes and report a match. An entry carrying its own digest reports
+the provenance of the data it holds: a hit answers for the bytes it was parsed from,
+a miss for the bytes just read. A change to this cache that drops or re-derives the
+digest therefore breaks exactly the case it exists for.
+
+`None` means no digest can be bound — the files could not be read whole, or the document
+was unusable and defaults were substituted. A caller must treat that as unknown and
+never as a match; two unknown provenances in particular are not equal. The member event
+log is the current consumer: see `member-event-log.md` for how a roster read and the
+startup sweep each refuse to correct the log from a config they cannot name.
+
 **Section construction.** Compound section constructors run in small private
-helpers in the loader namespace. This bounds each construction frame instead of
+helpers: `config/section_builders.py` holds 28 of them and `config/loader.py`
+keeps the agent, session, telemetry and dashboard ones (see the Overview); the
+loader re-exports all of them. This bounds each construction frame instead of
 putting every field expression in one large traced resolver frame. The helpers
 preserve field evaluation order, coercion, defaults, and section-local assignment
 expressions. Each call creates fresh dataclasses and mutable defaults; no resolved
@@ -1565,6 +1662,22 @@ purely to keep the kiro spec schema-clean; nothing in the fork resolves it.
 all times — after install, refresh, and any dashboard edit — or kiro-cli drops
 the agent and silently falls back to default.
 
+## Monitoring runtime policy
+
+`monitoring.max_runtime_secs` is the finite wall-clock ceiling shared by monitor
+MCP tools and API mutations; it is checked when a budget is written, never
+against a persisted record on load. It defaults to 604800
+seconds; an operator may set up to 2592000 (30 days). Invalid config
+values fall back to the shipped ceiling, and `coerce_runtime_ceiling` logs a
+warning naming the rejected value and the fallback whenever a configured value
+is replaced (an unset key is the ordinary default and is silent). Validation
+errors quote the ceiling with a duration gloss, `(7 days)` for the default.
+`monitoring.limits` reads the live
+snapshot (or the loader in standalone MCP processes). Raising or lowering the
+ceiling does not change existing budgets, creation times, deadlines, active
+state or the generic four-hour arming default. A PR-specific daily/30-day preference belongs in that
+installation's maintenance instructions and explicit new requests.
+
 ## Live config: one watcher, one applier registry
 
 `config/live.py` is the single mechanism by which a write to `config.json`
@@ -1657,6 +1770,25 @@ exist as nine hand-written copies. What stays on `subscribe` is orchestration
 rather than value adoption: the in-process channel restart, the provider
 switch, the SEL-audited approval widening, the Slack section's fan-out.
 
+`ConfigWatch.replay(sub)`, called on a subscription `watch_object` just returned,
+closes the registration gap for an owner that applied a config it loaded itself.
+A reload adopts its config and only then
+snapshots the registry, so one that snapshotted before the owner registered never
+reaches it. Run right after registration: when the
+watcher's fingerprint still matches the file, it hands the adopted snapshot to the
+applier, re-reading it after each apply so a reload landing mid-replay is not undone;
+when the file has moved past the snapshot (or nothing is fingerprinted yet), the
+snapshot may be older than the owner's own load, so it marks the subscription stale
+for its prefixes and the next tick delivers the new document even where it leaves
+them unchanged. A deferred, failed or async applier is marked stale the same way.
+Unstarted watchers (nothing adopted) make it a no-op. `VectorMemoryStore` is the one
+caller, and replays only when it was built with `config=` (a raised
+`memory.episodic_max_count` adopted during construction is not lost); a `config=None`
+store keeps its constructor defaults at construction. The other `watch_object`
+owners that copy caller-loaded config before registering (`cron_history.py`,
+`subagent.py`, `history_consolidation.py`, `adaptive/controller.py`,
+`slack/gateway.py`) keep the registration gap; they are out of scope for #10889.
+
 ### The point-of-use read
 
 `live.current(fallback, log_prefix=...)` is for a call site that reads a value
@@ -1737,7 +1869,18 @@ dispatcher; `WorkflowService` binds `agent.workflow_run_timeout_secs` to its
 ones whose holder is `DashboardState`, or that must rebuild agent artifacts,
 live in `server.py::_register_config_watch` — `agent.provider`,
 `agent.model`, `agent.role_models.background`, and `agent.log_level`
-(→ `handlers/updates.py::apply_log_level_from_config`).
+(→ `handlers/updates.py::apply_log_level_from_config`). The log-level applier
+shares `apply_log_level` with the Logs page's `POST /api/logs/level`, and that
+one function moves the `kiro_crew` logger only — which is the ONLY level gate
+on the way to `gateway.log`: the file handler and the queue handler
+`cli._setup_cli_logging` installs carry no level of their own (kiro_crew
+records are gated at the kiro_crew logger, third-party records on the detached
+gateway's root-attached handler at the root logger's WARNING), so the runtime
+change reaches the file with nothing else to update. The handlers used to hold
+a boot-time copy of the level that nothing updated, so a gateway booted at
+WARNING dropped its raised INFO records before the file until a restart while
+the live Logs stream showed them (#14231); a level re-added to either handler
+is that bug again, and `test_cli_logging.py` pins the contract.
 Both model appliers rebuild the installed agent specifications before the
 watcher finishes dispatching the change. After a successful `agent.model`
 rebuild, its applier emits a refresh frame, so dashboard PATCH responses and
@@ -1913,7 +2056,7 @@ class AgentConfig:
     streaming: bool = True
     model: str = "auto"            # resolved from agent config
     provider: str = "acp"          # fixed to "acp" (kiro-cli) — the only provider
-    sandbox: str = "auto"          # default "auto" (namespace on Linux, seatbelt on macOS; delegates to kiro-cli's internal sandbox on macOS when enabled); "off" skips Kiro Crew's sandbox
+    sandbox: str = "auto"          # "auto" (default: standard tier -- namespace on Linux, seatbelt on macOS; leaves ~/.aws, ~/.ssh, ~/.kube visible for credential tooling; delegates to kiro-cli's internal sandbox on macOS when enabled) | "strict" (opt-in: also hides ~/.aws incl. sso/cache, ~/.ssh bar known_hosts, ~/.kube, ~/.config/gh and the _CC_FILES credential files; applies to sessions started after the change) | "off" (skips Kiro Crew's sandbox). Enum widened to admit "strict" (the tier sandbox.py always implemented, and the one its remedies name) -- default and the other two values unchanged
     sandbox_allow_no_isolation: bool = False  # SEC-009: acknowledge running un-isolated when no sandbox backend exists; false = loud SECURITY warning, true = info-level
     soft_stop_budget_secs: float = 10.0  # seconds to wait for cooperative cancel before hard kill [0.5, 60.0]
     dangerously_skip_permissions: bool = False  # persistent all-tool approval; restart required
@@ -1973,6 +2116,7 @@ class MemoryConfig:
     persistence_enabled: bool = True # global switch: off = no automatic memory writes (lessons, consolidation, task-runner) AND no stored memory/lessons injected
     inject_memory: bool = True       # inject the stored memory block (preferences, activity index, recent-session snippets) into new-session context
     inject_lessons: bool = True      # inject the [Learned corrections] + [USER PROFILE] blocks into new-session context
+    inject_activity: bool = True     # inject the budgeted [Memory activity] block (projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts, relevant episodes); requires inject_memory
 
 @dataclass
 class KnowledgeConfig:
@@ -2045,6 +2189,7 @@ class DashboardConfig:
     theme_mode: str = ""           # "dark" | "light" | "system"; empty = unset (frontend falls back to localStorage or "system")
     theme_color: str = ""          # color-theme slug (e.g. "kiro", "emerald", "monokai"); empty = unset
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
+    folder_sort: str = "custom"    # sidebar folder order: "custom" (stored positions) | "name" (natural, 01. < 02. < 10.) | "created" (newest first). A view preference; never rewrites a folder's stored order. See "Sidebar folder order" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
     crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
@@ -2064,7 +2209,7 @@ class TelegramConfig:
     allow_forum: bool = False          # serve supergroup forum Topics as per-Topic sessions (Slack-thread style). Fail-closed: also requires the supergroup's chat_id in allowed_forum_chat_ids, and only real Topics (message_thread_id present) are served — ordinary groups and the supergroup General chat are denied
     allowed_forum_chat_ids: list[int] = []  # numeric supergroup chat_ids permitted to run forum-topic sessions; empty = deny all groups (fail closed)
 
-# Additional top-level DTOs (not fully expanded here — see sections.py):
+# Additional top-level DTOs (not fully expanded here — see the owner modules in the Overview):
 # OrchestratorConfig, CronHistoryConfig, TunnelConfig, InstancesConfig, HeartbeatConfig,
 # WorkspaceConfig, MemoryStoreConfig, ExternalRegistryConfig,
 # KiroCrewAgentConfig, SlackConfig.
@@ -2423,6 +2568,97 @@ appears.
 them at boot via `GET /api/theme/boot`; empty `theme_mode`/`theme_color` mean
 unset (the frontend falls back to `localStorage` or the built-in default).
 
+### Sidebar folder order
+
+`DashboardConfig.folder_sort` is the chat sidebar's folder sort mode — `custom`
+(the stored per-container `order` positions set by dragging or by the
+`chat_folder_move` tool; the default, so an upgrade changes nothing), `name` (an
+ASCII-case-insensitive natural order, so `01.` < `02.` < `10.` and `alpha` < `Beta`;
+only `A`-`Z` fold, every other letter compares as written, because that is the one
+fold both readers perform identically without a Unicode table) or `created` (newest first
+on the `created_at` epoch stamp every folder creator writes). It is workspace-
+persistent rather than browser-local because two readers must agree on it: the
+sidebar (and the folder pickers) through the shared `GET /api/config/kirocrew`
+query, and the `kirocrew-dashboard` MCP server's `chat_folder_tree`, which reads the
+same `config.json` through the loader (the HTTP route is cookie-only) and lists
+folders in the order the sidebar draws them so an agent can pick a `before`/`after`
+anchor from it (see `docs/architecture/mcp.md`). Written only through the
+`PATCH /api/config/kirocrew` allowlist (`dashboard.folder_sort`, enum
+`FOLDER_SORT_MODES`); the loader reads anything outside that set as `custom`.
+Choosing a mode is a VIEW change — no folder's stored `order` is rewritten — so
+switching back to `custom` restores the manual arrangement exactly; the sidebar
+re-sorts when the save lands (the success write into the shared `kirocrewConfig`
+cache), not on the pick, so every reader of that cache switches together. A sidebar
+drag among siblings is a write to the stored positions computed against the drawn
+order, so it is offered only when the mode is known to be `custom`: outside that
+(and while the settings query is still loading or has failed, when the tree draws
+the stored order as a fallback) the folder rows stop being reorder targets — their
+sortable's droppable side is off, so no slot opens — while dragging a folder into
+another still works; before the FIRST read lands no folder drag is offered at all
+(both sortable sides off, no grab cursor), since nothing on screen could yet say
+why a lift died at the drop. The status line that answers a withdrawn drop carries
+a **Switch to Custom** action on the same write path as the menu row. What the UI
+keys on is what it KNOWS, never the transient query status (`useFolderSortRead`):
+the mode is known when a config body is on hand — fresh, cached, or kept across a
+failed background refetch, which react-query retries on its own and which is
+therefore silent; a read that failed with no body to fall back on is said on an
+`ErrorNotice`, held through the retry's pending phase (`errorUpdatedAt`, so an
+observer mounted mid-retry reports it too) so the banner does not unmount and
+remount around each automatic retry, and cleared when a body arrives.
+One screen says it once: the sidebar's banner over its tree (the plain title leads,
+the server's own words sit under it as a smaller line -- they stay the notice's
+`message` because that string is the error-journal key the hand-off reads -- then
+a plain subline and the hand-off stacked under the text), and, on the screens with
+no sidebar, the job form beside its folder picker and the Command Bar above its
+folder list. The subline is ONE phrase wherever this failure is said -- *All
+folders are shown, in your Custom order; retries automatically* -- because a person
+may see it on up to four surfaces at once and two phrasings read as two failures,
+and it says that membership is intact, since a picker under a failure notice was
+not trusted to still list every folder; where the
+notice carries no hand-off of its own (the job form and the Command Bar: unsaved
+input beside them) it adds *Open the chat sidebar to ask the agent about it.* The
+session menu
+and the folder-suggestion card say nothing of their own while the sidebar is on the
+screen; when it is not (a phone with the drawer closed, a desktop with the panel
+collapsed, embed chat) they say it themselves — the menu in the rule's in-menu form
+(passive notice, the picker's subline, a sibling **Ask the agent** item described by
+the notice, a separator closing the block), the card as the same notice above it
+without a hand-off, with the picker-plus-pointer subline.
+
+The **Folder order** rows (*Custom* / *By name* / *By date created (newest first)* -- the
+direction spelled, as the session rows spell theirs, and worded so
+that no label mirrors the chat session sort rows in the same menu, whose heading
+names its object, **Sort sessions by**, because two orderings in one menu read as
+sorting twice; and *Custom*, not *Custom order*, under a heading that already says
+"order") are offered in every sidebar lane. The flat lane draws no folder tree and the conductor lane nests
+by lineage, but the mode is not idle there: every row menu's **Move to folder**
+picker, the history search's folder groups, the Command Bar, the job form and the
+MCP tree all list in it, and the menu rows are the only control that writes it -- a
+mode a person cannot change from the lane they are in would be a trap. Only the drag
+note under the rows (*Folders can be dragged into place in Custom order only*, a
+fact about the modes -- not the sidebar hint's "Switch to Custom" sentence, which
+sits beside a button that does the switching and would read as an inert action
+here) is confined to the lanes that draw a folder row to drag (the tree, and the
+board unless flat view empties its columns of folders). In `created` mode a second
+fact line joins it whenever a folder in the list has no `created_at` -- a folder
+from before the stamp existed -- because the comparator puts such rows after every
+stamped one, in the stored order: on a pre-upgrade tree that is the order the person
+already had, and the pick looks broken unless the menu says why (*Folders made
+before dates were recorded have no date; they come last, in your Custom order*);
+`chat_folder_tree` states the same fact in its header for the agent reading the
+tree, so neither reader takes that stored-order tail for a date order. The hint itself stays until
+the person's next interaction away from it -- a pointer or key landing anywhere but
+on the line -- a switch back to Custom, or the next drag; never a clock, which took
+the action away from under a hand reaching for it. The mode's saves go out ONE at a
+time, in pick order (react-query mutation `scope`): two picks inside one round-trip
+would be two concurrent `PATCH`es to the same path, and the server persists
+whichever arrives last -- a delayed first request would land after the second and
+store the earlier pick, and the settle-time refetch would then draw that order as
+if chosen. Queued behind an in-flight save, the newer pick's request starts when
+the previous one settles, so the last pick is both the last request the server sees
+and the persisted one; a refusal behind a newer pick is not reported (the newer
+save's own outcome is).
+
 ### Interactive model picker visibility
 
 `DashboardConfig.model_picker_hidden_models` is a workspace-persistent list of
@@ -2591,26 +2827,36 @@ auto-language workspaces have always sent.
 
 Two consequences fall out of naming in a non-latin script:
 
-- **The prose guard needs a second ceiling.** `_looks_like_prose` rejects a reply
-  that is a sentence rather than a name, and its word ceiling counts
-  `str.split()` tokens — which is 1 for any length of Chinese, Japanese or Thai.
-  `_TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
+- **The prose guard needs a second ceiling.** `label_guard.looks_like_prose`
+  (shared by every label path -- the session title, the Slack/Telegram
+  conversation name, the nav link chips and the session summary -- and reached
+  from `chat_title` through its `_looks_like_prose` alias) rejects a reply that
+  is a sentence rather than a name, and its word ceiling counts `str.split()`
+  tokens — which is 1 for any length of Chinese, Japanese or Thai.
+  `TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
   only unspaced-script characters so latin identifiers in a mixed title stay
   free, and the full-width terminators `。！？` are matched without the ASCII
   rule's trailing-whitespace requirement (those scripts do not space after
-  punctuation). A short refusal with no terminator remains a documented false
-  negative for those unspaced scripts. Korean is spaced, so the word ceiling
-  bounds its long sentences, but a SHORT Korean refusal clears every other
-  check -- and Korean puts the refusal verb last, so English-style prefix
-  openers cannot catch it. `_looks_like_prose` therefore also matches Korean
-  sentence shape: the sentence-final polite conjugations
-  (`_TITLE_KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
-  informal-polite "-yo" family) plus the apology opener
-  (`_TITLE_KO_PROSE_OPENERS`), which a title as a noun phrase never carries. A
-  plain-form (banmal) Korean refusal remains a documented false negative, and
-  a sentence-form Korean title loses to the fallback name -- the deliberate
-  direction of the trade, since a fallback name is still the user's own words
-  while a stored refusal is the bug.
+  punctuation). Both ceilings are parameters, because the prompts differ: the
+  title defaults (12 words / 24 characters) sit above its 3-6 word contract,
+  and the 18-word session summary passes its own. A short refusal with no
+  terminator remains a documented false negative for those unspaced scripts.
+  Korean is spaced, so the word ceiling bounds its long sentences, but a SHORT
+  Korean refusal clears every other check -- and Korean puts the refusal verb
+  last, so English-style prefix openers cannot catch it. `looks_like_prose`
+  therefore also matches Korean sentence shape: the sentence-final polite
+  conjugations (`KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
+  informal-polite "-yo" family) plus the apology opener (`KO_PROSE_OPENERS`),
+  which a title as a noun phrase never carries. A plain-form (banmal) Korean
+  refusal remains a documented false negative, and a sentence-form Korean
+  title loses to the fallback name -- the deliberate direction of the trade,
+  since a fallback name is still the user's own words while a stored refusal
+  is the bug. The sentence-shape signals (terminators, Korean conjugation) and
+  the narration openers (`PROSE_OPENERS`) are parameters too, for the one path
+  whose label IS a descriptive sentence: the session summary runs the guard
+  with `sentence_shape=False` and without the conversation-referring openers,
+  since "the conversation covers ..." is its legitimate shape and a false
+  positive there is re-spent on a model turn at every later list.
 - **The reveal animation needs characters.** The sidebar types a new title in one
   word at a time; a single-token title skipped the animation entirely, so
   `_title_reveal_prefixes` steps unspaced scripts two characters at a time
@@ -2623,9 +2869,10 @@ It also keeps the reply's first line only -- the rule
 `SKIP` verdict followed by a reason collapses back to the bare control word.
 `_validate_title_reply` treats BOTH taught control words (`SKIP`, `KEEP`) as
 no-title sentinels on every path, matched case-insensitively, alone or with a
-punctuation-separated reason on one line (`_is_verdict_reply`) -- while a real
-title that merely opens with the word ("SKIP and KEEP handling", "KEEP-ALIVE
-header bug") survives.
+punctuation-separated reason on one line (`label_guard.is_verdict_reply`, the
+same check the messaging namer and the session summary run against their own
+taught word) -- while a real title that merely opens with the word ("SKIP and
+KEEP handling", "KEEP-ALIVE header bug") survives.
 
 ### Response verbosity reaches every agent
 
@@ -2845,7 +3092,8 @@ Returns the effective config for a channel:
     "history_max_days": 365,
     "persistence_enabled": true,
     "inject_memory": true,
-    "inject_lessons": true
+    "inject_lessons": true,
+    "inject_activity": true
   },
   "knowledge": {
     "auto_add_documents": false,

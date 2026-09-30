@@ -65,6 +65,7 @@ from kiro_crew.mcp_core import (
     strict_identity_diagnosis,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context, redact_log_via_context
 from kiro_crew.platform import redact_via_context as redact
@@ -77,7 +78,9 @@ from kiro_crew.security import (
     enabled_rule_ids,
     is_sensitive_bash_command,
     is_sensitive_path,
+    is_unverifiable_path_refusal,
     scan_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
@@ -849,7 +852,7 @@ def _vet_script_contents(text: str) -> str | None:
     obvious register-a-malicious-script case and nothing more. Destructive-op risk is covered by the required ``cron_add``
     approval prompt.
 
-    ``_vet_script_file`` keeps its own ``is_sensitive_path`` on the resolved path.
+    ``_vet_script_file`` keeps its own ``sensitive_path_refusal`` on the resolved path.
     """
     if len(text) > _MAX_SCRIPT_SCAN_BYTES:
         return (
@@ -876,7 +879,7 @@ def _vet_script_file(file_path: str) -> str | None:
 
     ``file_path`` is expected to come from ``resolve_script_path`` (under
     ``~/.kiro/crew/crons/``), but this function does NOT trust that — it
-    independently resolves the real path and rejects it via ``is_sensitive_path``
+    independently resolves the real path and rejects it via ``sensitive_path_refusal``
     before opening, so a symlink under the crons dir pointing at a credential
     file (e.g. ``crons/evil.py -> ~/.aws/credentials``) cannot be read here. Read
     uses a nonblocking descriptor that must still name the same regular file
@@ -892,7 +895,9 @@ def _vet_script_file(file_path: str) -> str | None:
         resolved = Path(file_path).resolve()
     except (OSError, ValueError) as e:
         return f"Error: cannot resolve cron script path for security review: {e}"
-    if is_sensitive_path(str(resolved)):
+    if reason := sensitive_path_refusal(str(resolved)):
+        if is_unverifiable_path_refusal(reason):
+            return f"Error: {reason}"
         return "Error: cron script path blocked by security policy (resolves to a sensitive credential path)"
     try:
         before = os.lstat(resolved)
@@ -1130,7 +1135,7 @@ def _resolve_cron_folder(ref: str, *, session_key: str | None) -> tuple[str, str
 
 def _list_tools() -> list[dict[str, Any]]:
     """Return MCP tool definitions."""
-    return [
+    tools: list[dict[str, Any]] = [
         {
             "name": "cron_list",
             "description": (
@@ -1511,6 +1516,7 @@ def _list_tools() -> list[dict[str, Any]]:
             },
         },
     ]
+    return with_titles("kirocrew-cron", tools)
 
 
 # ── cron_list rendering ──
@@ -2048,7 +2054,8 @@ def _deny_channel_agent_cron(tool_name: str) -> str | None:
 
     Channel agents (session keys ``channel:<channel_id>:<agent_id>``) are
     confined to channel-post communication -- ``CHANNEL_AGENT_BLOCKED_TOOLS``
-    holds back ``send_*`` and every ``session_*`` verb for exactly that reason.
+    holds back ``send_*``, every ``session_*`` verb, and every verb that starts
+    work outside the caller's own turn, for exactly that reason.
     Scheduling a cron job is the same shape made durable: ``cron_add`` takes an
     ``agent`` and ``approval_mode`` that flow straight to ``add_job``, so a
     channel agent could schedule ``agent="kirocrew", approval_mode="auto"`` and

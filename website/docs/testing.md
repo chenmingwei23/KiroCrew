@@ -115,15 +115,16 @@ is dropped from a release build.
 
 That is why `src/i18n/index.ts` imports **English only** (1,027,227 bytes, 5.9% of the
 17,508,449 authored bytes), `src/i18n/catalogs.ts` owns every catalog import, and
-`src/i18n/all.ts` is the entry that registers them. Three rules hold that split in
-place:
+`src/i18n/all.ts` is the entry that registers them all. The browser boots through
+`src/i18n/lazy.ts` instead, which fetches one non-English catalog on demand. Three
+rules hold that split in place:
 
 - **No non-English catalog import in `src/i18n/index.ts`** — that is the module
   `integration/setup.ts` and ~600 components import.
 - **No all-catalogs import in `integration/setup.ts`**: neither `src/i18n/all` nor
   `src/i18n/catalogs`, and not transitively through a helper it pulls in.
-- **A page entry point imports `initI18n` from `src/i18n/all`**, never from
-  `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
+- **A page entry point imports `initI18n` from `src/i18n/lazy` or `src/i18n/all`**,
+  never from `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
   through the English-only module the dashboard renders English to a user who
   picked Japanese: i18next falls back, nothing throws, no key renders raw.
 
@@ -132,8 +133,8 @@ import graph, because none of them changes a test result on its own.
 
 A test that needs a language other than English imports `src/i18n/all`; a test that
 audits the whole catalog set imports `CATALOGS` from `src/i18n/catalogs`. Either way
-a single file pays the load. None of this defers a load — `t()` is synchronous on
-every path — it only settles which module owns the import.
+a single file pays the load. `t()` is synchronous on every path: the lazy entry
+registers a catalog before anything renders in its language.
 
 Weigh anything else you put in the setup graph the same way: multiply it by the
 file count first.
@@ -173,6 +174,25 @@ are in
 [../../docs/system-specs/common/testing-conventions.md](../../docs/system-specs/common/testing-conventions.md).
 The short version holds here too: never fix a flake with a rerun, a longer timeout,
 or a weakened assertion. Poll for the condition you actually care about.
+
+### Two front-end gates scan the WHOLE tree, so a diff-relevance run misses them
+
+`website/electron/test/port-owner-self-asserted-identity.test.js` requires every call
+site of the two port probes, and every use of the port-verdict vocabulary, to be
+declared in one of its lists; an unclassifiable site fails rather than passing. The
+i18n style tests under `website/src/i18n/style/` scan the whole catalog the same way.
+
+Neither is selected by a test run scoped to your diff, so a new probe call or a new
+catalog value passes locally and reds **every open pull request** on the round after
+it merges. If your change adds a port verdict, run that electron test explicitly; if
+it adds a catalog value, run the style tests with `I18N_BASE_REF` set so their
+diff-scoped halves actually evaluate. Registering a site is one line and the failure
+message names the list it belongs in.
+
+The general shape of this mistake, and the two other ways a deterministic gate ends
+up billing a stranger, are in
+[the testing spec](../../docs/system-specs/common/testing-conventions.md) under "A
+gate that reds on someone else's pull request".
 
 ## Determinism: establish the state you assert on
 

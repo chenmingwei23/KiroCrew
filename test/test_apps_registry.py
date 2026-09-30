@@ -487,6 +487,74 @@ async def test_install_script_timeout_routes_through_kill_process_group(monkeypa
     assert kpg_calls == [proc]
 
 
+class _ExitProc:
+    """Fake subprocess that exits at once with a fixed return code."""
+
+    def __init__(self, code: int) -> None:
+        self.pid = None  # skips the post-exit straggler reap
+        self.returncode: int | None = None
+        self._code = code
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.returncode = self._code
+        return b"secret-output", b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make_proc", "expected"),
+    [
+        (_TimeoutProc, ("timed_out", " exit=-9")),
+        (lambda: _ExitProc(3), ("failed", " exit=3")),
+        (lambda: _ExitProc(0), ("completed", " exit=0")),
+    ],
+)
+async def test_install_script_emits_terminal_sel_event(monkeypatch, tmp_path, make_proc, expected):
+    """Every onInstall exit records a terminal SEL event after `started`."""
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    audit = MagicMock()
+    monkeypatch.setattr(registry, "sel", lambda: audit)
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "true"}}), encoding="utf-8"
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+
+    async def _fake_kpg(proc):
+        proc.returncode = -9
+
+    monkeypatch.setattr(registry, "_kill_process_group", _fake_kpg)
+    proc = make_proc()
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    await registry.install_from_registry("demoapp")
+
+    events = [
+        c.kwargs
+        for c in audit.log_api_access.call_args_list
+        if c.kwargs.get("operation") == "app_install_script"
+    ]
+    assert [e["outcome"] for e in events] == ["started", expected[0]]
+    assert events[1]["resources"].endswith(expected[1])
+    # Script output is never written into the audit record.
+    assert all("secret-output" not in str(e) for e in events)
+
+
 # --------------------------------------------------------------------------
 # Identity-refusal cleanup + provenance-signer freshness
 # --------------------------------------------------------------------------
@@ -754,6 +822,63 @@ async def test_registry_reinstall_rechecks_retained_startup_before_replacement(
     assert result["code"] == "startup_hook_still_running"
     assert result["retryable"] is True
     assert cleanup_calls == [("demoapp", True), ("demoapp", True)]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_streaming_log_is_the_list_the_install_writes_to(monkeypatch, tmp_path):
+    """An empty ``StreamingLogLines`` is falsy but is still the caller's log: the
+    install writes into it (and so into its queue) rather than into a fresh list."""
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(monkeypatch, src, cloned_manifest={"name": "demoapp"})
+    monkeypatch.setattr(registry, "get_app", lambda _name: None)
+
+    from kiro_crew.apps import hooks_integration
+
+    async def _still_running(app_name: str, *, bounded: bool) -> bool:
+        return False
+
+    monkeypatch.setattr(hooks_integration, "stop_retained_startup_hooks", _still_running)
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    log = registry.StreamingLogLines(queue)
+    assert not log
+
+    result = await registry.install_from_registry("demoapp", log)
+
+    assert result["code"] == "startup_hook_still_running"
+    assert list(log) == [result["error"]]
+    assert queue.get_nowait() == result["error"]
+    # A refusal before the clone returns its own dict: nothing re-stamps it.
+    assert "log" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_boundary_refusal_is_stamped_by_the_finally(monkeypatch, tmp_path):
+    """The recheck after clone and build returns through the single ``finally``,
+    which stamps the whole log and strips internal ``_`` keys."""
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(monkeypatch, src, cloned_manifest={"name": "demoapp", "version": "2.0.0"})
+    monkeypatch.setattr(registry, "get_app", lambda _name: None)
+    monkeypatch.setattr(registry, "_resolved_clone_commit", lambda root: "a" * 40)
+    monkeypatch.setattr(registry, "verified_signer", lambda manifest: "")
+
+    from kiro_crew.apps import hooks_integration
+
+    calls: list[str] = []
+
+    async def _retained_after_the_build(app_name: str, *, bounded: bool) -> bool:
+        calls.append(app_name)
+        return len(calls) == 1
+
+    monkeypatch.setattr(hooks_integration, "stop_retained_startup_hooks", _retained_after_the_build)
+    log: list[str] = []
+
+    result = await registry.install_from_registry("demoapp", log)
+
+    assert calls == ["demoapp", "demoapp"]
+    assert result["code"] == "startup_hook_still_running"
+    assert result["log"] == "\n".join(log)
+    assert log[-1] == result["error"]
+    assert not [key for key in result if key.startswith("_")]
 
 
 @pytest.mark.asyncio

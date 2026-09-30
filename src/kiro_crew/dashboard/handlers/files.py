@@ -65,7 +65,11 @@ from kiro_crew.dashboard.chat_utils import (
     run_config_write,
 )
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
-from kiro_crew.dashboard.handlers._shared import _probe_persisted_session, read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    _probe_persisted_session,
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.messaging import _resolve_session_target
 from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.dashboard.state import (
@@ -74,7 +78,7 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
 )
 from kiro_crew.doc_blocks import extract_blocks
-from kiro_crew.doc_parser import extract_text
+from kiro_crew.doc_parser import extract_slides, extract_text, join_slides
 from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.github_runner import validate_provider_executable
 from kiro_crew.hooks import (
@@ -90,7 +94,7 @@ from kiro_crew.pdf_extract import PdfExtraction, extract_pdf_segments
 from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import wide_content_is_flagged
-from kiro_crew.platform.context import redact_log_via_context
+from kiro_crew.platform.context import redact_log_via_context, redact_owner_view_via_context
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     popen_limited,
@@ -104,6 +108,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
     redact_path_segments,
+    redaction_switch,
     sandbox_credential_targets,
 )
 from kiro_crew.validation import (
@@ -2076,8 +2081,6 @@ class _WorkspaceConflict(Exception):
 
 async def api_workspaces_create(request: web.Request) -> web.Response:
     """POST /api/workspaces — create a new workspace."""
-    import shutil  # noqa: F811
-
     from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
     from kiro_crew.validation import WORKSPACE_NAME_RE  # noqa: F811
 
@@ -2768,12 +2771,14 @@ class _TextRead(NamedTuple):
     ``invalid`` (validation refused), ``dir`` / ``missing`` (nothing to read),
     ``file`` (``content`` is the capped text) or ``read_failed``. ``path`` is the
     validated path, or ``""`` for ``invalid`` -- the raw input is the caller's to
-    log, as before.
+    log, as before. ``lossy`` says the UTF-8 decode had to substitute
+    replacement characters, so ``content`` is not the file as written.
     """
 
     kind: str
     path: str
     content: str
+    lossy: bool = False
 
 
 #: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
@@ -2881,7 +2886,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
             data = checked.file.read(read_cap * 4)
         if b"\x00" in data[:_FILE_READ_SNIFF_BYTES]:
             return _TextRead("binary", checked.path, "")
-        return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap])
+        try:
+            return _TextRead("file", checked.path, data.decode("utf-8")[:read_cap])
+        except UnicodeDecodeError:
+            # A text file the UTF-8 decode cannot render faithfully -- Latin-1,
+            # one stray byte, a codepoint split at the snapshot bound. The
+            # replacement characters make this body NOT the file as written,
+            # and the viewer must know before it offers the body as a copy.
+            return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap], True)
     except OSError:
         with contextlib.suppress(Exception):
             checked.file.close()
@@ -2890,7 +2902,9 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
 
 async def api_file_watch(request: web.Request) -> web.StreamResponse:
     """GET /api/file-watch?path=... — SSE stream of file content changes."""
-
+    owner_denied = await require_owner_dashboard_request(request, "file_watch")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "")
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -2982,6 +2996,11 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
                     break
                 try:
                     content = await asyncio.to_thread(_read_file, current_resolved, read_cap)
+                    # NOT an owner-view seam, on purpose: this stream also
+                    # serves file-backed artifact live reload, and neither
+                    # consumer renders the frame -- both re-read through
+                    # api_file_read, which is the one seam the owner's
+                    # credential-redaction switch applies to.
                     content = redact(content)
                 except Exception:
                     logger.warning("file-watch read error for %s", path, exc_info=True)
@@ -3004,8 +3023,33 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+async def _owner_view_bypasses_credential_pass(request: web.Request) -> bool:
+    """Whether THIS request renders the owner's own view with the credential pass
+    stood down: the requester is the dashboard owner AND the owner's switch is OFF.
+
+    The two handlers that feed the file viewer -- ``api_file_read`` (the buffer)
+    and ``api_file_diff`` (the ``original`` it is compared against) -- call this
+    with the same request, so both sides of one render carry the same verdict.
+    A non-owner never bypasses; the verdict is read off the event loop per
+    request, so it is never older than the response it shapes. The keystone is a
+    fixed, trusted path (not caller-supplied), so the default executor is the
+    right one.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+        owner_view_for_request,
+    )
+
+    if not owner_view_for_request(request):
+        return False
+    switch = await asyncio.to_thread(redaction_switch.read_state)
+    return not switch.enabled
+
+
 async def api_file_read(request: web.Request) -> web.Response:
     """GET /api/file-read?path=... — read file content for the markdown panel."""
+    owner_denied = await require_owner_dashboard_request(request, "file_read")
+    if owner_denied is not None:
+        return owner_denied
     from kiro_crew.validation import (  # noqa: F811
         FILE_READ_SCHEMA,
         ValidationError,
@@ -3113,11 +3157,35 @@ async def api_file_read(request: web.Request) -> web.Response:
         content = outcome.content
         truncated = len(content) > read_cap
         content = content[:read_cap]
-        content = redact(content)
+        # OWNER-VIEW seam: when the requester IS the dashboard owner, the owner's
+        # credential-redaction switch applies to this read of their own disk
+        # (``security.redaction_switch``). A non-owner dashboard user (a Slack
+        # allow-listed ``!dashboard`` caller) gets the unconditional pass. The only
+        # other opener in this module is ``api_file_diff``, which feeds the SAME
+        # panel the ``original`` this buffer is compared against; the outbox
+        # flagged-file check and the upload gates keep the unconditional ``redact``.
+        as_written = content
+        if await _owner_view_bypasses_credential_pass(request):
+            content = redact_owner_view_via_context(content)
+        else:
+            content = redact(content)
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )
-        headers = {"X-Truncated": "true"} if truncated else {}
+        # All three headers say the same thing to the viewer: this body is not
+        # the file as written. The panel keeps the last copy of a file deleted
+        # outside the dashboard and offers to download it; a capped, redacted
+        # or lossily decoded body must not be offered under the file's own
+        # name as if it were whole. The verdict rides in headers because
+        # nothing in the body can carry it: a file may quote the redaction tag
+        # verbatim, or contain the replacement character itself.
+        headers = {}
+        if truncated:
+            headers["X-Truncated"] = "true"
+        if content != as_written:
+            headers["X-Redacted"] = "true"
+        if outcome.lossy:
+            headers["X-Lossy-Decode"] = "true"
         # Pick a sensible content_type per file extension so browsers and
         # debuggers (DevTools "Response" preview, curl) interpret the body
         # correctly. JSON files in particular benefit from application/json
@@ -3399,6 +3467,9 @@ async def api_file_download(request: web.Request) -> web.Response:
     disposition + nosniff prevents inline rendering on the dashboard
     origin.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_download")
+    if owner_denied is not None:
+        return owner_denied
     # Path validation now happens inside ``_open_checked``, which keeps the
     # late-binding ``handlers`` alias so tests can still monkey-patch
     # ``_validate_dashboard_path`` (legitimate circular-import workaround,
@@ -3583,6 +3654,31 @@ class _PreviewUnsupported(Exception):
     """
 
 
+def _cap_slides(slides: list[tuple[int, str]], cap: int) -> list[dict[str, object]]:
+    """Redact each slide's text and bound the slides' TOTAL text to *cap*.
+
+    The same two rules the flat ``text`` field follows, applied per slide so
+    the structured form never carries more than the flat one would: redact
+    first (a credential must not be cut in half by the cap and slip past the
+    redactor), then spend one budget across the deck in slide order -- a
+    slide that does not fit is cut to the remaining budget and the slides
+    after it are dropped. Slide numbers are the deck's own (``slideN.xml``),
+    so a gap tells the reader a slide carried no text rather than that one
+    went missing.
+    """
+    out: list[dict[str, object]] = []
+    budget = cap
+    for index, raw in slides:
+        if budget <= 0:
+            break
+        text = redact(raw)
+        if len(text) > budget:
+            text = text[:budget]
+        budget -= len(text)
+        out.append({"index": index, "text": text})
+    return out
+
+
 async def api_file_office_preview(request: web.Request) -> web.Response:
     """GET /api/file-office-preview?path=...[&format=blocks] — inline preview of a .docx/.pptx.
 
@@ -3603,6 +3699,17 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
     frontend falls back to it whenever blocks comes back empty. python-docx /
     python-pptx are not required by either path.
 
+    For a .pptx the ``text`` response also carries
+    ``"slides": [{"index", "text"}, ...]``. The panel renders a deck slide
+    by slide from ``slides`` (a deck flattened into one string reads as a
+    parse failure, not a preview); ``text`` stays the flat form for the
+    .docx path and for any consumer that predates ``slides``. Both fields
+    come from ONE slide walk (``kiro_crew.doc_parser.extract_slides`` /
+    ``join_slides``), so they cannot disagree. This endpoint returns only a
+    document's text; a deck's rendered slide IMAGES (layout, charts,
+    positions) come from the separate ``/api/file-office-slides`` route,
+    which needs an office suite to rasterize the deck.
+
     Not supported (fall through to download): .doc, .ppt, .xls, .xlsx,
     .odt, .ods, .odp. The frontend keeps the download card for these.
 
@@ -3617,6 +3724,9 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
     applied. All of it — validation, open, fstat, ZIP+XML parsing,
     redaction — runs in ONE worker-thread hop, like ``api_file_sheet``.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_office_preview")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "")
 
     def _log(outcome: str, res: str, error: str = "") -> None:
@@ -3707,7 +3817,8 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
             return checked
         res_path = checked.path
         with checked.file as fobj:
-            if os.path.splitext(checked.path)[1].lower() not in _OFFICE_PREVIEWABLE_EXT:
+            ext = os.path.splitext(checked.path)[1].lower()
+            if ext not in _OFFICE_PREVIEWABLE_EXT:
                 raise _PreviewUnsupported(checked.path)
             if fmt == "blocks":
                 # Same handle, same one-hop discipline as the text branch:
@@ -3727,19 +3838,32 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
                     "blocks": _redact_blocks(blocks),
                     "truncated": blocks_truncated,
                 }
-            # extract_text parses through the SAME handle the prefix opened
-            # and fstat-ed (its opt-in fileobj parameter), so the bytes
+            # The extractors parse through the SAME handle the prefix opened
+            # and fstat-ed (their opt-in fileobj parameter), so the bytes
             # parsed are exactly the bytes measured — no stat→open TOCTOU
             # window. max_chars bounds AGGREGATE extraction (cap + 1 keeps
             # the truncation flag detectable): a deck with thousands of
             # slides stops parsing at the budget instead of accumulating
-            # unbounded text. It never raises — returns "" on any failure.
-            text = extract_text(
-                checked.path,
-                filename=os.path.basename(checked.path),
-                max_chars=_OFFICE_PREVIEW_CAP + 1,
-                fileobj=fobj,
-            )
+            # unbounded text. Neither raises — an empty result on any failure.
+            slides: list[tuple[int, str]] = []
+            if ext == ".pptx":
+                # One walk of the deck feeds both fields: `text` is the flat
+                # join of the same slides, never a second extraction that
+                # could read a different budget or a different byte range.
+                slides = extract_slides(
+                    checked.path,
+                    filename=os.path.basename(checked.path),
+                    max_chars=_OFFICE_PREVIEW_CAP + 1,
+                    fileobj=fobj,
+                )
+                text = join_slides(slides)
+            else:
+                text = extract_text(
+                    checked.path,
+                    filename=os.path.basename(checked.path),
+                    max_chars=_OFFICE_PREVIEW_CAP + 1,
+                    fileobj=fobj,
+                )
         truncated = len(text) > _OFFICE_PREVIEW_CAP
         # Redact BEFORE truncating: slicing first could cut a credential
         # across the cap boundary, leaving an unmatched prefix the redactor
@@ -3748,7 +3872,7 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
         text = redact(text)
         if truncated:
             text = text[:_OFFICE_PREVIEW_CAP]
-        return {
+        payload: dict[str, object] = {
             "text": text,
             "truncated": truncated,
             # No `empty` field: doc_parser returns "" for both a genuinely
@@ -3756,6 +3880,9 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
             # indistinguishable here. The frontend treats empty `text` as
             # "no preview available" and falls back to the download card.
         }
+        if slides:
+            payload["slides"] = _cap_slides(slides, _OFFICE_PREVIEW_CAP)
+        return payload
 
     try:
         result = await _run_path_probe(_open_and_extract, transfer=True)
@@ -3837,6 +3964,12 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
 
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
+    # A named App Kit app keeps its manifest-scoped path; the owner gate
+    # binds the dashboard-user class, whose reach is the whole host.
+    if not request.get("app"):
+        owner_denied = await require_owner_dashboard_request(request, "file_raw")
+        if owner_denied is not None:
+            return owner_denied
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
     # shared with api_file_download so a hardening change lands on both.
     # Offloaded to a worker thread: the envelope is synchronous file I/O and
@@ -4036,6 +4169,9 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
     (file-raw) performs no content scan at all. The probe exists to catch
     the honest-mistake shape: a text file wearing a forged media magic.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_stream")
+    if owner_denied is not None:
+        return owner_denied
 
     def _log(outcome: str, res: str) -> None:
         _sel().log_tool_invocation(
@@ -4449,16 +4585,74 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
     return score
 
 
+async def _audit_file_search_exit(
+    caller: str, resources: str, error: str = ""
+) -> None:
+    """Record one file-search outcome without blocking the loop or raising.
+
+    Two properties this endpoint needs and a bare ``_sel()`` call does not give:
+
+    * The singleton is warmed at gateway start, but a FAILED warm leaves
+      construction to the first caller -- key load and a tail read of the log --
+      and this runs on the event loop. Same gate and hop as
+      ``handlers/decisions._audit`` and ``server._audit_middleware_denial``: two
+      attribute reads on the healthy path, a worker thread on the degraded one
+      (``no-blocking-call-on-event-loop``).
+    * Best-effort. These calls sit on EARLY-EXIT paths that answered cleanly
+      before, so an audit that raised would turn a 200 or a 404 into a 500. The
+      record is what degrades, never the response.
+    """
+    from kiro_crew.sel import sel_is_warm
+
+    def _write() -> None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="file_search",
+            outcome="allowed",
+            resources=resources,
+            error=error,
+        )
+
+    try:
+        if sel_is_warm():
+            _write()
+        else:
+            await asyncio.to_thread(_write)
+    except Exception:  # noqa: BLE001 - the record degrades, not the answer
+        logger.warning("SEL logging failed for file_search", exc_info=True)
+
+
 async def api_file_search(request: web.Request) -> web.Response:
-    """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker."""
+    """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker.
+
+    OWNER-ONLY, like every other reader in this module (``file_read``,
+    ``file_grep``, ``browse_dirs``, ``browse_files`` and the rest). The gate
+    matters more here than on any of them, because this is the one path reader
+    that takes an ARBITRARY root: ``?project=`` names any directory on the host
+    and only ``is_sensitive_path`` is consulted, so without the gate a non-owner
+    dashboard session could walk the host outside the credential set and read
+    back real names, sizes and mtimes. ``/api/path-complete`` answers the same
+    picker and is not in that position: it resolves the SERVER-HELD value its
+    ``path`` matched against the known project directories.
+    """
     # Re-imported at call time (not reused from the module-level binding) so a
     # test that stubs ``kiro_crew.security.is_sensitive_path`` is observed by the
     # project-root rejection below.
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
+    owner_denied = await require_owner_dashboard_request(request, "file_search")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     query = request.query.get("q", "").strip().lower()
     if len(query) < 2:
+        # Audited like every other exit of this handler. The shared gate records
+        # only denials, so an exit that answers without an audit of its own leaves
+        # a SUCCESSFUL authorization with no SEL event at all -- the access was
+        # granted and nothing says so. Same idiom as ``api_file_diff``'s early
+        # ``allowed`` events: the ordinary outcome vocabulary, distinguished by
+        # ``resources``, rather than a marker only this handler emits.
+        await _audit_file_search_exit(caller, "short_query")
         return web.json_response({"results": []})
 
     # Result page size. Default mirrors SEARCH_RESULT_CAP in FolderPanel.tsx;
@@ -4498,6 +4692,11 @@ async def api_file_search(request: web.Request) -> web.Response:
         if project_is_dir:
             search_roots.append(project)
         else:
+            # Audited for the same reason as the short-query exit above: the
+            # authorization succeeded, so the record must not end at the gate.
+            await _audit_file_search_exit(
+                caller, f"project={project}", error="not a directory"
+            )
             return web.json_response(
                 {"results": [], "error": "Project directory not found"}, status=404
             )
@@ -5224,6 +5423,12 @@ def _grep_sensitive_globs(root: str) -> list[str]:
     """
     args: list[str] = []
     root_real = os.path.realpath(root)
+    # Should ``sandbox_credential_targets`` raise ``PathResolutionStalled`` (a
+    # ``RuntimeError``: the roots could not be canonicalised), it is deliberately
+    # NOT caught here. An empty exclusion list would let ripgrep read the stores
+    # before the per-hit filter sees them; letting it propagate reaches
+    # ``_grep_rg``'s ``RuntimeError`` catch, which returns ``None`` and routes the
+    # search to the fail-closed python engine instead.
     for target in sandbox_credential_targets():
         if not target:
             continue
@@ -5834,6 +6039,9 @@ async def api_file_grep(request: web.Request) -> web.Response:
     loop. The search takes a TRANSFER slot, not a probe slot, because it holds
     its worker for the length of the search.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_grep")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
@@ -5932,6 +6140,9 @@ async def api_file_grep(request: web.Request) -> web.Response:
 
 async def api_file_diff(request: web.Request) -> web.Response:
     """GET /api/file-diff?path=... — returns git diff and HEAD content for a file."""
+    owner_denied = await require_owner_dashboard_request(request, "file_diff")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "").strip()
     if not raw_path:
         _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources="empty_path")
@@ -6022,6 +6233,12 @@ async def api_file_diff(request: web.Request) -> web.Response:
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
             return {"diff": "", "original": "", "status": "error"}
 
+    # Same verdict as ``api_file_read`` for the same caller: the panel compares
+    # the buffer that read served against this ``original``, so the two MUST be
+    # redacted alike -- one side raw and the other masked renders an unchanged
+    # credential line as a hunk, in either direction.
+    bypass = await _owner_view_bypasses_credential_pass(request)
+
     def _run_redacted() -> dict:
         # Both text fields carry file content, so they pass through the same
         # redactor ``api_file_read`` applies to the panel's buffer. The panel's
@@ -6036,13 +6253,28 @@ async def api_file_diff(request: web.Request) -> web.Response:
         # credential's regex-required tail, and the surviving prefix is then
         # served as real bytes. Redacting whole text costs an unbounded scan,
         # which is why it runs here rather than on the event loop.
-        result["original"] = redact(result.get("original", ""))
-        result["diff"] = redact(result.get("diff", ""))
+        if bypass:
+            result["original"] = redact_owner_view_via_context(result.get("original", ""))
+            result["diff"] = redact_owner_view_via_context(result.get("diff", ""))
+        else:
+            result["original"] = redact(result.get("original", ""))
+            result["diff"] = redact(result.get("diff", ""))
         return result
 
     result = await asyncio.to_thread(_run_redacted)
     _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
     return web.json_response(result)
+
+
+def _browse_entry_is_dir(entry) -> bool:
+    # DirEntry.is_dir(follow_symlinks=True) stats the target, so one
+    # unreadable child (a TCC-protected dir, a permission-denied entry)
+    # raises instead of answering. Treat that as a non-dir so one bad
+    # sibling never aborts the sort or the listing loop.
+    try:
+        return bool(entry.is_dir(follow_symlinks=True))
+    except OSError:
+        return False
 
 
 def _browse_dirs_sync(base: str, skip: set[str]) -> list[dict]:
@@ -6057,12 +6289,15 @@ def _browse_dirs_sync(base: str, skip: set[str]) -> list[dict]:
     dirs: list[dict] = []
     try:
         for entry in sorted(os.scandir(base), key=lambda e: e.name.lower()):
-            if entry.is_dir(follow_symlinks=True) and entry.name not in skip and not entry.name.startswith("."):
-                # Resolve symlinks before the sensitivity check — a symlink in
-                # a benign dir pointing at ~/.aws would otherwise pass through.
-                if is_sensitive_path(os.path.realpath(entry.path)):
-                    continue
-                dirs.append({"name": entry.name, "path": entry.path})
+            if not _browse_entry_is_dir(entry):
+                continue
+            if entry.name in skip or entry.name.startswith("."):
+                continue
+            # Resolve symlinks before the sensitivity check — a symlink in
+            # a benign dir pointing at ~/.aws would otherwise pass through.
+            if is_sensitive_path(os.path.realpath(entry.path)):
+                continue
+            dirs.append({"name": entry.name, "path": entry.path})
     except PermissionError:
         pass
     return dirs
@@ -6077,9 +6312,19 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
     dirs: list[dict] = []
     files: list[dict] = []
     try:
-        # Sort: dirs before files, then alphabetical
-        for entry in sorted(os.scandir(base), key=lambda e: (not e.is_dir(follow_symlinks=True), e.name.lower())):
+        # Sort: dirs before files, then alphabetical. The key must not raise
+        # on an unreadable child: DirEntry.is_dir stats the target, so one
+        # bad sibling would abort sorted() and empty the whole listing.
+        for entry in sorted(os.scandir(base), key=lambda e: (not _browse_entry_is_dir(e), e.name.lower())):
             if entry.name.startswith("."):
+                continue
+            # An entry that cannot even be classified is skipped, not fatal:
+            # without this, one unreadable child aborts the loop and drops
+            # every entry after it.
+            try:
+                is_dir = entry.is_dir(follow_symlinks=True)
+                is_file = False if is_dir else entry.is_file(follow_symlinks=True)
+            except OSError:
                 continue
             # Resolve symlinks before the sensitivity check — a symlink in a
             # benign dir pointing at ~/.aws would otherwise pass through.
@@ -6092,10 +6337,10 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
                 mtime = int(entry.stat(follow_symlinks=True).st_mtime)
             except OSError:
                 mtime = 0
-            if entry.is_dir(follow_symlinks=True):
+            if is_dir:
                 if entry.name not in skip:
                     dirs.append({"name": entry.name, "path": entry.path, "mtime": mtime})
-            elif entry.is_file(follow_symlinks=True):
+            elif is_file:
                 files.append({"name": entry.name, "path": entry.path, "mtime": mtime})
     except PermissionError:
         pass
@@ -6151,6 +6396,9 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     knows it is at the top. On other platforms the flag is a 400: there is no
     such level to show.
     """
+    owner_denied = await require_owner_dashboard_request(request, "browse_dirs")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     if request.query.get("drives") == "1":
         if not platform_compat.IS_WINDOWS:
@@ -6429,6 +6677,9 @@ async def api_browse_files(request: web.Request) -> web.Response:
     are sorted dirs-first then alphabetically; hidden files and common build dirs
     are skipped.
     """
+    owner_denied = await require_owner_dashboard_request(request, "browse_files")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     raw = request.query.get("path", "").strip()
     # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
@@ -7277,6 +7528,9 @@ async def api_file_sheet(request: web.Request) -> web.Response:
     dashboard egress. openpyxl is soft-imported: without it the endpoint
     answers 501 and the frontend degrades to the download card.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_sheet")
+    if owner_denied is not None:
+        return owner_denied
 
     def _log(outcome: str, res: str) -> None:
         _sel().log_tool_invocation(
@@ -8170,6 +8424,9 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 "directories": [],
                 "repo": False,
                 "truncatedDirectories": [],
+                "hiddenOnlyDirectories": [],
+                "unreadableDirectories": [],
+                "linkedDirectories": [],
             }
         )
 
@@ -8213,21 +8470,130 @@ async def api_project_tree(request: web.Request) -> web.Response:
                     "repo": True,
                     "truncated": bool(truncated_directories),
                     "truncatedDirectories": truncated_directories,
+                    # A directory row exists here only as the parent of a listed
+                    # file, so an ignored-only folder is absent rather than
+                    # childless; the only childless directory this branch can
+                    # produce is a truncated one, reported above. The same holds
+                    # for a directory git cannot read: `--others` cannot scan it,
+                    # so it contributes no untracked file, and with no indexed
+                    # file beneath it it is absent, never childless -- while an
+                    # indexed path beneath it still comes from the index
+                    # (`--cached` reads no directory) and makes it an ordinary
+                    # populated row. A symlink to a directory is listed by git
+                    # as a FILE (the link itself is the tracked object), so it
+                    # is a file row here, never a childless directory.
+                    "hiddenOnlyDirectories": [],
+                    "unreadableDirectories": [],
+                    "linkedDirectories": [],
                 }
 
         # Fallback: walk twice so the first pass can compute fair per-directory
         # quotas without retaining every filename in memory. The complete walk
         # is required to return the directory skeleton past the file cap.
         directories: list[str] = []
+        # Directories the walk leaves CHILDLESS although they are not empty on
+        # disk: every entry is a directory this filter drops (a dot-directory
+        # or a tooling cache) and there is no file -- a symlink to a directory
+        # is NOT such an entry (it is a visible row of its own, see
+        # ``linked_directories``). The dashboard renders a childless folder
+        # with a state row beneath it, and the row must not call such a folder
+        # empty -- `_bg/` holding only `.kiro/` is the reported case. Reported
+        # separately from `directories` so the tree can tell the two apart; a
+        # directory with a listed file or a kept subfolder is never in this list
+        # even when it also holds hidden entries. The root itself, when its top
+        # level holds only such entries, is named as ``.`` (it is no row).
+        hidden_only_directories: list[str] = []
+        # Symlinks to directories, listed as rows of their own (see the walk
+        # below): the walk never follows a link, so nothing beneath one is
+        # listed, and the dashboard says so beneath its row rather than calling
+        # the link -- or the folder holding only links -- empty.
+        linked_directories: list[str] = []
+        # Directories the walk KEPT but could not read. ``os.walk`` reports a
+        # failed ``scandir`` on a subdirectory through ``onerror`` and then
+        # skips it WITHOUT yielding it (its default ``onerror=None`` swallows
+        # the failure), so a kept, non-symlink child the process may not read
+        # (permission denied is the usual cause) would otherwise leave no trace:
+        # its parent has no row beneath it, is not hidden-only (the child is no
+        # symlink), and the dashboard would call the parent empty -- a lie,
+        # ``ls`` shows the child. Such a directory is therefore listed as a row
+        # AND named here: the tree shows the folder, with nothing beneath it and
+        # no status line (a failed read is an error, and the dashboard reports
+        # an error only through its ``ErrorNotice`` above the tree, which names
+        # every directory in this list; the folder's own row carries a lock
+        # marker pointing at that notice), and its parent is not childless at
+        # all. Any failure
+        # counts, not only EACCES: the parent listed the entry, so a row that
+        # makes no claim about its contents is the honest rendering whatever
+        # stopped the read (a directory removed mid-walk is stale for exactly
+        # one refresh either way). The file pass below needs no hook: an
+        # unreadable directory has no files to list and is already a row. The
+        # root itself failing is recorded as ``.`` (see ``_record_unreadable``).
+        unreadable_directories: list[str] = []
+
+        def _record_unreadable(error: OSError) -> None:
+            failed = error.filename
+            # ``scandir`` names the directory on every error it raises; the
+            # guard keeps a bare OSError from aborting the whole listing.
+            if not isinstance(failed, str):
+                return
+            rel_failed = os.path.relpath(failed, base)
+            if rel_failed == ".":
+                # The root itself could not be read: the walk yields nothing,
+                # so the payload would be indistinguishable from a workspace
+                # with no files in it and the dashboard would say so -- the
+                # same "empty" claim this listing refuses to make one level
+                # down. The root is no directory row (rows are relative to
+                # it), so it is named only here, as ``.``; the dashboard shows
+                # its not-readable state in place of the empty-workspace one.
+                unreadable_directories.append(".")
+                return
+            directory = rel_failed.replace(os.sep, "/")
+            directories.append(directory)
+            unreadable_directories.append(directory)
+
         file_counts: dict[str, int] = {}
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = sorted(
-                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
-            )
+        for dirpath, dirnames, filenames in os.walk(base, onerror=_record_unreadable):
+            had_subdirectories = bool(dirnames)
             rel_dir = os.path.relpath(dirpath, base)
             directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
             if directory:
                 directories.append(directory)
+            # A symlink to a directory is a visible, navigable entry -- ``ls``
+            # shows it -- but the walk never descends it (``followlinks`` is
+            # off, against link cycles) and never yields it, so it would be
+            # neither a row nor a parent and its folder would read as childless.
+            # It is listed as a directory row of its own and named in
+            # ``linkedDirectories``: the row shows, nothing beneath it is
+            # listed (the target is not walked), and the dashboard says so
+            # beneath it instead of calling the link empty. The name filter
+            # below applies to every entry alike, link or not: what a folder
+            # shows must be predictable from the NAME alone, and a ``.cache``
+            # or ``node_modules`` that is a link to another disk is as much a
+            # hidden item as its real twin (Design lane on ``9f52681b54``) --
+            # so links are told apart among the names the filter KEPT, and a
+            # filtered link counts as a hidden entry like any filtered
+            # directory. Hidden-only therefore means every entry the folder
+            # holds is one the listing filters out by nature (dot-directories,
+            # the skip set), real or linked: it applies when the filter emptied
+            # ``dirnames`` and no file remains. A kept link is a row, and a
+            # folder holding only kept links is not hidden-only. The root is
+            # judged by the same rule, OUTSIDE the ``if directory`` above: a
+            # project directory whose top level holds only skipped or hidden
+            # entries yields no file and no kept subdirectory, so the payload
+            # would be the empty-workspace shape and the dashboard would call
+            # the workspace empty -- the claim this listing refuses to make one
+            # level down. The root is no directory row of its own, so it is
+            # named as ``.``, exactly as an unreadable root is.
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            links = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
+            for name in links:
+                link = f"{directory}/{name}" if directory else name
+                directories.append(link)
+                linked_directories.append(link)
+            if had_subdirectories and not filenames and not dirnames:
+                hidden_only_directories.append(directory or ".")
             file_counts[directory] = len(filenames)
 
         quotas = _project_tree_file_quotas(file_counts, _PROJECT_TREE_MAX_ENTRIES)
@@ -8251,6 +8617,9 @@ async def api_project_tree(request: web.Request) -> web.Response:
             "repo": False,
             "truncated": bool(truncated_directories),
             "truncatedDirectories": truncated_directories,
+            "hiddenOnlyDirectories": hidden_only_directories,
+            "unreadableDirectories": unreadable_directories,
+            "linkedDirectories": linked_directories,
         }
 
     result = await asyncio.to_thread(_run)
@@ -8273,7 +8642,14 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
     # occurrence. This does not affect "truncated": the cap is applied to the
     # raw listing above.
-    for key in ("paths", "directories", "truncatedDirectories"):
+    for key in (
+        "paths",
+        "directories",
+        "truncatedDirectories",
+        "hiddenOnlyDirectories",
+        "unreadableDirectories",
+        "linkedDirectories",
+    ):
         result[key] = list(
             dict.fromkeys(redact_path_segments(p, redact) for p in result[key])
         )

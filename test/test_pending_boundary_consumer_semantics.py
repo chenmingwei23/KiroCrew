@@ -245,12 +245,20 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("chat_runner.py", "_eager_spawn"),
                 ("chat_runner.py", "_prefetch_ttl"),
                 ("handlers/autonudge.py", "api_autonudge_fire"),
+                ("handlers/mcp_apps.py", "api_mcp_apps_message"),
                 ("handlers/members.py", "api_member_thread"),
                 ("handlers/members.py", "api_members"),
                 ("handlers/messaging.py", "api_send_message"),
                 ("session_control.py", "create_session"),
+                # The roster verb. Reservation state, like `read_messages` beside
+                # it and for the same reason: it reports whether a session is
+                # working so a patrol knows whether to wait, and a slot between a
+                # plan's stages is still working even though no task is assigned.
+                ("session_control.py", "created_session_status"),
                 ("session_control.py", "read_messages"),
                 ("session_control.py", "send_to_target"),
+                # Pre-pick idle check via _switch_target_busy (idle-only tool contract).
+                ("session_control.py", "set_model_target"),
                 ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
                 ("ws.py", "_handle_slot_focused"),
             }
@@ -288,6 +296,7 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
         ("chat_rewind.py", "api_chat_slot_rewind"),
         ("chat_runner.py", "_finish_queue_cycle"),
         ("chat_runner.py", "_start_next_queued_turn"),
+        ("handlers/mcp_apps.py", "api_mcp_apps_message"),
         ("handlers/messaging.py", "api_send_message"),
         ("handlers/taskrunner.py", "api_taskrunner_to_chat"),
         ("openai_compat.py", "api_completions"),

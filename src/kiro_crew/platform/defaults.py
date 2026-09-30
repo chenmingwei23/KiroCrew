@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         ImportSource,
         InboundToken,
         McpScope,
+        MemoryRoots,
         SessionPrincipal,
         WorkloadIdentity,
     )
@@ -580,6 +581,25 @@ class DefaultTelemetryProvider:
         )
 
 
+class DefaultMemoryFilesProvider:
+    """Local-disk memory files — today's behaviour, unchanged.
+
+    Every store gets a :class:`~kiro_crew.memory_files.LocalMemoryFiles`, which is
+    the gate/reader/writer code lifted out of ``MemoryStore`` without alteration,
+    so the public edition reads and writes memory with the same syscalls in the
+    same order as before this seam existed.
+
+    The import is deferred: ``memory_files`` pulls in ``hooks``, ``pinned_fs`` and
+    ``memory_startup``, and this module is imported at boot by every edition
+    including ones that never touch memory.
+    """
+
+    def files_for(self, roots: "MemoryRoots") -> Any:
+        from kiro_crew.memory_files import LocalMemoryFiles
+
+        return LocalMemoryFiles(roots)
+
+
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
 
@@ -730,6 +750,14 @@ class DefaultRemoteProvisionerProvider:
                 dataclasses.replace(
                     FARGATE_REMOTE_PROVISIONER,
                     confirm_before_launch=config.credential_recipient(),
+                    # Which MATE the configured image and secret belong to, so the mate
+                    # picker says so while the user is choosing a lane rather than after
+                    # a refused launch. This lane deploys one agent, not a gateway, which
+                    # is why it has a mate to name at all. Derived from the secret
+                    # references by the engine's own `sole_binding`, which
+                    # `is_complete()` above already ran over this set -- so a registered
+                    # lane always names its mate.
+                    serves_mate=config.serves_mate(),
                 )
             )
         return rows
@@ -790,6 +818,14 @@ class DefaultRemoteProvisionerProvider:
                 # be the file confirming itself. ``provision`` resolves the recipient from
                 # the spec and compares, and it refuses an empty value.
                 confirmed_recipient=confirmed_recipient,
+                # The operator's own trust-boundary claim, read from the block they
+                # wrote. It is the only field here that loosens a posture, and it is
+                # read rather than asked for at launch because the statement it makes --
+                # these are the operator's own crews, and they bear the risk of what
+                # those crews read -- is a property of the lane, not of one launch.
+                # Absent means not claimed, so a lane that says nothing keeps the
+                # container's sandboxed-only refusal.
+                internal_only=config.internal_only,
             ),
             # What bounds the task's cost. Passed rather than left to default, which is
             # the whole point: the engine defaults to six hours, and until this argument

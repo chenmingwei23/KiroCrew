@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, runtime_death
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
@@ -123,6 +123,7 @@ from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trust
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -151,8 +152,7 @@ from kiro_crew.security import (
     redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionClosingError, SessionManager
-from kiro_crew.session_map import SessionMap
+from kiro_crew.session import _CIRCUIT_BREAKER_THRESHOLD, SessionClosingError, SessionManager
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
@@ -172,6 +172,13 @@ from kiro_crew.slack.sessions_view import (
     _build_sessions_blocks,
     _collect_recent_sessions_off_loop,
     sessions_include_ended,
+)
+from kiro_crew.slack.thread_parent import (
+    fetch_thread_parent,
+    has_prior_turns,
+    is_slack_born,
+    parent_prompt_text,
+    record_thread_parent,
 )
 from kiro_crew.stats import Stats
 from kiro_crew.subagent import SubagentManager
@@ -808,17 +815,6 @@ def _is_slack_restricted(session_key: str) -> bool:
     return privacy_mode.is_restricted(session_key)
 
 
-def _conv_state_map(sessions: object) -> "SessionMap | None":
-    """Return the SessionManager's canonical SessionMap, or None.
-
-    Thin wrapper over :func:`kiro_crew.messaging.privacy_mode.conv_state_map`,
-    which documents why requiring the real class (rather than any attribute) is
-    load-bearing for a test double.
-    """
-    sm = privacy_mode.conv_state_map(sessions)
-    return sm if isinstance(sm, SessionMap) else None
-
-
 def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     """Restore persisted temporary/incognito flags into the in-memory caches.
 
@@ -827,21 +823,6 @@ def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     from the durable ``SessionMap`` entry).
     """
     privacy_mode.hydrate(sessions, session_key)
-
-
-def _strip_incognito_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!incognito`` token from *text*."""
-    return privacy_mode.strip_token(text, privacy_mode.MODE_INCOGNITO)
-
-
-def _strip_temporary_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!temporary`` token from *text*.
-
-    Returns ``(cleaned_text, found)`` where *found* is True if the token
-    was present.  The cleaned text has the token removed and excess
-    whitespace collapsed.
-    """
-    return privacy_mode.strip_token(text, privacy_mode.MODE_TEMPORARY)
 
 
 async def _apply_privacy_mode(
@@ -857,8 +838,9 @@ async def _apply_privacy_mode(
     """Mark a session as *mode* and notify the user (idempotent).
 
     Everything platform-shaped is a callback into this module, which is what lets
-    the shared applier own the ordering (mark before any await, then the durable
-    flag, then the audit, then the notice).
+    the shared applier own the ordering (``privacy_mode._commit_mode``, whose
+    docstring is the one statement of it: the durable records first, awaited,
+    then the publication -- or a refusal that publishes nothing).
     """
 
     async def _notify(message: str) -> None:
@@ -889,50 +871,6 @@ async def _apply_privacy_mode(
     )
 
 
-async def _apply_temporary_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as temporary and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_TEMPORARY,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
-    )
-
-
-async def _apply_incognito_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as incognito and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_INCOGNITO,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
-    )
-
-
 async def maybe_apply_privacy_modifiers(
     text: str,
     cmd_text: str,
@@ -955,8 +893,13 @@ async def maybe_apply_privacy_modifiers(
     - *cmd_text* — the mention-stripped command text with the token removed
       (the native path reuses it for its subsequent ``!compact``/``!bang``
       checks; the transport path ignores it).
-    - *only_modifier* — True when the message was nothing but the modifier(s);
-      the caller MUST then return without starting an LLM turn.
+    - *only_modifier* — True when there is nothing left to run: the message was
+      nothing but the modifier(s), OR the modifier was REFUSED (the gateway's
+      private-conversation limit, or an over-long key -- ``apply_mode`` has
+      already audited the denial and told the user the message was not
+      processed). The caller MUST then return without starting an LLM turn:
+      running the message with the mode silently dropped would be the leak the
+      modifier exists to prevent.
 
     Slack's TWO texts are why this drives ``privacy_mode``'s primitives rather
     than its single-text ``strip_and_apply``: only *cmd_text* decides whether the
@@ -971,9 +914,13 @@ async def maybe_apply_privacy_modifiers(
         cmd_stripped, had_mode = privacy_mode.strip_token(cmd_text, mode)
         if not had_mode:
             continue
-        await _apply_privacy_mode(
-            mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
-        )
+        try:
+            await _apply_privacy_mode(
+                mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
+            )
+        except privacy_mode.PrivacyModeRefused:
+            # Audited and announced by apply_mode; nothing is left to run.
+            return text, cmd_stripped, True
         cmd_text = cmd_stripped
         text = pattern.sub("", text)
         text = " ".join(text.split()) or text  # collapse whitespace
@@ -4010,18 +3957,30 @@ async def handle_message(
         # Fetch thread parent message when starting a new session in an
         # existing thread (e.g. replying to a cron thread).  Gives the LLM
         # context about what started the thread without requiring manual
-        # batch_get_thread_replies.
+        # batch_get_thread_replies. This path persists the user's row only
+        # after the turn, so ``compressed`` is non-empty only when earlier
+        # turns exist. A Slack-born session also records the parent as the
+        # transcript's first row (see ``slack/thread_parent.py``).
         thread_parent_text: str | None = None
         if is_new and not resumed and thread_ts and context_builder:
             if not compressed:
-                thread_parent_text = await slack.fetch_message(channel, thread_ts)
-            if thread_parent_text:
-                thread_parent_text = redact(thread_parent_text)
-                if len(thread_parent_text) > 3000:
-                    thread_parent_text = (
-                        thread_parent_text[:3000]
-                        + "\n[truncated — use batch_get_thread_replies for full text]"
-                    )
+                _record_parent = bool(
+                    conversation_log
+                    and thread_ts != msg_ts
+                    and is_slack_born(session_key)
+                    and not _is_slack_restricted(session_key)
+                    and not await has_prior_turns(conversation_log, session_key)
+                )
+                _thread_parent = await fetch_thread_parent(
+                    slack, channel, thread_ts, with_author=_record_parent
+                )
+                if _thread_parent is not None:
+                    thread_parent_text = parent_prompt_text(_thread_parent)
+                    if _record_parent:
+                        assert conversation_log is not None
+                        await record_thread_parent(
+                            conversation_log, session_key, _thread_parent, agent=_agent
+                        )
 
         if context_builder:
             # Thread-scoped temporary mode: blocks memory reads.
@@ -4437,7 +4396,17 @@ async def handle_message(
                         # block.
                         _ng_refusal = await name_grant.refusal_for_event(event)
                         if _ng_refusal is None:
-                            await client.approve_tool(event.request_id)
+                            approval_sent = await client.approve_tool(event.request_id)
+                            if approval_sent is False:
+                                sel().log_tool_invocation(
+                                    session_key=session_key,
+                                    source="slack",
+                                    tool_name=event.title,
+                                    tool_kind=event.tool_kind,
+                                    outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                    request_id=event.request_id,
+                                )
+                                continue
                             Stats().inc_tool_auto_approved()
                             sel().log_tool_invocation(
                                 session_key=session_key,
@@ -4483,7 +4452,17 @@ async def handle_message(
 
                 # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
                 if _should_auto_approve_spawn(context_builder, event):
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
                         session_key=session_key,
@@ -4497,7 +4476,17 @@ async def handle_message(
                     continue
 
                 if approval_mode == APPROVAL_AUTO:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
                         session_key=session_key,
@@ -4513,7 +4502,17 @@ async def handle_message(
                 # Trust mode (per-session) or YOLO mode (owner-only global) → auto-approve
                 _yolo_now = is_yolo_mode()
                 if _yolo_now or session_key in _trusted_sessions:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     logger.info(
                         "Auto-approved %s (%s)",
@@ -4788,7 +4787,62 @@ async def handle_message(
         _had_error = True
         accumulated = accumulated or "💀 Agent process died. Please try again."
         task.fail("process_died")
-        await sessions.record_failure(session_key)
+        # The circuit breaker counts a session's OWN consecutive failures, and
+        # trips into a reset. A process this session was sharing dying is not
+        # this session's failure, and counting it there is how N co-tenants each
+        # marched their own breaker toward tripping over one process event. The
+        # death was classified once where it was detected; this reads that record.
+        # A single-tenant runtime is charged exactly as before.
+        if runtime_death.caused_by_this_session(client):
+            await sessions.record_failure(session_key)
+        else:
+            # Bounded, like every other exemption: the breaker is what resets a
+            # session whose runtime keeps dying, so an unbounded skip would leave
+            # a session on a permanently dying shared process never recovering.
+            # The streak is counted against that runtime rather than the session.
+            #
+            # At the limit the substitute bound PERFORMS the actuator rather than
+            # adding one charge to the counter it stood in for. Charging instead
+            # would deliver twice the bound it claims: the exemption spends the
+            # first `_CIRCUIT_BREAKER_THRESHOLD` deaths, and a counter still at
+            # zero then needs that many charges again, so a session on a
+            # permanently dying shared runtime would lose about twice as many
+            # turns as one that was never exempted. `record_failure` trips into
+            # exactly this reset, so calling it here is the same recovery at the
+            # limit the breaker would have reached -- and it leaves the session's
+            # own failure count untouched, which is the whole point: the session
+            # never misbehaved.
+            _shared_streak = runtime_death.note_shared_death(session_key)
+            if _shared_streak >= _CIRCUIT_BREAKER_THRESHOLD:
+                logger.warning(
+                    "session %s: the runtime it shares has died %d times running — "
+                    "resetting it now, the same recovery the breaker performs",
+                    session_key,
+                    _shared_streak,
+                )
+                try:
+                    await sessions.reset(session_key)
+                    # The reset IS the hand-over, so the streak is spent: clear it
+                    # or the next shared death hands over again and every death
+                    # from here on performs the actuator, which is the unexempted
+                    # behaviour the bound exists to replace. Cleared only once the
+                    # reset has returned -- a reset that raised transferred
+                    # nothing, and keeping the streak is what makes the next death
+                    # retry it.
+                    runtime_death.clear_shared_deaths(session_key)
+                except Exception:
+                    logger.warning(
+                        "session %s: reset after a shared runtime's deaths failed",
+                        session_key,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "session %s lost a turn to a SHARED runtime's death (%d running) — "
+                    "not counting it toward the circuit breaker",
+                    session_key,
+                    _shared_streak,
+                )
         Stats().inc_message_failed()
     except AcpPromptBusy as e:
         _had_error = True
@@ -4922,6 +4976,11 @@ async def handle_message(
                 return
             _verdict_booked = True
             sessions.record_success(session_key)
+            # Reset with the counter it substitutes for: record_success clears
+            # consecutive_failures, so a completed turn must clear the shared-death
+            # streak too. Otherwise the streak is a LIFETIME total and the bound
+            # stays permanently tripped, silently ending the exemption.
+            runtime_death.clear_shared_deaths(session_key)
             Stats().inc_message_success()
             if client is not None:
                 record_interaction_event(client, session_key, "slack")
@@ -6384,6 +6443,7 @@ async def handle_interaction(
     # replaces. approve_tool pops the recorded options before sending, so the
     # guard's fallback reject can land as a cancelled outcome (ends the turn's
     # remaining tool calls) — still strictly better than a wedged subprocess.
+    floor_refused = False
     try:
         if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
             # Set trust state BEFORE approving (so subsequent tools auto-approve)
@@ -6408,15 +6468,25 @@ async def handle_interaction(
                     logger.warning(
                         "No session_key on pending approval %s; approving without trust", key
                     )
+            approval_sent = True
             if pending.provider:
-                await pending.provider.approve_tool(pending.request_id)
+                approval_sent = await pending.provider.approve_tool(pending.request_id)
             if not pending.future.done():
-                pending.future.set_result(_OUTCOME_APPROVED)
-            Stats().inc_tool_approval()
+                pending.future.set_result(
+                    _OUTCOME_APPROVED if approval_sent is not False else _OUTCOME_REJECTED
+                )
+            if approval_sent is not False:
+                Stats().inc_tool_approval()
+            else:
+                # The transport's gate refused the call: the card must not
+                # be relabelled as approved.
+                floor_refused = True
             sel().log_api_access(
                 caller=user_id,
                 operation="slack.interactive.approval",
-                outcome="allowed",
+                outcome=(
+                    "allowed" if approval_sent is not False else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                ),
                 source="slack",
                 resources=action_id,
             )
@@ -6445,7 +6515,7 @@ async def handle_interaction(
             pending.future.set_result(_OUTCOME_REJECTED)
         raise
 
-    return action_id
+    return _ACTION_REJECT if floor_refused else action_id
 
 
 def _build_approval_blocks(event: LLMEvent, is_dm: bool = True, source: str = "") -> list[dict]:

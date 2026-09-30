@@ -4,7 +4,10 @@ import { createPortal } from 'react-dom'
 import { i18nT } from '../i18n/t'
 
 /** Tiny ? button that shows a tooltip on click. Portal-rendered to escape overflow clipping. */
-export default function InfoTip({ text, placement = 'auto' }: { text: string; placement?: 'auto' | 'top' }) {
+export default function InfoTip({ text, placement = 'auto' }: {
+  text: string
+  placement?: 'auto' | 'top'
+}) {
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -47,6 +50,10 @@ export default function InfoTip({ text, placement = 'auto' }: { text: string; pl
     <>
       <button
         ref={btnRef}
+        /* A <button> defaults to type="submit": inside a <form> (the New crewmate
+           dialog wraps its fields in one) a bare toggle would submit the owner form
+           on click. This is a help toggle, never a submitter. */
+        type="button"
         /* The visible glyph is a bare "?", which assistive technology announces as
            "question mark" — a control with no discoverable purpose. The NAME is a
            short generic verb phrase and the tip text is attached as the

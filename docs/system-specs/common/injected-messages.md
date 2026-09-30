@@ -144,7 +144,10 @@ completion — this path fires for every terminal state, including runs that
 never executed (the never-ran reading comes from the record's execution marker,
 never from its error wording):
 
-- completed: `The agent finished but result delivery timed out.`
+- completed: `The agent finished, but its result could not be delivered.`
+  The line names no mechanism: `<reason>` above it already carries one, and
+  most call sites pass something other than a timeout (a dead provider, a
+  died ACP process, a raw exception string).
 - failed after execution began: `The agent failed before a result could be delivered.`
 - failed before execution (approval or queued rejection, no output exists):
   `The run failed before it started, so there is no result to deliver.`
@@ -246,8 +249,9 @@ permission request. Holding the unanswered request is what makes that race-free:
 the turn is provably in flight, so the notice is queued and folded in at the next
 model-inference boundary — the one right after the rejected tool resolves — and
 the model adapts inside the SAME turn. It is opt-in by positive capability
-(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
-steer is unchanged.
+(`supports_refusal_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged, and so is codex: its user steer rides `_session/steering`, but its
+approval answer cancels the turn and drops what was injected into it.
 
 `should_queue_refusal_recovery` then suppresses the extra turn only when every
 refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
@@ -371,10 +375,16 @@ next turn into the same slot:
 
 ```
 [auto-nudge cycle <N>]
+[patrol budget: cycle <N>/<max_cycles>, <left>s/<max_runtime_secs>s runtime left]
 <nudge message>
 ```
 
 - `N` is `cycle_count + 1`. Only DELIVERED nudges count toward `max_cycles`.
+- The `[patrol budget: ...]` line appears only on a loop with a cycle or runtime
+  cap, and names only the caps it has; an uncapped loop's tag is unchanged. It
+  ends `; 10% or less left` once either budget is at or under 10% of its cap. It states a
+  fact and asks for nothing; the goal-conductor skill is what tells its agent to
+  renew on those cycles (`nudge_cycle_header`).
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
@@ -504,9 +514,9 @@ speech rather than as the user.
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
 | `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold; take the lighter path this turn. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
-| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
+| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 
 ## Adding a new envelope
 

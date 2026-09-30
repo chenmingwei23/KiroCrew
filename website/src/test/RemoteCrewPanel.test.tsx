@@ -9,6 +9,15 @@ import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn() }))
 
+// PARTIAL: the panel also reads the chain-refusal store from this module through
+// useSyncExternalStore, so replacing the whole module would break rendering. Only the
+// announce is spied, which is the one decision under test.
+vi.mock('../lib/chainAnnounce', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/chainAnnounce')>()),
+  announceChainedCrew: vi.fn(),
+}))
+import { announceChainedCrew } from '../lib/chainAnnounce'
+
 vi.mock('../api/client', () => {
   class ApiError extends Error {
     status: number
@@ -37,6 +46,8 @@ vi.mock('../api/client', () => {
       instanceStatus: vi.fn(),
       updateInstance: vi.fn(),
       patchConfig: vi.fn(),
+      // The mate picker reads the roster to offer names.
+      members: vi.fn(),
       cloudLaunches: vi.fn(),
       cloudPreflight: vi.fn(),
       cloudProvisioners: vi.fn(),
@@ -61,6 +72,47 @@ import {
 /** Open a crew row's overflow menu — Edit / Stop / Start / Delete live there. */
 async function openRowMenu(u: ReturnType<typeof userEvent.setup>, name: RegExp = /More actions/i) {
   await u.click(await screen.findByRole('button', { name }))
+}
+
+/**
+ * Open the EC2 launcher, which used to be this panel's whole second tab.
+ *
+ * It is on the CREWS tab now, behind that tab's footer button, because what it creates
+ * is a crew -- a gateway on a fresh machine. It sits behind a button rather than always
+ * open because it is a long form (an AWS probe, a size ladder, a subnet, an identity) and
+ * the answer to "which crews do I have" must not be below all of it.
+ */
+async function openCrewLauncher(u: ReturnType<typeof userEvent.setup>) {
+  await u.click(await screen.findByTestId('deploy-crew-open'))
+}
+
+/**
+ * Switch to the MATES tab, where a single-agent row lists.
+ *
+ * A Fargate task is one agent with no dashboard and no roster, so it is a mate and not a
+ * crew, and it has its own tab. The two shared one list before, which is what made the
+ * list unreadable.
+ */
+async function openMatesTab(u: ReturnType<typeof userEvent.setup>) {
+  await u.click(await screen.findByRole('button', { name: /Remote mates/i }))
+}
+
+/**
+ * Open a row's kebab and return its Details block.
+ *
+ * The identifiers and the long explanatory sentences live HERE now, not on the card:
+ * a reader scanning the list is answering "which crew, and can I use it", and an ECS
+ * task target answers neither — while the card was long enough that the target had to
+ * be truncated in exactly the tail that tells two tasks in one cluster apart. Details
+ * is where an identifier IS the question, so it is a lookup table, verbatim.
+ */
+async function openDetails(
+  u: ReturnType<typeof userEvent.setup>,
+  id: string,
+  menuName: RegExp = /More actions/i,
+): Promise<HTMLElement> {
+  await openRowMenu(u, menuName)
+  return await screen.findByTestId(`crew-details-${id}`)
 }
 
 
@@ -195,7 +247,7 @@ describe('RemoteCrewPanel', () => {
 
     // A fresh mount: nothing was launched in this component's lifetime.
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     expect(await screen.findByText(/WXYZ-1234/)).toBeInTheDocument()
     expect(document.querySelector('a[href="https://device.sso/verify"]')).not.toBeNull()
@@ -204,7 +256,7 @@ describe('RemoteCrewPanel', () => {
 
   it('refreshes the crew list when a launch finishes, without waiting for a manual reload', async () => {
     // Switching tabs does not remount the panel, so nothing would invalidate the
-    // instances cache and the brand-new crew would stay missing from Your crews.
+    // instances cache and the brand-new crew would stay missing from Remote crews.
     vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [RUNNING_JOB] })
     vi.mocked(api.cloudLaunchStatus).mockResolvedValue({ ...RUNNING_JOB, status: 'done' as const })
@@ -224,21 +276,81 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    // Not labelled as hand-added, because we cannot know that. The row is
-    // EC2-stamped, so its caption agrees with the badge hint.
-    expect(
-      await screen.findByText(/Launched by the EC2 launcher\. Its instance may still be running and billing/i),
-    ).toBeInTheDocument()
-    expect(screen.queryByText(/does not manage this machine/i)).not.toBeInTheDocument()
-    const row = screen.getByText(CLOUD_INSTANCE.name).closest('[data-crew-id]') as HTMLElement
+    // ONE lane chip, naming the lane the user chose when they deployed. Both acronyms
+    // used to sit here (EC2 SSM) because the transport alone cannot tell an EC2 machine
+    // from a Fargate task; the lane can, so the second chip has nothing left to say.
+    const row = (await screen.findByText(CLOUD_INSTANCE.name)).closest(
+      '[data-crew-id]',
+    ) as HTMLElement
     expect(within(row).getByText('EC2')).toBeInTheDocument()
-    expect(within(row).getByText('SSM')).toBeInTheDocument()
+    expect(within(row).queryByText('SSM')).not.toBeInTheDocument()
+    // Not labelled as hand-added, because we cannot know that. The card carries the one
+    // consequence a reader acts on; the stamped sentence itself is in Details, where it
+    // sits beside the instance id it is about.
+    expect(within(row).getByText(/May still be running and billing in AWS/i)).toBeInTheDocument()
+    expect(within(row).queryByText(/Added by you/i)).not.toBeInTheDocument()
+    const details = await openDetails(u, CLOUD_INSTANCE.id)
+    expect(
+      within(details).getByText(
+        /Launched by the EC2 launcher\. Its instance may still be running and billing/i,
+      ),
+    ).toBeInTheDocument()
+    expect(within(details).getByText(CLOUD_INSTANCE.ssm_target)).toBeInTheDocument()
+    expect(screen.queryByText(/does not manage this machine/i)).not.toBeInTheDocument()
+    await u.keyboard('{Escape}')
 
     // The trash is confirm-gated, and the warning states what Remove does NOT do.
     await openRowMenu(u)
     await u.click(screen.getByRole('menuitem', { name: /Remove Kiro Crew Cloud/i }))
     expect(await screen.findByText(/keeps running and billing/i)).toBeInTheDocument()
     expect(api.removeInstance).not.toHaveBeenCalled()
+  })
+
+  it('labels a chained crew\u2019s host as reported rather than as a target', async () => {
+    // The host on a chained row arrives in the announcing pane's payload, which is
+    // untrusted, and this gateway never dials it -- the forward rides the parent. Shown
+    // bare, where every other row shows a verified target, an attacker-chosen string
+    // borrows that authority: a compromised pane could make a row read like a
+    // production database while reaching nothing at all.
+    const chained = {
+      ...MANUAL_INSTANCE,
+      id: 'c1',
+      name: 'Prod DB',
+      ssh_host: 'prod-db.internal.example',
+      via_instance_id: 'm1',
+      via_remote_port: 53999,
+      via_remote_id: 'c-2',
+    }
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true,
+      warm_set_cap: 5,
+      instances: [MANUAL_INSTANCE, chained],
+    })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    const u = userEvent.setup()
+    // The value is kept -- only the parent knows which machine the crew is on, and
+    // replacing it with the parent's host would state something false -- but in Details,
+    // under a label that marks it as the crew's own claim rather than a verified address.
+    expect(await screen.findByText('Prod DB')).toBeInTheDocument()
+    const chainedDetails = await openDetails(u, 'c1', /More actions for Prod DB/i)
+    expect(within(chainedDetails).getByText('Host, as reported')).toBeInTheDocument()
+    expect(within(chainedDetails).getByText('prod-db.internal.example')).toBeInTheDocument()
+    // The port is dropped: it is the crew's own gateway port, which is not what this
+    // dashboard forwards to either.
+    expect(within(chainedDetails).queryByText(/53999/)).not.toBeInTheDocument()
+    await u.keyboard('{Escape}')
+
+    // The unchained row beside it is labelled plainly, so the marking is a distinction
+    // and not a blanket hedge.
+    const plainDetails = await openDetails(u, MANUAL_INSTANCE.id, /More actions for dev-box-1/i)
+    expect(within(plainDetails).getByText('Host')).toBeInTheDocument()
+    expect(within(plainDetails).getByText(/dev-box-1 .*5476/i)).toBeInTheDocument()
+
+    // Neither host reaches the CARD, whichever kind it is.
+    const chainedRow = screen.getByText('Prod DB').closest('[data-crew-id]') as HTMLElement
+    expect(within(chainedRow).queryByText(/prod-db\.internal\.example/)).not.toBeInTheDocument()
   })
 
   it('treats an EC2-stamped SSH crew with no launch job as possibly cloud', async () => {
@@ -258,15 +370,21 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    // The stamped caption agrees with the EC2 badge hint on the same row —
-    // it was launched by the EC2 launcher — not the hedging "cannot verify" copy.
+    // A stamped row is never called "added by you" on the card, and its Details note is
+    // the stamped sentence — it WAS launched by the EC2 launcher — not the hedging
+    // "cannot verify" copy a row with no stamp gets.
+    expect(await screen.findByText('gpu-box')).toBeInTheDocument()
+    expect(screen.queryByText(/Added by you/i)).not.toBeInTheDocument()
+    const stamped = await openDetails(u, 'e1', /More actions for gpu-box/i)
     expect(
-      await screen.findByText(/Launched by the EC2 launcher\. Its instance may still be running and billing/i),
+      within(stamped).getByText(
+        /Launched by the EC2 launcher\. Its instance may still be running and billing/i,
+      ),
     ).toBeInTheDocument()
     expect(
-      screen.queryByText(/cannot verify whether this machine has AWS resources/i),
+      within(stamped).queryByText(/cannot verify whether this machine has AWS resources/i),
     ).not.toBeInTheDocument()
-    expect(screen.queryByText(/Added by you/i)).not.toBeInTheDocument()
+    await u.keyboard('{Escape}')
 
     // Remove is confirm-gated, and the warning states what Remove does NOT do.
     await openRowMenu(u, /More actions for gpu-box/i)
@@ -299,7 +417,11 @@ describe('RemoteCrewPanel', () => {
     }
     vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [fargate] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
+    // A Fargate row is a MATE -- one agent, no dashboard, no roster -- so it lists on
+    // the mates tab rather than among the machines.
+    await openMatesTab(u)
 
     const field = await screen.findByTestId('turn-url')
     expect(within(field).getByText('http://127.0.0.1:7790/v1/chat/completions')).toBeInTheDocument()
@@ -308,8 +430,6 @@ describe('RemoteCrewPanel', () => {
     // is shortened so the tail that tells two tasks in one cluster apart
     // survives the row's right-side truncation; the full target is on hover.
     expect(screen.getByText('Fargate')).toBeInTheDocument()
-    const shownTarget = screen.getByText('ecs:crew_01234567\u2026-0123456789')
-    expect(shownTarget).toHaveAttribute('title', fargate.ssm_target)
     // No open / dashboard affordance anywhere on the ROW (the page has other
     // buttons whose copy mentions opening the app; the row is what RULING 2
     // constrains).
@@ -319,10 +439,18 @@ describe('RemoteCrewPanel', () => {
     expect(within(row).queryByRole('link')).not.toBeInTheDocument()
     // Disconnect is the primary action of a connected row, fargate included.
     expect(within(row).getByRole('button', { name: /Disconnect/i })).toBeInTheDocument()
-    // A fargate row IS an AWS resource, so its caption states that plainly and
-    // never hedges the way an unidentified SSM row does.
-    expect(within(row).getByText(/An AWS Fargate task\./)).toBeInTheDocument()
-    expect(within(row).queryByText(/cannot verify whether this machine has AWS resources/)).not.toBeInTheDocument()
+    // The ECS target is no longer SHORTENED, because it is no longer on the card: the
+    // truncation existed to fit one line, and it cut off the tail that tells two tasks
+    // in one cluster apart. Details carries it whole.
+    expect(screen.queryByText(/ecs:crew_01234567\u2026/)).not.toBeInTheDocument()
+    const details = await openDetails(u, 'f1', /More actions for fargate-crew/i)
+    expect(within(details).getByText(fargate.ssm_target)).toBeInTheDocument()
+    // A fargate row IS an AWS resource, so its note states that plainly and never
+    // hedges the way an unidentified SSM row does.
+    expect(within(details).getByText(/An AWS Fargate task\./)).toBeInTheDocument()
+    expect(
+      within(details).queryByText(/cannot verify whether this machine has AWS resources/),
+    ).not.toBeInTheDocument()
   })
 
   it('shows a failed turn URL copy and clears it after a successful retry', async () => {
@@ -348,6 +476,9 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(copyToClipboard).mockResolvedValueOnce(false).mockResolvedValueOnce(true)
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
+    // A Fargate row is a MATE -- one agent, no dashboard, no roster -- so it lists on
+    // the mates tab rather than among the machines.
+    await openMatesTab(u)
 
     const copyButton = await screen.findByRole('button', {
       name: 'Copy the chat API URL of copy-crew',
@@ -375,7 +506,11 @@ describe('RemoteCrewPanel', () => {
     }
     vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [fargate] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
+    // A Fargate row is a MATE -- one agent, no dashboard, no roster -- so it lists on
+    // the mates tab rather than among the machines.
+    await openMatesTab(u)
 
     expect(await screen.findByText('fargate-idle')).toBeInTheDocument()
     expect(screen.queryByTestId('turn-url')).not.toBeInTheDocument()
@@ -401,11 +536,23 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
     renderWithProviders(<RemoteCrewPanel />)
 
+    const u = userEvent.setup()
+    // A Fargate row is a MATE -- one agent, no dashboard, no roster -- so it lists on
+    // the mates tab rather than among the machines.
+    await openMatesTab(u)
+
     const name = await screen.findByText('fargate-note')
     const row = name.closest('[data-crew-id="f3"]') as HTMLElement
     expect(row).not.toBeNull()
-    expect(within(row).getByText(/An AWS Fargate task\./)).toBeInTheDocument()
-    expect(within(row).queryByText(/cannot verify whether this machine has AWS resources/)).not.toBeInTheDocument()
+    // The CARD says the one thing a reader acts on — there is no dashboard to connect
+    // to, only a chat — and the full sentence about what Remove does not do is in
+    // Details, beside the task target it is about.
+    expect(within(row).getByText(/Chat only/i)).toBeInTheDocument()
+    const details = await openDetails(u, 'f3', /More actions for fargate-note/i)
+    expect(within(details).getByText(/An AWS Fargate task\./)).toBeInTheDocument()
+    expect(
+      within(details).queryByText(/cannot verify whether this machine has AWS resources/),
+    ).not.toBeInTheDocument()
   })
 
   it('still lists the crews when the gateway cannot do cloud provisioning at all', async () => {
@@ -437,11 +584,11 @@ describe('RemoteCrewPanel', () => {
     expect(screen.queryByText(/requires a POSIX host/i)).not.toBeInTheDocument()
 
     // With no launch history, the SSM row must NOT be downgraded to "added by you":
-    // the CLI launcher registers real cloud crews the same way. This row carries
-    // the EC2 stamp, so it gets the stamped caption with the confirm step.
-    expect(
-      screen.getByText(/Launched by the EC2 launcher\. Its instance may still be running and billing/i),
-    ).toBeInTheDocument()
+    // the CLI launcher registers real cloud crews the same way. Its card says the
+    // consequence instead, which is the part a reader acts on.
+    const cloudRow = screen.getByText(/Kiro Crew Cloud/).closest('[data-crew-id]') as HTMLElement
+    expect(within(cloudRow).getByText(/May still be running and billing in AWS/i)).toBeInTheDocument()
+    expect(within(cloudRow).queryByText(/Added by you/i)).not.toBeInTheDocument()
   })
 
   it('labels SSM, confirmed EC2 over SSH, and plain SSH crews accurately', async () => {
@@ -474,22 +621,29 @@ describe('RemoteCrewPanel', () => {
     expect(cloudRow).not.toBeNull()
     expect(ec2SshRow).not.toBeNull()
     expect(sshRow).not.toBeNull()
-    expect(within(cloudRow as HTMLElement).getByText('EC2')).toBeInTheDocument()
-    expect(within(cloudRow as HTMLElement).getByText('SSM')).toBeInTheDocument()
-    expect(within(ec2SshRow as HTMLElement).getByText('EC2')).toBeInTheDocument()
-    expect(within(ec2SshRow as HTMLElement).getByText('SSH')).toBeInTheDocument()
-    expect(within(sshRow as HTMLElement).getByText('SSH')).toBeInTheDocument()
-    expect(within(sshRow as HTMLElement).queryByText('EC2')).not.toBeInTheDocument()
+    // ONE chip per row, naming the LANE. An EC2 machine reached over SSM and an EC2
+    // machine reached over SSH are the same lane and now read the same, which is the
+    // point: the user chose EC2, not a transport. A row carries no second chip, so the
+    // acronym pair that used to compensate for the transport's ambiguity is gone.
+    for (const [row, lane] of [
+      [cloudRow, 'EC2'],
+      [ec2SshRow, 'EC2'],
+      [sshRow, 'SSH'],
+    ] as const) {
+      const chips = within(row as HTMLElement).getAllByText(/^(SSH|EC2|Fargate|Coder)$/)
+      expect(chips.map(c => c.textContent)).toEqual([lane])
+    }
+    expect(within(cloudRow as HTMLElement).queryByText('SSM')).not.toBeInTheDocument()
 
-    // The acronym badges explain themselves with matching hover titles and
-    // accessible names.
-    const ec2Badge = within(cloudRow as HTMLElement).getByText('EC2').closest('span')
-    expect(ec2Badge).toHaveAttribute('title', expect.stringMatching(/EC2 launcher/))
-    expect(ec2Badge).toHaveAttribute('aria-label', expect.stringMatching(/EC2 launcher/))
-    expect(
-      within(cloudRow as HTMLElement).getByText('SSM').closest('span'),
-    ).toHaveAttribute('title', expect.stringMatching(/Session Manager/))
-    expect(within(cloudRow as HTMLElement).getByText('SSM').closest('span')).toHaveAccessibleName(expect.stringMatching(/Session Manager/))
+    // The chip still explains itself on hover, with the transport it rides.
+    expect(within(cloudRow as HTMLElement).getByText('EC2').closest('span')).toHaveAttribute(
+      'title',
+      expect.stringMatching(/Session Manager/),
+    )
+    expect(within(sshRow as HTMLElement).getByText('SSH').closest('span')).toHaveAttribute(
+      'title',
+      expect.stringMatching(/SSH/),
+    )
   })
 
   it('renames a configured crew and refreshes its visible label', async () => {
@@ -590,7 +744,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     expect(await screen.findByText(/sudo dnf install -y/)).toBeInTheDocument()
     expect(screen.queryByText(/brew install/)).not.toBeInTheDocument()
@@ -606,7 +760,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     // The localized "not installed" line still explains the gap…
     expect(await screen.findByText(/Session Manager plugin/i)).toBeInTheDocument()
@@ -626,7 +780,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     // The field is repopulated…
     expect(await screen.findByLabelText(/AWS profile/i)).toHaveValue('Admin')
@@ -651,7 +805,7 @@ describe('RemoteCrewPanel', () => {
       )
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     const recheck = (await screen.findAllByRole('button', { name: /Re-check/i }))[0]
     await u.click(recheck)
@@ -676,7 +830,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudPreflight).mockResolvedValue({ ...PREFLIGHT_OK, account: '1234•••7890' })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     const profileInput = await screen.findByLabelText(/AWS profile/i)
     const credsRow = await screen.findByText(/Credentials/i)
@@ -702,7 +856,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudLaunchStatus).mockResolvedValue(SIGNIN_JOB)
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     const card = (await screen.findByText(/WXYZ-1234/)).closest('div')?.parentElement
     expect(card).toBeTruthy()
@@ -735,7 +889,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudLaunchStatus).mockResolvedValue(job as never)
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     expect(await screen.findByText(/WXYZ-9876/)).toBeInTheDocument()
     expect(screen.getByText(/could not confirm the sign-in/i)).toBeInTheDocument()
@@ -798,14 +952,14 @@ describe('RemoteCrewPanel', () => {
 
     // While loading: a spinner, no tabs, no form.
     expect(screen.getByText(/Loading/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Your crews/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Set up a new one/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Remote crews/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Remote mates/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Enable remote crew management/i })).not.toBeInTheDocument()
 
     // After the 403 resolves: transitions directly to the disabled card.
     rejectInstances(new ApiError(403, 'instances feature is disabled'))
     expect(await screen.findByText(/Remote crew management is off/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Your crews/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Remote crews/i })).not.toBeInTheDocument()
   })
 
   it('distinguishes cloud crews from hand-added machines, and shows an in-progress launch', async () => {
@@ -816,9 +970,14 @@ describe('RemoteCrewPanel', () => {
 
     // Cloud row carries the cloud attribution + a Stop control; manual row does not.
     expect(await screen.findByText('Launched by Kiro Crew')).toBeInTheDocument()
-    expect(screen.getByText(/does not manage this machine/i)).toBeInTheDocument()
+    const manualRow = screen.getByText(MANUAL_INSTANCE.name).closest('[data-crew-id]') as HTMLElement
+    expect(within(manualRow).getByText('Added by you')).toBeInTheDocument()
+    const manualDetails = await openDetails(u, MANUAL_INSTANCE.id, /More actions for dev-box-1/i)
+    expect(within(manualDetails).getByText(/does not manage this machine/i)).toBeInTheDocument()
+    await u.keyboard('{Escape}')
     await openRowMenu(u, /More actions for Kiro Crew Cloud/i)
     expect(screen.getByRole('menuitem', { name: 'Stop Kiro Crew Cloud (kc-3f9a)' })).toBeInTheDocument()
+    await u.keyboard('{Escape}')
 
     // The still-launching job shows a "Setting up" row with step progress + the note.
     expect(screen.getByText(/Setting up/)).toBeInTheDocument()
@@ -833,7 +992,7 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     // Prereq checklist rendered; a missing plugin blocks Launch.
     expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
     expect(screen.getByText(/Session Manager plugin/i)).toBeInTheDocument()
@@ -848,7 +1007,7 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     // The sub-agent count is the headline the size choice turns on, so it must be
     // the real number: a var-name mismatch renders the raw `{{n}}` placeholder.
     expect(await screen.findByText(/~3 parallel sub-agents/)).toBeInTheDocument()
@@ -903,7 +1062,7 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     // Collapsed: the arm64 ladder only.
     expect(screen.queryByText(/m7i\.2xlarge/)).not.toBeInTheDocument()
 
@@ -929,7 +1088,7 @@ describe('RemoteCrewPanel', () => {
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     const launch = await screen.findByRole('button', { name: /^Launch$/ })
     await waitFor(() => expect(launch).not.toBeDisabled())
     await u.click(launch)
@@ -937,6 +1096,25 @@ describe('RemoteCrewPanel', () => {
     await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalledWith({ provider_id: 'aws_ec2', profile: '', region: 'us-east-1', size_key: 'balanced' }))
     // Progress card polls the job and renders its steps.
     expect(await screen.findByText('Installing Kiro Crew')).toBeInTheDocument()
+  })
+
+  it('sends a typed subnet ID with the launch', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+    vi.mocked(api.cloudLaunch).mockResolvedValue(RUNNING_JOB)
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue(RUNNING_JOB)
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openCrewLauncher(u)
+    await u.type(await screen.findByRole('textbox', { name: 'Subnet ID (optional)' }), ' subnet-0123abcd ')
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+    await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalledWith({
+      provider_id: 'aws_ec2', profile: '', region: 'us-east-1', size_key: 'balanced', subnet_id: 'subnet-0123abcd',
+    }))
   })
 
   it('preselects the inherited Identity Center sign-in, gates launch on the region, and sends the target', async () => {
@@ -951,7 +1129,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
 
     // The organization's portal is preselected and named; the form asks only for the region.
     const idc = await screen.findByRole('radio', { name: /Company SSO/i })
@@ -987,7 +1165,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     const url = await screen.findByRole('textbox', { name: /Identity Center start URL/i })
     await waitFor(() => expect(url).toHaveValue('https://example.awsapps.com/start'))
     await u.type(screen.getByRole('textbox', { name: /Identity Center region/i }), 'us-gov-west-1')
@@ -1015,7 +1193,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     await waitFor(() => expect(screen.getByRole('radio', { name: /Company SSO/i })).toBeChecked())
     await u.click(screen.getByRole('radio', { name: /^Builder ID$/i }))
     const launch = screen.getByRole('button', { name: /^Launch$/ })
@@ -1036,7 +1214,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudIdentity).mockReturnValue(new Promise((r) => { resolveIdentity = r }))
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     // Prerequisites are satisfied, but the identity read is pending: the
     // Builder ID default is a placeholder, so Launch must NOT be clickable —
     // a click here would send no target and ignore the preselection that
@@ -1064,7 +1242,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudIdentity).mockReturnValue(new Promise(() => {})) // never resolves
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     const launch = screen.getByRole('button', { name: /^Launch$/ })
     expect(launch).toBeDisabled()
     await u.click(screen.getByRole('radio', { name: /^Builder ID$/i }))
@@ -1084,7 +1262,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudIdentity).mockRejectedValue(new Error('kiro-cli whoami timed out'))
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     // The failure is shown as a short human cause (never the raw exception
     // text) and offers NO agent hand-off: a hand-off would unmount the form
     // the user is about to submit.
@@ -1121,7 +1299,7 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.cloudIdentity).mockResolvedValue({ identity: null, suggested_target: null, discovery: 'unknown' })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     await screen.findByText(/kiro-cli whoami did not answer/i)
     const launch = screen.getByRole('button', { name: /^Launch$/ })
     expect(launch).toBeDisabled()
@@ -1153,7 +1331,7 @@ describe('RemoteCrewPanel', () => {
     })
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
-    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await openCrewLauncher(u)
     const notice = await screen.findByText(/signed in through Identity Center, but its portal address could not be read/i)
     expect(notice.textContent).not.toMatch(/did not answer/)
     expect(screen.getByRole('radio', { name: /^Builder ID$/i })).not.toBeChecked()
@@ -1164,6 +1342,132 @@ describe('RemoteCrewPanel', () => {
     await u.click(screen.getByRole('radio', { name: /Company SSO/i }))
     expect(screen.getByRole('radio', { name: /Company SSO/i })).toBeChecked()
     expect(screen.getByRole('textbox', { name: /start URL/i })).toBeInTheDocument()
+  })
+
+  describe('the chained-crew announce and a crew with no dashboard', () => {
+    // A fargate crew serves a turn API on its forwarded port and nothing else -- no
+    // dashboard, no token -- so announcing it to a host makes that host persist a row
+    // promising a tab nothing can serve, and the host writes the row BEFORE it tries to
+    // connect it, so the phantom survives until a human presses Remove. The announce gate
+    // used to check only `local_port`, which a fargate connect does supply.
+    const FARGATE = {
+      id: 'f9',
+      name: 'fargate-crew',
+      connection_method: 'fargate' as const,
+      ssh_host: '',
+      ssm_target: 'ecs:crew_0123456789abcdef0123456789abcdef_0123456789abcdef0123456789abcdef-0123456789',
+      aws_region: 'us-west-2',
+      remote_port: 8080,
+      local_port: 0,
+      status: { instance_id: 'f9', state: 'disconnected' as const },
+    }
+    const SSH = {
+      id: 's9',
+      name: 'ssh-crew',
+      connection_method: 'ssh' as const,
+      ssh_host: 's9-alias',
+      remote_port: 5476,
+      local_port: 0,
+      status: { instance_id: 's9', state: 'disconnected' as const },
+    }
+    // The control that matters most. `usesSsmTransport` is true for BOTH ssm and
+    // fargate, so an ssh-only control cannot tell "gated on having a dashboard" from
+    // "gated on not being SSM-family" -- an ssm crew DOES have a dashboard, so it must
+    // still be announced, and only that distinguishes the two rules.
+    const SSM = {
+      id: 'm9',
+      name: 'ssm-crew',
+      connection_method: 'ssm' as const,
+      ssh_host: '',
+      ssm_target: 'i-0123456789abcdef0',
+      aws_region: 'us-west-2',
+      remote_port: 5476,
+      local_port: 0,
+      status: { instance_id: 'm9', state: 'disconnected' as const },
+    }
+    // A crew THIS dashboard already reaches through another crew. Announcing it asks the
+    // host for a third hop, and the host cannot refuse: it counts hops in its own
+    // registry, where our hop to this crew is invisible, so it accepts the add and
+    // commits the row. Our own gateway is the only one that can see the extra hop, and
+    // it does -- the mint answers `chain_too_deep` -- but the row is already persisted
+    // by then and the refusal relay leaves it behind.
+    const CHAINED = {
+      id: 'x9',
+      name: 'chained-crew',
+      connection_method: 'ssh' as const,
+      ssh_host: 'x9-alias',
+      remote_port: 5476,
+      local_port: 0,
+      via_instance_id: 's9',
+      via_remote_id: 'x9-there',
+      via_remote_port: 53710,
+      status: { instance_id: 'x9', state: 'disconnected' as const },
+    }
+
+    async function connect(rowName: string, localPort: number) {
+      vi.mocked(api.connectInstance).mockResolvedValue({
+        state: 'connected',
+        local_port: localPort,
+        token: 'tok',
+      } as unknown as Awaited<ReturnType<typeof api.connectInstance>>)
+      const row = screen.getByText(rowName).closest('[data-crew-id]') as HTMLElement
+      expect(row).not.toBeNull()
+      await userEvent.setup().click(within(row).getByRole('button', { name: /Connect/i }))
+      await waitFor(() => expect(api.connectInstance).toHaveBeenCalled())
+    }
+
+    it('announces an ssh crew but never one that has no dashboard to embed', async () => {
+      vi.mocked(api.listInstances).mockResolvedValue({
+        active: true,
+        warm_set_cap: 5,
+        instances: [FARGATE, SSH, SSM, CHAINED],
+      } as unknown as Awaited<ReturnType<typeof api.listInstances>>)
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      // The two rows are on the two tabs now, because they are two different things: the
+      // fargate row is a MATE (one agent, no dashboard) and the ssh row is a CREW (a
+      // gateway). Switching between them is what a user does, so the test does it too.
+      await openMatesTab(u)
+      await screen.findByText('fargate-crew')
+
+      // The fargate connect SUCCEEDS and carries a port -- the exact shape that passed
+      // the old gate -- and must still produce no announcement.
+      await connect('fargate-crew', 7790)
+      expect(announceChainedCrew).not.toHaveBeenCalled()
+
+      // The control: an ssh crew, same flow, IS announced. Without this the case above
+      // would pass just as well if the announce were broken outright.
+      vi.mocked(api.connectInstance).mockClear()
+      await u.click(await screen.findByRole('button', { name: /Remote crews/i }))
+      await connect('ssh-crew', 53701)
+      await waitFor(() => expect(announceChainedCrew).toHaveBeenCalledTimes(1))
+      expect(vi.mocked(announceChainedCrew).mock.calls[0][0]).toMatchObject({
+        id: 's9',
+        port: 53701,
+      })
+
+      // The discriminating control: an SSM crew shares `usesSsmTransport` with fargate
+      // but DOES have a dashboard, so it must still be announced. A gate keyed on SSM
+      // transport instead of on the dashboard predicate passes both cases above and
+      // fails only here.
+      vi.mocked(api.connectInstance).mockClear()
+      await connect('ssm-crew', 53702)
+      await waitFor(() => expect(announceChainedCrew).toHaveBeenCalledTimes(2))
+      expect(vi.mocked(announceChainedCrew).mock.calls[1][0]).toMatchObject({
+        id: 'm9',
+        port: 53702,
+      })
+
+      // The depth cap, from the only end that can see it. This crew has a dashboard and
+      // a port, so it passes both gates above; only `via_instance_id` separates it, and
+      // announcing it leaves the host holding a row its own connect can never satisfy.
+      vi.mocked(api.connectInstance).mockClear()
+      await connect('chained-crew', 53703)
+      await waitFor(() => expect(api.connectInstance).toHaveBeenCalled())
+      expect(announceChainedCrew).toHaveBeenCalledTimes(2)
+    })
   })
 
   describe('agent hand-off from the diagnosis note', () => {
@@ -1334,6 +1638,15 @@ describe('RemoteCrewPanel', () => {
       steps: [{ key: 'provision', label: 'Claim a pool host' }],
     }
     const DEVSPACE_ROW_2 = { ...DEVSPACE_ROW, id: 'devspace_iad', label: 'Amazon DevSpace (IAD)' }
+    /** The MATE lane. Core-drawn, and deliberately not one of the answers here. */
+    const FARGATE_ROW = {
+      id: 'aws_fargate',
+      kind: 'aws_fargate',
+      label: 'AWS Fargate in your own account',
+      posix_only: false,
+      serves_mate: 'demo',
+      steps: [{ key: 'provision', label: 'Run the task' }],
+    }
 
     /** The edition's form. Registered once for the whole file — the registry is a
      *  module singleton and a second registration of one kind is a collision. */
@@ -1355,7 +1668,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       // The built-in prerequisites card and size ladder, unchanged.
       expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
@@ -1365,6 +1678,188 @@ describe('RemoteCrewPanel', () => {
       expect(
         screen.queryByRole('button', { name: /AWS EC2 in your own account/i }),
       ).not.toBeInTheDocument()
+    })
+
+    it('never offers the mate lane as a place a new CREW could run', async () => {
+      // A crew is a gateway; the Fargate lane deploys one agent. Offering it under
+      // "where should the new crew run?" is the same category error as listing a
+      // Fargate task among the crews, and it ends in a launch the lane must refuse.
+      // With EC2 as the only crew lane left there is one choice, so the question is
+      // not even asked.
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({
+        provisioners: [AWS_EC2_ROW, FARGATE_ROW],
+      })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await openCrewLauncher(u)
+
+      expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
+      expect(screen.queryByText(/Where should the new crew run/i)).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: 'AWS Fargate in your own account' }),
+      ).not.toBeInTheDocument()
+    })
+
+    it('sends a mate launch a tier the Fargate engine knows, never an x86 variant', async () => {
+      // The mate picker asks for no size, so the value can only come from the crews
+      // tab's remembered tier -- and that tier may be an x86 one. The Fargate engine
+      // maps the three interactive tier keys and nothing else, so the raw key would
+      // persist a job, answer 202, and then raise inside provision on a size the mate
+      // dialog never offered: every mate deploy failing, for that user only.
+      localStorage.setItem('mc-cloud-size', 'balanced-x86')
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+      vi.mocked(api.cloudLaunch).mockResolvedValue(RUNNING_JOB)
+      vi.mocked(api.members).mockResolvedValue({
+        members: [{ name: 'demo', slug: 'demo', display_name: '', avatar: '' }],
+      } as never)
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({
+        provisioners: [AWS_EC2_ROW, FARGATE_ROW],
+      })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await openMatesTab(u)
+      await u.click(await screen.findByTestId('deploy-mate-open'))
+      await u.click(await screen.findByRole('option', { name: 'demo', exact: true }))
+      await u.click(screen.getByTestId('deploy-mate-continue'))
+      await u.click(await screen.findByRole('checkbox'))
+      await u.click(screen.getByTestId('deploy-mate-launch'))
+
+      await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalled())
+      expect(vi.mocked(api.cloudLaunch).mock.calls[0][0]).toMatchObject({
+        mate_name: 'demo',
+        size_key: 'balanced',
+      })
+    })
+
+    it('keeps the warm-set cap on the crews list, which is what it governs', async () => {
+      // "Up to N stay warm at once" is a crew-TUNNEL cap. Printed over the mates list it
+      // put a concept those rows do not answer to beside them, in the one place a reader
+      // is deciding whether to spend money.
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 3, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({
+        provisioners: [AWS_EC2_ROW, FARGATE_ROW],
+      })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      expect(await screen.findByText(/stay warm at once/i)).toBeInTheDocument()
+
+      await openMatesTab(u)
+
+      expect(screen.queryByText(/stay warm at once/i)).not.toBeInTheDocument()
+    })
+
+    it('drops the crew footnote while the launcher it describes is open', async () => {
+      // The footnote describes what the launcher CREATES. Beside "Hide the launcher" it
+      // described neither the button nor anything on screen.
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      // TWICE while closed: under the list heading, where it says what the rows ARE, and
+      // beside the button, where it says what the button creates.
+      expect(await screen.findAllByText(/A whole gateway, with a dashboard/i)).toHaveLength(2)
+
+      await openCrewLauncher(u)
+
+      // ONCE while open: the heading keeps it, the button's copy does not describe the
+      // button any more.
+      expect(screen.getAllByText(/A whole gateway, with a dashboard/i)).toHaveLength(1)
+      expect(screen.getByTestId('deploy-crew-open')).toHaveAttribute('aria-expanded', 'true')
+      expect(screen.getByTestId('deploy-crew-open')).toHaveTextContent(/Hide the setup form/i)
+    })
+
+    it('puts a launch in flight under the list it will land in, not both', async () => {
+      // An in-flight EC2 launch is a CREW arriving. Unsplit, its "Setting up" row drew
+      // under "Mates you can chat to" as well, and its mere presence also suppressed the
+      // "no mates yet" line -- so the mates tab claimed a mate was on its way that never
+      // would be.
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [RUNNING_JOB] })
+      vi.mocked(api.cloudLaunchStatus).mockResolvedValue(RUNNING_JOB)
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({
+        provisioners: [AWS_EC2_ROW, FARGATE_ROW],
+      })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      // Twice on the crews tab: the row inside the list, and the panel-level progress
+      // card, which is deliberately on both tabs because a launch can be started from
+      // either and its failure must be reportable wherever the user is.
+      expect(await screen.findAllByText(/kc-4d10/)).toHaveLength(2)
+
+      await openMatesTab(u)
+
+      // Once on the mates tab: the progress card alone. No row in the mates list, and
+      // the empty state is back.
+      expect(await screen.findByText(/No mates in the cloud yet/i)).toBeInTheDocument()
+      expect(screen.getAllByText(/kc-4d10/)).toHaveLength(1)
+    })
+
+    it('reports a failed launch on the MATES tab, where a mate launch is started', async () => {
+      // The progress card and `job.error` are the only place a failed job says anything.
+      // They used to live inside the crew launcher, drawn on the crews tab behind a
+      // disclosure -- so a mate deployed from the mates tab whose POST succeeded and
+      // whose JOB then failed (an ECS RunTask refusal, a stale confirmed_recipient, the
+      // engine's own mate_name_refusal) reported nothing at all: the mutation's onError
+      // never fires for a failure that arrives later, and the row drops out of the
+      // in-progress list as it goes.
+      const FAILED = {
+        ...RUNNING_JOB,
+        id: 'j-fail',
+        provider_id: 'aws_fargate',
+        status: 'failed' as const,
+        error: 'this Fargate lane serves demo, so it cannot deploy orchard-sde',
+      }
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [FAILED] })
+      vi.mocked(api.cloudLaunchStatus).mockResolvedValue(FAILED)
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({
+        provisioners: [AWS_EC2_ROW, FARGATE_ROW],
+      })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await openMatesTab(u)
+
+      expect(await screen.findByText(/cannot deploy orchard-sde/i)).toBeInTheDocument()
+      // And without opening the crews tab's launcher, which is where it used to hide.
+      expect(screen.queryByText(/Before you start/i)).not.toBeInTheDocument()
+    })
+
+    it('says the crews tab has nothing to launch when the mate lane is all there is', async () => {
+      // The complement: a gateway offering ONLY the mate lane has no lane that makes a
+      // crew, and the crews tab says so rather than drawing the EC2 form for a lane the
+      // server would refuse. The mates tab still draws that same lane.
+      vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+      vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+      vi.mocked(api.cloudProvisioners).mockResolvedValue({ provisioners: [FARGATE_ROW] })
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await openCrewLauncher(u)
+
+      expect(
+        await screen.findByText(/offers no way to create a crew that this dashboard can draw/i),
+      ).toBeInTheDocument()
+      expect(screen.queryByText(/Before you start/i)).not.toBeInTheDocument()
+      // And the probe never ran: there is no EC2 form to fill in.
+      expect(vi.mocked(api.cloudPreflight)).not.toHaveBeenCalled()
+
+      await openMatesTab(u)
+
+      expect(await screen.findByText('AWS Fargate in your own account')).toBeInTheDocument()
+      expect(screen.getByText('demo')).toBeInTheDocument()
     })
 
     it('offers both rows of a registered kind and posts provider_id for the one picked', async () => {
@@ -1378,7 +1873,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       // Every renderable row is offered by its SERVER-authored label; two rows may
       // share one kind, so the selector is per row, not per renderer.
@@ -1422,7 +1917,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       expect(await screen.findByText('Pool: devspace_pdx')).toBeInTheDocument()
       await waitFor(() => expect(api.cloudProvisioners).toHaveBeenCalled())
@@ -1442,7 +1937,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       // The built-in row is first, so that is what shows.
       expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
@@ -1469,7 +1964,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
       await u.click(await screen.findByRole('button', { name: 'AWS EC2 (GovCloud account)' }))
 
       // Same built-in prerequisites and size form, different lane.
@@ -1495,7 +1990,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
       expect(screen.queryByRole('status')).not.toBeInTheDocument()
@@ -1517,7 +2012,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       expect(await screen.findByText(/no way to create a crew that this dashboard can draw/i)).toBeInTheDocument()
       expect(screen.queryByText(/Before you start/i)).not.toBeInTheDocument()
@@ -1562,7 +2057,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       // One renderable row is left, so there is no selector and no unpickable card.
       expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
@@ -1581,7 +2076,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
 
       expect(await screen.findByText(/Before you start/i)).toBeInTheDocument()
       expect(screen.queryByText(/Where should the new crew run/i)).not.toBeInTheDocument()
@@ -1612,7 +2107,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       const first = renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
       // The x86 tiers live behind a disclosure; open it and pick one. Several cards
       // match, so address the list rather than expecting a unique name.
       await u.click(await screen.findByRole('button', { name: /Smaller and x86_64 sizes/i }))
@@ -1623,7 +2118,7 @@ describe('RemoteCrewPanel', () => {
       first.unmount()
 
       renderWithProviders(<RemoteCrewPanel />)
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
       // Visible WITHOUT touching the disclosure: a remembered size whose card is
       // hidden would drive the launch with nothing on screen saying so.
       const back = await screen.findAllByRole('button', { name: /· x86_64/i })
@@ -1641,7 +2136,7 @@ describe('RemoteCrewPanel', () => {
       const u = userEvent.setup()
       renderWithProviders(<RemoteCrewPanel />)
 
-      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      await openCrewLauncher(u)
       const arm = await screen.findAllByRole('button', { name: /· arm64/i })
       expect(arm.some(c => c.getAttribute('aria-pressed') === 'true')).toBe(true)
     })

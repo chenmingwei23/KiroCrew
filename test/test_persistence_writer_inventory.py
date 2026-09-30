@@ -35,6 +35,7 @@ _WRITE_PRIMITIVES = frozenset(
     {
         "write_lesson",
         "write_episodic",
+        "write_episodic_outcome",
         "set_semantic",
         "set_semantic_if_absent",
         "write_preferences",
@@ -53,6 +54,9 @@ GATED_AUTOMATIC = {
     # projects. Gated in _consolidate plus all three automatic entry points.
     "history_consolidation.py::_save_lessons",
     "history_consolidation.py::_write_structured_memory",
+    "history_consolidation.py::_append_history_under_hold",
+    "history_consolidation.py::_write_preferences",
+    "history_consolidation.py::_write_projects",
     "history_consolidation.py::_consolidate",
     # Distils a lesson from a repeatedly failing task; gated before the LLM call.
     "taskrunner.py::_extract_lesson",
@@ -82,6 +86,7 @@ EXEMPT = {
     # the module docstring): these are reached from the classified entry points
     # or from an explicit migration/import the user asked for.
     "vector_memory.py::write_lesson": "storage primitive",
+    "vector_memory.py::write_episodic": "storage primitive (bool wrapper of write_episodic_outcome)",
     "vector_memory.py::seed_item_if_absent": "storage primitive",
     "vector_memory.py::import_memory": "explicit user-initiated import",
     "vector_memory.py::migrate_from_markdown": "explicit one-shot migration",

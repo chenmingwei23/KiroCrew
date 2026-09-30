@@ -60,9 +60,9 @@ class TestFargateLane:
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "b" * 64,
             "secrets": [
                 [
-                    "kirocrew/crew/demo/KIRO_API_KEY",
+                    "kirocrew/crew/demo/KIRO_IDENTITY",
                     "arn:aws:secretsmanager:us-east-1:123456789012:"
-                    "secret:kirocrew/crew/demo/KIRO_API_KEY-AbCdEf",
+                    "secret:kirocrew/crew/demo/KIRO_IDENTITY-AbCdEf",
                 ]
             ],
             "cpu_architecture": "X86_64",
@@ -100,6 +100,31 @@ class TestFargateLane:
         assert spec.placement.security_groups == tuple(block["security_groups"])
         assert spec.image == block["image"]
         assert spec.cpu_architecture == block["cpu_architecture"]
+
+    def test_the_configured_internal_only_claim_reaches_the_engine(self, monkeypatch, tmp_path):
+        """The wiring for the one field that LOOSENS a posture.
+
+        Asserted on the engine the provider BUILT, for the reason the bound's test gives:
+        a ``FargateConfig`` holding the right value proves nothing about a launch, and
+        this test would pass with the wiring deleted. The spec is the only place the
+        file's claim can change what a task gets.
+
+        Both directions, because the safe one is the one a deletion produces. A test that
+        only checked the claimed case would pass if the field were hardcoded true, which
+        is the failure that hands every lane an unsandboxed worker.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew.config.loader import config_dir
+
+        self._write_config(config_dir(), {**self._complete_block(), "internal_only": True})
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is True
+
+        block = self._complete_block()
+        assert "internal_only" not in block, "the fixture must not claim it"
+        self._write_config(config_dir(), block)
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is False
 
     def test_the_configured_bound_reaches_the_engine(self, monkeypatch, tmp_path):
         """The wiring, which is the whole point: a number in the file bounds a launch.
@@ -361,14 +386,14 @@ class TestTheConfirmationReachesTheEngine:
     def _block() -> dict:
         arn = (
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-            "kirocrew/crew/demo/KIRO_API_KEY-abcdef"
+            "kirocrew/crew/demo/KIRO_IDENTITY-abcdef"
         )
         return {
             "cluster": "kirocrew-crew-prod",
             "subnets": ["subnet-a"],
             "security_groups": ["sg-1"],
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "a" * 64,
-            "secrets": [["kirocrew/crew/demo/KIRO_API_KEY", arn]],
+            "secrets": [["kirocrew/crew/demo/KIRO_IDENTITY", arn]],
             "cpu_architecture": "X86_64",
         }
 
@@ -446,14 +471,14 @@ class TestTheOperatorCanReadTheRecipientBeforeConfirming:
     def _block() -> dict:
         arn = (
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-            "kirocrew/crew/demo/KIRO_API_KEY-abcdef"
+            "kirocrew/crew/demo/KIRO_IDENTITY-abcdef"
         )
         return {
             "cluster": "kirocrew-crew-prod",
             "subnets": ["subnet-a"],
             "security_groups": ["sg-1"],
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "a" * 64,
-            "secrets": [["kirocrew/crew/demo/KIRO_API_KEY", arn]],
+            "secrets": [["kirocrew/crew/demo/KIRO_IDENTITY", arn]],
             "cpu_architecture": "X86_64",
         }
 
@@ -526,6 +551,65 @@ class TestTheOperatorCanReadTheRecipientBeforeConfirming:
 
         field = {f.name: f for f in dataclasses.fields(RemoteProvisioner)}["confirm_before_launch"]
         assert field.default == ""
+
+
+class TestTheRowNamesTheMateTheLaneServes:
+    """The lane publishes WHICH CREW it deploys, for the same reason it publishes the recipient.
+
+    The crew picker draws its lane chips from ``GET /api/cloud/provisioners``. A lane pinned to
+    one crew that says so on its row is a constraint the user reads while choosing; the same
+    constraint discovered only as a refused launch is one they could not plan around.
+    """
+
+    _block = staticmethod(TestTheOperatorCanReadTheRecipientBeforeConfirming._block)
+    _provider = TestTheOperatorCanReadTheRecipientBeforeConfirming._provider
+
+    def test_the_fargate_row_names_its_crew(self, monkeypatch, tmp_path):
+        """Read from the SECRET references, which is where the crew's identity already lives.
+
+        ``is_complete`` binds that same set through ``sole_binding`` before the lane is
+        registered, so any row a launch can reach answers -- and it costs no AWS call.
+        """
+        provider = self._provider(monkeypatch, tmp_path, self._block())
+
+        row = next(p for p in provider.provisioners() if p.id == FARGATE_PROVISIONER_ID)
+
+        assert row.serves_mate == "demo"
+
+    def test_a_block_naming_a_different_crew_changes_the_row(self, monkeypatch, tmp_path):
+        """Otherwise the field could be a constant and every test above would still pass."""
+        arn = (
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
+            "kirocrew/crew/orchard/KIRO_IDENTITY-abcdef"
+        )
+        block = {
+            **self._block(),
+            "secrets": [["kirocrew/crew/orchard/KIRO_IDENTITY", arn]],
+        }
+        provider = self._provider(monkeypatch, tmp_path, block)
+
+        row = next(p for p in provider.provisioners() if p.id == FARGATE_PROVISIONER_ID)
+
+        assert row.serves_mate == "orchard"
+
+    def test_the_builtin_row_is_pinned_to_no_crew(self, monkeypatch, tmp_path):
+        """It installs a gateway on a fresh machine, which then serves whatever it is given,
+        so an empty value is the truthful answer and not a missing one."""
+        provider = self._provider(monkeypatch, tmp_path, self._block())
+
+        row = next(p for p in provider.provisioners() if p.id == BUILTIN_PROVISIONER_ID)
+
+        assert row.serves_mate == ""
+
+    def test_the_descriptor_declares_the_field(self):
+        """On the shared descriptor, so an edition's own pinned lane can carry one too."""
+        import dataclasses
+
+        from kiro_crew.platform.interfaces import RemoteProvisioner
+
+        assert {f.name: f for f in dataclasses.fields(RemoteProvisioner)}[
+            "serves_mate"
+        ].default == ""
 
 
 class TestTheAliasRefusalSitsWhereTheFileIsConsumed:
@@ -637,9 +721,9 @@ class TestTheAliasRefusalSitsWhereTheFileIsConsumed:
                         "image": "public.ecr.aws/x/base@sha256:" + "a" * 64,
                         "secrets": [
                             [
-                                "kirocrew/crew/demo/KIRO_API_KEY",
+                                "kirocrew/crew/demo/KIRO_IDENTITY",
                                 "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-                                "kirocrew/crew/demo/KIRO_API_KEY-abcdef",
+                                "kirocrew/crew/demo/KIRO_IDENTITY-abcdef",
                             ]
                         ],
                         "cpu_architecture": "X86_64",

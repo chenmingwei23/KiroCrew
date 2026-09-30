@@ -112,7 +112,7 @@ class TestAFailedRevertIsNotReportedAsSuccess:
 
     def test_the_success_wording_is_not_printed_unconditionally(self) -> None:
         """The claim and the case it is true in must be in the same branch."""
-        src = inspect.getsource(snap)
+        src = inspect.getsource(snap.restore_main)
         claim = "Your previous state was put back"
         assert claim in src
         # The honest branch must exist and must be the one handling a partial revert.

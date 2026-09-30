@@ -21,13 +21,17 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.constants import BANNER, DATA_WARNING
+from kiro_crew.constants import BANNER
 from kiro_crew.hooks import (
     TOOL_DENY,
     HookManager,
     hooks_config_from_config_dict,
     mcp_identity_ref,
     target_paths,
+)
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
 )
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -847,6 +851,7 @@ async def _answer_permission(
             mcp_server_name=event.mcp_server_name,
             mcp_tool_name=event.tool_name,
             mcp_identity_trusted=event.mcp_identity_trusted,
+            spawn_target=event.spawn_target,
         )
     except Exception:
         logger.warning("CLI permission gate failed; refusing the request", exc_info=True)
@@ -885,9 +890,15 @@ async def _answer_permission(
         await provider.reject_tool(event.request_id)
         try:
             safe_title = _for_consent(title, stream=sys.stderr)
+            # Name what actually failed. A request whose kind reads as a command
+            # claimed one; a request with no classification at all claimed
+            # nothing, and saying it did sends the reader after the wrong defect.
+            if is_shell_kind(_kind_text(event)):
+                what = "claims to run a command, but its command could not be verified"
+            else:
+                what = "could not be identified as a known tool call, so it cannot be verified"
             _print_permission_notice(
-                f"\nDenied automatically: {safe_title} claims to run a command, "
-                "but its command could not be verified.\n"
+                f"\nDenied automatically: {safe_title} {what}.\n"
                 "   Ask the agent to retry the tool call."
             )
         except Exception:
@@ -991,7 +1002,7 @@ async def _answer_permission(
         # best-effort by necessity -- the writer that just failed is the only one
         # available -- so it is attempted and its own failure only logged.
         try:
-            await _audit_off_loop(gate, event, "allowed", critical=True)
+            await _audit_off_loop(gate, event, OUTCOME_PENDING_APPROVAL, critical=True)
         except Exception:
             logger.warning("SEL audit unwritable; refusing the approved call", exc_info=True)
             await _audit_refusal(gate, event, error=_UNAUDITABLE_CODE)
@@ -1006,7 +1017,9 @@ async def _answer_permission(
             except Exception:
                 logger.warning("Could not prepare the CLI audit-denial notice", exc_info=True)
             return
-        await provider.approve_tool(event.request_id)
+        approval_sent = await provider.approve_tool(event.request_id)
+        outcome = OUTCOME_REJECTED_TRANSPORT_FLOOR if approval_sent is False else "allowed"
+        await _audit_off_loop(gate, event, outcome)
     else:
         # Deliberately NOT critical, and the asymmetry is the point: this call is
         # already being refused, so a lost record cannot authorize anything. Making
@@ -1062,7 +1075,6 @@ async def _interactive(
 ) -> None:
     """REPL loop — read user input, stream responses, auto-compact at configured threshold."""
     print(BANNER)
-    print(DATA_WARNING)
     print()
 
     print("Type your message (Ctrl+D or 'exit' to quit)\n")

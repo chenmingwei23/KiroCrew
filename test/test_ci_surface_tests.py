@@ -141,7 +141,14 @@ def test_backend_roots_cover_every_configured_testpath() -> None:
     import configparser
 
     parser = configparser.ConfigParser()
-    parser.read(_REPO_ROOT / "setup.cfg")
+    # `encoding` is not optional here. `ConfigParser.read` opens with no encoding,
+    # which decodes using `locale.getpreferredencoding()` -- UTF-8 on POSIX, but
+    # the legacy ANSI code page on Windows. `setup.cfg` contains non-ASCII (em
+    # dashes in its comments), so on a CJK Windows host this raises
+    # `UnicodeDecodeError` and the contract below is never checked at all. Same
+    # failure class `scripts/check_subprocess_encoding.py` exists for, reached
+    # through a file read rather than a subprocess pipe.
+    parser.read(_REPO_ROOT / "setup.cfg", encoding="utf-8")
     configured = parser.get("tool:pytest", "testpaths").split()
     assert configured, "setup.cfg declares no testpaths -- selector cannot be verified"
     missing = [p for p in configured if p not in _load_selector()._BACKEND_ROOTS]
@@ -150,6 +157,40 @@ def test_backend_roots_cover_every_configured_testpath() -> None:
         "_BACKEND_ROOTS, so every test under them would be SKIPPED (never run) "
         "on a frontend-only diff. Add them to _BACKEND_ROOTS."
     )
+
+
+def test_setup_cfg_carries_non_ascii_so_its_read_must_pin_utf8() -> None:
+    """Pins WHY the read above names an encoding, on hosts that cannot show it.
+
+    The defect is host-conditioned: an unpinned `ConfigParser.read` only
+    misbehaves where `locale.getpreferredencoding()` is not UTF-8, so a UTF-8 CI
+    runner passes either way and cannot exercise it. The two facts that make the
+    encoding load-bearing DO hold everywhere, and this asserts both -- so the
+    guard cannot rot silently on the runners that never feel it.
+
+    Deliberately not a repo-wide "missing encoding=" rule. `cross-platform.yml`
+    documents why it ships none (a line regex breaks on nested and multi-line
+    calls), and an AST version means editing `.github/workflows/**`. This stays
+    the size of the defect.
+    """
+    import configparser
+
+    raw = (_REPO_ROOT / "setup.cfg").read_bytes()
+    assert any(b > 0x7F for b in raw), (
+        "premise gone: setup.cfg is now pure ASCII, so the host code page can no "
+        "longer break this read and the pinned encoding may be retired"
+    )
+
+    # Guard the guard: those bytes are genuinely undecodable under a legacy code
+    # page, so an unpinned read really does RAISE rather than merely differ. cp950
+    # is the code page this was first reproduced on.
+    with pytest.raises(UnicodeDecodeError):
+        (_REPO_ROOT / "setup.cfg").read_text(encoding="cp950")
+
+    # And the pinned read is the one that works, on every host.
+    parser = configparser.ConfigParser()
+    assert parser.read(_REPO_ROOT / "setup.cfg", encoding="utf-8")
+    assert parser.get("tool:pytest", "testpaths").split()
 
 
 def test_frontend_spec_roots_cover_vitest_include(selector) -> None:
@@ -575,7 +616,7 @@ def test_windows_filter_is_scoped_to_the_test_root(tmp_path, monkeypatch) -> Non
 # skip the suite when those collection-time deps are absent, rather than raising a
 # ``ModuleNotFoundError`` at collection that cascades every backend shard. These
 # pin that guard: it must skip on a missing dep, and it must NOT skip when all are
-# present (or the 309 tests silently stop running everywhere).
+# present (or the whole suite silently stops running everywhere).
 
 _CONTAINER_CONFTEST = (
     _REPO_ROOT
@@ -665,7 +706,7 @@ def test_container_suite_runs_when_all_collect_time_deps_present() -> None:
     assert ns._missing_image_deps == []
     assert getattr(ns, "collect_ignore_glob", None) is None, (
         "conftest must NOT skip the image suite when every collection-time dep is "
-        "importable, or the 309 tests stop running where their subject can run"
+        "importable, or the whole suite stops running where its subject can run"
     )
 
 
@@ -675,8 +716,8 @@ def test_the_platform_branch_wins_over_the_dep_branch() -> None:
     The two branches answer different questions -- "can this subject run here at all"
     and "are its imports satisfied" -- and the platform one has to win, because the
     image is Linux-only however complete the dev env is. Ordering them the other way
-    would collect 309 POSIX-dependent tests on Windows whenever someone had installed
-    ``requirements-dev.txt`` there.
+    would collect the suite's POSIX-dependent tests on Windows whenever someone had
+    installed ``requirements-dev.txt`` there.
     """
     ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"}, os_name="nt")
     assert ns._missing_image_deps == [], "the dep branch had nothing to complain about"
@@ -763,4 +804,387 @@ def test_the_makemodule_hook_leaves_other_directories_alone() -> None:
         "the decline is scoped to the container suite's own directory; a "
         "conftest hook runs for every module under it in the tree, so an "
         "unscoped decline would skip unrelated suites"
+    )
+
+
+# --- container image test suite: the collection-completeness checks --------------
+#
+# The conftest's ``pytest_collection_modifyitems`` runs only under
+# ``CREW_CONTAINER_TESTS_REQUIRED`` and answers four questions about a collection
+# that already happened: did every module that defines tests yield an item, did
+# every test name the source declares yield an item, did the total clear the
+# floor, and is the floor still close enough to the real collection to mean
+# anything. The last one exists because the first three cannot see a floor going
+# stale: a suite that grows while the floor stays put reports green on a run that
+# lost every test in the gap.
+#
+# These pin the hook's decisions with fabricated items, so each check is exercised
+# on its own rather than through a real 20-second collection. The reader is pinned
+# separately against synthetic modules, because what it must NOT require is the
+# half that a live tree cannot demonstrate.
+
+_CONTAINER_SUITE_DIR = _CONTAINER_CONFTEST.parent
+_OMIT = object()
+
+
+class _FakeItem:
+    """A collected item as the hook reads one: a path, a name, an originalname."""
+
+    def __init__(self, module: str, name: str, originalname: object = _OMIT) -> None:
+        self.path = _CONTAINER_SUITE_DIR / module
+        self.name = name
+        if originalname is not _OMIT:
+            self.originalname = originalname
+
+
+def _required_conftest(*, declared: dict[str, set[str]] | None = None, floor: int | None = None):
+    """The conftest loaded with the requirement ON, and its reader optionally stubbed.
+
+    ``_REQUIRED`` is read from the environment at import and every test process
+    leaves the variable unset, so the hook would return at its first line. Setting
+    the module global is the same switch the lane flips, and it is read at call
+    time.
+    """
+    ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    ns._REQUIRED = True
+    if declared is not None:
+        ns._declared_tests = lambda: declared
+    if floor is not None:
+        ns._MIN_COLLECTED = floor
+    return ns
+
+
+def _run_hook(ns, items: list[_FakeItem]) -> None:
+    ns.pytest_collection_modifyitems(session=None, config=None, items=items)
+
+
+def _items(module: str, name: str, count: int) -> list[_FakeItem]:
+    """*count* parametrized items for one declared function name."""
+    return [_FakeItem(module, f"{name}[{i}]", name) for i in range(count)]
+
+
+def test_the_collection_floor_reds_below_its_value() -> None:
+    """One test short of the floor is an error, because the floor IS the collection.
+
+    This is the property the floor's POSITION buys and the reason it is set to the
+    measured collection rather than to the collection less the margin. Set below the
+    collection, the same margin would be spent hiding losses of that size instead:
+    the drain this check exists to catch would pass silently up to ``_FLOOR_MARGIN``
+    cases, while ordinary growth would red on the very first added test.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    with pytest.raises(pytest.UsageError, match="below its floor of 10"):
+        _run_hook(ns, _items("test_a.py", "test_one", 9))
+    # And the margin does not soften it: the floor is a hard minimum in this direction.
+    assert ns._FLOOR_MARGIN > 0, "this assertion is vacuous if the margin is already zero"
+
+
+def test_the_collection_floor_passes_at_its_own_value() -> None:
+    """A collection exactly ON the floor is a pass, not a failure.
+
+    The floor is a minimum, so reading it as "more than" would red a suite that
+    lost nothing, and the lane's own green run sits within a couple of tests of
+    this boundary.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    _run_hook(ns, _items("test_a.py", "test_one", 10))
+
+
+def test_a_floor_left_behind_by_a_growing_suite_is_an_error() -> None:
+    """The check that makes the floor's staleness loud instead of silent.
+
+    One side is a hand-written constant and the other is the live collection, so
+    this can fail -- and it does fail on a tree whose suite has outgrown its
+    floor, which is the whole point. A floor that recomputed itself from the
+    collection could never trip and would report green forever.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    with pytest.raises(pytest.UsageError, match="the floor stayed behind"):
+        _run_hook(ns, _items("test_a.py", "test_one", 10 + ns._FLOOR_MARGIN + 1))
+
+
+def test_the_floor_may_sit_exactly_its_margin_below_the_collection() -> None:
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    _run_hook(ns, _items("test_a.py", "test_one", 10 + ns._FLOOR_MARGIN))
+
+
+def test_a_passing_collection_reports_its_count_and_remaining_headroom() -> None:
+    """A passing collection reports its count and remaining headroom.
+
+    Every failure check above is silent while the margin is unspent, so on its own a
+    green run says nothing about how close the floor sits to the collection -- the
+    drift the guard bounds is invisible until it trips. The success line closes that
+    gap: a passing collection states the observed count AND the growth headroom still
+    remaining, so the number is read while the margin is unspent rather than only when
+    it is gone.
+
+    Asserted on ``_headroom_report`` directly (the pure line-builder) so the check
+    does not depend on how the line is surfaced, and both numbers are present so a
+    future edit cannot drop the headroom and leave only a count that says nothing
+    about drift.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    # One test inside the margin window: floor 10, margin 2, so 11 collected leaves
+    # one more of headroom before the floor must be raised.
+    line = ns._headroom_report(11)
+    assert "collected 11 tests" in line, line
+    assert "floor 10" in line, line
+    assert f"headroom 1 of {ns._FLOOR_MARGIN} remaining" in line, line
+
+
+def test_the_reported_headroom_moves_as_the_collection_changes() -> None:
+    """The reported numbers are computed from the live collection, not remembered.
+
+    A signal that did not move with the suite would be another stale constant, the
+    very failure this line-builder exists to avoid. Sitting on the floor spends no headroom
+    (the full margin remains); each test added above the floor spends one; at the
+    ceiling it is zero, and below the floor it clamps at zero, because the failure
+    checks own that state and a positive number would read as headroom that does not
+    exist.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    assert f"headroom {ns._FLOOR_MARGIN} of {ns._FLOOR_MARGIN} remaining" in ns._headroom_report(10)
+    assert (
+        f"headroom {ns._FLOOR_MARGIN - 1} of {ns._FLOOR_MARGIN} remaining"
+        in ns._headroom_report(11)
+    )
+    assert "headroom 0 of" in ns._headroom_report(10 + ns._FLOOR_MARGIN)
+    # Below the floor the guard fails rather than reports, but the line-builder must
+    # not emit a negative headroom if it is ever reached.
+    assert "headroom 0 of" in ns._headroom_report(9)
+
+
+def test_the_passing_hook_emits_the_headroom_line(capsys) -> None:
+    """The line is actually emitted on the pass path, not merely computable.
+
+    The hook is driven with ``config=None`` (no live pytest session), under which
+    the emitter falls back to ``print``, so a captured run can read the number. The
+    property under test is that a green collection produces the line at all -- a
+    guard whose only output is the failure path leaves the drift it bounds invisible
+    on a passing run.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    _run_hook(ns, _items("test_a.py", "test_one", 11))
+    printed = capsys.readouterr().out
+    assert "crew container collection floor" in printed, printed
+    assert "collected 11 tests" in printed, printed
+    assert "headroom 1 of" in printed, printed
+
+
+def test_the_headroom_line_prefers_the_terminal_reporter() -> None:
+    """On a real run the line goes to pytest's terminal reporter, not raw stdout.
+
+    ``config=None`` in the pin above proves the fallback; a live run has a
+    ``terminalreporter`` plugin, and the line must land there so it sits in the same
+    summary a human reads rather than in captured output nobody sees. The emitter is
+    driven directly with a fake config exposing that plugin.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    written: list[str] = []
+
+    class _Reporter:
+        def write_line(self, line: str) -> None:
+            written.append(line)
+
+    class _PluginManager:
+        def get_plugin(self, name: str):
+            return _Reporter() if name == "terminalreporter" else None
+
+    class _Config:
+        pluginmanager = _PluginManager()
+
+    ns._emit_headroom_report(_Config(), ns._headroom_report(11))
+    assert written, "the emitter must write to the terminal reporter when one exists"
+    assert "collected 11 tests" in written[0], written
+    assert "headroom 1 of" in written[0], written
+
+
+def test_the_stale_floor_message_names_both_ways_the_margin_can_be_exceeded() -> None:
+    """The message must not send a reader hunting a regression that is not there.
+
+    A margin above zero legalises growth with no floor edit, so two branches may
+    each add up to ``_FLOOR_MARGIN`` tests, clear this bound separately, and compose
+    past it without either one touching the constant. The lane then reds on a commit
+    that did not grow the suite, and a message naming only the same-commit cause
+    misattributes it. Both causes are asserted because naming one is what makes the
+    other invisible.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one"}}, floor=10)
+    collected = 10 + ns._FLOOR_MARGIN + 1
+    with pytest.raises(pytest.UsageError) as caught:
+        _run_hook(ns, _items("test_a.py", "test_one", collected))
+    message = " ".join(str(caught.value).split())
+    assert "in the commit that grew the suite" in message, message
+    assert "concurrently merged one did" in message, message
+    # The prescribed value is the COLLECTION itself, never the collection less the
+    # margin: prescribing the latter re-pins the floor at maximum staleness, which
+    # spends the margin on hiding losses and leaves growth no headroom at all.
+    assert f"Raise _MIN_COLLECTED to {collected}" in message, message
+    assert f"Raise _MIN_COLLECTED to {collected - ns._FLOOR_MARGIN}" not in message, message
+
+
+def test_a_module_that_defines_tests_and_yields_nothing_is_an_error() -> None:
+    ns = _required_conftest(
+        declared={"test_a.py": {"test_one"}, "test_gone.py": {"test_two"}}, floor=1
+    )
+    with pytest.raises(pytest.UsageError, match="no collected test: test_gone.py"):
+        _run_hook(ns, _items("test_a.py", "test_one", 3))
+
+
+def test_a_declared_test_that_yields_no_item_is_an_error() -> None:
+    """The shape a module-level presence check cannot see.
+
+    The module is collected and contributes items, so the presence check is
+    satisfied; one name the source declares produced nothing. A decorator that
+    returns a non-function is the shape that lands here. The other shapes that
+    silence a test do NOT reach this check: two module-level ``def test_x`` collapse
+    to one name in ``_declared_tests``' set, so shadowing is never seen here, and a
+    class body an import guard emptied puts its methods under an ``ast.If`` that the
+    reader never descends into, because it scans only the direct children of a
+    ``ClassDef`` -- both drain the count instead and are caught by the floor.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one", "test_swallowed"}}, floor=1)
+    with pytest.raises(pytest.UsageError, match=r"test_a\.py::test_swallowed"):
+        _run_hook(ns, _items("test_a.py", "test_one", 3))
+
+
+def test_a_parametrized_item_counts_under_the_function_that_declares_it() -> None:
+    """Case ids must not make a declared name look absent.
+
+    ``test_one[0]`` is not a name the source declares, so matching on ``name``
+    would report every parametrized test as missing. The function's own name is
+    on ``originalname``; an item that carries neither falls back to the part of
+    the name before the case id.
+    """
+    ns = _required_conftest(declared={"test_a.py": {"test_one", "test_bare"}}, floor=4)
+    _run_hook(
+        ns,
+        _items("test_a.py", "test_one", 3) + [_FakeItem("test_a.py", "test_bare[x]")],
+    )
+
+
+def test_items_outside_the_suite_directory_are_not_judged() -> None:
+    """A wider run that sweeps this suite in must not be measured by its floor."""
+    ns = _required_conftest(declared={}, floor=1)
+    stranger = _FakeItem("test_a.py", "test_one", "test_one")
+    stranger.path = _REPO_ROOT / "test" / "test_widget_slug.py"
+    with pytest.raises(pytest.UsageError, match="below its floor of 1"):
+        _run_hook(ns, [stranger])
+
+
+def test_the_hook_is_silent_without_the_requirement() -> None:
+    """Every check above is gated: a developer's own run is never judged by them."""
+    with mock.patch.dict(os.environ):
+        os.environ.pop("CREW_CONTAINER_TESTS_REQUIRED", None)
+        ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    assert ns._REQUIRED is False, "an unset variable must leave the requirement off"
+    ns._declared_tests = lambda: {"test_gone.py": {"test_two"}}
+    _run_hook(ns, [])
+
+
+def test_the_reader_excludes_names_pytest_cannot_collect(tmp_path: Path) -> None:
+    """What the reader must NOT require, which a live tree cannot demonstrate.
+
+    Requiring an item for a name pytest never collects is a red with nothing
+    wrong behind it, so the scan is scoped to the two places pytest looks: a
+    module-level function, and a method of a class whose name matches
+    ``python_classes``. A helper nested inside another function and a method of a
+    plain helper class are both named ``test*`` and neither is collected.
+    """
+    (tmp_path / "test_shapes.py").write_text(
+        "def test_module_level():\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "async def test_async_module_level():\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class TestGroup:\n"
+        "    def test_method(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Helper:\n"
+        "    def test_not_a_pytest_class(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "def build():\n"
+        "    def test_nested():\n"
+        "        pass\n"
+        "\n"
+        "    return test_nested\n",
+        encoding="utf-8",
+    )
+    ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    ns._HERE = tmp_path
+    declared = ns._declared_tests()
+    assert declared == {
+        "test_shapes.py": {"test_module_level", "test_async_module_level", "test_method"}
+    }, (
+        "the reader must name exactly what pytest's default collection reaches: a "
+        "nested definition and a method of a non-Test class are not collected, so "
+        "requiring an item for either reds a correct tree"
+    )
+
+
+def test_a_module_whose_tests_pytest_cannot_reach_is_still_required_to_yield_one(
+    tmp_path: Path,
+) -> None:
+    """Presence stays the loose question even though the names are the strict one.
+
+    A module whose only ``test*`` definition is somewhere pytest does not look has
+    no names to require, and it must still be required to yield SOMETHING -- that
+    is the check that catches a module dropping out of collection entirely, and a
+    module must not escape it by holding its tests in an unusual place.
+    """
+    (tmp_path / "test_odd.py").write_text(
+        "def build():\n    def test_nested():\n        pass\n\n    return test_nested\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_empty.py").write_text("X = 1\n", encoding="utf-8")
+    ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    ns._HERE = tmp_path
+    declared = ns._declared_tests()
+    assert declared == {"test_odd.py": set()}, (
+        "a module defining a test anywhere is required to yield an item with no name "
+        "pinned; a module defining none at all is not required to yield anything"
+    )
+
+
+def test_the_margin_is_smaller_than_the_smallest_module() -> None:
+    """The floor's margin is derived from the tree, not chosen for comfort.
+
+    The margin is growth headroom, so its bound is about what may land WITHOUT the
+    floor being raised. A margin at or above the smallest module's test count would
+    let a whole new module arrive while the constant stays put, and the floor would
+    resume drifting by exactly the mechanism this file exists to stop. Losing tests
+    is not what the margin governs -- a collection below the floor reds at any size.
+    """
+    ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    per_module = {name: len(names) for name, names in ns._declared_tests().items() if names}
+    assert per_module, "the container suite's own modules must be readable from source"
+    smallest = min(per_module.values())
+    assert ns._FLOOR_MARGIN < smallest, (
+        f"the floor's margin is {ns._FLOOR_MARGIN} and the smallest module declares "
+        f"{smallest} tests, so a whole module could be added without raising the floor"
+    )
+
+
+def test_the_suite_has_a_module_that_declares_no_test() -> None:
+    """The reason the presence check is read from source rather than from the glob.
+
+    ``test_supervisor_fakes.py`` matches ``test_*.py`` to sit inside one track's
+    ownership and declares no test. Requiring every matching file to yield an item
+    would fail on the tree as it stands, which is why the check asks the source
+    what it defines.
+    """
+    ns = _run_container_conftest(present={"fastapi", "httpx", "uvicorn"})
+    files = {path.name for path in _CONTAINER_SUITE_DIR.glob("test_*.py")}
+    required = set(ns._declared_tests())
+    assert files - required == {"test_supervisor_fakes.py"}, (
+        "a file matching test_*.py that declares no test must not be required to "
+        "yield an item; a tree where every matching file declares a test leaves this "
+        "exemption unexercised and the pin stops measuring it"
     )

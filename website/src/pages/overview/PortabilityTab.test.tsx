@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
-import { refusalText } from './PortabilityTab'
+import PortabilityTab, { refusalText, unbundledTemplates } from './PortabilityTab'
 
 describe('refusalText', () => {
   const fallback = 'Import failed.'
@@ -35,5 +36,53 @@ describe('refusalText', () => {
   it('falls back when the body carries no message at all', () => {
     expect(refusalText(500, {}, fallback)).toBe(fallback)
     expect(refusalText(400, { error: '' }, fallback)).toBe(fallback)
+  })
+})
+
+describe('unbundledTemplates', () => {
+  it('reads the header list and drops anything that is not a name', () => {
+    expect(unbundledTemplates('["a", 3, "b"]')).toEqual({ names: ['a', 'b'], more: 0 })
+    expect(unbundledTemplates('["a", "+12"]')).toEqual({ names: ['a'], more: 12 })
+    expect(unbundledTemplates(null)).toEqual({ names: [], more: 0 })
+    expect(unbundledTemplates('{not json')).toEqual({ names: [], more: 0 })
+    expect(unbundledTemplates('{"a": 1}')).toEqual({ names: [], more: 0 })
+  })
+})
+
+describe('PortabilityTab template warnings', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('names the templates an export leaves out, and still downloads', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Blob(['PK']), {
+      status: 200,
+      headers: { 'X-Kirocrew-Unbundled-Templates': '["reviewer", "writer", "+3"]' },
+    })))
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = () => 'blob:x'
+      static revokeObjectURL = () => {}
+    })
+    render(<PortabilityTab />)
+    fireEvent.click(screen.getByRole('button', { name: /download export/i }))
+    const warning = await screen.findByTestId('portability-export-warning')
+    expect(warning.textContent).toContain('reviewer, writer, 3 more')
+    expect(warning.textContent).not.toContain('+3')
+    expect(screen.getByText('Download started.')).toBeTruthy()
+  })
+
+  it('names each imported crew whose template is missing, beside the success line', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('preview')
+        ? { ok: true, manifest: { version: 1, created_at: 't', hostname: 'h', user: 'u', contents: {} } }
+        : { ok: true, summary: { items: ['config (restored)'], missing_agent_templates: [{ crew: 'triage', kiro_agent: 'local-only' }] } },
+    ), { status: 200 })))
+    render(<PortabilityTab />)
+    const input = screen.getByLabelText(/choose import file/i) as HTMLInputElement
+    fireEvent.change(input, { target: { files: [new File(['PK'], 'e.zip')] } })
+    const importButton = screen.getByRole('button', { name: /^import$/i })
+    await waitFor(() => expect((importButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(importButton)
+    const warning = await screen.findByTestId('portability-import-warning')
+    expect(warning.textContent).toContain('triage \u2192 local-only')
+    expect(screen.getByText(/Import complete/)).toBeTruthy()
   })
 })

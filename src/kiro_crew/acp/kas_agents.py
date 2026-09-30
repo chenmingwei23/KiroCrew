@@ -70,18 +70,28 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.acp.kas_permissions import (
+    AUTO_APPROVABLE_CAPABILITIES,
     allowed_tools_to_permissions,
+    auto_approved_capabilities,
     merge_user_permissions,
+    withhold_hook_gated_auto_approval,
 )
 from kiro_crew.agent_discovery import (
     AgentsDirMemo,
     AmbiguousAgentSpecError,
+    plain_markdown_document,
     read_agent_spec_strict,
     spec_by_declared_name,
     spec_welcome_message,
 )
 from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS
-from kiro_crew.agent_spec_format import agent_spec_candidates
+from kiro_crew.agent_sdk.spec_hooks import spec_script_hooks
+from kiro_crew.agent_spec_format import agent_spec_candidates, is_markdown_spec
+from kiro_crew.hooks import (
+    HOOK_EVENT_PRE_TOOL_USE,
+    get_global_hook_store,
+    persisted_hook_store,
+)
 from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     MCP_REGISTRY_TYPE,
@@ -162,7 +172,9 @@ _PSEUDO_FS_ROOTS = ("/proc", "/sys", "/dev")
 #: is what kept ``hooks`` written off as unsupported. KAS runs pre/post-tool-use
 #: hooks natively and loads them from an agent profile ON DISK (it even accepts
 #: Crew's object form), so what is lost here is a delivery path, not a feature:
-#: an agent injected over the wire cannot carry them.
+#: an agent injected over the wire cannot carry them. Crew's turn loop fires the
+#: spec's ``hooks`` for such a session instead (:mod:`kiro_crew.agent_sdk.spec_hooks`), so of
+#: these keys only :data:`SPEC_KEYS_WITHOUT_CARRIER` is actually lost.
 #:
 #: ``allowedTools`` is deliberately NOT in this set. It has no slot either, but
 #: :mod:`kiro_crew.acp.kas_permissions` translates it into ``permissions``, so
@@ -174,6 +186,16 @@ UNSUPPORTED_SPEC_KEYS = frozenset(
         "toolsSettings",
     }
 )
+
+
+#: The keys in :data:`UNSUPPORTED_SPEC_KEYS` that nothing carries to a KAS session,
+#: so an agent that sets one runs without it. The user is told once per session.
+SPEC_KEYS_WITHOUT_CARRIER = UNSUPPORTED_SPEC_KEYS - {"hooks"}
+
+
+def spec_keys_without_carrier(spec: dict[str, Any]) -> list[str]:
+    """The keys of :data:`SPEC_KEYS_WITHOUT_CARRIER` that *spec* sets, sorted."""
+    return sorted(k for k in SPEC_KEYS_WITHOUT_CARRIER if spec.get(k))
 
 
 class KasAgentTranslationError(ValueError):
@@ -704,6 +726,7 @@ def to_client_custom_agent(
     member_dispatch: bool = False,
     crew_panel: bool = False,
     session_key: str = "",
+    pre_tool_hook_matchers: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Project one Crew agent spec onto a KAS ``ClientCustomAgent`` descriptor.
 
@@ -728,6 +751,12 @@ def to_client_custom_agent(
     capabilities are assigned per server and withdrawn by separate operator
     switches: a member may hold session control without a panel, or a panel
     without session control.
+
+    *pre_tool_hook_matchers* are the matchers of every PreToolUse hook this
+    session's calls meet on Crew's permission path (the spec's own and the Hooks
+    page's). A capability one of them covers is not auto-approved, so its calls
+    reach that path; see
+    :func:`kiro_crew.acp.kas_permissions.withhold_hook_gated_auto_approval`.
     """
     if not agent_id:
         raise KasAgentTranslationError("agent id must be non-empty")
@@ -752,11 +781,11 @@ def to_client_custom_agent(
 
     dropped = sorted(k for k in UNSUPPORTED_SPEC_KEYS if spec.get(k))
     if dropped:
-        # Says WHY the key is dropped, because the previous wording ("no KAS
-        # equivalent") reads as "KAS cannot do this" and sent readers looking for
-        # a missing feature instead of a missing wire field. Debug, not warning:
-        # this fires on every session/new with a constant payload, so at WARNING
-        # it drowns the log without ever telling anyone something new.
+        # Says WHY the key is dropped: a missing wire field, not a missing KAS
+        # feature. Debug, not warning: this fires on every session/new with a
+        # constant payload. The user learns of it from the session-start notice
+        # the turn loop posts for SPEC_KEYS_WITHOUT_CARRIER, and ``hooks`` still
+        # runs, fired by that loop.
         logger.debug(
             "agent %r: spec keys the customAgents wire schema cannot carry, "
             "so an injected agent runs without them: %s",
@@ -828,6 +857,14 @@ def to_client_custom_agent(
         allowlist_present=isinstance(allowed_tools_input, list),
         agent_id=agent_id,
     )
+    permissions = withhold_hook_gated_auto_approval(
+        permissions,
+        pre_tool_hook_matchers,
+        audit_decision=lambda refs, outcome, reason: _audit_permission_decision(
+            refs, outcome, reason, agent_id
+        ),
+        agent_id=agent_id,
+    )
     if permissions:
         out["permissions"] = permissions
 
@@ -892,6 +929,38 @@ def to_client_custom_agent(
 _SPEC_SCAN_MEMO: AgentsDirMemo[dict[str, Any] | None] = AgentsDirMemo()
 
 
+def _declared_spec(agents_dir: Path, agent_id: str) -> dict[str, Any] | None:
+    """The spec that declares *agent_id*, memoised; the one directory scan both
+    :func:`load_agent_spec` and :func:`agent_spec_absent` read."""
+    return _SPEC_SCAN_MEMO.get(
+        agents_dir,
+        agent_id,
+        lambda: spec_by_declared_name(
+            agents_dir, agent_id, operation="kas_agent_projection", source="unknown"
+        ),
+    )
+
+
+def agent_spec_absent(agents_dir: Path, agent_id: str) -> bool:
+    """Whether *agent_id* has no spec at all in *agents_dir*.
+
+    True when no spec declares the id and neither ``<agent_id>.json`` nor
+    ``<agent_id>.md`` exists: a KAS built-in mode (``vibe``) a session switched
+    to. A spec that exists but cannot be read is NOT absent; the caller keeps
+    its own fail-closed answer for that. Raises when the directory cannot be
+    scanned, as :func:`load_agent_spec` does.
+    """
+    if any(p.is_file() for p in agent_spec_candidates(agents_dir, agent_id)):
+        return False
+    try:
+        declared = _declared_spec(agents_dir, agent_id)
+    except AmbiguousAgentSpecError:
+        return False
+    except OSError as exc:
+        raise KasAgentTranslationError(f"agents dir {agents_dir} is unreadable: {exc}") from exc
+    return declared is None
+
+
 def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     """Read a materialized agent spec.
 
@@ -948,13 +1017,7 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     candidates = agent_spec_candidates(agents_dir, agent_id)
     path = candidates[0]
     try:
-        declared = _SPEC_SCAN_MEMO.get(
-            agents_dir,
-            agent_id,
-            lambda: spec_by_declared_name(
-                agents_dir, agent_id, operation="kas_agent_projection", source="unknown"
-            ),
-        )
+        declared = _declared_spec(agents_dir, agent_id)
     except AmbiguousAgentSpecError as exc:
         raise KasAgentTranslationError(str(exc)) from exc
     except OSError as exc:
@@ -971,13 +1034,91 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
         # user-writable, so a symlink here must not be followed to a sensitive
         # target or an oversized file slurped into the projection.
         raw = read_agent_spec_strict(path, operation="kas_agent_projection", source="unknown")
-    except OSError as exc:
-        raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        if is_markdown_spec(path) and plain_markdown_document(path):
+            # ``<agent_id>.md`` with no opening fence and no JSON twin is a
+            # prose document sharing the name, not this agent's spec: it is
+            # skipped, which leaves the agent with no spec at all -- the same
+            # answer as no candidate file. A FENCED document that fails to
+            # parse falls through and raises as a broken spec.
+            raise KasAgentTranslationError(
+                f"agent {agent_id!r} has no spec: {path} has no frontmatter fence, "
+                "so it is a plain markdown document, not an agent spec"
+            ) from None
+        if isinstance(exc, OSError):
+            raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
         raise KasAgentTranslationError(f"agent spec {path} is not a valid spec: {exc}") from exc
     if not isinstance(raw, dict):
         raise KasAgentTranslationError(f"agent spec {path} is not an object")
     return raw
+
+
+def pre_tool_hook_matchers(agent_id: str, spec: dict[str, Any]) -> tuple[str, ...]:
+    """The matchers of every PreToolUse hook a KAS session's calls meet.
+
+    Two sources, both fired by Crew's permission path: the spec's own ``hooks``
+    (Crew fires them on KAS, see :mod:`kiro_crew.agent_sdk.spec_hooks`) and the
+    Hooks page's store. The projection withholds auto-approval for what they cover,
+    because an auto-approved call never reaches that path. Read at session start:
+    a Hooks-page hook added later gates auto-approved calls from the next session
+    on.
+
+    Fails toward gating. A source that cannot be read answers ``("*",)``, which
+    withholds every auto-approval, rather than an empty tuple that would let a call
+    past a hook nobody could list.
+    """
+    try:
+        # A process that registers no store (``kirocrew run``) still has the
+        # saved hooks on disk, and they still gate its calls; a saved file that
+        # cannot be read raises, which withholds every auto-approval below.
+        store = get_global_hook_store() or persisted_hook_store()
+        hooks = [*spec_script_hooks(agent_id, spec), *store.list_all()]
+    except Exception:  # noqa: BLE001 - fail toward gating, see the docstring
+        logger.warning(
+            "PreToolUse hooks for %r could not be listed; no call is auto-approved",
+            agent_id,
+            exc_info=True,
+        )
+        return ("*",)
+    return tuple(
+        h.matcher
+        for h in hooks
+        if h.enabled and h.event == HOOK_EVENT_PRE_TOOL_USE and h.command.strip()
+    )
+
+
+def projected_auto_approved(custom_agents: Any, agent_id: str) -> frozenset[str] | None:
+    """What the projection sent for *agent_id* auto-approves, or ``None`` with no
+    projection (a host that took its agent at spawn time).
+
+    Recorded on the session when the batch is handed over, because a live session
+    keeps the batch it registered: ``set_mode`` activates, it does not re-send. The
+    turn loop compares this with what the PreToolUse hooks cover NOW (see
+    :func:`kiro_crew.agent_sdk.spec_hooks.hook_projection_stale`).
+    """
+    if not isinstance(custom_agents, list) or not custom_agents:
+        return None
+    entries = [a for a in custom_agents if isinstance(a, dict)]
+    if not entries:
+        return None
+    entry = next((a for a in entries if a.get("id") == agent_id), entries[0])
+    return auto_approved_capabilities(entry.get("permissions"))
+
+
+def switched_auto_approved(custom_agents: Any, agent_id: str) -> frozenset[str]:
+    """What the session auto-approves once a KAS mode switch moves it to *agent_id*.
+
+    ``set_mode`` activates a definition KAS already holds, so the answer is the
+    registered entry for *agent_id* when the batch carries one. A mode the batch
+    does not carry (a KAS built-in) runs permissions Crew never projected, so every
+    auto-approvable capability is assumed approved: any PreToolUse hook then reads
+    the session as stale, which is the side that re-projects.
+    """
+    entries = [a for a in custom_agents if isinstance(a, dict)] if custom_agents else []
+    entry = next((a for a in entries if a.get("id") == agent_id), None)
+    if entry is None:
+        return frozenset(AUTO_APPROVABLE_CAPABILITIES)
+    return auto_approved_capabilities(entry.get("permissions"))
 
 
 def build_kas_custom_agents(
@@ -1025,6 +1166,7 @@ def build_kas_custom_agents(
             member_dispatch=member_dispatch,
             crew_panel=crew_panel,
             session_key=session_key,
+            pre_tool_hook_matchers=pre_tool_hook_matchers(agent_id, spec),
         )
     ]
 
@@ -1043,6 +1185,7 @@ def hoist_managed_servers(
     custom_agents: list[dict[str, Any]] | None,
     agent_id: str,
     session_servers: list[dict[str, Any]],
+    session_token: str = "",
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Carry the ACTIVE agent's managed declarations in the session-level array.
 
@@ -1075,6 +1218,32 @@ def hoist_managed_servers(
     * an entry with a key outside :data:`_HOISTABLE_ENTRY_KEYS`, a ``type``
       other than ``stdio``, or no usable command -- a restriction, a registry
       marker or a malformed entry keeps the block path, where it is honoured.
+
+    *session_token* is this session's signed identity token, and every hoisted
+    element carries it (``KIROCREW_STUB_SESSION_TOKEN``). The runtime stamps the
+    token onto its session-level array BEFORE this hoist runs, so the elements
+    added here would otherwise be the only managed servers launched without it:
+    each one reads the session's tool policy behind an attestation, and without
+    the token ``kirocrew-core`` comes up present-but-unusable, refusing every call
+    as ``identity_unattested``. Only the hoisted elements receive it -- a caller
+    entry already carries its own identity, and a third-party server is not
+    Crew's to hand a session credential. Empty leaves the elements as projected.
+
+    A tokened element never launches what the spec says. KAS spawns the hoisted
+    element itself, so ``gatewayd._spawns_own_control_plane`` -- the check that
+    refuses the token to any binary that is not the managed one -- never sees it,
+    and a hand-edited spec naming another program ``kirocrew-core`` would
+    otherwise be handed this session's identity. So the launch is re-derived from
+    :func:`~kiro_crew.agent.managed_mcp_spec_entry` (``include_opt_in=True``, the
+    form the daemon compares against), exactly as
+    ``mcp_gateway.rewriter._repair_control_plane_entry`` and the native-mount
+    path in :mod:`kiro_crew.acp.session_mcp` do. The env is composed outward
+    too: only ``KIROCREW_PORT`` / ``KIROCREW_SESSION_KEY``, which the projection
+    set from the gateway's own values, then the managed env pinned last; the
+    spec's ``KIROCREW_HOME`` does not survive onto a tokened launch. A name
+    whose managed invocation does not resolve is still hoisted as projected,
+    WITHOUT the token -- the daemon would deny it anyway, and a session with an
+    unattested control plane is better than one with none.
 
     The agent's ``tools`` / ``excludedTools`` / ``permissions`` are untouched:
     ``@server`` refs resolve wherever the server was declared, which is the same
@@ -1127,4 +1296,72 @@ def hoist_managed_servers(
     if not hoisted:
         return custom_agents, session_servers
     hoisted.sort(key=lambda element: element["name"])
+    if session_token:
+        # Deferred like session_mcp above: the kiro path returns before this, and
+        # the token is per SESSION while the projection is per agent.
+        from kiro_crew.mcp_gateway.session_servers import attach_stub_session_token
+
+        hoisted = [
+            _tokened_managed_element(element, session_token, attach_stub_session_token)
+            for element in hoisted
+        ]
     return out_agents, [*session_servers, *hoisted]
+
+
+#: Env keys a tokened hoisted element keeps from its projection. Both are set by
+#: :func:`to_client_custom_agent` from the gateway's own values (the bound port,
+#: the session key) and never from the spec, which ``_MANAGED_ENV_KEYS_KEPT``
+#: limits to ``KIROCREW_HOME`` -- a home-deriving key a tokened launch must not
+#: take from a hand edit.
+_TOKENED_ENV_KEYS_KEPT = ("KIROCREW_PORT", "KIROCREW_SESSION_KEY")
+
+
+def _tokened_managed_element(
+    element: dict[str, Any],
+    session_token: str,
+    attach: Any,
+) -> dict[str, Any]:
+    """*element* relaunched as the managed invocation and stamped with the token.
+
+    ``None`` from the managed source (name not managed, closed ``spec_gate``,
+    unresolvable invocation) returns *element* untouched and untokened: that is
+    the verdict ``gatewayd._spawns_own_control_plane`` reaches for the same name,
+    so nothing here hands out a token the daemon would refuse.
+    """
+    from kiro_crew.agent import _managed_mcp_env, managed_mcp_spec_entry
+
+    name = str(element.get("name", ""))
+    managed = managed_mcp_spec_entry(name, include_opt_in=True)
+    if not isinstance(managed, dict) or not managed.get("command"):
+        logger.warning(
+            "hoisted MCP server %r gets no session token: its managed invocation does"
+            " not resolve, so the launch the spec declares cannot be attested",
+            name,
+        )
+        return element
+    managed_cmd = str(managed["command"])
+    managed_args = [str(a) for a in managed.get("args", [])]
+    declared_args = element.get("args")
+    if element.get("command") != managed_cmd or declared_args != managed_args:
+        # Neither value is logged: the declared args may carry a secret, and the
+        # managed invocation is enough to find the entry.
+        logger.warning(
+            "hoisted MCP server %r declares a launch that is not the managed"
+            " invocation; launching the managed one so the session token only"
+            " reaches Kiro Crew's own binary",
+            name,
+        )
+    raw_env = element.get("env")
+    pairs: list[Any] = raw_env if isinstance(raw_env, list) else []
+    env = {
+        str(pair["name"]): str(pair.get("value", ""))
+        for pair in pairs
+        if isinstance(pair, dict) and pair.get("name") in _TOKENED_ENV_KEYS_KEPT
+    }
+    env.update(_managed_mcp_env())
+    relaunched = dict(element)
+    relaunched["command"] = managed_cmd
+    relaunched["args"] = managed_args
+    relaunched["env"] = [{"name": k, "value": v} for k, v in env.items()]
+    (stamped,) = attach([relaunched], session_token)
+    return stamped

@@ -415,12 +415,14 @@ class McpSessionReport:
     #: Empty means Kiro Crew injected none — NOT that the session has none, since
     #: the backend also starts the agent spec's own servers.
     configured: tuple[str, ...] = ()
-    #: Agent-spec ``@server`` refs that named no server this session receives, as
-    #: :mod:`kiro_crew.acp.mcp_ref_guard` found them. A DIFFERENT claim from every
-    #: bucket below, and the difference is what makes it worth a slot: those say
-    #: what a configured server reported, this says the spec asked for a server
-    #: nothing configured -- so there is no row for it to be missing FROM, which
-    #: is exactly why the defect was invisible three times.
+    #: Agent-spec ``@server`` refs that named no server in Crew's projection for
+    #: this session, as :mod:`kiro_crew.acp.mcp_ref_guard` found them. Crew's
+    #: projection delivers none of them; the harness may still mount a same-named
+    #: server from its own configuration, which this field does not read. A
+    #: DIFFERENT claim from every bucket below, and the difference is what makes it
+    #: worth a slot: those say what a configured server reported, this says the
+    #: spec asked for a server nothing configured -- so there is no row for it to
+    #: be missing FROM, which is exactly why the defect was invisible three times.
     unresolved_refs: tuple[str, ...] = ()
     _ready: list[str] = field(default_factory=list)
     _failed: list[str] = field(default_factory=list)
@@ -458,7 +460,11 @@ class McpSessionReport:
         self._started = True
 
     def record_unresolved_refs(self, refs: Any) -> None:
-        """Record the spec refs that named no server this session receives.
+        """Record the spec refs that named no server in Crew's projection.
+
+        The guard's claim, not a stronger one: Crew's projection delivers none of
+        them, and the harness may still mount a same-named server from its own
+        configuration, which neither the guard nor this report reads.
 
         Sanitized and capped on the same terms as a server name: a ref is
         config-derived, so an installed app chooses the text, and it reaches a log

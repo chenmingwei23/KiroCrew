@@ -172,8 +172,15 @@ def _request(
     body: Any = None,
     match_info: dict[str, str] | None = None,
 ) -> web.Request:
-    """A mocked request whose ``json()`` yields ``body`` (or raises for a sentinel)."""
-    request = make_mocked_request(method, path, match_info=match_info or {})
+    """A mocked request whose ``json()`` yields ``body`` (or raises for a sentinel).
+
+    It carries the dashboard owner's claims, so owner-gated routes reach their body.
+    """
+    app = web.Application()
+    app["state"] = mock.MagicMock(owner_id="owner-subject")
+    request = make_mocked_request(method, path, match_info=match_info or {}, app=app)
+    request["app"] = ""
+    request["user"] = "owner-subject"
     if body is _BAD_JSON:
         request.json = mock.AsyncMock(  # type: ignore[method-assign]
             side_effect=ValueError("not json")
@@ -184,6 +191,16 @@ def _request(
 
 
 _BAD_JSON = object()
+
+
+def _owner_request(method: str = "POST") -> web.Request:
+    """A mocked request carrying the dashboard owner's claims, for owner-gated routes."""
+    app = web.Application()
+    app["state"] = mock.MagicMock(owner_id="owner-subject")
+    request = make_mocked_request(method, "/api/apps/auto-improvement/deps/install", app=app)
+    request["app"] = ""
+    request["user"] = "owner-subject"
+    return request
 
 
 def _json_of(response: web.StreamResponse) -> dict[str, Any]:
@@ -1603,7 +1620,7 @@ class TestReadOnlySurface:
 
     async def test_a_successful_install_is_a_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(deps, "install_deps", lambda: {"ok": True, "installed": ["ruff"]})
-        response = await routes._handle_deps_install(_request("POST"))
+        response = await routes._handle_deps_install(_owner_request())
         assert response.status == 200
         assert _json_of(response)["installed"] == ["ruff"]
 
@@ -1612,7 +1629,7 @@ class TestReadOnlySurface:
     ) -> None:
         monkeypatch.setattr(deps, "install_deps", lambda: {"ok": False, "error": "pip SECRET"})
         monkeypatch.setattr(routes, "redact", lambda text: text.replace("SECRET", "***"))
-        response = await routes._handle_deps_install(_request("POST"))
+        response = await routes._handle_deps_install(_owner_request())
         assert response.status == 500
         payload = _json_of(response)
         assert payload["code"] == "operation_failed"

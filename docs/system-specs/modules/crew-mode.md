@@ -90,12 +90,22 @@ typed list as `choices` (the chat agent pop-up renders it grouped under
 **Crewmates** / **Agent templates**, each member row wearing the same avatar the
 roster draws for it, the origin badge dropped because the header already says what
 a row is, and the templates group carrying a one-line hint that a template pick
-runs the shared template on the shared default memory and enrols nothing) and
+runs on the default crewmate's workspace and memory and creates nothing new) and
 the same list folded to one row per name, member first, as `agents` for the
 name-only consumers (cron `agent_id`, channel and project bindings, the cycle
 shortcuts). The pop-up draws the group headers and the templates hint only when it
 lists more than one kind: a header that separates nothing is chrome, and the hint
-contrasts a template against a crewmate the list must then be showing. Temporarily,
+contrasts a template against a crewmate the list must then be showing. The folded
+rows keep their `selection_kind`, and `AgentSelector` (the shared roster picker)
+groups by it under the same two headers and hint when a caller passes
+`groupByKind`; the schedule job form does, so a cron's agent field offers
+**Crewmates** then **Agent templates** in one dropdown, and a template pick stores
+the bare template name -- the backend's name-first resolution runs an unaliased
+template on the default crew's workspace and memory, so no cron contract changes.
+The chrome follows the same one-kind rule, decided on the unfiltered roster so a
+filter that narrows to one group keeps its header; the `role="group"` label stays
+for assistive technology either way. Callers that do not opt in, and any name-only
+roster, render flat as before. Temporarily,
 `HIDE_CREWMATE_CHOICES` in `useAgents.ts` withholds the member rows from `choices`,
 so the pop-up offers templates only -- a plain list, no header -- and a crewmate is
 reached from its DM thread instead; the folded `agents` list and the request
@@ -722,6 +732,28 @@ then uses the existing verified thread-opening endpoint. A failed thread open
 retains its localized error heading and structured diagnostic report. Details
 reveals the redacted reason on demand; Ask the agent receives the same report
 when navigation permits. The cached conversation and its drafts remain available.
+
+The Crewmates page (`/members`, titled "Crewmates") creates a crewmate in place.
+Its "New crewmate" dialog — name, Built from (the default agent or an installed
+custom agent), "What it looks after", and an Advanced fold with workspace, model,
+triggers and session colour — posts to the same `POST /api/agents` the crew
+manager's create form uses: one write path, two front doors. "What it looks
+after" is stored as the crew record's `description`. After the create the page
+re-reads the roster, opens the new crewmate's chat through the verified
+thread-opening endpoint, and seeds one first user turn into that chat over the
+composer's own send path, so the chat opens with the crewmate's greeting; the
+seed names the job when one was given. If that chat open fails, the greeting is
+parked in page memory and seeds the crewmate's next successful open in this
+visit, once; leaving or reloading the page drops it, and nothing is persisted.
+Landing rule: with no crewmates the page
+shows a single empty-state hero (ghost avatar, "No crewmates yet", one line,
+"New crewmate") in place of a roster call to action and a "pick a member" pane;
+with crewmates and no `?member=`, the remembered crewmate opens, else the most
+recently used one (greatest `last_active_ts`, ties keep roster order). Below md
+nothing auto-opens — the roster is the page. A `?member=` naming a crewmate that
+is gone falls back the same way, under the existing swap notice. The page's copy
+says crewmate / Crewmates and "Built from"; the crew record, its API and its
+identifiers are unchanged.
 
 Reopening a running Member DM, including a turn awaiting tool approval,
 reuses its captured execution record. The canonical session key, selected

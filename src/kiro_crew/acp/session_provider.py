@@ -54,6 +54,13 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.providers.base import CancelOutcome, LLMEvent, LLMProvider
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.runtime_ownership import (
+    CHAT_RUNTIME_CAP,
+    RUNTIME_OWNERSHIP,
+    RuntimeTeardownCommitted,
+    claim_runtime_tenancy,
+    release_runtime_tenancy,
+)
 from kiro_crew.session_token_sig import schedule_session_token_publish
 
 logger = logging.getLogger(__name__)
@@ -87,6 +94,21 @@ class AcpSessionProvider(LLMProvider):
         # When True, shutdown() kills the runtime (parent session owns it).
         # When False, shutdown() only destroys the session handle (subagent).
         self._owns_runtime = owns_runtime
+        # This provider's LEASE on the runtime, or None when it holds none.
+        #
+        # The durable form of ``_owns_runtime``: that flag says "I may kill this
+        # process" but lives only inside this object, so nothing else asking "is
+        # anyone still using pid N?" can see it. The lease records the same claim
+        # in the one registry the kill gate consults, which is what lets a
+        # non-owning killer -- the dashboard's reset-all fallback, a pid sweep --
+        # be refused instead of taking a co-tenant's runtime with it.
+        #
+        # Only an OWNING provider takes one. A session-sharing subagent is handed
+        # a runtime it did not spawn and must not kill, and at ``cap=1`` no entry
+        # holding a lease has room for a second, so having subagents acquire
+        # would either refuse them or change which process they land on. Their
+        # co-tenancy becomes a lease in the change that raises the cap.
+        self._runtime_lease: str | None = None
         self._resumed_flag: bool = False
         self._resume_session_id: str = ""
         # The session this provider serves. ``rekey()`` sets it on a warm-pool
@@ -104,7 +126,139 @@ class AcpSessionProvider(LLMProvider):
     # ── LLMProvider interface ──
 
     async def start(self) -> None:
-        """No-op — the session handle is already initialized."""
+        """No-op — the session handle is already initialized.
+
+        Deliberately NOT where the runtime lease is taken. The kiro startup path
+        constructs this provider and assigns it to the outer provider's
+        ``_client`` without ever awaiting this method, so a lease taken here would
+        never exist in a running gateway. ``acquire_runtime_lease`` is called from
+        the registration point instead.
+        """
+
+    async def acquire_runtime_lease(self) -> None:
+        """Record this session's claim on the runtime in the kill gate's registry.
+
+        Bookkeeping only, and no I/O: the runtime is running and the handle
+        initialized before this provider was constructed. Idempotent, and a no-op
+        for a subagent, which is handed a runtime it must not kill.
+
+        Called when the session becomes a REGISTERED tenant, so the lease means
+        the same thing as membership of the session registry: a live session is
+        using this process. That is what makes every pre-registration cleanup path
+        -- a failed ``start``, a failed identity stamp, a discarded pool provider
+        -- authorized without exception, because none of them has a tenant yet.
+
+        The runtime is passed in already spawned, so the ``spawn`` callback hands
+        the existing one back rather than making a second. At ``cap=1`` no entry
+        that holds a lease has room, so this always founds its own entry with
+        exactly one lease -- one process per owning session, which is what the
+        unpooled path already did.
+        """
+        if not self._owns_runtime or self._runtime_lease is not None:
+            return
+        runtime = self._runtime
+
+        async def _already_spawned() -> AcpRuntime:
+            return runtime
+
+        acquisition = await RUNTIME_OWNERSHIP.acquire(
+            runtime,
+            self._session_key,
+            _already_spawned,
+            cap=CHAT_RUNTIME_CAP,
+        )
+        self._runtime_lease = acquisition.lease
+
+    def _claim_shared_turn(self) -> str | None:
+        """Defend the SHARED runtime for the length of this subagent's turn.
+
+        A session-sharing subagent holds no lease: it is handed a runtime it did
+        not spawn and must not kill, and at ``cap=1`` an acquisition cannot join
+        an occupied runtime, so a lease of its own would either be placed on a
+        second process or found a duplicate entry for the one it already shares.
+        Without a claim of some other kind it is undefended in one window: once
+        the principal's teardown releases the principal's lease, nothing in the
+        kill gate's registry says the process is still in use, so the reset-all
+        fallback or a sweep may SIGTERM a live subagent mid-turn -- the abandoned
+        prompt keeps burning credits, its frames are dropped as unknown-session,
+        and the sessionId can wedge the next prompt.
+
+        A tenancy is the claim that fits: not a lease, so it neither consumes the
+        cap nor changes placement, and it outlives the entry the principal's last
+        release forgets. Scoped to the TURN rather than to this object's life,
+        because a turn is what a signal destroys and because a claim paired inside
+        one function cannot outlive it -- an object-lifetime claim would leak on
+        any path that drops a provider without shutting it down, and a leaked
+        claim refuses that pid's kills for the life of the gateway.
+
+        Returns None for an owning provider, which already holds a lease for its
+        whole session: a second claim would defend a process that is defended, and
+        would refuse its owner's teardown until the turn ended.
+
+        Guarded, like the stub re-claim at the top of ``stream``: a turn must never
+        fail because bookkeeping could not be done, and the worst case of not
+        claiming is the behaviour that shipped before this table existed. The state
+        is read directly rather than through defaults, so a wiring break surfaces
+        in the log instead of being papered over by a guessed value -- and a
+        provider assembled without ``__init__``, which the unit tests of this
+        class's exception translation do, is inert here rather than an
+        ``AttributeError`` raised into someone's turn.
+
+        A committed teardown is the one refusal that must NOT be swallowed. It says
+        the process is being ended right now and a claim would defend nothing -- the
+        first signal has already left -- so proceeding would run the turn on a
+        corpse and surface as a mid-stream death with no cause attached. It is
+        translated into the same ``AcpProcessDied`` a dead runtime raises, which is
+        the answer callers already handle by getting another runtime.
+
+        Raised directly rather than through ``_translate_dead``: that mapping exists
+        to tell a login-expiry death from an ordinary one by reading runtime state,
+        and reading more state inside a guard written expressly not to crash is the
+        wrong trade -- a committed teardown is a death whatever the login state says.
+        """
+        try:
+            if self._owns_runtime:
+                return None
+            return claim_runtime_tenancy(
+                self._runtime, holder=f"subagent:{self._session_key or 'unnamed'}"
+            )
+        except RuntimeTeardownCommitted as exc:
+            logger.warning("_claim_shared_turn: shared runtime is being torn down: %s", exc)
+            raise AcpProcessDied(str(exc)) from exc
+        except Exception:
+            logger.debug("_claim_shared_turn: tenancy claim skipped", exc_info=True)
+            return None
+
+    async def _end_shared_turn(self, claim: str | None) -> None:
+        """Stop defending the shared runtime, and end it if nobody is left on it.
+
+        A hand-back means the runtime is ORPHANED -- this was the last tenancy and
+        no lease owns it -- which happens when the principal's teardown was
+        refused on this turn's behalf and then returned without signalling. Its
+        own shield keeps the sweep off it and no session owns it, so the tenant
+        that just finished is the only party that will ever visit it again.
+
+        Shielded because this runs in a ``finally`` that a cancellation reaches:
+        a subagent reaped mid-turn is exactly the case that leaves an orphan, so
+        letting the cancellation skip the teardown would leak the process in the
+        one scenario it is written for.
+        """
+        try:
+            orphan = release_runtime_tenancy(claim)
+        except Exception:
+            logger.debug("_end_shared_turn: tenancy release failed", exc_info=True)
+            return
+        if orphan is None:
+            return
+        try:
+            await asyncio.shield(
+                self._runtime.kill(
+                    expected=True,
+                    reason="last shared tenant finished; runtime left with no owner",
+                )
+            )
+        except Exception:
+            logger.debug("_end_shared_turn: orphaned runtime teardown failed", exc_info=True)
 
     async def new_conversation(self) -> None:
         """Reset to a fresh conversation on the SAME warm runtime (kiro path).
@@ -233,6 +387,17 @@ class AcpSessionProvider(LLMProvider):
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
     @property
+    def kas_auto_approved_capabilities(self) -> frozenset[str] | None:
+        """See ``AcpSessionHandle.kas_auto_approved``."""
+        return getattr(self._handle, "kas_auto_approved", None)
+
+    @property
+    def kas_projected_agent(self) -> str:
+        """See ``AcpSessionHandle.kas_projected_agent``."""
+        value = getattr(self._handle, "kas_projected_agent", "")
+        return value if isinstance(value, str) else ""
+
+    @property
     def work_scratch_dir(self) -> Path | None:
         """The session tree's ``$KIROCREW_SCRATCH`` directory (see ``AcpRuntime.work_scratch_dir``)."""
         return self._runtime.work_scratch_dir
@@ -247,6 +412,27 @@ class AcpSessionProvider(LLMProvider):
         if hasattr(self._handle, "child_fidelity_aware"):
             self._handle.child_fidelity_aware = value
 
+    async def release_runtime_lease(self) -> None:
+        """Give up this provider's lease on the runtime, if it holds one.
+
+        Idempotent, and a no-op for a subagent, which never took one. The lease
+        handle is cleared first so a second call -- a teardown that races the
+        dashboard's reset, or a shutdown retried after a cancellation -- cannot
+        release a lease a later acquisition now owns.
+
+        Separate from ``shutdown`` because the callers differ. ``shutdown`` is the
+        owner ending its own runtime. The other caller is a path that kills a
+        process it did not lease: it must release the sessions it IS ending, so
+        their runtimes die, and must NOT release the ones it is not, so the gate
+        refuses and a co-tenant survives. Folding this into ``shutdown`` would
+        force such a path to choose between a full teardown and no release.
+        """
+        lease = self._runtime_lease
+        if lease is None:
+            return
+        self._runtime_lease = None
+        await RUNTIME_OWNERSHIP.release(lease)
+
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
 
@@ -260,6 +446,18 @@ class AcpSessionProvider(LLMProvider):
             cancel_hooks = getattr(self._handle, "_cancel_hook_tasks", None)
             if callable(cancel_hooks):
                 cancel_hooks()
+            # Release BEFORE the kill, and before the destroy that precedes it.
+            # From this line on this provider is committed to ending the runtime,
+            # so holding the lease any longer would only make the gate refuse
+            # this teardown -- the process's owner refusing its own kill.
+            #
+            # Releasing first also covers the paths that never reach the kill
+            # below. A cancellation delivered into this coroutine leaves the
+            # process alive exactly as it does today, and the hard-kill fallback
+            # that cleans up after it then finds no lease and is authorized. Were
+            # the release after the kill, that fallback would be refused and the
+            # leak it exists to prevent would become permanent.
+            await self.release_runtime_lease()
             try:
                 if self.memory_mode != "persistent":
                     try:
@@ -379,6 +577,7 @@ class AcpSessionProvider(LLMProvider):
             self.reclaim()
         except Exception:
             logger.debug("stream: stub re-claim failed", exc_info=True)
+        claim = self._claim_shared_turn()
         try:
             async with aclosing(
                 self.essential_delivery.stream(
@@ -400,6 +599,8 @@ class AcpSessionProvider(LLMProvider):
             # keep the provider surface within AcpError so chat_runner catches
             # it instead of hitting its generic `except Exception`.
             raise AcpError(str(exc)) from exc
+        finally:
+            await self._end_shared_turn(claim)
 
     async def steer(self, message: str) -> bool:
         """Forward a mid-turn steer to the session handle (kiro _session/steer)."""
@@ -412,8 +613,18 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def supports_steer(self) -> bool:
-        """True when the backing handle supports mid-turn steer (kiro-cli)."""
+        """True when the backing handle takes a user's mid-turn steer."""
         return self._handle.supports_steer
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when a delivered steer can still be lost (see the handle)."""
+        return self._handle.steer_needs_loss_recovery is True
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when the backing handle can steer a deny notice into a refused turn."""
+        return self._handle.supports_refusal_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
         """Execute a slash command natively via ``_kiro.dev/commands/execute``.
@@ -431,6 +642,7 @@ class AcpSessionProvider(LLMProvider):
         # so the next warm turn resends the complete snapshot even when the
         # status receipt is missing or arrives late.
         self.essential_delivery.prepare_command(command)
+        claim = self._claim_shared_turn()
         try:
             async with aclosing(
                 self.essential_delivery.stream(
@@ -443,6 +655,8 @@ class AcpSessionProvider(LLMProvider):
             raise self._translate_dead(exc) from exc
         except AcpRuntimeError as exc:
             raise AcpError(str(exc)) from exc
+        finally:
+            await self._end_shared_turn(claim)
 
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
@@ -492,12 +706,12 @@ class AcpSessionProvider(LLMProvider):
 
     async def approve_tool(
         self, request_id: str | int, option_id: str | None = None, *, always: bool = False
-    ) -> None:
+    ) -> bool:
         """Approve a pending tool permission request. Accepts an explicit
         option_id (signature parity with AcpClient.approve_tool); falls back to
         allow_always/allow_once from `always`."""
         resolved = option_id or ("allow_always" if always else "allow_once")
-        await self._guarded(self._handle.approve_tool(request_id, option_id=resolved))
+        return await self._guarded(self._handle.approve_tool(request_id, option_id=resolved))
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending tool permission request."""
@@ -554,12 +768,30 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.session_id
 
     def is_alive(self) -> bool:
-        """True if the underlying runtime is still alive."""
+        """True if the underlying runtime is still alive.
+
+        A PROCESS-level answer wearing a session-level name. Every session on a
+        shared runtime gets the same one, so it is right about death (the process
+        dying does end all of them) and wrong about eviction: a session removed
+        by ``terminate_session`` still reads alive while its co-tenants keep the
+        process up. A caller asking "may I still use MY session" needs a
+        per-session liveness bit, which this contract has no vocabulary for.
+        """
         return self._runtime.is_alive()
 
     def is_process_alive(self) -> bool:
-        """True if the runtime process exists and has not exited."""
+        """True if the runtime process exists and has not exited.
+
+        Process-level by name as well as by behaviour, and shared by every
+        session on the runtime. Do not read it as "my session is usable" -- see
+        :meth:`is_alive`.
+        """
         return self._runtime.is_alive()
+
+    @property
+    def process_tree_confirmed_dead(self) -> bool:
+        """Whether the owned runtime confirmed its whole process tree exited."""
+        return self._runtime.process_tree_confirmed_dead
 
     @property
     def process_instance(self) -> str:
@@ -594,7 +826,16 @@ class AcpSessionProvider(LLMProvider):
         return proc.returncode if proc else None
 
     def touch_activity(self) -> None:
-        """Refresh activity timestamp on the runtime."""
+        """Refresh activity timestamp on the runtime.
+
+        PROCESS-level: the clock belongs to the runtime, so one session's
+        activity refreshes it for every session on it. An idle co-tenant is
+        therefore never idle while a neighbour talks, which is the SAFE
+        direction for anything that reaps on idleness (it defers, never
+        signals early) and the wrong one for anything that reports idle time
+        as a fact about a session. A per-session activity stamp is the fix;
+        this method cannot be it, because it has only the runtime to write to.
+        """
         self._runtime._last_activity = time.monotonic()
 
     def rekey(
@@ -887,8 +1128,11 @@ class AcpSessionProvider(LLMProvider):
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
+            # A user's explicit pick must earn a FRESH probe, not be refused on a
+            # recent no-evidence failure the picker read path may have cached
+            # (force=True skips the failure/empty attempt-clock replay).
             fresh = advertised_model_ids(
-                await self._guarded(self._handle.refresh_available_models())
+                await self._guarded(self._handle.refresh_available_models(force=True))
             )
             if model_is_unusable(model_id, fresh or advertised):
                 raise AcpModelUnavailable(model_id, fresh or advertised)
@@ -953,6 +1197,23 @@ class AcpSessionProvider(LLMProvider):
     def available_models(self) -> list[dict[str, str]]:
         """Models advertised by the backend."""
         return self._handle.available_models
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the read path.
+
+        The read-path counterpart to the refresh-before-refuse in
+        :meth:`set_model`: the dashboard picker filter narrows the catalog
+        through this session's snapshot, and an unconfirmed startup-race snapshot
+        would hide models the account actually has with no explicit pick to
+        trigger the refusal-path heal. Delegates the staleness decision and the
+        single-flight probe to
+        :meth:`AcpSessionHandle.maybe_refresh_available_models`, and propagates
+        its contract: on the read deadline it raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` (the probe
+        keeps running); on a probe FAILURE it returns the current snapshot (fail
+        open).
+        """
+        return await self._guarded(self._handle.maybe_refresh_available_models(catalog_ids))
 
     def pop_pending_oauth_requests(self) -> list[dict[str, str]]:
         """Drain OAuth requests captured while the shared session initialized."""

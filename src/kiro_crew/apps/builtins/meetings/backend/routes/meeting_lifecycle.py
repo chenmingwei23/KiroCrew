@@ -6,6 +6,7 @@
 ``POST …/{id}/stop``          flush agents, mark ended
 ``GET  …/meetings``           list every meeting with metadata on disk
 ``GET  …/{id}``               one meeting's metadata
+``PATCH …/{id}``              rename a meeting (``title``)
 ``DELETE …/{id}``             permanently remove an inactive meeting
 ``GET  …/{id}/transcript``     finalized speech and typed broadcasts
 ``GET  …/{id}/outputs``       batch-read every agent output + tasks.json
@@ -172,6 +173,31 @@ async def handle_get_meeting(request: web.Request) -> web.Response:
             "live": live_payload,
         }
     )
+
+
+def _rename_meeting(meeting_id: str, title: str, root: Any) -> dict[str, Any] | None:
+    """Set a meeting's title, or return None when it does not exist. BLOCKING."""
+    with store.meta_transaction():
+        meta = store.read_meeting_meta(meeting_id, root)
+        if meta is None:
+            return None
+        meta["title"] = redact(title)
+        store.write_meeting_meta(meeting_id, meta, root)
+    return meta
+
+
+async def handle_patch_meeting(request: web.Request) -> web.Response:
+    """Rename a meeting. The title is trimmed and must not be empty."""
+    meeting_id = _meeting_id(request)
+    body = await json_body(request)
+    title = field_str(body, "title", required=True, max_len=k.MAX_TITLE_LEN)
+    meta = await asyncio.to_thread(_rename_meeting, meeting_id, title, data_root(request))
+    if meta is None:
+        return web.json_response(
+            {"error": "meeting not found", "code": "meeting_not_found"}, status=404
+        )
+    audit("meetings.rename", meeting_id, outcome="ok")
+    return web.json_response({"ok": True, "meta": meta})
 
 
 async def handle_list_meetings(request: web.Request) -> web.Response:
@@ -420,6 +446,14 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
                 buffered,
                 dropped,
             )
+        if buffered or dropped:
+            # Every enqueue above started the ordinary 30-second batch timer. This
+            # is the meeting's opening, already delayed by agent initialization, so
+            # send it on the next event-loop turn instead of adding another full
+            # interval. Scheduling is synchronous: START_LOCK must not wait for an
+            # ordinary transcript turn, which has no lifecycle timeout.
+            for queue in session.agents.values():
+                queue.flush_soon()
         if dropped:
             # Off the lock (this is disk IO) but still inside START_LOCK. Recorded
             # so the human transcript states the loss too: the agents were told by

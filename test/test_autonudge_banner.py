@@ -45,13 +45,33 @@ from kiro_crew.validation import ValidationError
 # ── Fire-path harness (mirrors test_autonudge_dashboard_fire.py) ──
 
 
+def _owner_dashboard_identity():
+    """The owner's dashboard claims, for the routes the owner gate covers.
+
+    ``app == ""`` with the owner's subject: ``state.owner_id`` when one is
+    configured, else the signed local bootstrap subject.
+    """
+    from aiohttp import web
+
+    @web.middleware
+    async def middleware(request, handler):
+        state = request.app.get("state")
+        request["user"] = str(getattr(state, "owner_id", "") or "") or "local-app"
+        request["app"] = ""
+        return await handler(request)
+
+    return middleware
+
+
 def _loop(**kw) -> NudgeLoop:
     base = dict(
         id="loop-abc",
         slot_key="chat-1-1785",
         message="the full multi-paragraph babysit instruction",
         idle_secs=300,
-        max_cycles=24,
+        # Uncapped: a capped loop adds a ``[patrol budget: ...]`` line to the
+        # tag (``test_patrol_budget.py``), which these banner pins are not about.
+        max_cycles=0,
         cycle_count=3,
     )
     base.update(kw)
@@ -142,6 +162,20 @@ async def _fire_full(loop: NudgeLoop, *, ledger: str = "") -> tuple[str, str, di
     prompt = run_chat.call_args.args[2]
     meta = slot.append.call_args.kwargs["meta"]["nudge"]
     return appended, prompt, meta
+
+
+class TestCappedLoopShowsItsBudget:
+    @pytest.mark.asyncio
+    async def test_the_prompt_carries_the_budget_line(self) -> None:
+        """A capped loop's prompt names what is left, under the unchanged tag.
+
+        The conductor renews its patrol from this line; without it the cap runs
+        out and the loop deactivates before any turn could call monitor_update.
+        """
+        loop = _loop(max_cycles=24)
+        row, prompt = await _fire(loop)
+        assert prompt == f"[auto-nudge cycle 4]\n[patrol budget: cycle 4/24]\n{loop.message}"
+        assert row == prompt
 
 
 class TestDefaultRowIsUnchanged:
@@ -746,7 +780,7 @@ class TestRestSurface:
         state._slots = {
             "chat-1-123": MagicMock(workspace="default", memory_mode="persistent", mode="chat")
         }
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_dashboard_identity()])
         app["state"] = state
         app.router.add_post("/api/autonudge", _handler.api_autonudge_start)
         app.router.add_patch("/api/autonudge/{loop_id}", _handler.api_autonudge_update)

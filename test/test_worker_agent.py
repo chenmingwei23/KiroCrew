@@ -18,11 +18,12 @@ import ast
 import json
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from source_corpus import parsed_candidates, source_texts
+from source_corpus import iter_source_texts, parsed_candidates
 
 from kiro_crew import agent
 from kiro_crew.agent_files import (
@@ -54,36 +55,29 @@ def _pin_spec_permissions_cli(monkeypatch, which):
     monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
 
 
-# One xdist worker for the whole module: the four enumeration gates below share ONE read of
-# src/ (~1,550 files, 0.9 s and ~187 MB of text while it is warm), and under `--dist
-# loadgroup` an unmarked module is spread across workers -- so those four can land on four
-# workers, each paying the read again and each holding its own copy of the corpus at the
-# same time. Grouping keeps it single-copy per run; the copy itself is released at module
-# teardown by `conftest._release_source_corpus_after_module`.
+# One xdist worker for the whole module: the four enumeration gates below each stream
+# src/ (~1,700 files) through ``test/source_corpus.py``, which memoises only the file
+# list. Grouping keeps that list single-copy per run and the gates on one worker, so
+# their reads do not compete with three other workers re-walking the same tree.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_worker_agent")
 
 
-def _package_sources() -> tuple[tuple[Path, str], ...]:
-    """Every ``kiro_crew`` module except ``agent.py``, off the shared corpus read.
+def _package_sources() -> Iterator[tuple[Path, str]]:
+    """Every ``kiro_crew`` module except ``agent.py``, streamed off the shared corpus.
 
-    Four enumeration tests below reason over the package, and one traversal serves all of
-    them. A walk per test is thousands of small reads each -- seconds on Linux and far
-    worse on the Windows shards, whose job budget is 40 minutes for a quarter of a
-    100k-test suite. The rule-shaped assertions are what matter; repeating the traversal
-    is not part of them.
-
-    The sharing is ``test/source_corpus.py``'s and NOT an ``lru_cache`` of our own,
-    because the text of the ~1,550 modules under ``src/`` is ~115 MB of retained ``str``
-    and only the corpus helper's copy can be released: ``test/conftest.py``'s
-    ``_release_source_corpus_after_module`` calls ``_clear_caches()`` at module teardown,
-    but a second tuple of ours holding those same ``str`` objects would keep every one of
-    them alive for the rest of the xdist worker's life, paid by every later test that
-    worker runs. So this stays uncached -- rebuilding a tuple of ~1,550 references costs
-    nothing measurable -- and the ``agent.py`` exclusion stays HERE with the gates rather
-    than in the shared helper, because which files a gate polices is that gate's contract
-    (and ``agent.py``, defining every name these gates hunt for, would match them all).
+    Four enumeration tests below reason over the package. Streamed, not collected: the
+    text of the ~1,700 modules under ``src/`` is ~130 MB of ``str`` (a quarter of the
+    files hold an emoji, which makes CPython store the whole file at four bytes per code
+    point), and a tuple holding all of it was this module's entire +229 MiB high-water
+    mark. ``iter_source_texts`` keeps one file live at a time, and the rule-shaped
+    assertions below only ever look at one file at a time anyway. The ``agent.py``
+    exclusion stays HERE with the gates rather than in the shared helper, because which
+    files a gate polices is that gate's contract (and ``agent.py``, defining every name
+    these gates hunt for, would match them all).
     """
-    return tuple((path, text) for path, text in source_texts() if path.name != "agent.py")
+    for path, text in iter_source_texts():
+        if path.name != "agent.py":
+            yield path, text
 
 
 @pytest.fixture(autouse=True)
@@ -908,14 +902,22 @@ def test_every_read_and_the_write_sit_in_one_critical_section(tmp_path, monkeypa
     # it hashes the bytes this derivation already mirrored. A stamp that went back to the
     # file would be a separate observation, so it could record a fingerprint for a
     # generation the spec on disk does not mirror.
+    #
+    # The mirror is read ONCE too, first, and both things the writer needs from that file
+    # come out of the one parse: whether it is this derivation's to overwrite at all
+    # (a shared crew parked on the mirror's filename is refused, not replaced) and the
+    # frozen ``model``. It is inside the lock for the same reason the default read
+    # is: an attribution made outside it would vouch for a file a dashboard edit could
+    # replace before the write.
     assert order == [
         "lock",
-        f"read:{AGENT_FILENAME}:{True}",
         f"read:{WORKER_AGENT_FILENAME}:{True}",
+        f"read:{AGENT_FILENAME}:{True}",
         f"write:{True}",
         "unlock",
     ], order
     assert order.count(f"read:{AGENT_FILENAME}:{True}") == 1, order
+    assert order.count(f"read:{WORKER_AGENT_FILENAME}:{True}") == 1, order
 
 
 def test_the_withheld_cron_grants_are_sel_audited(tmp_path, monkeypatch):
@@ -3410,6 +3412,48 @@ def test_a_revocation_between_the_array_build_and_session_new_ends_the_session(
 
     assert sent[:2] == [METHOD_INITIALIZE, METHOD_SESSION_NEW], sent
     assert "changed during worker load" in str(excinfo.value)
+
+
+def test_post_check_uses_snapshot_sent_not_the_reseeded_one(tmp_path, monkeypatch):
+    """The post-check judges the snapshot sent to session/new even after re-seeding
+    invalidates the instance projection for the next composition."""
+    import asyncio
+
+    from kiro_crew import agent_state
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.acp.types import METHOD_SESSION_NEW
+
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    monkeypatch.setattr(agent_state, "config_dir", lambda: tmp_path)
+    default = tmp_path / AGENT_FILENAME
+    default.write_text(json.dumps(_DEFAULT_SPEC_ON_DISK), encoding="utf-8")
+    agent._install_worker_agent()
+    sent_snapshot = agent.require_fresh_derived_spec("kirocrew-worker", None)
+
+    c, _sent = _claude_client_at_session_new(tmp_path, sent_snapshot)
+    real_wait = c._wait_for_response
+    real_reseed = c._reseed_after_capture
+    snapshots_after_reseed = []
+
+    async def _wait_then_revoke(rid, timeout=None, *, method="", expected_mcp=None):
+        resp = await real_wait(rid, timeout=timeout, method=method, expected_mcp=expected_mcp)
+        if method == METHOD_SESSION_NEW:
+            revoked = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
+            revoked["mcpServers"].pop("builder-mcp")
+            default.write_text(json.dumps(revoked), encoding="utf-8")
+        return resp
+
+    async def _reseed_and_observe_reset():
+        await real_reseed()
+        snapshots_after_reseed.append(c._session_mcp_snapshot)
+
+    c._wait_for_response = _wait_then_revoke  # type: ignore[method-assign]
+    c._reseed_after_capture = _reseed_and_observe_reset  # type: ignore[method-assign]
+
+    with pytest.raises(AcpError, match="changed during worker load"):
+        asyncio.run(c._initialize_session())
+
+    assert snapshots_after_reseed == [None]
 
 
 def test_an_unchanged_default_lets_the_array_backed_session_proceed(tmp_path, monkeypatch):

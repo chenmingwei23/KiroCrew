@@ -271,7 +271,10 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     _LineSpec(LINE_MEMBER_SAVED_AGENT, ("ACP_BACKENDS_MEMBER_CAPABILITIES",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
     _LineSpec(LINE_SUBAGENT_CONTINUATION, ("ACP_BACKENDS_SESSION_SHARING",)),
-    _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER",)),
+    # Two verbs carry a user's mid-turn message: kiro-cli's ``_session/steer`` and
+    # codex-acp's ``_session/steering``. A user asks "can I add to a running turn?",
+    # and either verb answers yes, so the line is their union.
+    _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER", "ACP_BACKENDS_STEERING_REQUEST")),
     _LineSpec(LINE_MANUAL_COMPACT, ("ACP_BACKENDS_COMPACT",)),
     # Effort travels down one of two channels, and neither set alone answers the
     # question a user asks. The config-option members advertise an ``effort``
@@ -341,6 +344,12 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "member asks nothing and a non-member loses nothing. A wrong membership would "
         "answer a backend that never defined the channel, which is a defect rather "
         "than a shortfall"
+    ),
+    "ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS": (
+        "who runs the agent spec's own hooks: the harness, or Crew's turn loop for a "
+        "harness that never receives them. The hooks run either way, so a reader "
+        "choosing a harness loses nothing; a wrong membership runs every hook twice "
+        "or not at all, which is a defect"
     ),
     "ACP_BACKENDS_HARNESS_OWNED_SESSIONS": (
         "whose disk the transcript sits on. Crew holds a non-member's transcript under "

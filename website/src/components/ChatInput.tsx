@@ -10,12 +10,13 @@ import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
+import { haptic } from '../lib/haptic'
 import { createPortal } from 'react-dom'
 import { InstantTip, useInstantTip } from './InstantTip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
-import { useAppSelector, useAppDispatch } from '../store'
-import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone, setAgentSwitchNotice, switchSlot } from '../store/chatSlice'
+import { useAppStore, useAppSelector, useAppDispatch } from '../store'
+import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone, setAgentSwitchNotice, switchSlot, selectSlotMessages } from '../store/chatSlice'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { useSlotId } from '../providers/SlotContext'
 import { useToolPillVisible } from '../store/toolPillRegistry'
@@ -69,6 +70,7 @@ import type { SendMode } from '../pages/chat/ChatSettings'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import type { ComposerControl } from './composerControl'
 import {
+  isRawPasteChord,
   clipboardFiles,
   hasPlainClipboardText,
   stripTrailingBlankLines,
@@ -148,6 +150,7 @@ import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
 import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
+import { Glass } from './Glass'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -325,6 +328,11 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
   // path at the same width, and an off-screen node carrying a real placeholder
   // attribute would answer accessibility and test queries meant for the live one.
   twin.value = el.value || el.placeholder || ''
+  // A placeholder the stylesheet holds to one line must be MEASURED on one line;
+  // the copied `whiteSpace` above is the element's, which still wraps.
+  if (!el.value && el.placeholder && getComputedStyle(el, '::placeholder').whiteSpace === 'nowrap') {
+    twin.style.whiteSpace = 'nowrap'
+  }
   return twin.scrollHeight
 }
 
@@ -624,7 +632,15 @@ interface ChatInputProps {
   stopState?: 'idle' | 'soft_pending' | 'killing'
   approvalMode?: string
   reasoningEffort?: string
-  onReasoningEffortClick?: (rect: DOMRect) => void
+  /** True when `reasoningEffort` is the configured default rather than a
+   *  per-slot pick. Only the chip's hover / accessible name says so: outside
+   *  the picker the two states otherwise read identically. */
+  effortIsDefault?: boolean
+  /** True when the session's model takes a reasoning-effort level. The chip
+   *  then names the level in force beside the model; the slider that CHANGES
+   *  it lives inside the model picker the chip opens -- model + effort are one
+   *  control, never a second composer button (docs/decisions/2026-06-14). */
+  hasEffort?: boolean
   providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
@@ -801,6 +817,19 @@ const NO_VOICE: Partial<ComposerVoiceInputProps> = {}
  *  effect on every render (a fresh [] literal changes deps each time). */
 const NO_DIRS: string[] = []
 
+/** Staged attachments and folder references above the composer.
+ *
+ *  Every tile is a `role="group"` named by its FULL path. `title` shows that
+ *  path on pointer hover only -- no browser opens a native tooltip on keyboard
+ *  focus -- and a tile's visible text is the short label, so without the group
+ *  name the path reaches nobody using assistive technology. A group's name IS
+ *  announced when focus enters it, which is the reliable case and is what these
+ *  tiles have: each one holds a focusable button.
+ *
+ *  The name also tells the per-tile controls apart: their labels are bare verbs
+ *  ("Remove", "Remove folder"), so with several files staged a screen reader
+ *  announces each one inside its own file's group instead of a row of identical
+ *  buttons. */
 function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir, rootRef }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void; rootRef?: (node: HTMLDivElement | null) => void }) {
   const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Chips are added and removed while the strip stays mounted (a paste, a
@@ -824,7 +853,7 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         const src = `/api/file-raw?path=${encodeURIComponent(path)}`
         const resize = resizedInfo?.[path]
         return (
-          <div key={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
+          <div key={path} role="group" aria-label={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
             {/* The corner controls anchor to the IMAGE, not to the chip: the chip
                 is as wide as the wider of tile and resize pill, so a locale
                 whose pill is wider than the 64px tile (de: 104px pill) would
@@ -870,7 +899,7 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         )
       })}
       {nonImgs.map(path => (
-        <div key={path} className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text">
+        <div key={path} role="group" aria-label={path} title={path} className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text">
           <span>{path.split('/').pop()}</span>
           {onRemove && (
             <button className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0" onClick={() => onRemove(path)} title={i18nT('components.chatInput.remove')} aria-label={i18nT('components.chatInput.remove')}><X size={12} /></button>
@@ -891,6 +920,8 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         <div
           key={path}
           data-dir-chip=""
+          role="group"
+          aria-label={path}
           title={path}
           className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
         >
@@ -980,7 +1011,8 @@ function ChatInput({
   stopState,
   approvalMode,
   reasoningEffort,
-  onReasoningEffortClick,
+  effortIsDefault = false,
+  hasEffort,
   providerId: _providerId,
   onFileSelect,
   onFileOpen,
@@ -1032,6 +1064,7 @@ function ChatInput({
     voiceDeviceSwitchIsLive = false,
     voiceTranscribing = false,
     voiceTranscribeActive,
+    voiceDrainCancellable = false,
     voiceBusyElsewhere = false,
     voiceBusyElsewhereSession = null,
     voiceHeldLanded = false,
@@ -1058,6 +1091,11 @@ function ChatInput({
   const disabled = disabledProp
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
+  // The store handle, read at click time (not subscribed) so "Optimize prompt"
+  // can pull THIS pane's slot messages without re-rendering every composer on
+  // each streamed frame. useAppStore returns the Provider-injected store, the
+  // same pattern ChatPane uses for its at-send reads.
+  const chatStore = useAppStore()
   const pendingApprovalRaw = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
   // Suppressed at the READ so every consumer (bar, ghost, pill, rounded-corner
   // class) follows one judgment instead of each render site re-deciding.
@@ -1484,6 +1522,11 @@ function ChatInput({
   // Below ~340px the labels no longer fit comfortably alongside the context bar
   // + model chip, so collapse the chips (agent/project) to icon-only.
   const shelfCompact = shelfWidth < 340
+  // A two-column split can leave under 200px per composer. The effort level on
+  // the model chip is the only at-a-glance readout of what a turn runs at, so
+  // it survives the compact collapse and drops only when even a short word has
+  // no room (the picker the chip opens always shows the level in force).
+  const shelfTiny = shelfWidth < 220
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
@@ -1505,6 +1548,29 @@ function ChatInput({
   useEffect(() => {
     if (showDictation || voiceTranscribing) composerControl()?.focus()
   }, [showDictation, voiceTranscribing, composerControl])
+
+  // Discarding a drain from the strip's own button removes the element the press
+  // happened on: the discard clears `draining`, so `voiceDrainCancellable` goes
+  // false and the strip unmounts with the focused button inside it. The effect
+  // above cannot catch that -- a streaming drain has already cleared `recording`
+  // (so `showDictation` is null) and `voiceTranscribing` is the batch flag -- and
+  // focus would land on the document body, leaving the composer deaf to the very
+  // keyboard and touch users this control was added for. Hand focus back as part
+  // of the discard rather than on an effect edge, so it is the same press.
+  //
+  // Stays `undefined` when there is no discard to run, because the strip reads
+  // the handler's presence as one of the two terms deciding whether to offer the
+  // control at all: wrapping unconditionally would put a button on screen whose
+  // only effect is to move focus.
+  const cancelVoiceDrain = useMemo(
+    () => onVoiceCancel
+      ? () => {
+        onVoiceCancel()
+        composerControl()?.focus()
+      }
+      : undefined,
+    [onVoiceCancel, composerControl],
+  )
 
   // Escape CANCELS dictation (discards the audio), from ANYWHERE. Deliberately a
   // document-level listener rather than the textarea's onKeyDown: starting a
@@ -1643,9 +1709,19 @@ function ChatInput({
     // A flipped send never asks: the chord is the sender answering the question
     // themselves for this one message, so handing it to the oracle anyway would
     // ignore the only explicit instruction on the send.
+    // The message leaves the hand here, on every path (Enter, Send, steer) --
+    // but only when there is one: an Enter on an empty composer reaches onSend
+    // (which drops it) and must stay as silent as the Send button it disables.
+    if (value.trim() || pendingFiles.length || pendingSessions.length) haptic('light')
     if (steerNow && onSteer) onSteer(steerAuto && !flip ? { auto: true } : undefined)
     else onSend()
-  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend])
+  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend, value, pendingFiles.length, pendingSessions.length])
+  // Every stop button in the row goes through this, so the tap and the truthiness
+  // checks on `onStop` (which decide whether a button renders at all) stay apart.
+  const stopWithTap = useCallback(() => {
+    haptic('medium')
+    onStop?.()
+  }, [onStop])
   const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
     if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
   }, [disabled, onFollowUpSend])
@@ -1871,7 +1947,14 @@ function ChatInput({
     onChange(next.value)
     requestAnimationFrame(() => composerControl()?.setSelection(next.caret, next.caret, { focus: true }))
   }, [value, onChange, composerControl])
-  const chatMessages = useAppSelector(s => s.chat.messages)
+  // The optimizer's context is the ONLY reader of this slot's message history,
+  // and only when "Optimize prompt" is clicked. Subscribing here forced every
+  // mounted composer to re-render on each streamed frame (Immer hands back a new
+  // `state.messages` reference per flush, so the `===` selector always tripped),
+  // which multiplied with N split panes. Read the slot's own messages at click
+  // time instead — `selectSlotMessages` returns THIS pane's slot (falling back
+  // to the active mirror when this pane IS active), which also fixes a bug where
+  // a non-active pane sent the *active* pane's conversation as optimizer context.
   /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
    *  this is the raw stored value and is not what the composer renders at. */
   const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
@@ -2647,7 +2730,17 @@ function ChatInput({
     // Pin the slot that owns this optimize so the overlay and the completion
     // handler stay bound to it across session switches.
     optimizeSlotRef.current = slotId
-    const context = chatMessages
+    // Read THIS pane's slot messages at click time (not via a live subscription),
+    // so a non-active pane optimizes against its own conversation, not the active
+    // pane's. When slotId is null (no SlotProvider / global composer) read the
+    // active mirror, which is exactly what the old `s.chat.messages` subscription
+    // returned; selectSlotMessages also falls back to that mirror for the active
+    // slot, so the focused composer's behavior is preserved.
+    const rootState = chatStore.getState()
+    const slotMessages = slotId
+      ? selectSlotMessages(rootState, slotId)
+      : rootState.chat.messages
+    const context = slotMessages
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .slice(-10)
       .map(m => (m.content || '').slice(0, 200))
@@ -2660,14 +2753,15 @@ function ChatInput({
     const referenced = pruneBlocks(txt, pasteBlocks)
     const pastes = referenced.map(b => ({ seq: b.seq, content: b.content }))
     runOptimize({ prompt: txt, context, pastes, slotId })
-  }, [runOptimize, chatMessages, pasteBlocks, slotId])
+  }, [runOptimize, pasteBlocks, slotId, chatStore])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Cmd/Ctrl+Shift+V → next paste inserts full text inline (no chip collapse).
+    // Cmd/Ctrl+Shift+V (or Cmd+Option+Shift+V on macOS) → next paste inserts
+    // full text inline (no chip collapse).
     // Self-clearing: any other keydown resets the flag so it only ever affects
     // the paste that immediately follows this exact shortcut. We do NOT
     // preventDefault — the browser still fires the paste event we hook below.
-    rawPasteRef.current = (e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'v'
+    rawPasteRef.current = isRawPasteChord(e)
     // Undo / redo — drive the explicit per-slot history so Ctrl/Cmd+Z restores
     // text even after a programmatic reset (send-clear, ↑/↓ recall, optimize)
     // wiped the browser's native undo stack. We own the gesture and
@@ -3577,6 +3671,20 @@ function ChatInput({
   const voiceModePlaceholder = voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
     ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
     : ''
+  const activePlaceholder = !connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : transcribingIsHonest ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder
+  // The sigil hint is a label and may be cut to one line. Every other
+  // placeholder here is a sentence the user needs whole, so it still wraps —
+  // including a caller's own `placeholder`, which `resolvedPlaceholder` carries.
+  const placeholderIsHint = !placeholder && activePlaceholder === resolvedPlaceholder
+  // Re-measure when the PLACEHOLDER swaps at an unchanged value: an empty composer
+  // measures its placeholder, and the value effect's deps cannot see it. The caret
+  // is NOT followed here — a placeholder only shows over an empty box, so there is
+  // no line of the user's to keep in view, and this effect also runs on a
+  // parent-driven value change, where snapping is what the seeded-prompt rule forbids.
+  useEffect(() => {
+    const el = inputRef.current
+    if (el && !dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current, false)
+  }, [activePlaceholder, manualHeight, prefillHint])
   /** Combined height of every strip currently stacked above the textarea,
    *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
@@ -3685,7 +3793,16 @@ function ChatInput({
        *  Approve all / Reject all plus a per-agent row (task + Approve/Reject)
        *  so one can run while another is rejected. "Review in panel" opens the
        *  Subagents tab. Not a single <button> wrapper — every control is its
-       *  own button. */}
+       *  own button. Plain glass, not the warn tint the tool-approval pane
+       *  below wears: when both are up, two warn panes in one band read as ONE
+       *  request (UX review of 76851c90 -- "I'd fear double-approving"), and
+       *  this card's Bot framing and pulse already say what it is.
+       *  While the tool-approval bar below is ALSO pending, this card keeps its
+       *  count and "Review in panel" but withholds Approve/Reject and its glow:
+       *  one set of decision buttons on screen at a time, so a reader cannot
+       *  take the two panes for one request and wonder whether a click answers
+       *  half of it (UX review of 21b8e79b). The buttons return the moment the
+       *  tool decision lands; the Subagents tab can resolve the spawn meanwhile. */}
       <AnimatePresence>
         {pendingSpawnApprovals.length > 0 && (
           <motion.div
@@ -3694,20 +3811,40 @@ function ChatInput({
             exit={{ opacity: 0, y: 8 }}
             transition={{ type: 'spring', damping: 25, stiffness: 300, mass: 0.8 }}
           >
-            <div className="w-full bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border rounded-2xl mb-2 approval-glow">
+            <Glass variant="chip" radius={16} className={`w-full mb-2${hasApproval ? '' : ' approval-glow'}`} data-testid="spawn-approval-card">
               <div className="flex items-center gap-1.5 px-3.5 py-2.5 select-none flex-wrap">
                 <Bot size={13} className="text-warn shrink-0" />
                 <span className="text-[13px] font-body text-muted flex-1 min-w-0">
-                  {pendingSpawnApprovals.length === 1
-                    ? '1 sub-agent is awaiting your approval to run'
-                    : `${pendingSpawnApprovals.length} sub-agents are awaiting your approval to run`}
+                  {/* While the tool approval bar is up, the decision lives THERE
+                   *  (the spawn's own permission row is what holds the bar), so
+                   *  this line must not point at itself as the thing to approve:
+                   *  it names the count and defers to the panel link. */}
+                  {hasApproval
+                    ? i18nT('components.chatInput.spawn_pending', { count: pendingSpawnApprovals.length })
+                    : i18nT('components.chatInput.spawn_awaiting', { count: pendingSpawnApprovals.length })}
                 </span>
+                {/* The action area swaps between three forms (resolving / panel
+                 *  link only / Approve + Reject) as the tool bar comes and goes;
+                 *  `mode="wait"` fades one out before the next fades in, so the
+                 *  swap reads as the same slot changing state, not a new control
+                 *  appearing from nowhere. */}
+                <AnimatePresence mode="wait" initial={false}>
                 {spawnApprovalsResolving ? (
-                  <span className="inline-flex items-center gap-1 text-[12px] text-muted/60 shrink-0">
+                  <motion.span key="resolving" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className="inline-flex items-center gap-1 text-[12px] text-muted/60 shrink-0">
                     <Loader2 size={12} className="animate-spin shrink-0" />{i18nT('components.chatInput.resolving')}
-                  </span>
+                  </motion.span>
+                ) : hasApproval ? (
+                  <motion.button
+                    key="panel-only"
+                    initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}
+                    type="button"
+                    onClick={reviewSpawnApprovals}
+                    className="inline-flex items-center gap-1 text-[11px] text-muted hover:text-text shrink-0 cursor-pointer bg-transparent border-none px-1"
+                  >
+                    <Target size={11} className="shrink-0" />{i18nT('components.chatInput.review_in_panel')}
+                  </motion.button>
                 ) : (
-                  <div className="flex items-center gap-1.5 shrink-0">
+                  <motion.div key="decide" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className="flex items-center gap-1.5 shrink-0">
                     <button
                       type="button"
                       onClick={() => resolveSpawnApprovals('approve')}
@@ -3731,13 +3868,19 @@ function ChatInput({
                     >
                       <Target size={11} className="shrink-0" />{i18nT('components.chatInput.review_in_panel')}
                     </button>
-                  </div>
+                  </motion.div>
                 )}
+                </AnimatePresence>
               </div>
               {/* Per-agent rows — only when more than one is pending, so a single
                *  spawn stays a compact one-liner. Each row resolves just its own
-               *  sub-agent via resolveOneSpawn. */}
-              {pendingSpawnApprovals.length > 1 && (
+               *  sub-agent via resolveOneSpawn. They collapse out when a tool
+               *  approval lands, the same way the action area fades: the card
+               *  shrinks to its one-line form instead of the rows vanishing on
+               *  one frame while the header cross-fades (UX review of fddfcb86). */}
+              <AnimatePresence initial={false}>
+              {pendingSpawnApprovals.length > 1 && !hasApproval && (
+                <motion.div key="rows" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.15 }} className="overflow-hidden">
                 <div className="px-3.5 pb-2.5 flex flex-col gap-1.5">
                   {pendingSpawnApprovals.map(a => (
                     <div key={a.id} className="flex items-center gap-2 rounded-lg border border-border/60 bg-bg/40 px-2.5 py-1.5">
@@ -3771,8 +3914,10 @@ function ChatInput({
                     </div>
                   ))}
                 </div>
+                </motion.div>
               )}
-            </div>
+              </AnimatePresence>
+            </Glass>
           </motion.div>
         )}
       </AnimatePresence>
@@ -3786,6 +3931,17 @@ function ChatInput({
        *    outer  → mounts/unmounts the whole bar with the approval lifecycle
        *    inner  → toggles the ghost pill based on inline-pill viewport state
        */}
+      {/* The dock pane. ONE Liquid Glass surface (components/Glass.tsx) holds the
+          approval bar, the notices, the composer and the collapsed bar, so a bar
+          fused to the composer's top shares its pane instead of meeting it at a
+          seam; it is always mounted so an approval landing never remounts the
+          editor. It carries the composer halo at rest and the approval glow
+          while a decision is pending (both are box-shadows, so one at a time). */}
+      <Glass
+        radius={16}
+        data-testid="composer-dock"
+        className={hasApproval ? 'approval-glow' : `composer-halo${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
+      >
       <AnimatePresence>
         {pendingApproval && approvalId && (
           <motion.div
@@ -3794,7 +3950,7 @@ function ChatInput({
             exit={{ opacity: 0, y: 8 }}
             transition={{ type: 'spring', damping: 25, stiffness: 300, mass: 0.8 }}
           >
-          <div className={`bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border ${showGhost ? 'rounded-2xl' : 'border-b-0 rounded-t-2xl'} approval-glow transition-[border-radius,border-color,border-width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]`}>
+          <div className={`bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] ${showGhost ? 'rounded-2xl' : 'rounded-t-2xl border-b border-[color:var(--glass-edge)]'} transition-[border-radius,border-color,border-width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]`}>
               <AnimatePresence initial={false}>
                   {showGhost && (
                       <motion.div
@@ -4096,7 +4252,6 @@ function ChatInput({
         // at all times; the focus halo takes the same color there so the one
         // control lights up in one color instead of an accent ring around a
         // warn or aim edge.
-        className={hasApproval ? undefined : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
         style={{ overflow: 'hidden' }}
       >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
@@ -4105,7 +4260,7 @@ function ChatInput({
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} bg-transparent ${memoryMode === 'temporary' ? 'border-aim' : memoryMode === 'incognito' ? 'border-warn' : 'border-transparent focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -4149,6 +4304,21 @@ function ChatInput({
         ) : (
           <VoiceStatusBar
             recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload}
+            /* The released utterance's own window. Gated on the transport of the
+               request IN FLIGHT, which is what `voiceDrainCancellable` reads: a
+               streaming drain is held against an open socket and the discard
+               closes it, while a batch transcription is already in the
+               transcriber's hands over HTTP and the strip offers it no exit
+               rather than an exit that leaves the work running.
+
+               Not on `voiceStreaming`. That is the saved setting, so it describes
+               the NEXT utterance; a setting flipped while one request is open
+               names a transport nothing in flight is using, and the control then
+               appears over a batch request whose transcript still lands. The flag
+               is ownership-gated at its source, so a composer offers the discard
+               for its OWN drain and never for a session another chat holds. */
+            draining={voiceDrainCancellable}
+            onCancelDrain={cancelVoiceDrain}
             /* Visible reasons, not tooltips: why the mic is blocked, or that a
                held dictation just arrived. Only while the mic is offered at all.
                Shown in hold mode too: one message, one shape, and the name
@@ -4203,7 +4373,7 @@ function ChatInput({
                 onSelectionChange={publishLexicalSelection}
                 sentMessages={sentMessages}
                 ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
-                placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : transcribingIsHonest ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
+                placeholder={activePlaceholder}
                 disabled={disabled}
                 readOnly={optimizing}
                 sendOnEnter={sendOnEnter}
@@ -4221,9 +4391,11 @@ function ChatInput({
           spellCheck={spellCheck}
           aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
-          className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
+          // Chromium paints no `text-overflow` on a `::placeholder`, so the cut tail
+          // fades out instead, the way the app's other cut edges do.
+          className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${placeholderIsHint ? 'placeholder:whitespace-nowrap placeholder:overflow-hidden placeholder:[mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)] placeholder:[-webkit-mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)]' : ''} ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
-          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : transcribingIsHonest ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
+          placeholder={activePlaceholder}
           readOnly={optimizing}
           rows={1}
           value={value}
@@ -4665,7 +4837,7 @@ function ChatInput({
                   <div className="flex items-center gap-1.5">
                     <button
                       className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-pointer hover:bg-danger/80 transition-all"
-                      onClick={onStop}
+                      onClick={stopWithTap}
                       title={i18nT('components.chatInput.force_reset_taking_longer_than_expected')}
                       aria-label={i18nT('components.chatInput.force_reset_session_taking_longer_than_expected')}
                       data-testid="stop-button-escape-hatch"
@@ -4687,7 +4859,7 @@ function ChatInput({
                       force-stop path while a cancel hangs (#9548 UX review). */}
                   <motion.button
                     className="w-8 h-8 rounded-lg bg-danger/10 border-none text-danger hover:bg-danger/20 flex items-center justify-center cursor-pointer transition-all"
-                    onClick={onStop}
+                    onClick={stopWithTap}
                     title={i18nT('components.chatInput.force_kill_discards_in_progress_work_and_queued')}
                     aria-label={i18nT('components.chatInput.force_kill_session_discards_in_progress_work_and')}
                     animate={{ opacity: [0.8, 1, 0.8] }}
@@ -4699,7 +4871,7 @@ function ChatInput({
                   <span className="text-xs text-muted whitespace-nowrap" data-testid="stop-force-hint">{i18nT('components.chatInput.click_again_to_force_stop')}</span>
                 </div>
               ) : isQueued ? (
-                <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={onStop} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
+                <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
                   <Loader2 size={18} className="animate-spin" />
                 </button>
               ) :
@@ -4744,7 +4916,7 @@ function ChatInput({
                   </button>
                 )
               ) : onStop ? (
-                <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={onStop} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
+                <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
                   <Square size={18} fill="currentColor" />
                 </button>
               ) : steerOnly ? (
@@ -4874,7 +5046,7 @@ function ChatInput({
           aria-expanded={false}
           aria-label={i18nT('components.chatInput.expand_composer')}
           title={i18nT('components.chatInput.expand_composer')}
-          className="w-full flex items-center gap-2 px-3.5 py-2 rounded-2xl border border-border bg-bg-elevated text-muted hover:text-text transition-colors cursor-pointer text-left"
+          className="w-full flex items-center gap-2 px-3.5 py-2 rounded-2xl border-none bg-transparent text-muted hover:text-text transition-colors cursor-pointer text-left"
         >
           <ChevronsUpDown size={16} className="shrink-0" />
           {/* The verb is ALWAYS visible, and the draft joins it when there is one.
@@ -4901,6 +5073,7 @@ function ChatInput({
           )}
         </button>
       )}
+      </Glass>
 
       {/* Context shelf — plain full-width row below input.
           Stands down with the composer for the same reason it stands down for the
@@ -4917,7 +5090,7 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-        <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="pt-1 flex items-center gap-2 min-w-0">
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
@@ -5153,7 +5326,26 @@ function ChatInput({
             </div>
             )
           })()}
-          {onModelClick && modelName && (
+          {onModelClick && modelName && (() => {
+            // The chip shows the level in every state (running, routed, pinned
+            // or inherited), so its title / accessible name carries it in every
+            // state too -- one suffix, appended to each branch.
+            // A default and an override show the same level on the chip; the
+            // name says which one it is (the picker's own "Default · High").
+            const effortShown = effortIsDefault
+              ? i18nT('components.reasoningEffortDropdown.default_with_level', { level: effortLabel(reasoningEffort || '') })
+              : effortLabel(reasoningEffort || '')
+            const effortSuffix = hasEffort
+              ? ` · ${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortShown}`
+              : ''
+            const modelChipLabel = `${isRunning
+              ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
+              : modelIsJevRouted
+                ? i18nT('pages.chatPage.model_auto_jev_description')
+                : modelIsInheritedDefault
+                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                  : i18nT('components.chatInput.model_2', { name: modelName })}${effortSuffix}`
+            return (
             <button
               className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
               onMouseDown={() => {
@@ -5171,20 +5363,12 @@ function ChatInput({
               // the label, and the explanation on hover (title) AND keyboard
               // focus / screen readers (aria-label), because a bare served id
               // reads exactly like a pin. A pinned chip keeps the plain hint.
-              title={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsJevRouted
-                  ? i18nT('pages.chatPage.model_auto_jev_description')
-                  : modelIsInheritedDefault
-                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                    : i18nT('components.chatInput.model_2', { name: modelName })}
-              aria-label={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsJevRouted
-                  ? i18nT('pages.chatPage.model_auto_jev_description')
-                  : modelIsInheritedDefault
-                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                    : i18nT('components.chatInput.model_2', { name: modelName })}
+              // The effort level rides along on both: `aria-label` REPLACES the
+              // chip's content in the accessible name, so without it a screen
+              // reader never hears the level the chip shows, and the tooltip is
+              // the only readout left when the shelf is too narrow to show it.
+              title={modelChipLabel}
+              aria-label={modelChipLabel}
             >
               <span className="truncate max-w-[180px]">
                 {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
@@ -5201,14 +5385,25 @@ function ChatInput({
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>
                 </>
               )}
-              {onReasoningEffortClick && !shelfCompact && (
+              {/* A default and an override show the same level, and a glance
+                  at "High" alone could not tell which one set it. So the chip
+                  says so where there is room -- the picker's own "Default ·
+                  High" -- and keeps the bare level only in a compact shelf,
+                  where the hover / accessible name above still carries it.
+                  An inherited-default MODEL already put one "Default" on the
+                  chip; a second, meaning the effort, right after it would be
+                  the same word twice for two unrelated facts, so that chip
+                  keeps the bare level as well (the name above still says
+                  "Reasoning effort: Default · High"). */}
+              {hasEffort && !shelfTiny && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
-                  <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort || '')}</span>
+                  <span className="opacity-60 shrink-0">{shelfCompact || modelIsInheritedDefault ? effortLabel(reasoningEffort || '') : effortShown}</span>
                 </>
               )}
             </button>
-          )}
+            )
+          })()}
           </div>
         </div>
       )}

@@ -84,19 +84,35 @@ _LANDMARKS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _pin_ssh_accept_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``_ssh_supports_accept_new`` at the seam ``_build_launcher_script`` reads.
+
+    The real probe runs the host's ``ssh -V``. It is ``lru_cache``d, but any test
+    that clears the cache (``TestSshSupportsAcceptNew`` does) hands the next
+    launcher-building test in the process a real spawn -- 32 across the three
+    launcher suites on a five-run hygiene sweep, a host program none of them is about
+    (test-hygiene class 7). ``True`` is what a modern host answers.
+    """
+    monkeypatch.setattr("kiro_crew.sandbox._ssh_supports_accept_new", lambda: True)
+
+
 class _FakeLibc:
     """``_libc``, with a ``mount`` that fails on a chosen call.
 
     ``fail_at`` is 1-based over the calls this region makes, in source order:
-    1 = propagation, 2 = first credential dir, 3 = read-only bind, 4 = read-only
-    remount, 5 = first sensitive file, 6 = ~/.ssh. ``None`` means every mount
-    succeeds.
+    1 = propagation, 2 = read-only bind, 3 = read-only remount, 4 = first
+    credential dir, 5 = first sensitive file, 6 = ~/.ssh. ``None`` means every
+    mount succeeds. The seal pair comes BEFORE the credential hide on purpose:
+    a hidden leaf under a sealed parent must be hidden on top of the parent's
+    self-bind, or the non-recursive bind masks the hide.
     """
 
     def __init__(self, *, fail_at: int | None, err: int = errno.EPERM) -> None:
         self.fail_at = fail_at
         self.err = err
         self.calls: list[tuple[object, object, int]] = []
+        self.unmounts: list[tuple[object, int]] = []
 
     def mount(self, source, target, fstype, flags, data):  # noqa: ANN001
         self.calls.append((source, target, flags))
@@ -105,6 +121,15 @@ class _FakeLibc:
 
             ctypes.set_errno(self.err)
             return -1
+        return 0
+
+    def umount2(self, target, flags):  # noqa: ANN001
+        """Retiring a private window's stage, recorded separately from the mounts.
+
+        Kept off ``calls`` on purpose: ``fail_at`` numbers the MOUNTS in source order,
+        and counting an unmount there would renumber every case below.
+        """
+        self.unmounts.append((target, flags))
         return 0
 
 
@@ -139,6 +164,9 @@ def _run(
     script: str | None = None,
     writable_dirs: list[str] | None = None,
     private_dirs: list[str] | None = None,
+    sensitive_dirs: list[str] | None = None,
+    readonly_dirs: list[str] | None = None,
+    private_dir_ids: dict[str, list[int]] | None = None,
 ) -> tuple[_FakeLibc, str | None]:
     """Run the mount region. Returns ``(fake_libc, refusal_message_or_None)``.
 
@@ -151,7 +179,9 @@ def _run(
 
     home = tmp_path / "home"
     aws = home / ".aws"
-    aws.mkdir(parents=True)
+    # ``exist_ok``: a case that needs a private window inside this mask root creates the
+    # window first, because the staging loop resolves it before this setup would run.
+    aws.mkdir(parents=True, exist_ok=True)
     (aws / "credentials").write_text("[default]\n")
     ssh = home / ".ssh"
     ssh.mkdir()
@@ -177,6 +207,9 @@ def _run(
         "_MS_NOSUID": 2,
         "_MS_NODEV": 4,
         "_MS_NOEXEC": 8,
+        # Defined above the extracted slice, like the MS_ flags: the detach flag the
+        # stage-retirement helper passes to ``umount2``.
+        "_MNT_DETACH": 2,
         "ctypes": ctypes,
         "os": os,
         "sys": sys,
@@ -187,15 +220,29 @@ def _run(
         "_src_prefix": "kirocrew_sb_%d_" % os.getpid(),
         "expose_data": {},
         "EXPOSE_FILES": [],
-        "SENSITIVE_DIRS": [str(aws)],
+        # Overridable so the nesting test can hand the region a hidden leaf that
+        # lives INSIDE a sealed parent; the default keeps the six-site numbering.
+        "SENSITIVE_DIRS": [str(aws)] if sensitive_dirs is None else list(sensitive_dirs),
+        # Empty by default: these cases exercise a launcher whose caller vouched for no
+        # mask-root identity, so the child masks by name exactly as it always has. A
+        # populated map would make the loop refuse before reaching any mount.
+        "SENSITIVE_DIR_IDS": {},
         # Empty by default for the same reason as WRITABLE_DIRS: a private
         # window stages its own bind, which would shift the call numbering.
         "PRIVATE_DIRS": list(private_dirs or []),
-        "READONLY_DIRS": [str(cache)],
+        # Read by the staging loop for every window that sits under a mask root. Empty
+        # here: these cases vouch for no window identity, so the child stages by name.
+        "PRIVATE_DIR_IDS": dict(private_dir_ids or {}),
+        "READONLY_DIRS": [str(cache)] if readonly_dirs is None else list(readonly_dirs),
         # Empty by default so the six-site call numbering above stays stable;
         # the carve-out tests inject their own entry.
         "WRITABLE_DIRS": list(writable_dirs or []),
         "SENSITIVE_FILES": [str(lone)],
+        # Empty by default for the same reason as WRITABLE_DIRS: an entry here makes the
+        # region refuse before any mount when its path is absent or single-linked, which
+        # would end the run before the call numbering above is exercised. The alias tests
+        # inject their own entry.
+        "FAIL_CLOSED_FILE_MASKS": [],
         "SSH_DIR": str(ssh),
         "SSH_KNOWN_HOSTS": str(ssh / "known_hosts"),
         "HIDE_SSH": True,
@@ -221,7 +268,7 @@ def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:
     """
     libc, refusal = _run(tmp_path, fail_at=None)
     assert refusal is None
-    # propagation + credential dir + read-only bind + its sealing remount + file + ssh
+    # propagation + read-only bind + its sealing remount + credential dir + file + ssh
     assert len(libc.calls) == 6
 
 
@@ -229,17 +276,17 @@ def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:
     ("fail_at", "expect_in_message"),
     [
         (1, "propagation"),
-        (2, "credential directory"),
-        (3, "exposing read-only path"),
-        (4, "sealing read-only path"),
+        (2, "exposing read-only path"),
+        (3, "sealing read-only path"),
+        (4, "credential directory"),
         (5, "sensitive file"),
         (6, "ssh key directory"),
     ],
     ids=[
         "propagation",
-        "credential-dir",
         "readonly-bind",
         "readonly-seal",
+        "credential-dir",
         "sensitive-file",
         "ssh-dir",
     ],
@@ -272,7 +319,7 @@ def test_the_refusal_names_the_hidden_path(tmp_path: Path) -> None:
 
     Break-arm: ``drop_path`` (the dirs site's label made a constant).
     """
-    libc, refusal = _run(tmp_path, fail_at=2)
+    libc, refusal = _run(tmp_path, fail_at=4)
     assert refusal is not None
     target = libc.calls[-1][1].decode()
     assert target in refusal
@@ -299,6 +346,126 @@ def test_the_refusal_names_the_deliberate_opt_out(tmp_path: Path) -> None:
     assert "sandbox_level" in refusal
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the private-window staging path pins with os.O_PATH and binds through "
+    "/proc/self/fd, neither of which exists outside Linux",
+)
+def test_a_private_windows_stage_does_not_outlive_the_mask(tmp_path: Path) -> None:
+    """The staging mount is a SECOND path to the window's real tree, and must not survive.
+
+    The stage carries the window's inode across the bind that hides its parent, so the
+    window can be bound back at its own path. What it leaves behind is the same tree
+    reachable under ``_tmpfs_src``, which nothing masks -- and a masked leaf INSIDE a
+    window is re-hidden at the window's path only, because a non-recursive bind carries no
+    submount. So the leaf would be readable through the stage with the mask otherwise
+    fully applied.
+
+    Break-arm: ``drop_stage_retirement``.
+    """
+    window = tmp_path / "home" / ".aws" / "alpha" / "data"
+    window.mkdir(parents=True)
+
+    libc, refusal = _run(tmp_path, fail_at=None, private_dirs=[str(window)])
+
+    assert refusal is None
+    # The staging mount is the one whose SOURCE is a descriptor path.
+    staged = [
+        t for s, t, _flags in libc.calls if isinstance(s, bytes) and s.startswith(b"/proc/self/fd/")
+    ]
+    assert len(staged) == 1, f"expected one staging mount, got {staged}"
+    assert libc.unmounts == [(staged[0], 2)], "the stage was not detached"
+    assert not os.path.exists(staged[0].decode()), "the stage directory survived"
+
+
+_LINUX_WINDOW_ONLY = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the private-window staging path pins with os.O_PATH and binds through "
+    "/proc/self/fd, neither of which exists outside Linux",
+)
+
+
+@_LINUX_WINDOW_ONLY
+def test_a_vouched_window_whose_identity_changed_refuses_the_spawn(tmp_path: Path) -> None:
+    """A pinned window that is not the approved directory must end the spawn.
+
+    Skipping it would leave the parent's mask over the path, and that mask is an empty
+    WRITABLE bind: the child's writes under it succeed and disappear with the namespace,
+    so the app loses exactly the data the window exists to keep durable.
+    """
+    window = tmp_path / "home" / ".aws" / "alpha" / "data"
+    window.mkdir(parents=True)
+    real = os.lstat(window)
+
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        private_dirs=[str(window)],
+        private_dir_ids={str(window): [real.st_dev, real.st_ino + 1]},
+    )
+
+    assert refusal is not None, "a mismatched window identity was accepted"
+    assert "approved as a data window" in refusal
+    staged = [
+        t for s, t, _flags in libc.calls if isinstance(s, bytes) and s.startswith(b"/proc/self/fd/")
+    ]
+    assert staged == [], f"the mismatched window was staged anyway: {staged}"
+
+
+@_LINUX_WINDOW_ONLY
+def test_a_vouched_window_that_cannot_be_opened_refuses_the_spawn(tmp_path: Path) -> None:
+    """The producer opened this window, so a child that cannot is in the same raced state."""
+    (tmp_path / "home" / ".aws").mkdir(parents=True, exist_ok=True)
+    window = tmp_path / "home" / ".aws" / "alpha" / "data"
+
+    _libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        private_dirs=[str(window)],
+        private_dir_ids={str(window): [1, 2]},
+    )
+
+    assert refusal is not None, "an unopenable vouched window was skipped silently"
+    assert "cannot open" in refusal
+
+
+@_LINUX_WINDOW_ONLY
+def test_a_window_whose_identity_matches_is_staged(tmp_path: Path) -> None:
+    """The control: the ordinary case must still get its window."""
+    window = tmp_path / "home" / ".aws" / "alpha" / "data"
+    window.mkdir(parents=True)
+    real = os.lstat(window)
+
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        private_dirs=[str(window)],
+        private_dir_ids={str(window): [real.st_dev, real.st_ino]},
+    )
+
+    assert refusal is None, f"a matching window was refused: {refusal}"
+    staged = [
+        t for s, t, _flags in libc.calls if isinstance(s, bytes) and s.startswith(b"/proc/self/fd/")
+    ]
+    assert len(staged) == 1, f"expected one staging mount, got {staged}"
+
+
+@_LINUX_WINDOW_ONLY
+def test_a_window_no_one_vouched_for_is_skipped_not_refused(tmp_path: Path) -> None:
+    """The second control: absence of an identity is not a mismatch.
+
+    The three pre-existing window producers pass paths only, so an unopenable window of
+    theirs must stay a skip -- nothing vouched for it, and refusing would turn an ordinary
+    absent scratch directory into a dead spawn.
+    """
+    (tmp_path / "home" / ".aws").mkdir(parents=True, exist_ok=True)
+    window = tmp_path / "home" / ".aws" / "alpha" / "data"
+
+    _libc, refusal = _run(tmp_path, fail_at=None, private_dirs=[str(window)])
+
+    assert refusal is None, f"an unvouched window was refused: {refusal}"
+
+
 def test_every_tier_routes_all_eight_mounts_through_the_guard() -> None:
     """No tier may keep a raw, unchecked ``_libc.mount`` call site.
 
@@ -313,11 +480,131 @@ def test_every_tier_routes_all_eight_mounts_through_the_guard() -> None:
             if "_libc.mount(" in line and "source, target, None, flags, None" not in line
         ]
         assert raw == [], f"{level}: unchecked mount call(s): {raw}"
-        # 1 def + 8 call sites: propagation, credential dirs, the read-only
-        # bind and its sealing remount, sensitive files, ~/.ssh, and the private
+        # 1 def + 9 call sites: propagation, credential dirs, the read-only
+        # bind and its sealing remount, sensitive files, ~/.ssh, the private
         # window's two -- staging its real contents out before the parent is
-        # masked, then binding them onto the placeholder inside the stand-in.
-        assert script.count("_mount_or_die(") == 9
+        # masked, then binding them onto the placeholder inside the stand-in --
+        # and the nested re-mask that re-hides a masked leaf sitting INSIDE such
+        # a window, applied after the window is bound.
+        assert script.count("_mount_or_die(") == 10
+
+
+# --------------------------------------------------------------------------
+# Seal before hide: a hidden leaf under a sealed parent
+# --------------------------------------------------------------------------
+
+_MS_BIND, _MS_REMOUNT = 4096, 32
+
+
+def _nested_pair(tmp_path: Path) -> tuple[str, str]:
+    """A sealed parent and a hidden leaf inside it -- the ``run`` /
+    ``run/voice-runtime`` shape, on paths under pytest's tmp_path."""
+    parent = tmp_path / "home" / "run"
+    leaf = parent / "voice-runtime"
+    leaf.mkdir(parents=True)
+    (leaf / "marker.txt").write_text("decoder image\n")
+    return str(parent), str(leaf)
+
+
+def _seal_and_hide_positions(libc: _FakeLibc, parent: str, leaf: str) -> tuple[int, int, int]:
+    """Call indexes of the parent's self-bind, its sealing remount, and the
+    leaf's hide, in the order the region issued them."""
+    calls = libc.calls
+    parent_b, leaf_b = parent.encode(), leaf.encode()
+    self_bind = next(
+        i
+        for i, (src, tgt, flags) in enumerate(calls)
+        if tgt == parent_b and src == parent_b and flags == _MS_BIND
+    )
+    remount = next(
+        i for i, (src, tgt, flags) in enumerate(calls) if tgt == parent_b and flags & _MS_REMOUNT
+    )
+    hide = next(
+        i
+        for i, (src, tgt, flags) in enumerate(calls)
+        if tgt == leaf_b and src != leaf_b and flags == _MS_BIND
+    )
+    return self_bind, remount, hide
+
+
+def test_a_hidden_leaf_under_a_sealed_parent_is_hidden_after_the_seal(
+    tmp_path: Path,
+) -> None:
+    """The leaf's empty-dir hide must be issued AFTER both halves of the
+    parent's seal.
+
+    A non-recursive ``MS_BIND`` does not replicate submounts, so a parent
+    self-bind issued after the leaf's hide masks it: lookups through the new
+    parent mount reach the REAL leaf, and the hide degrades to read-only
+    visible (container measured on the shipped launcher: the marker inside
+    ``run/voice-runtime`` was ``cat``-readable, writes EROFS). Issued after the
+    seal, the hide is a mount ON the sealed parent and stays reachable through
+    it -- the same property the write carve-outs rely on.
+
+    Break-arm: ``test_break_arm_hide_before_seal_is_caught`` (the two loops
+    swapped back to the pre-fix order).
+    """
+    parent, leaf = _nested_pair(tmp_path)
+    libc, refusal = _run(tmp_path, fail_at=None, sensitive_dirs=[leaf], readonly_dirs=[parent])
+    assert refusal is None
+    self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    assert self_bind < remount < hide, [c[1] for c in libc.calls]
+
+
+def test_seal_before_hide_keeps_the_carveout_after_the_seal(tmp_path: Path) -> None:
+    """The reorder must not disturb the carve-out's own ordering constraint:
+    the write carve-out is still issued after the parent's seal, and
+    after the leaf hide, so neither the hide nor the carve-out is masked."""
+    parent, leaf = _nested_pair(tmp_path)
+    scratch = Path(parent) / "mcp-tmp" / "probe-x" / "tmp"
+    scratch.mkdir(parents=True)
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        sensitive_dirs=[leaf],
+        readonly_dirs=[parent],
+        writable_dirs=[str(scratch)],
+    )
+    assert refusal is None
+    _self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    carve = next(
+        i
+        for i, (_src, tgt, flags) in enumerate(libc.calls)
+        if tgt == str(scratch).encode() and flags == _MS_BIND
+    )
+    assert remount < hide < carve, [c[1] for c in libc.calls]
+
+
+def _swap_hide_and_seal(script: str) -> str:
+    """The pre-fix launcher: the SENSITIVE_DIRS hide loop ahead of the
+    READONLY_DIRS seal loop. Built by moving the blocks, not by editing them,
+    so the mutant differs from the shipped script in ORDER only."""
+    ro_start = script.index("        # Exposed-but-read-only dirs")
+    hide_start = script.index("        # Bind-mount empty dirs over credential paths")
+    carve_start = script.index("        # Writable carve-outs")
+    assert ro_start < hide_start < carve_start
+    return (
+        script[:ro_start]
+        + script[hide_start:carve_start]
+        + script[ro_start:hide_start]
+        + script[carve_start:]
+    )
+
+
+def test_break_arm_hide_before_seal_is_caught(tmp_path: Path) -> None:
+    """Swapping the loops back must falsify the ordering assertion."""
+    parent, leaf = _nested_pair(tmp_path)
+    mutant = _swap_hide_and_seal(_build_launcher_script("strict"))
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        script=mutant,
+        sensitive_dirs=[leaf],
+        readonly_dirs=[parent],
+    )
+    assert refusal is None
+    self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    assert hide < self_bind < remount, "the mutant did not reorder the mounts"
 
 
 # --------------------------------------------------------------------------
@@ -385,21 +672,21 @@ _ARMS: dict[str, tuple[str, str]] = {
         '_libc.mount(None, b"/", None, _MS_REC | _MS_PRIVATE, None)',
     ),
     "site2": (
-        "_mount_or_die(per_dir_empty, target, _MS_BIND,\n"
-        '                              "hiding credential directory %s" % d)',
-        "_libc.mount(per_dir_empty, target, None, _MS_BIND, None)",
-    ),
-    "site3": (
         "_mount_or_die(target, target, _MS_BIND,\n"
         '                              "exposing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_BIND, None)",
     ),
-    "site4": (
+    "site3": (
         "_mount_or_die(target, target,\n"
         "                              _MS_REMOUNT | _MS_BIND | _MS_RDONLY\n"
         "                              | _locked_mount_flags(target),\n"
         '                              "sealing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_REMOUNT | _MS_BIND | _MS_RDONLY, None)",
+    ),
+    "site4": (
+        "_mount_or_die(per_dir_empty, target, _MS_BIND,\n"
+        '                              "hiding credential directory %s" % d)',
+        "_libc.mount(per_dir_empty, target, None, _MS_BIND, None)",
     ),
     "site5": (
         "_mount_or_die(empty_path.encode(), target, _MS_BIND,\n"
@@ -456,7 +743,7 @@ def test_break_arms_falsify_each_assertion(tmp_path: Path, arm: str) -> None:
         return
 
     if arm == "drop_path":
-        libc, refusal = _run(tmp_path, fail_at=2, script=script)
+        libc, refusal = _run(tmp_path, fail_at=4, script=script)
         assert refusal is not None
         assert libc.calls[-1][1].decode() not in refusal
         return
@@ -481,7 +768,7 @@ def test_break_arms_falsify_each_assertion(tmp_path: Path, arm: str) -> None:
 
 def test_break_arm_reintroduce_raw_is_caught_by_the_tier_sweep() -> None:
     """The no-raw-call-sites sweep must fail when a raw call comes back."""
-    script = _mutate("site2")
+    script = _mutate("site4")
     raw = [
         line
         for line in script.splitlines()

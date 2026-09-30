@@ -46,7 +46,7 @@ from __future__ import annotations
 import ast
 import collections
 
-from .test_producer import BUILD_PY
+from .test_producer import builder_trees, called_name
 
 # ---------------------------------------------------------------------------
 # what counts as touching the filesystem
@@ -257,9 +257,9 @@ class _Walk(ast.NodeVisitor):
         self._try(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        func = node.func
-        if isinstance(func, ast.Name) and func.id in REPORT_WRITERS:
-            self.report_writes.append((self.scope[-1], func.id, node.lineno))
+        writer = called_name(node)
+        if writer in REPORT_WRITERS:
+            self.report_writes.append((self.scope[-1], writer, node.lineno))
         label = _call_label(node)
         if label is not None:
             self.sites.append((self.scope[-1], label, any(self.covered), node.lineno))
@@ -267,8 +267,10 @@ class _Walk(ast.NodeVisitor):
 
 
 def _walk() -> _Walk:
+    """One walk over every builder file; a site keeps its function name as its key."""
     walk = _Walk()
-    walk.visit(ast.parse(BUILD_PY.read_text(encoding="utf-8")))
+    for _path, tree in builder_trees():
+        walk.visit(tree)
     return walk
 
 
@@ -307,7 +309,7 @@ UNCONVERTED: dict[str, dict[str, int]] = {
     "_descend": {"os.open": 1},
     "_dispose_via_private_aside": {".resolve": 1, "os.mkdir": 1},
     "_is_shape_this_build_never_writes": {".is_dir": 1, ".is_file": 1},
-    "_open_dir_nofollow_pinned": {".resolve": 1, "os.open": 2},
+    "_open_dir_nofollow_pinned": {"os.open": 2},
     "_publish_report": {"os.open": 1, "os.unlink": 1},
     "_refuse_unless_our_report": {".is_file": 1},
     "_refuse_unless_this_build_wrote_it": {
@@ -329,9 +331,8 @@ UNCONVERTED: dict[str, dict[str, int]] = {
     "_write_bytes_nofollow": {".exists": 1, ".is_dir": 2, ".is_file": 1, ".write_bytes": 1},
     "_write_guarded": {".mkdir": 1},
     "build_bundle": {
-        ".exists": 4,
+        ".exists": 3,
         ".is_dir": 3,
-        ".is_file": 2,
         ".is_symlink": 1,
         ".resolve": 2,
     },
@@ -359,8 +360,9 @@ VERDICTS: dict[str, str] = {
         "raises for an unreadable one, and its answer gates a recursive delete"
     ),
     "_open_dir_nofollow_pinned": (
-        "crash: the resolve() here raises RuntimeError on a symlink loop, and every caller "
-        "wraps this call in an OSError handler that lets RuntimeError through"
+        "crash: the resolve() here is now normalised (a symlink loop's RuntimeError becomes "
+        "OSError(ELOOP) that every caller's handler catches), but the anchor open and the "
+        "Windows-fallback open still escape as a traceback"
     ),
     "_publish_report": (
         "crash: the report open and the temp unlink escape; the caller restores the prior "
@@ -371,8 +373,10 @@ VERDICTS: dict[str, str] = {
         "an unreadable one, and the build command converts neither"
     ),
     "_refuse_unless_this_build_wrote_it": (
-        "strand: it runs once staging and its marker exist, and its caller catches only the "
-        "domain refusal, so an OSError leaves the tree and the marker on disk"
+        "collapse: exists() and is_dir()/is_file() answer False for an absent and an invalid "
+        "entry and raise for an unreadable one; its sole caller in build_bundle now runs it "
+        "inside the OSError-to-ExportRefused boundary that releases this run's staging and "
+        "marker, so a raised OSError no longer strands them"
     ),
     "_refuse_unusable_parent": (
         "collapse: exists() and is_dir() answer False for an absent and an invalid parent and "
@@ -399,8 +403,10 @@ VERDICTS: dict[str, str] = {
         "converting it"
     ),
     "build_bundle": (
-        "strand: three of these run once staging and its marker exist but before the "
-        "transaction opens, so an OSError there leaves the tree and the marker on disk"
+        "crash: the post-marker report/plan reads now sit inside an OSError-to-ExportRefused "
+        "boundary that releases this run's staging and marker, so those no longer strand; the "
+        "remaining sites are the pre-staging shape probes and the parent resolves, whose "
+        "failure is a traceback before anything is created"
     ),
     "build_bundle.<lambda>": (
         "deliberate: the promotion rename runs inside the transaction that restores the prior "

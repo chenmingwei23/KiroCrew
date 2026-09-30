@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
@@ -88,6 +89,7 @@ from kiro_crew.slack.renderer import (
     TOOL_DENY_ACTION_PREFIX,
     TOOL_TRUST_ACTION_PREFIX,
     SlackApprovalDecider,
+    split_approval_token,
 )
 from kiro_crew.slack.scope_probe import warn_unreadable_tracked_channels
 
@@ -99,22 +101,87 @@ logger = logging.getLogger(__name__)
 # Matches the plain-text quarantine/context fence keyword phrase, tolerant of
 # case, surrounding dashes, and whitespace, so attacker-controlled forwarded
 # text cannot forge a boundary line. Used to neutralize embedded markers BEFORE
-# the fence is interpolated around untrusted content (XPIA hardening).
+# the fence is interpolated around untrusted content (XPIA hardening). Matching
+# runs on the normalized view, so each word join is one run of whitespace,
+# underscore or hyphen, possibly empty; no two optional classes are adjacent.
+#
+# The pattern starts at the first keyword, not at the leading dashes and
+# whitespace: a leading ``-*\s*`` lets a search restart at every offset of a
+# long whitespace run, which is quadratic in the run length.
+# :func:`_extend_fence_span_left` adds that prefix back in one linear pass.
+_FENCE_WORD_JOIN = r"[\s_-]*"
 _FENCE_MARKER_RE = re.compile(
-    r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
+    r"(?:"
+    + _FENCE_WORD_JOIN.join(("UNTRUSTED", "FORWARDED", "CONTENT"))
+    + "|"
+    + _FENCE_WORD_JOIN.join(("CONTEXT", "ENTRY"))
+    + ")"
+    + _FENCE_WORD_JOIN
+    + r"(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
 _FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"
+
+
+def _fence_fold(ch: str) -> str:
+    """*ch* as the marker matcher's normalized view spells it (see ``_marker_spans``)."""
+    from kiro_crew.context import _MULTIBYTE_TABLE, _is_marker_ignorable
+
+    if ch.isascii():
+        return ch
+    folded = ""
+    for compatible in unicodedata.normalize("NFKC", ch):
+        if not _is_marker_ignorable(compatible):
+            for candidate in compatible.translate(_MULTIBYTE_TABLE):
+                folded += "-" if unicodedata.category(candidate) == "Pd" else candidate
+    return folded
+
+
+def _extend_fence_span_left(text: str, start: int, floor: int) -> int:
+    """Move *start* left over the ``-*\\s*`` prefix a fence marker may carry.
+
+    Reads the normalized view right to left like the regex prefix did:
+    whitespace next to the keyword, then dashes, never below *floor* (the end of
+    the previous span).  One original character can fold to several view
+    characters (``←`` folds to ``<-``); it joins the prefix when its trailing
+    view characters do, and the walk stops at it when the rest do not.  A
+    character the normalized view drops counts in either phase.
+    """
+    in_dashes = False
+    while start > floor:
+        folded = _fence_fold(text[start - 1])
+        consumed = 0
+        for view_char in reversed(folded):
+            if view_char == "-":
+                in_dashes = True
+            elif in_dashes or not view_char.isspace():
+                break
+            consumed += 1
+        if folded and not consumed:
+            break
+        start -= 1
+        if consumed < len(folded):
+            break
+    # A dropped character is part of the prefix only between matched ones.
+    while _fence_fold(text[start]) == "":
+        start += 1
+    return start
 
 
 def _neutralize_fence_markers(text: str) -> str:
     """Neutralize Unicode-normalized forwarded/context fence variants."""
     # Local import avoids the context -> Slack handler import cycle during
     # module initialization; interaction handlers run only after startup.
-    from kiro_crew.context import _apply_marker_spans, _marker_spans
+    from kiro_crew.context import _apply_marker_spans, _marker_spans, _merge_overlapping_spans
 
     spans = _marker_spans(text, (_FENCE_MARKER_RE,))
-    return _apply_marker_spans(text, spans, _FENCE_MARKER_NEUTRALIZED)
+    floor = 0
+    extended: list[tuple[int, int]] = []
+    for start, end in spans:
+        extended.append((_extend_fence_span_left(text, start, floor), end))
+        floor = end
+    merged = _merge_overlapping_spans(extended)
+    return _apply_marker_spans(text, merged, _FENCE_MARKER_NEUTRALIZED)
 
 
 # Module-level orchestrator reference — set by ``init()``.
@@ -976,8 +1043,13 @@ async def dispatch(payload: dict) -> None:
         approved = is_trust or action_id.startswith(TOOL_APPROVE_ACTION_PREFIX)
         # value / action_id suffix carry the session-namespaced approval token
         # (session_key:request_id) so a click resolves ONLY its own session's
-        # pending tool — kiro-cli request ids restart at 1 per session.
-        approval_key = action.get("value", "") or action_id.rsplit("_", 1)[-1]
+        # pending tool — kiro-cli request ids restart at 1 per session — plus the
+        # prompt's own nonce, which is what distinguishes these buttons from an
+        # earlier prompt's still clickable at the same key. Split rather than
+        # forwarded whole so the audit line records the request, not the secret.
+        approval_key, press_nonce = split_approval_token(
+            action.get("value", "") or action_id.rsplit("_", 1)[-1]
+        )
         # Inbound channels-governance gate: a button press resolves a tool approval
         # (executes the governed tool) or a Trust escalation, so a channels policy
         # that denies ``slack`` must stop it — same gate as an inbound message.
@@ -990,7 +1062,7 @@ async def dispatch(payload: dict) -> None:
             logger.info("slack tool-approval dropped: denied by channels governance policy")
             # Resolve the pending future as DENIED so the tool is refused promptly
             # instead of left pending until timeout.
-            SlackApprovalDecider.resolve_global(approval_key, False)
+            SlackApprovalDecider.resolve_global(approval_key, False, nonce=press_nonce)
             sel().log_api_access(
                 caller=user_id,
                 operation="slack.transport_tool_approval",
@@ -1002,9 +1074,12 @@ async def dispatch(payload: dict) -> None:
         # Trust grants per-session auto-approve BEFORE resolving, so subsequent
         # tools in this session are auto-approved (mirrors native trust_tool).
         if is_trust:
-            sess_key = SlackApprovalDecider.session_for(approval_key)
-            add_trusted_session(sess_key, _orch.sessions if _orch else None)
-        resolved = SlackApprovalDecider.resolve_global(approval_key, approved)
+            sess_key = SlackApprovalDecider.session_for(approval_key, nonce=press_nonce)
+            # No live prompt answers to this press, so there is no session to widen.
+            # Granting on the empty key would escalate whatever later reads it.
+            if sess_key:
+                add_trusted_session(sess_key, _orch.sessions if _orch else None)
+        resolved = SlackApprovalDecider.resolve_global(approval_key, approved, nonce=press_nonce)
         if not resolved:
             label = "⏱ This approval already expired."
             outcome = "expired"
@@ -1480,7 +1555,11 @@ def _options_block_id(payload: dict, action: dict | None = None) -> str | None:
             return bid
     values = (payload.get("state") or {}).get("values") or {}
     for block_id, vals in values.items():
-        if isinstance(vals, dict) and OPTIONS_CHECKBOXES_ACTION in vals and isinstance(block_id, str):
+        if (
+            isinstance(vals, dict)
+            and OPTIONS_CHECKBOXES_ACTION in vals
+            and isinstance(block_id, str)
+        ):
             return block_id
     return None
 
@@ -1938,8 +2017,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
     async with options_edit_lock(channel, msg_ts):
         if not claim_options_answer(channel, msg_ts):
             logger.debug(
-                "options click: control %s/%s was already answered; dropping the "
-                "duplicate",
+                "options click: control %s/%s was already answered; dropping the " "duplicate",
                 channel,
                 msg_ts,
             )
@@ -2120,9 +2198,7 @@ async def _handle_allowlist(
             return
         _orch._allowed_users.add(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(
-            persist_allowed_user, new_user_id, name=display_name
-        )
+        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.approve",
@@ -2137,9 +2213,7 @@ async def _handle_allowlist(
                 dm = await _orch.slack.open_dm(new_user_id)
                 await _orch.slack.post_message(
                     dm,
-                    "✅ You've been added to the allowlist. You can now message me!\n\n"
-                    "⚠️ *Do not enter sensitive or confidential data into Kiro Crew.*"
-                    " Follow your organization's data handling policy when using this tool.",
+                    "✅ You've been added to the allowlist. You can now message me!",
                 )
             except Exception:
                 logger.debug("Failed to DM approved user %s", new_user_id, exc_info=True)
@@ -2200,9 +2274,7 @@ async def _handle_track_channel(
         _orch._tracking_channels.add(target_channel_id)
         set_tracking_channels(_orch._tracking_channels)
         _probe_tracked_channel_scope({target_channel_id})
-        await run_config_write(
-            persist_tracking_channel, target_channel_id, name=channel_name
-        )
+        await run_config_write(persist_tracking_channel, target_channel_id, name=channel_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.track_channel.approve",
@@ -2219,9 +2291,7 @@ async def _handle_track_channel(
         # Remove from in-memory set and persisted config
         _orch._tracking_channels.discard(target_channel_id)
         set_tracking_channels(_orch._tracking_channels)
-        await run_config_write(
-            persist_tracking_channel, target_channel_id, remove=True
-        )
+        await run_config_write(persist_tracking_channel, target_channel_id, remove=True)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.track_channel.deny",
@@ -3022,9 +3092,7 @@ async def _clear_session_dismissed(session_key: str) -> None:
     try:
         await asyncio.to_thread(_orch.conv_log.clear_closed, session_key)
     except Exception:
-        logger.warning(
-            "session resume: dismissal not cleared for %s", session_key, exc_info=True
-        )
+        logger.warning("session resume: dismissal not cleared for %s", session_key, exc_info=True)
 
 
 async def _handle_session_end(
@@ -3269,7 +3337,9 @@ async def _handle_tool_approval(
 # ---------------------------------------------------------------------------
 
 # Shown when a non-authorized user clicks a review-mode button.
-_REVIEW_AUTH_DENIED_MSG = "⚠️ Only the bot owner or the user who requested this draft can act on it."
+_REVIEW_AUTH_DENIED_MSG = (
+    "⚠️ Only the bot owner or the user who requested this draft can act on it."
+)
 
 
 async def _delete_review_placeholder(channel: str, thread_ts: str) -> None:

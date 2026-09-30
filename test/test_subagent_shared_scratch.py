@@ -599,7 +599,9 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         monkeypatch.setattr(
             skill_projection,
             "prepare_native_skill_projection",
-            lambda work_dir: skill_projection.NativeSkillProjection({"kirocrew": "kirocrew-view"}),
+            lambda work_dir, **_kwargs: skill_projection.NativeSkillProjection(
+                {"kirocrew": "kirocrew-view"}
+            ),
         )
         calls: list[tuple[str, Path, int]] = []
         fake_scratch = SimpleNamespace(
@@ -613,7 +615,7 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         monkeypatch.setattr(runtime_mod, "agent_scratch", fake_scratch)
         monkeypatch.setattr(runtime_mod, "register_protected_pid", lambda pid: None)
         monkeypatch.setattr(runtime_mod, "_track_pid", lambda pid: None)
-        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid, token=None: None)
 
         async def _no_reader(_self) -> None:
             return None

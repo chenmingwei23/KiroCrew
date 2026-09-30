@@ -155,20 +155,14 @@ writers, projections, migration, and transport are owned by
 [member-event-log.md](member-event-log.md); this core owns only the shared
 envelope, storage, lease, and damage rules it uses.
 
-## 5. The session-log format, pre-release
+## 5. The session-log format and its compatibility rule
 
-**The shapes below are PRE-RELEASE and may change.** `KIROCREW_CREW_LOG` defaults off, so
-the session emitter creates no session-kind unit on a stock install. The shared `crew-log`
-root is still pre-created as a security boundary, and independent member-kind logs may exist;
-neither freezes the default-off session entry shapes. While that holds, a session type may be
-added, removed or reshaped in one commit.
-
-**The freeze point is the release that turns the flag on by default.** From then on there are
-files a reader may hold, so the compatibility strategy has to be decided rather than assumed: a
-type gains fields additively and an unknown type is skipped when its writer marked it
-`ignorable`, OR a shape change carries a migration. That choice belongs to the change that flips
-the default, which is the first one with data to migrate. `version` is the escape hatch it would
-spend.
+`KIROCREW_CREW_LOG` defaults on, so a stock install writes session-kind units and a later
+build may read files an earlier one wrote. The shapes below change under one rule. A type
+gains fields additively, and a reader ignores a key it does not know. A new type that an
+older reader may safely skip is written `ignorable` (see "An unknown type is the reader's
+rule" below). Any other change to an existing type's shape carries a migration and spends
+`version`, the header's escape hatch.
 
 Every type is `domain/<past participle>`, a fact that happened. Every turn-scoped entry carries
 `data.turn`, and `data.step` where a step exists. `thread` stays unset on session entries.
@@ -344,14 +338,42 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
-without pruning before allocation publishes the successor over it. One limit is recorded rather than
-handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
-so for that window a mapping read can
-name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
-and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
-supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, and an entry the read proves is the slot's first records `previous_none`,
+because neither meaning may rest on a key being ABSENT. A log that merely omits every
+predecessor key is one written before these keys existed, and its silence is equally "I am
+first" and "I could not tell": without the two fields the state a later fold must refuse on is
+byte-identical to the state it may pass over, and passing over it elects the log before it.
+The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not cited at all: an allocation whose
+replay is still
+pending holds the prior resumable id in the mapping on purpose, so that a restart can still
+resume it, and the mapping is then a generation
+behind -- two successive crew logs would cite one predecessor
+and the crew log between them would be cited by nobody, the one chain gap a reader cannot see.
+Whether that window is open is asked where a SESSION EXISTS to answer, as the edge is handed to
+an entry, and not where the id is read: the marker belongs to a live session, the read runs
+before this turn's session is allocated, and asked from there it answers "no replay owed" both
+when none is owed and when there is nobody to ask -- the second being a cold start, which is the
+restart this whole tier exists to survive. So a mapped id is carried provisional and becomes a
+recorded break at that point instead; what this process itself recorded is never provisional.
+A successful resume answers the same id and the emitter writes no edge,
 since a crew log cannot be its own predecessor.
+
+An empty answer from that mapping is a FINDING only when the store holds no unit of the slot at
+all. When it holds units this read could not rank, the mapping having nothing to give says nothing
+about the slot, so the entry records no predecessor key rather than stating it has none -- which
+would let a later fold pass over a log whose siblings sit uncited beside it.
 
 The edge is a citation and nothing else. Recording it opens no store for writing but this session's
 own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
@@ -359,10 +381,16 @@ own, and no writer here appends to the crew log it names. It does READ that crew
 wrote -- a mapping entry can be stale or recycled: the
 edge is recorded only when the named crew log's own header names this slot, and a candidate whose
 header cannot be read is not named at all. Closing that crew log's own dangling turn and tool calls
-is a separate change: a repair that must wait on the predecessor's outstanding writes has to be
-resumable rather than decided once, which a citation neither needs nor has. Tracked as #12148. Until
-then a superseded crew log keeps an open `turn/started`, which is the state every reader of this log
-already tolerates.
+is a SEPARATE job, and the separation is what makes the wait possible: the repair is queued under the
+PREDECESSOR's id, and the writer keeps a session's jobs in submission order, so it runs only after
+everything that crew log already owes has been attempted -- a real `turn/completed` still queued or
+retrying is written first, and one abandoned after its attempt budget is spent is dropped and admitted
+in a `write/dropped` marker first. So the superseded crew log's turn is closed as
+`turn/completed {stop_reason: "interrupted"}` and its open calls as `tool/completed {status: "unknown"}`,
+exactly once, with no create-time decision to stand down on and nothing left to re-run. The repair
+re-reads the candidate's header before writing, because it is the one place an outcome is authored into
+a unit that is not this session's own, and it closes no unmatched `subagent/spawned`: those children
+were dispatched by a session that is gone.
 
 The read side is `session/opened.data.previous` itself, folded into the `status` projection and served
 by the existing projection route. A reader that wants the SLOT rather than the session folds the newest
@@ -449,6 +477,10 @@ A resume's belief that the previous writer is gone is not verifiable from the fi
 
 Ownership is taken LAZILY, on a handle's first write, and never by `open` itself, because `open` also serves readers: `iter_from`, `page` and `resolve` need no ownership, and making a reader contend with the writer would buy nothing. `open(repair=True)` claims it before the closers, and that is the same rule rather than an exception -- the closers are appends. `create` claims nothing: it publishes a header for a unit that has none, and two processes racing it are already settled by `already_exists` under the per-append lock.
 
+`append_if` adds a THIRD append outcome beside written and refused: **declined**, reported as `None`. It takes `max_tail_seq`, the seq the caller's decision was made against, and writes the entry only while the tail read under ownership is still at or below it. The outcome exists because a decision that governs append ORDER cannot be made outside the hold that assigns the order: another process's entry committed between a caller's decision and its own write lands first, and for a reader that takes the last word per field that ordering is the whole result. Comparing the caller's seq here is what proves nothing was committed in between. A decline appends nothing; it is NOT byte-identical, because the torn-tail repair above it is unconditional and a decline can leave that repair behind.
+
+A seq rather than a callback, and that choice is load-bearing. The comparison runs while the lease and the per-append lock are both held, so anything done there is a window in which every other process's append to the unit is refused `already_owned` -- and a peer that exhausts its own retry budget loses its entry for good, since this file has no compaction and nothing replays it. An int cannot parse the file or write to it, so no caller can turn that window into a long one. A caller whose decision needs the log's contents reads it BEFORE calling and passes the tail that read reached.
+
 The lock is REFCOUNTED PER PROCESS, keyed by the lease file's path. That is a correctness requirement rather than an optimization: a POSIX lock belongs to an open file description rather than to a process, so a second `open()` of the lease path inside one process contends exactly as another process would -- and one process legitimately holds several handles for one unit, since the emitter's cached handle and the handle a session claim opens overlap while the cache entry is replaced. So the first writer in a process takes the kernel lock, every later handle shares it, and the last handle to be dropped gives it up. The path is the key rather than `(kind, id)` because the data home is repointable and the kernel locks a file, not a name. Acquire and release both run under one module lock, for the same reason the count exists: two threads reaching for one unit must share a descriptor rather than race two of them and have one refuse the other.
 
 Release is bound to the HANDLE being dropped rather than to an explicit call, and that timing closes the window from both sides. The emitter's eviction rule never drops a handle belonging to a live turn, so ownership can only end BETWEEN turns -- and between turns there is no live turn for a successor's repair to damage. A terminal event is queued rather than written, so "between turns" begins when that entry LANDS, not when it is handed over: the emitter marks the turn's record as owing a closer at handover, and a re-claim leaves such a record alone while still closing one whose terminal was never emitted, since nothing else will ever close that one. Meanwhile a queued write that still holds the handle keeps the ownership it is about to need, which an eager release at eviction would have taken out from under it.
@@ -489,11 +521,29 @@ format change to land.
 ### Retention: whole units
 
 A unit's whole crew log is removed by `store.remove_unit(kind, id)`, and that is the ONE spelling of
-deletion in this module: the retention sweep and the session permanent-delete funnel both call it,
+deletion in this module: the retention sweep and the two permanent-delete funnels that call it -- a
+session's, and the dashboard's crew-member route -- all reach the same spelling,
 because two callers deleting one tree two ways is two chances to get the order wrong and the order is
 the entire correctness argument. It is not rotation and not a format change, and NOTHING is written
 to a crew log that is about to go -- no tombstone, no `pruned` entry. A reader holding a citation into
 it already has its answer: `resolve` reports `gone` for a pointer into a unit with no crew log at all.
+
+**A caller whose unit has a companion file OUTSIDE it passes `in_hold`.** Some of a unit's meaning
+lives elsewhere -- a crew member's pre-log activity source is the case -- and a caller that removed
+such a file after `remove_unit` RETURNED would do it in the window between the lease's release and its
+own next line, where another process can create the unit afresh and fold that file back in. Since the
+lease is `sole` and cannot be shared, the caller cannot hold it itself, so the step is handed inward
+instead. The parameter is optional and the sweep and the session funnel pass nothing, so the one
+spelling of deletion stays one spelling.
+
+**It runs FIRST, and a refusal stops the removal.** The gate that keeps such a companion from being
+read again can live INSIDE the unit -- a fold marker does -- so a unit destroyed while its companion
+survives has ARMED that gate rather than half-finished the job: the survivor becomes readable again
+with nothing left to say it was already read, and nothing revisits a unit afterwards. So the action
+answers whether the companion is really gone, an exception counts as a refusal, and a false answer
+returns `failed` with the unit, its marker and the companion all still in place for a later pass to
+aim at again. Taken in this order the partial path needs no special case: the companion is gone
+before the first segment is touched.
 
 **Removal goes through the lease, and the lease it takes is SOLE.** Ownership is what stands between
 a removal and unlinking the segments a live writer is appending to, so the removal claims it
@@ -517,7 +567,11 @@ first, and why there is no default that skips it. The sweep's guard re-derives t
 and requires the same unit id; a caller whose reason is not a property of the file passes an
 accept-all guard and says at its call site what does decide.
 
-Then order, with IDENTITY LAST. Segments carry the header, so they are the history and they go first;
+Then order, with IDENTITY LAST. A unit whose own NAME is a link is refused before any of this and
+answers `linked`, which is its own outcome rather than `absent`: absence says the name is free, and a
+caller acting on that does its own cleanup at the RESOLVED path, which is where the link points -- very
+likely another member's live unit. The two conditions invite opposite actions, so they cannot share a
+value. Segments carry the header, so they are the history and they go first;
 the per-append `.lock` next; then any other entry, none of them followed if it is a link. The
 `.lease` file is removed LAST and only by its holder, which is what keeps the inode check under
 "Write ownership" a fact about this code rather than an assumption: while the lease exists its path
@@ -555,7 +609,7 @@ running right now, and a rule that read the newest close would call it expired a
 conversation's log. Entries that are neither -- a turn, a tool, an in-flight closer the emitter writes
 after a teardown by design -- say nothing about the state and are skipped.
 
-Four things are skipped regardless of age, and each is a refusal rather than an oversight:
+Five things are skipped regardless of age, and each is a refusal rather than an oversight:
 
 - **An OPEN unit** -- one whose newest lifecycle entry is a `session/opened`, or which has no
   lifecycle entry in the window at all. The deciding entry is looked for in a bounded read of the
@@ -567,6 +621,8 @@ Four things are skipped regardless of age, and each is a refusal rather than an 
 - **A torn tail.** Unterminated trailing bytes are what `open(repair=True)` truncates, and the sweep
   cannot tell a dead writer's crash artifact from an append that has not reached its fsync -- the
   bytes are identical. Deleting the unit would destroy the history the repair exists to recover.
+- **A unit the session trash holds** (a `.trash-hold` file in its directory). Its session is
+  still in the trash or being restored, so the user can still get it back whole.
 - **A header whose id does not fold back to its own directory name.** The removal is aimed by id, so
   a directory carrying another unit's id would have the removal land on that other unit.
 - **A close whose reason does not END the ACP id's life.** A unit is collectable on exactly ONE reason:
@@ -669,6 +725,34 @@ SESSION ID, which never names a different conversation, so the removal cannot re
 all; and it holds a kernel-arbitrated lease, so a writer that IS still there refuses the removal
 rather than racing it. Neither property is available to the work ledger, which is why one is collected
 here and the other is not.
+
+**Deleting a crew member removes its crew log too, and the ROSTER is the whole authorization.** A
+member's unit is keyed by its slug, so the only question that makes the removal safe is whether a live
+member still derives that key -- not an age, not a size, and not a threshold anyone can tune, because a
+member log has no lifecycle-end entry for the sweep to age from. The crew-delete funnel resolves the
+slug through `member_slug` against the config it captured while the record still existed (a member
+carrying an explicit `member_id` keys its log by that id, so folding the name after the record is gone
+aims at a different unit), and the `guard` re-reads the roster inside the lease hold: a same-name
+member created in that window derives THIS unit, and its history is what an unguarded removal would
+take. That re-read is a snapshot on its own, so the funnel decides while it still holds
+`memory_store_namespace_lock` -- the one seam every allocator of a member id shares, and so the only
+thing that stops another PROCESS committing a same-slug record between the decision and the unlink,
+which nothing rebuilds. The predicate fails closed -- a config the loader marks degraded answers
+`claimed`, since a load
+that could not read the file returns defaults and an emptiness test alone would read that as proof the
+owner is gone -- and it is asked through `eventlog.service`, not from the handler, so the service's
+cached log for that slug is dropped in the same step as the files.
+
+**Exactly one member-delete path reclaims, and the others are named rather than implied.** The
+dashboard delete route is that path. `kirocrew agent delete`, the package-sync prune and the crewmate
+prune migration each remove a member record without collecting its unit, and a unit orphaned before
+this exists has no collector at all -- the first two already hold `memory_store_namespace_lock`, so
+reaching them is a call apiece, while the migration holds no such lock and reads a member's own
+activity to decide what to prune. A sweep that collected ANY unclaimed member unit would cover all of
+them, the crash window and the backlog together, but it would also ask the predicate about the whole
+tree instead of the one slug a delete is deciding, and that bound is what keeps a wrong answer's cost
+to a single already-deleted member. Widening it is a retention decision in its own right, not a
+follow-on to this one.
 
 ## 9. Scope
 

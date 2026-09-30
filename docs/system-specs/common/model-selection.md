@@ -159,6 +159,36 @@ Entitlement stays with the live `session/new` list (`_entitled_kiro_models`,
 install, and in that window the catalogs alone cannot call any pin foreign; every
 send is still a wire decision, so no turn runs the wrong model.
 
+That live list is revalidated on the read path before it narrows anything. A
+`session/new` snapshot is one answer captured at one instant, and an entitlement
+lookup racing a token refresh can answer with the free tier; no explicit pick is
+ever refused on the picker read path, so the refresh-before-refuse heal never
+fires there. `_entitled_kiro_models` therefore first calls the newest kiro
+session's `maybe_refresh_available_models(catalog_ids)` and narrows with what it
+returns. The ACP handle re-probes only when the snapshot would drop a catalog row
+-- judged by `catalog_row_would_drop`, the same per-row verdict the endpoint
+applies, and not when the endpoint would fail open to the full catalog -- AND the
+snapshot is suspect: never probe-confirmed, captured within
+`_READ_PATH_SPAWN_RACE_SECS` of runtime spawn, or advertising only `auto`. The
+probe is single-flight per handle and shielded under
+`_READ_PATH_PROBE_DEADLINE_SECS` (3s). A deadline miss raises
+`EntitlementRevalidating`; `GET /api/models` answers it with
+`503 model_list_revalidating`, the client keeps its last-good list and re-polls,
+and the shielded probe lands so the next read serves its result. A probe that
+fails, rather than times out, fails open: the current snapshot narrows as before.
+Underneath, `probe_advertised_models` keeps two clocks -- a result TTL that
+replays a recent non-empty answer and an attempt TTL that replays a recent empty
+or failed attempt as no evidence -- and `force=True` (an explicit `set_model`
+pick, the spawn-time pin check) bypasses only the failed-attempt replay, so a user
+action always earns a real answer. Either replay is served only if its clock is at
+least as new as the snapshot the caller holds (`not_before`): a cached broader
+answer can never replace a session's newer narrower one, and a failed attempt that
+predates the snapshot never stands in for the probe it has yet to receive. The
+handle dates the snapshot it stores by the answer's own clock (the runtime's
+result clock, `entitlement_probe_result_at`), not by its call time, so its floor
+never rises above the data it holds and a replayed answer is never re-dated out
+of the spawn-race window it was captured in.
+
 The vocabulary side and the spelling side fold ids with ONE function. A pin can be
 native to a harness while spelled in another namespace's provider-id form:
 `global.anthropic.claude-opus-4-8[1m]` folds through `catalog_key` onto kiro's
@@ -223,6 +253,34 @@ its own once the cache refreshes with a list that carries it.
 - **Pickers** MUST list options from `GET /api/models`, the advertised set, never a
   static in-code list. A hand-maintained list offers models the account cannot run and
   hides the ones it can.
+- Backends with `resolves_model_from_advertised_list` use their own advertised
+  model namespace. Claude retains its registry display-name reconciliation.
+  Other advertised-selection backends use their live session's model ids, then
+  their persisted namespace cache, preserving exact wire ids (including Pi
+  provider/model ids) without substituting the Kiro CLI catalog. A cold cache
+  offers `auto` and a scoped configured default until that backend advertises
+  its choices.
+- The chat composer reads `GET /api/chat/slots/{slot}/selection-capabilities` for
+  the active ACP session's backend, effort support, and ordered effort levels. A
+  missing session answers `known: false`; the composer then uses its existing
+  model-name heuristic until ACP reports the session's actual options. The same
+  endpoint proxies a remote slot to its execution peer. Model and effort are ONE
+  composer control (`docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md`):
+  the model chip names the level in force, and the model picker embeds the effort
+  slider below its model list whenever the capability read reports support, offering
+  exactly the advertised levels in their advertised order, whether the backend is
+  Claude, Codex, Pi, or another capable ACP harness. A session that reports no
+  effort support gets no effort row inside the picker. The composer never grows a
+  second, standalone effort control.
+- Codex advertises `model[effort]` pairs, but its `model` config option accepts the
+  base ID and its `reasoning_effort` option accepts the level. The live capability
+  marks only backends in `ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS` for pair grouping;
+  before the session exists, the configured backend ID supplies the same Codex
+  fallback. The pair shape alone is never sufficient. Existing pair pins display
+  as their base model; an unset effort control remains Default until the user
+  chooses an override. Picking a model stores the base ID; the backend's existing
+  effort reapply path keeps a slot override in force. Other backends' model IDs,
+  including Claude window suffixes such as `[1m]`, remain intact.
 - `dashboard.model_picker_hidden_models` is a presentation preference over that
   advertised set. It filters only the interactive ChatPage and ChatPane pickers;
   `auto` and each slot's active model remain visible. Settings defaults, role and
@@ -249,6 +307,17 @@ its own once the cache refreshes with a list that carries it.
 - The predicate is only meaningful where the advertised ids share a namespace with the
   id being tested, and callers gate on that. Comparing ids across two harnesses'
   namespaces calls every legitimate model unusable (harness-parity invariant `H12`).
+
+Member create and update validation pass the DM slot's backend to the shared
+model-pin check. When the configured default harness (`agent.acp_backend`) and
+the member DM harness (`agent.member_acp_backend`) share a model-registry
+namespace, the default scopes the entitlement evidence; when they diverge the
+member backend does, because the DM thread runs on it. Entitlement evidence then
+comes only from live providers sharing that scoped backend's namespace: `kiro`
+(including the empty default backend) and `kas` share `acp`. Providers with
+unknown identity or another namespace supply no evidence, so a pin the scoped
+backend has no live catalog for is treated as unknown (allowed), never rejected
+by an unrelated harness's advertised ids.
 
 ## The one allowed concrete fallback
 

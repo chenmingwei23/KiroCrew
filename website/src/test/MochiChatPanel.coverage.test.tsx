@@ -256,6 +256,66 @@ describe('PinnedSidePanel', () => {
     expect(screen.queryByText('c.md')).not.toBeInTheDocument()
   })
 
+  // The pin store keeps whatever `add_pin` was handed, and it only accepts an
+  // ABSOLUTE path (`pinned_files_service.py:318`, `os.path.isabs`). On Windows
+  // that is a native `C:\…` string, which contains no forward slash at all —
+  // so a `split('/')` parent rule returns one element, `parts.pop()` empties
+  // it, and every pin lands in the same `''` bucket. The fixtures below are
+  // `String.raw` on purpose: written as an ordinary quoted string,
+  // `'C:\Users'` is just `C:Users`, and the fixture would stop being a Windows
+  // path at all.
+  it('groups pins by their real parent folder when the store holds native Windows paths', () => {
+    const a = String.raw`C:\Users\dev\project\src\a.ts`
+    const b = String.raw`C:\Users\dev\project\src\b.py`
+    const c = String.raw`C:\Users\dev\project\docs\c.md`
+    // Guard the guard: these fixtures must really contain no forward slash,
+    // or the test would pass against a `/`-only rule for the wrong reason.
+    expect([a, b, c].some(p => p.includes('/'))).toBe(false)
+
+    // No labels, so the chip caption falls through to the panel's own
+    // basename rule and this covers BOTH native-path sites at once.
+    render(
+      <PinnedSidePanel
+        pins={[pin(a), pin(b), pin(c)]}
+        updatedPaths={new Set()} deletedPaths={new Set()} visible />,
+    )
+
+    // Two distinct folders, named — not one collapsed bucket.
+    expect(screen.getByText('src')).toBeInTheDocument()
+    expect(screen.getByText('docs')).toBeInTheDocument()
+    expect(screen.queryByText('/')).not.toBeInTheDocument()
+    // …and each chip is captioned with the file name, not the whole path.
+    expect(screen.getByText('a.ts')).toBeInTheDocument()
+    expect(screen.getByText('b.py')).toBeInTheDocument()
+    expect(screen.getByText('c.md')).toBeInTheDocument()
+    expect(screen.queryByText(a)).not.toBeInTheDocument()
+    // The group header's tooltip is the full parent, so it must be the real
+    // one rather than the fallback.
+    expect(screen.getByTitle(String.raw`C:\Users\dev\project\src`.replace(/\\/g, '/')))
+      .toBeInTheDocument()
+  })
+
+  it('groups pins by their real parent folder for a UNC store path', () => {
+    const a = String.raw`\\server\share\team\notes\a.md`
+    render(
+      <PinnedSidePanel pins={[pin(a, 'a.md')]} updatedPaths={new Set()}
+        deletedPaths={new Set()} visible />,
+    )
+    expect(screen.getByText('notes')).toBeInTheDocument()
+    expect(screen.queryByText('/')).not.toBeInTheDocument()
+  })
+
+  // Negative control for the blanket-rewrite mistake: on POSIX a backslash is a
+  // legal filename character, so a directory really can be called `we\ird`.
+  // This passes both before and after the fix, which is what makes it a control.
+  it('leaves a POSIX parent that contains a backslash intact', () => {
+    render(
+      <PinnedSidePanel pins={[pin(String.raw`/home/u/we\ird/a.ts`, 'a.ts')]}
+        updatedPaths={new Set()} deletedPaths={new Set()} visible />,
+    )
+    expect(screen.getByText(String.raw`we\ird`)).toBeInTheDocument()
+  })
+
   it('previews a pin and marks it seen on click', async () => {
     const onMarkSeen = vi.fn()
     render(
@@ -283,7 +343,7 @@ describe('PinnedSidePanel', () => {
     expect(previewFile).not.toHaveBeenCalled()
   })
 
-  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin on hover', async () => {
+  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin reachable', async () => {
     electronShell = false
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
@@ -296,20 +356,24 @@ describe('PinnedSidePanel', () => {
     fireEvent.click(label)
     expect(previewFile).not.toHaveBeenCalled()
     expect(markPinnedSeen).not.toHaveBeenCalled()
-    // The unpin affordance is its own HTTP-backed control and stays reachable.
-    await userEvent.hover(label)
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // The unpin affordance is its own HTTP-backed control, always rendered
+    // (a keyboard tab stop) and named "Unpin <file>". fireEvent, not userEvent:
+    // the control is `pointer-events: none` until the CSS hover/focus reveal,
+    // which happy-dom does not paint.
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin a.ts' }))
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
-  it('reveals Unpin on hover and unpins on click', async () => {
+  it('renders a self-describing unpin control (always present, revealed by CSS) and unpins on click', async () => {
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set()} visible />,
     )
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
-    await userEvent.hover(screen.getByText('a.ts'))
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // Always in the DOM as a real tab stop, named with the file; the CSS
+    // :hover/:focus-within rule (not a mount) controls its visibility.
+    const unpin = screen.getByRole('button', { name: 'Unpin a.ts' })
+    expect(unpin).toBeInTheDocument()
+    fireEvent.click(unpin)
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
@@ -318,8 +382,7 @@ describe('PinnedSidePanel', () => {
       <PinnedSidePanel pins={[pin('/home/u/src/gone.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set(['/home/u/src/gone.ts'])} visible />,
     )
-    await userEvent.hover(screen.getByText('gone.ts'))
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Unpin gone.ts' })).not.toBeInTheDocument()
   })
 })
 

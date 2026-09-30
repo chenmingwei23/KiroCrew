@@ -139,6 +139,22 @@ describe('client transport', () => {
     expect(call(2).body).toEqual({ enabled: false })
   })
 
+  it('uses a distinct adoption route before ordinary tag policy PATCH', async () => {
+    await api.adoptChatTag('tag / one', true)
+    expect(call()).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one/adopt',
+      method: 'POST',
+      body: { status: true },
+    })
+
+    await api.updateChatTag('tag / one', { agent: 'add-only' })
+    expect(call(1)).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one',
+      method: 'PATCH',
+      body: { agent: 'add-only' },
+    })
+  })
+
   it('DELETE omits the JSON content type when it carries no body, and sets it when it does', async () => {
     await api.deleteUserDeniedCommand('r1')
     expect(call().method).toBe('DELETE')
@@ -1309,8 +1325,10 @@ describe('request bodies with conditionally-omitted keys', () => {
   it('mcpGatewaySetStub has a single and a batch form', async () => {
     await api.mcpGatewaySetStub('fs', true)
     expect(call().body).toEqual({ name: 'fs', stub: true })
+    await api.mcpGatewaySetStub('fs', true, 'command-hash:env-hash')
+    expect(call(1).body).toEqual({ name: 'fs', stub: true, expected_launch: 'command-hash:env-hash' })
     await api.mcpGatewaySetStubMany(['fs', 'git'], false)
-    expect(call(1).body).toEqual({ names: ['fs', 'git'], stub: false })
+    expect(call(2).body).toEqual({ names: ['fs', 'git'], stub: false })
   })
 
   it('createTagColumn/updateTagColumn pass the filter mode straight through', async () => {

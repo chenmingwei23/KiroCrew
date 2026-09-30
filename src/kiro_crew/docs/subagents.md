@@ -30,8 +30,6 @@ The grammar is `spawn <task>` (or `bg <task>`) — there is no `run` subcommand;
 The `spawn_run` tool accepts:
 - `task` — single task description
 - `tasks` — array of tasks for parallel execution
-- `solo_reason` — `parent_parallel`, `bulk_data`, `fresh_context`, `specialist`, or `user_requested` (see below)
-- `solo_details` — concrete benefit and ownership; required for `parent_parallel`, `specialist`, and `user_requested`
 - `agent` / `agents` — optional agent name(s) for each task
 - `include_memory` / `include_lessons` / `include_project` — booleans (default `true`) switching off a context group the sub-agent would otherwise inherit
 - `max_turns` — per-spawn tool-call budget override (0 = unset, max 1000)
@@ -43,39 +41,22 @@ The `spawn_run` tool accepts:
 Setting `model` or `reasoning_effort`, or `keep: true`, forces the
 dedicated-process path instead of session sharing.
 
-#### The solo gate
+#### When to delegate
 
-Do focused work directly. Delegate when separate ready work can progress in
-parallel, a large input needs distillation, independent verification adds value,
-a specialist capability is needed, or the user explicitly asks. A long task,
-empty slots or a different model name alone is not a reason to delegate.
+Do focused work directly: one task is faster done in the parent, even a
+multi-step one. Spawn when the work splits into two or more independent tasks,
+when a step would flood the parent's context with bulk output and only the
+distilled result is needed, when you need an independent review or reproduction
+whose result would be wrong if it saw this session's context, or when the user
+asks for delegation or the task needs a different agent, model or crew. A long task, empty slots or a different
+model name alone is not a reason to delegate. Guidance lives in the prompt; no
+runtime gate refuses a one-task call. (A solo-spawn gate shipped in #11710 and
+was removed after audit data showed it passed 33 of 34 one-task calls.)
 
-One child is valid when the parent owns a separate useful workstream. For example:
-
-```python
-spawn_run(task="Update docs to the finalized API in api-v2.json; own docs/api.md; return the diff and link checks",
-          solo_reason="parent_parallel",
-          solo_details="I implement backend validation in server.py; docs inputs are finalized and disjoint")
-```
-
-`parent_parallel` needs asynchronous `spawn_run` and a dashboard-owned parent
-turn. Its receipt says whether bounded parent work is supported. When supported,
-finish at most one minute of ready non-overlapping work, then end the turn so
-queued results can arrive. Otherwise yield immediately. This guidance is not a
-timer enforced by the runtime. Blocking `spawn_sub_agents` cannot support
-parent-child parallel work; `spawn_continue` still requires immediate yield.
-
-For one child without separate parent work, use `bulk_data` for substantial
-inputs, `fresh_context` for blind review/clean reproduction, `specialist` with a
-concrete capability, or `user_requested` with the user's request quoted in
-`solo_details`. The last two require details; existing bulk/fresh payloads keep
-working. `fresh_context` alone does not turn off memory or project context.
-
-An unexplained equivalent-worker solo call is refused without spawning. Do it
-directly or give the real benefit; do not invent tasks or swap models to bypass
-the gate. Reasons/details are retained in the run record as model claims, not
-verified authorization. Existing direct SDK/API calls without the model solo
-marker remain compatible.
+The spawn receipt says whether bounded parent work is supported (a
+dashboard-owned parent turn). When supported, the parent may finish at most one
+minute of ready non-overlapping work, then end the turn so queued results can
+arrive. Otherwise it yields immediately. `spawn_continue` always yields.
 
 Wait through completion events when no useful independent work remains. Do not
 repeat a child's task to stay busy. Collect all outcomes in the batch, including
@@ -90,7 +71,7 @@ The other spawn tools:
 - `spawn_steer` — inject a message into a RUNNING subagent's in-flight turn (`agent_id`, `message`, `mode`: `interrupt` default or `follow_up`)
 - `spawn_release` — end a continuable conversation (`conversation`) so it can no longer be continued
 - `spawn_list` — list running and completed subagents
-- `spawn_status` — read a completed run's retained transcript (see below)
+- `spawn_status` — read a run's transcript: the live partial view while it runs, the retained full transcript once complete (see below)
 - `resource_status` — advisory host headroom (available memory, CPU load, posture, and the current concurrent sub-agent cap)
 
 ## How It Works
@@ -167,7 +148,7 @@ Set via `kirocrew config set agent.completion_keep tail` or by editing
 
 ### Reading the full transcript on demand
 
-`spawn_status` reads the retained transcript by agent ID and supports
+`spawn_status` reads a run's transcript by agent ID and supports
 line-oriented paging (like reading code) for large results:
 
 - `spawn_status(agent_id, limit=200)` — first 200 lines
@@ -176,5 +157,16 @@ line-oriented paging (like reading code) for large results:
 
 A paged/filtered response is prefixed with a continuation header
 (`showing lines X-Y of N | more available — call again with offset=Y`). With no
-paging args it returns the full transcript. You can also point the generic
-`read` / `grep` tools straight at the `result_path` from the completion event.
+paging args it returns the full transcript of a completed run. You can also
+point the generic `read` / `grep` tools straight at the `result_path` from the
+completion event.
+
+While the run is still going, the same call returns its live status and the
+redacted partial transcript streamed so far, under a
+`[RUNNING · <elapsed>s · <N> turns · last tool: <X>]` header. A run still
+parked on the spawn-approval prompt has launched no process, so its header
+leads with `AWAITING-APPROVAL` instead of `RUNNING` and the body says to
+approve it in the dashboard (Approvals) to start it. The partial view grows
+as the run streams and, past the manager's bound, is truncated from the
+front, so line offsets can shift between polls: `offset`/`limit` paging is
+best-effort until completion. Completed-run output is unchanged.

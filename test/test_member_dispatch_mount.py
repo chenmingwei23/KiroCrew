@@ -348,6 +348,12 @@ class TestKasMemberProjection:
         # The dispatch loop's write verbs specifically — without these the loop
         # stalls on an approval prompt at its second step.
         assert "session_send" in rendered
+        # The fan-out write joins on session_send's own argument: a member's
+        # broadcast audience is read from the same `created_by` field the ownership
+        # fence reads, and every delivery re-runs that fence, so it reaches the
+        # worker sessions the member opened and nothing else. Gating it would cost
+        # one approval prompt per worker on an unattended cycle.
+        assert "session_broadcast" in rendered
         assert "session_stop" in rendered
 
     def test_spec_is_not_mutated(self):
@@ -376,6 +382,17 @@ class _ClientStub:
     # The real guard, for the same reason: it is where the disabled, restricted and
     # permission-surface preconditions are decided, and both member mounts read it.
     _member_mount_withheld = AcpClient._member_mount_withheld
+
+    _claude_settings_shared = False
+    _permission_surface_share_validated = False
+
+    @property
+    def _permission_surface_governed(self):
+        # The real governed-surface derivation (authored OR share-validated),
+        # reached at call time through the live class so the stub cannot drift
+        # from what production actually reads -- and so a tree without the
+        # property fails these tests at call rather than at collection.
+        return AcpClient._permission_surface_governed.fget(self)
 
 
 def _base_servers() -> list[dict]:
@@ -411,6 +428,17 @@ class TestClaudeMemberAppend:
         stub = _ClientStub()
         stub._claude_settings_authored = False
         assert self._run(stub) == _base_servers()
+
+    def test_a_shared_permission_surface_mounts(self):
+        """A sharer's surface is governed too: the file on disk is a sibling's
+        byte-identical Crew seed, so session control rides the same permission
+        file it would have under ownership."""
+        stub = _ClientStub()
+        stub._claude_settings_authored = False
+        stub._claude_settings_shared = True
+        stub._permission_surface_share_validated = True
+        out = self._run(stub)
+        assert [e["name"] for e in out][-1] == MEMBER_DISPATCH_SERVER
 
     def test_kiro_backend_is_untouched(self):
         stub = _ClientStub()

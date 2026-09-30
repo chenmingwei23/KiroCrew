@@ -277,9 +277,9 @@ def test_a_report_with_no_citable_unit_is_still_refused():
 def test_an_append_that_fails_does_not_claim_the_report_was_recorded(monkeypatch, caplog):
     """The unthreaded OUTCOME is stated only once the append has succeeded.
 
-    An append failure is reported through ``_report``, which warns once per process
-    and is debug-only after that, so a line claiming the report landed would be the
-    only default-level trace of a write that never happened.
+    An append failure is reported through ``_report``, which warns once per kind of
+    failure and is debug-only for repeats of that kind, so a line claiming the report
+    landed would be the only default-level trace of a write that never happened.
     """
 
     class _FailingLog:
@@ -409,7 +409,7 @@ def test_a_malformed_payload_is_refused_without_failing_the_caller():
 
 
 def test_the_flag_being_off_writes_nothing_and_creates_no_directory(monkeypatch):
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     _seed_session()
     assert emit.on_crew_dispatch(CREW, DISPATCH_DATA) == 0
     assert emit.on_crew_report(CREW, {"item": "it_1", "status": "done"}, cite_unit=WORKER_UNIT) == 0

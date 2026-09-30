@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -287,6 +288,8 @@ class TestHumanOverrideHandler:
         assert 'select(.external_id | startswith(\\"$lane-pr-$PR-\\"))' in script
         assert 'select(.external_id == \\"$lane-pr-$PR\\")' not in script
         assert "sort_by(.started_at) | last" in script
+        # The default filter=latest returns one check-run per name: nothing to sort.
+        assert "check-runs?check_name=$enc&per_page=100&filter=all" in script
         # The resolved run must be verified to belong to the expected fork
         # lane before anything is re-run: any workflow with checks:write
         # could post a check-run of the same name.
@@ -964,11 +967,24 @@ class TestPrReadiness:
         assert '"GPT 5.6 Review (fork PR)"' not in workflow
         assert 'state="maintainer_review"' not in workflow
         assert "AI reviews could not run" not in workflow
-        # Stage-2 fork reviewers re-trigger readiness on completion so the
-        # green verdict actually lands.
-        assert "Fork Opus 5 Review" in workflow
-        assert "Fork GPT 5.6 Review" in workflow
-        assert "github.event.workflow_run.event == 'workflow_run'" in workflow
+        # The Stage-2 fork reviewers must NOT be in the trigger allowlist.
+        # Asserting their presence there proves nothing about function: presence
+        # does not say the trigger can resolve a pull request, and it cannot. A
+        # `workflow_run`-triggered lane runs from the default branch, so the
+        # payload it hands readiness names the default branch's tip, and the
+        # resolve step's `pulls?head=<repo>:<default branch>` lookup is empty by
+        # construction. Measured 700/700 runs across all seven fork lanes on the
+        # default branch, and 158 no-op readiness runs on one default-branch SHA.
+        # The green fork verdict lands through the lanes that DO run on the PR
+        # head -- Fast Gate above -- plus the 15-minute sweep, which re-fires by
+        # PR number.
+        assert "      - Fork Opus 5 Review" not in workflow
+        assert "      - Fork GPT 5.6 Review" not in workflow
+        assert "      - Fork Internal Content Scan" not in workflow
+        assert "github.event.workflow_run.event == 'workflow_run'\n" not in workflow
+        # The check-run specs above are what read a fork lane's verdict, and
+        # they are keyed on Fast Gate, which does carry the PR head.
+        assert '|fast-gate.yml"' in workflow
 
     def test_external_check_polling_counts_each_pass_once(self) -> None:
         workflow = _workflow("pr-readiness.yml")
@@ -976,6 +992,56 @@ class TestPrReadiness:
         assert 'success|neutral|skipped) passed+=("$check_name")' not in workflow
         assert 'if [ "${#failed[@]}" -gt 0 ]; then' in workflow
         assert 'if [ "${#pending[@]}" -gt 0 ]; then' in workflow
+
+    def test_no_monitored_lane_is_itself_workflow_run_triggered(self) -> None:
+        # GitHub runs a `workflow_run`-triggered workflow from the default
+        # branch, so the payload its completion hands readiness names the
+        # default branch as head_branch and the default branch's tip as
+        # head_sha, never the pull request's head. The resolve step then asks
+        # which open pull request has `<this repo>:<default branch>` as its head
+        # and gets an empty answer every time, so the run exits SKIP having
+        # published nothing and spent one request from the shared hourly REST
+        # pool. Listing such a lane therefore buys no refresh at all while
+        # dispatching a run per completion, keyed on ONE shared concurrency
+        # group (the default branch's tip) rather than per head update -- which
+        # is how it accumulated across every open pull request at once.
+        #
+        # A lane whose verdict readiness must observe belongs in the check-run
+        # specs (keyed on a workflow that does carry the PR head) or behind the
+        # `pr-readiness-sweep.yml` backstop, which re-fires by PR number.
+        readiness = yaml.safe_load(_workflow("pr-readiness.yml"))
+        # PyYAML resolves a bare `on:` key to the boolean True.
+        monitored = (readiness.get("on") or readiness[True])["workflow_run"]["workflows"]
+        assert monitored, "readiness must monitor at least one lane"
+
+        triggers: dict[str, object] = {}
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                continue
+            name = doc.get("name")
+            on = doc.get("on", doc.get(True))
+            if isinstance(name, str):
+                triggers[name] = on
+
+        offenders = sorted(
+            name
+            for name in monitored
+            if isinstance(triggers.get(name), dict) and "workflow_run" in triggers[name]
+        )
+        assert offenders == [], (
+            "these monitored lanes are themselves workflow_run-triggered, so their "
+            f"payload can never resolve to a pull request: {offenders}"
+        )
+
+    def test_the_job_gate_refuses_a_workflow_run_upstream(self) -> None:
+        # Second fence for the same rule, so re-adding such a lane has to clear
+        # both. The allowlist is the primary one.
+        gate = yaml.safe_load(_workflow("pr-readiness.yml"))["jobs"]["readiness"]["if"]
+
+        assert "github.event.workflow_run.event == 'pull_request'" in gate
+        assert "github.event.workflow_run.event == 'dynamic'" in gate
+        assert "github.event.workflow_run.event == 'workflow_run'" not in gate
 
 
 class TestDesignReviewPresentation:
@@ -1172,8 +1238,12 @@ class TestFirstPrinciplesReview:
         assert "- name: Fetch PR intent (untrusted data file)" in workflow
         # Fetched BEFORE the OIDC role is assumed, and bounded.
         assert workflow.index("Fetch PR intent") < workflow.index("role-to-assume")
-        assert "read($fh, my $b, 8000)" in workflow
-        assert "[description TRUNCATED at 8000 bytes]" in workflow
+        # The capture is the shared script this lane sources, so the bound lives
+        # there. Assert the lane reaches it and that the bound is in it.
+        assert CAPTURE_SOURCE_LINE in workflow
+        capture = CAPTURE_SCRIPT.read_text(encoding="utf-8")
+        assert "read($fh, my $b, 8000)" in capture
+        assert "[description TRUNCATED at 8000 bytes]" in capture
         assert "pr-intent.txt" in workflow
         # The cap must not pipe into `head -c`, and must not fall back to a second
         # copy of the body. `head -c` exits as soon as it has its bytes, so the
@@ -1391,7 +1461,17 @@ class TestFirstPrinciplesReview:
         # as it has its bytes, so the writer takes SIGPIPE and `pipefail` turns the
         # 141 into a step failure -- on exactly the over-cap body the cap exists for.
         # A 30 KB PR description lost that race and took this lane red.
-        assert "read($fh, my $b, 8000)" in prefetch
+        assert CAPTURE_SOURCE_LINE in prefetch
+        capture = CAPTURE_SCRIPT.read_text(encoding="utf-8")
+        assert "read($fh, my $b, 8000)" in capture
+        # Scan the CODE, not the commentary. The capture's header names the
+        # rejected `printf | head -c` spelling and says why it is rejected, so a
+        # whole-file match would report that explanation as the offender it warns
+        # about. Strip comment lines and assert on what actually runs.
+        capture_code = "\n".join(
+            ln for ln in capture.splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "| head -c" not in capture_code, capture_code
         assert "| head -c" not in prefetch
 
     def test_a_contract_absent_from_the_base_is_not_a_red_check(self) -> None:
@@ -1474,8 +1554,12 @@ class TestFirstPrinciplesReview:
         workflow = _workflow("pr-readiness.yml")
 
         assert "      - First Principles Review" in workflow
-        assert "      - Fork First Principles Review" in workflow
         assert '"first-principles-review.yml|First Principles Review"' in workflow
+        # The fork path is registered by its check-run spec, keyed on Fast Gate.
+        # It is NOT in the trigger allowlist: a `workflow_run`-triggered lane
+        # runs from the default branch, so its payload names the default
+        # branch's tip and readiness can never resolve it to a pull request.
+        assert "      - Fork First Principles Review" not in workflow
         assert (
             '"checkrun:First Principles Review|First Principles Review'
             '|first-principles-pr-|fast-gate.yml"' in workflow
@@ -1602,13 +1686,12 @@ class TestFirstPrinciplesIntentCapSurvivesALongBody:
     """
 
     def _cap_block(self, lane: str) -> str:
-        workflow = _workflow(lane)
-        step = (
-            "Fetch PR intent (untrusted data file)"
-            if lane.startswith("fork-")
-            else "Prefetch the change as data files"
-        )
-        script = _step_script(workflow, step)
+        # The cap lives in the ONE shared capture both lanes source, so the block
+        # under test is the block that runs. Assert the lane reaches it, then
+        # execute the script's own copy: extracting per lane would assert against
+        # a string the workflow does not contain.
+        assert CAPTURE_SOURCE_LINE in _workflow(lane), lane
+        script = CAPTURE_SCRIPT.read_text(encoding="utf-8")
         start = script.index("# Cap at 8000 bytes")
         end = script.index('rm -f "$full"', start) + len('rm -f "$full"')
         return script[start:end]
@@ -1694,14 +1777,12 @@ class TestIntentReadFailureFailsClosed:
     """
 
     def _read_block(self, lane: str) -> str:
-        workflow = _workflow(lane)
-        step = (
-            "Fetch PR intent (untrusted data file)"
-            if lane.startswith("fork-")
-            else "Prefetch the change as data files"
-        )
-        script = _step_script(workflow, step)
-        start = script.index('raw=""')
+        # The read lives in the ONE shared snapshot both lanes reach through the
+        # ONE shared capture they source. Assert the lane reaches it, then
+        # execute the capture's own copy of the block that consumes it.
+        assert CAPTURE_SOURCE_LINE in _workflow(lane), lane
+        script = CAPTURE_SCRIPT.read_text(encoding="utf-8")
+        start = script.index('. "${KC_SCRIPT_DIR:')
         end = script.index("# Strip embedded media")
         return script[start:end]
 
@@ -1709,8 +1790,11 @@ class TestIntentReadFailureFailsClosed:
         bash = _bash()
         if bash is None:
             pytest.skip("the read block is Bash; skip where Bash is absent")
-        body_file = tmp_path / "api-reply.txt"
-        body_file.write_text("Title: t\n\nDescription:\nprose\n", encoding="utf-8")
+        # The snapshot fetches the WHOLE PR object once and splits the title
+        # and the description out of it, so the stub answers with that object
+        # rather than with the composed text two separate reads returned.
+        body_file = tmp_path / "api-reply.json"
+        body_file.write_text('{"title":"t","body":"prose"}\n', encoding="utf-8")
         attempts = tmp_path / "gh-attempts"
         gh = tmp_path / "gh"
         stub = f'#!/bin/sh\nprintf x >> "{attempts}"\n'
@@ -1747,14 +1831,22 @@ class TestIntentReadFailureFailsClosed:
             env={
                 # tmp_path first so the `gh` stub wins; starve any real gh of
                 # credentials so a stub-resolution failure can never turn into
-                # a live API call.
-                "PATH": f"{tmp_path}{os.pathsep}/usr/local/bin{os.pathsep}/usr/bin{os.pathsep}/bin",
+                # a live API call. `_stub_path` appends the host's real `jq`,
+                # which the read block needs to split the title and body out of
+                # one API response and which the Windows runners' Git Bash does
+                # not put under the Unix defaults -- without it the read fails
+                # closed there and the case reads as a broken lane.
+                "PATH": _stub_path(tmp_path),
                 "GH_TOKEN": "",
                 "GITHUB_TOKEN": "",
                 "LC_ALL": "C",
                 "REPO": "example/repo",
                 "PR": "1",
                 "TMPDIR": str(tmp_path),
+                # This block is executed as `bash -c` text, so $BASH_SOURCE is
+                # empty and the sibling-path source cannot resolve itself. The
+                # real lanes source the capture from a file and need no override.
+                "KC_SCRIPT_DIR": str(CAPTURE_SCRIPT.parent),
             },
             cwd=tmp_path,
         )
@@ -2117,10 +2209,19 @@ DESIGN_EVIDENCE_LANES = ("design-review.yml", "fork-design-review.yml")
 # trusted base checkout, so a fork cannot alter what fetches its evidence.
 ATTACHMENT_SCRIPT = ".github/scripts/pr-attachment-evidence.sh"
 ATTACHMENT_SOURCE_LINE = '. "$GITHUB_WORKSPACE/.github/scripts/pr-attachment-evidence.sh"'
+# The ONE read of the PR's mutable title and description, shared by both
+# consumers in a job. Sourced by sibling path rather than through an env var,
+# so a lane cannot silently opt out of it.
+SNAPSHOT_SCRIPT = ".github/scripts/pr-body-snapshot.sh"
+SNAPSHOT_SOURCE_FRAGMENT = "/pr-body-snapshot.sh"
 
 
 def _attachment_script() -> str:
     return (ROOT / ATTACHMENT_SCRIPT).read_text(encoding="utf-8")
+
+
+def _snapshot_script() -> str:
+    return (ROOT / SNAPSHOT_SCRIPT).read_text(encoding="utf-8")
 
 
 class TestUxReviewReadsTheScreenshotsBlindFirst:
@@ -2362,17 +2463,21 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
 
     @staticmethod
     def _gh_stub() -> str:
-        """A `gh` that answers the one call the step makes -- the PR body --
-        from $GH_STUB_BODY, and fails loudly on anything else, so a step that
-        grew a second gh call would be caught here rather than in CI. The
-        first $GH_STUB_FAIL_FIRST calls fail with exit 1, the way a 5xx or a
-        rate limit would, so the retry around the read can be exercised."""
+        """A `gh` that answers the one call the step makes -- the whole PR
+        object, which pr-body-snapshot.sh reads once per job for the title and
+        the description together -- from $GH_STUB_BODY, and fails loudly on
+        anything else, so a step that grew a second gh call would be caught
+        here rather than in CI. The first $GH_STUB_FAIL_FIRST calls fail with
+        exit 1, the way a 5xx or a rate limit would, so the retry around the
+        read can be exercised."""
         return (
             "gh() {\n"
             '  n=$(cat "$GH_STUB_CALLS" 2>/dev/null || echo 0); n=$((n + 1)); printf \'%s\' "$n" > "$GH_STUB_CALLS"\n'
             '  if [ "$n" -le "${GH_STUB_FAIL_FIRST:-0}" ]; then echo "gh stub: transient failure $n" >&2; return 1; fi\n'
             '  case "$1 $2" in\n'
-            '    "api repos/$REPO/pulls/$PR") printf \'%s\' "$GH_STUB_BODY" ;;\n'
+            '    "api repos/$REPO/pulls/$PR") printf \'{"title":%s,"body":%s}\' '
+            '"$(printf \'%s\' "${GH_STUB_TITLE:-t}" | jq -Rs .)" '
+            '"$(printf \'%s\' "$GH_STUB_BODY" | jq -Rs .)" ;;\n'
             '    *) echo "gh stub: unexpected call: $*" >&2; return 1 ;;\n'
             "  esac\n"
             "}\n"
@@ -2463,6 +2568,16 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         if bash is None:
             pytest.skip("the evidence step runs only under Bash")
         env = self._git_env(tmp_path)
+        # One CALL of this harness is one job, and several cases below run it
+        # twice to compare two runs of the same lane -- a 404 then a 503 on the
+        # same PR, say. The step reads the description through a snapshot cached
+        # under `$RUNNER_TEMP`, so a temp shared between those two calls would
+        # serve call 2 the body call 1 asked for, and the second case would
+        # silently measure the first one's input.
+        self._job_seq = getattr(self, "_job_seq", 0) + 1
+        job_temp = tmp_path / f"job-temp-{self._job_seq}"
+        job_temp.mkdir(parents=True, exist_ok=True)
+        env["RUNNER_TEMP"] = str(job_temp)
         # bash -c is a non-interactive shell, so it sources $BASH_ENV before
         # the script: the functions defined there shadow every gh and curl on
         # PATH, wherever the platform's bash put them. gh() serves the body
@@ -2556,12 +2671,28 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         `GIT_*` location variable is dropped. Global and system config are
         pointed away too, so a host-wide `commit.gpgsign` or hook path cannot
         reach the fixture.
+
+        `RUNNER_TEMP` is given its own per-case directory for the same reason,
+        and it matters as soon as a step under test keeps anything there. The
+        evidence step reads the PR description through pr-body-snapshot.sh,
+        which caches that read under `$RUNNER_TEMP` BECAUSE a job is exactly
+        the scope one read should serve. On a GitHub runner that variable is
+        set job-wide, so inheriting it makes every case in the shard share one
+        cache: the first case to run leaves a snapshot for `example/repo#7`,
+        and every later case reuses it instead of calling its own `gh` stub --
+        its call counter is never written, and a case that asks the stub to
+        fail sees the step succeed. The failure is invisible off-runner, where
+        `RUNNER_TEMP` is unset and each case falls back to a fresh `mktemp -d`.
+        One case is one job, so one case gets one job temp.
         """
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         gitconfig = tmp_path / "gitconfig"
         gitconfig.touch()
         env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
         env["GIT_CONFIG_NOSYSTEM"] = "1"
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        env["RUNNER_TEMP"] = str(runner_temp)
         return env
 
     def _git(self, repo: Path, *args: str) -> str:
@@ -2574,6 +2705,30 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
             cwd=repo,
             env=self._git_env(repo.parent),
         ).stdout.strip()
+
+    def test_each_case_gets_its_own_job_temp_not_the_shard_s(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One case is one job, so the harness must not hand two cases the same
+        `$RUNNER_TEMP`.
+
+        The evidence step reads the PR description through a snapshot cached
+        under `$RUNNER_TEMP`, which is the right scope on a runner and the wrong
+        one here: a runner sets that variable job-wide, so an inherited value
+        lets case 1's snapshot answer for case 2, whose `gh` stub is then never
+        called. That is silent off-runner, where the variable is unset, which is
+        why it is pinned rather than left to the next reader to notice.
+        """
+        monkeypatch.setenv("RUNNER_TEMP", "/the/whole/shard/temp")
+        seen: list[str] = []
+        for case in ("case-one", "case-two"):
+            (tmp_path / case).mkdir()
+            got = self._git_env(tmp_path / case)["RUNNER_TEMP"]
+            assert got != "/the/whole/shard/temp", "the harness inherited the shard's job temp"
+            assert Path(got).is_dir(), got
+            assert Path(got).parent == tmp_path / case, got
+            seen.append(got)
+        assert seen[0] != seen[1], "two cases were handed one job temp"
 
     def test_the_evidence_step_copies_regular_images_under_opaque_names(
         self, tmp_path: Path
@@ -3187,7 +3342,10 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
             gh_fail_first=2,
         )
         assert self._gh_calls == 3, self._evidence_stdout
-        assert self._evidence_stdout.count("Reading the PR description failed on attempt") == 2
+        assert (
+            self._evidence_stdout.count("Reading the PR title and description failed on attempt")
+            == 2
+        )
         assert [p.name for p in blind_dir.iterdir()] == [
             "shot-01.png" if lane == "ux-review.yml" else "attachment-01.png"
         ]
@@ -3354,12 +3512,19 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         script = _attachment_script()
         code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
         assert any(
-            ln.strip() == 'if body="$(gh api "repos/$REPO/pulls/$PR" --jq \'.body // ""\')"; then'
-            for ln in code
-        ), "the shared script reads the description from the API into one variable"
+            SNAPSHOT_SOURCE_FRAGMENT in ln for ln in code
+        ), "the shared script takes the description from this job's one snapshot read"
+        assert any(
+            ln.strip() == 'body="$(cat "$KC_PR_BODY_FILE")"' for ln in code
+        ), "and reads it into one variable, as before"
+        assert not [ln for ln in code if "gh api" in ln], [ln for ln in code if "gh api" in ln]
         # A transient API failure is retried, bounded, and then fails closed.
-        assert "for attempt in 1 2 3; do" in script
-        assert 'sleep "$attempt"' in script
+        # The retry lives in the snapshot, the only reader now; the fail-closed
+        # MESSAGE stays here, because a failed read costs each consumer
+        # something different.
+        snapshot = _snapshot_script()
+        assert "for _kc_snap_try in 1 2 3; do" in snapshot
+        assert 'sleep "$_kc_snap_try"' in snapshot
         assert "::error::Could not read this PR's description after 3 attempts" in script
         body_lines = [ln for ln in code if "$body" in ln or "${body" in ln]
         assert len(body_lines) == 1, body_lines
@@ -3394,12 +3559,19 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
         body_lines = [ln for ln in code if "$body" in ln or "${body" in ln]
         assert any(
-            ln.strip() == 'if body="$(gh api "repos/$REPO/pulls/$PR" --jq \'.body // ""\')"; then'
-            for ln in code
-        ), "the shared script reads the description from the API into one variable"
+            SNAPSHOT_SOURCE_FRAGMENT in ln for ln in code
+        ), "the shared script takes the description from this job's one snapshot read"
+        assert any(
+            ln.strip() == 'body="$(cat "$KC_PR_BODY_FILE")"' for ln in code
+        ), "and reads it into one variable, as before"
+        assert not [ln for ln in code if "gh api" in ln], [ln for ln in code if "gh api" in ln]
         # A transient API failure is retried, bounded, and then fails closed.
-        assert "for attempt in 1 2 3; do" in script
-        assert 'sleep "$attempt"' in script
+        # The retry lives in the snapshot, the only reader now; the fail-closed
+        # MESSAGE stays here, because a failed read costs each consumer
+        # something different.
+        snapshot = _snapshot_script()
+        assert "for _kc_snap_try in 1 2 3; do" in snapshot
+        assert 'sleep "$_kc_snap_try"' in snapshot
         assert "::error::Could not read this PR's description after 3 attempts" in script
         assert len(body_lines) == 1, body_lines
         assert (
@@ -9522,7 +9694,14 @@ class TestReviewLaneVerdictVisibility:
         # And that branch answers 2 as well: a rival comment in the slot is the
         # same refusal as finding one before the first write, reached later.
         rival = canonical.split("took this lane's slot while this run was retrying", 1)[1]
-        assert rival.split("\n")[1].strip() == "return 2", rival[:160]
+        # Read as the FIRST return after that branch rather than the next
+        # physical line: a withheld arm retains the verdict before returning, so
+        # a line sits between the message and the answer. Any other status here,
+        # including one the retention introduced, still fails.
+        rival_returns = [
+            line.strip() for line in rival.split("\n") if line.strip().startswith("return ")
+        ]
+        assert rival_returns and rival_returns[0] == "return 2", rival[:240]
         # Two classified reads, asking the same question at different times:
         # before the first write, and again during the backoff. Both are scoped
         # to the slot as well as the needle.
@@ -10397,10 +10576,23 @@ class TestConcernsIsVisibleInTheChecksUi:
     def test_pr_readiness_still_counts_neutral_as_a_pass(self) -> None:
         # This is what makes the change safe: `neutral` is visible to a human
         # and invisible to the gate, so an advisory CONCERNS cannot start
-        # blocking merges. Read-only assertion -- this PR does not edit the file.
+        # blocking merges.
         readiness = _workflow("pr-readiness.yml")
         assert 'IN("success","neutral")' in readiness
-        assert "success|neutral|skipped) passed+=" in readiness
+        # Bound to the SAME-REPO advisory case block -- the second of the two
+        # readers that name all three lanes -- so the arm scoring `neutral`
+        # cannot be confused with the generic lane reader's own arm below it.
+        # Whatever else that arm does, `neutral` reaches `passed` and never the
+        # BLOCK-only failing arm, which is the property this pins.
+        branch = (
+            '[ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] '
+            '|| [ "$label" = "First Principles Review" ]'
+        )
+        region = readiness.split(branch)[2].split("esac", 1)[0]
+        arms = [arm for arm in region.split(";;") if "neutral" in arm]
+        assert len(arms) == 1, "exactly one arm may score a neutral conclusion"
+        assert 'passed+=("$label")' in arms[0]
+        assert "failed+=" not in arms[0]
 
     def test_same_repo_lanes_annotate_concerns_and_still_exit_zero(self) -> None:
         for name, _, status_step, lane in CONCERNS_SAME_LANES:
@@ -10816,6 +11008,24 @@ class TestFirstPrinciplesProblemsFirstContract:
         assert "DO NOT REASON FROM AN ASSUMED USER COUNT, in either direction" in contract
         assert "the AGENT is untrusted with respect to its own governance" in contract
 
+    def test_over_engineering_is_judged_against_the_frozen_goal(self) -> None:
+        # The body below `## What changed` is regenerated each round to match
+        # the diff, so it cannot be the Goal a mechanism is measured against.
+        # An out-of-goal mechanism must surface as a removable Subtraction, and
+        # an older PR without the frozen headings still has a Goal to read.
+        flat = " ".join(_fp_contract().split())
+        assert "THE GOAL: when the description has a `**Goal:**` line" in flat
+        assert "never from `## What changed` or anything below it" in flat
+        assert "When there is no `**Goal:**` line (an older PR)" in flat
+        # Today's template already has `## Problem / Motivation`, so that
+        # heading alone must not switch a PR into frozen-goal mode.
+        assert "a `## Problem / Motivation` section or" not in flat
+        assert "does any mechanism go beyond the Goal's scope" in flat
+        assert "If so, is that justified?" in flat
+        assert "MINIMALITY PRINCIPLE: the change fits the original Goal" in flat
+        assert "tagged `oversized`" in flat
+        assert "`Clears when: the mechanism is removed, or a human amends the Goal.`" in flat
+
 
 class TestFirstPrinciplesOneStatementPerProblem:
     """A review that says the same three items three times -- under
@@ -10990,7 +11200,12 @@ class TestReviewLanesPublishOnlyTheReview:
         script = (
             'summary="$(cat body.md)"\n'
             + trim
-            + "\nprintf '%s\\n' \"$summary\" | head -n1\n"
+            # First line via `awk 'NR == 1'`, never `head -n1`: head closes the
+            # pipe on its producer, and under this script's own `-o pipefail`
+            # the producer's SIGPIPE (141) becomes the script's exit status.
+            # Same reason the lanes themselves are held to it -- see
+            # test_guard_function_is_byte_identical_across_all_lanes.
+            + "\nprintf '%s\\n' \"$summary\" | awk 'NR == 1'\n"
             + "awk '/<details>/ { skip = 1 } !skip { print } /<\\/details>/ { skip = 0 }' <<< \"$summary\" | wc -w | tr -d ' '\n"
         )
         result = subprocess.run(
@@ -11564,6 +11779,42 @@ class TestForkLaneSurfacesAnUnstampedReviewBody:
         assert "UNSTAMPED" not in posted
 
 
+def _fork_gpt_cli_config(tmp_path: Path) -> dict:
+    """Run the fork GPT lane's config step and parse the file it writes.
+
+    PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
+    substring assertion while codex discards the whole file -- taking the shell
+    environment policy and the sandbox mode with it.
+    """
+    import tomllib
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("writing the review CLI config requires Bash")
+    home = tmp_path / "home"
+    home.mkdir()
+    script_file = tmp_path / "step.sh"
+    script_file.write_text(
+        _step_script(
+            _workflow("fork-gpt-review.yml"), "Configure the review CLI for Amazon Bedrock"
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    proc = subprocess.run(
+        [bash, "-e", str(script_file)],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    written = home / ".codex" / "config.toml"
+    assert written.is_file(), "the step wrote no config.toml"
+    return tomllib.loads(written.read_text(encoding="utf-8"))
+
+
 class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     """`codex exec` hands the model a shell; the Opus lane deliberately does not.
 
@@ -11579,34 +11830,7 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     STEP = "Configure the review CLI for Amazon Bedrock"
 
     def _config(self, tmp_path: Path) -> dict:
-        import tomllib
-
-        bash = _bash()
-        if bash is None:
-            pytest.skip("writing the review CLI config requires Bash")
-        home = tmp_path / "home"
-        home.mkdir()
-        script_file = tmp_path / "step.sh"
-        script_file.write_text(
-            _step_script(_workflow("fork-gpt-review.yml"), self.STEP),
-            encoding="utf-8",
-            newline="\n",
-        )
-        proc = subprocess.run(
-            [bash, "-e", str(script_file)],
-            check=False,
-            capture_output=True,
-            encoding="utf-8",
-            cwd=tmp_path,
-            env={**os.environ, "HOME": str(home)},
-        )
-        assert proc.returncode == 0, proc.stderr
-        written = home / ".codex" / "config.toml"
-        assert written.is_file(), "the step wrote no config.toml"
-        # PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
-        # substring assertion while codex discards the policy and the model's
-        # shell keeps the credentials.
-        return tomllib.loads(written.read_text(encoding="utf-8"))
+        return _fork_gpt_cli_config(tmp_path)
 
     def test_the_bedrock_provider_still_resolves(self, tmp_path: Path) -> None:
         # The exclusions must not cost the lane its model: the provider reads its
@@ -11630,6 +11854,55 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
         # false so GH_TOKEN and future secret-shaped variables drop out too.
         policy = self._config(tmp_path)["shell_environment_policy"]
         assert policy["ignore_default_excludes"] is False
+
+
+class TestForkGptLaneSandboxModeLivesInTheConfigFile:
+    """A `--sandbox` flag on the command line makes this lane's config unreachable.
+
+    The flag wins over `sandbox_mode` in the staged config AND suppresses a
+    `default_permissions` profile outright, so a filesystem rule written into that
+    file is inert for as long as the flag is passed. The mode therefore belongs in
+    the file, which is the only place a read restriction can be attached to it.
+
+    Both halves are asserted because either one alone is unsafe. Dropping the flag
+    without pinning the key leaves the effective mode to a config default this
+    repository does not control, and `workspace-write` and `danger-full-access`
+    are legal values for it -- on a lane that reviews a fork's UNTRUSTED diff
+    holding Bedrock credentials.
+    """
+
+    WORKFLOW = "fork-gpt-review.yml"
+
+    def _codex_commands(self) -> list[str]:
+        """Every `codex exec` invocation, backslash continuations joined up."""
+        joined = re.sub(r"\\\n\s*", " ", _workflow(self.WORKFLOW))
+        commands = [
+            _flat(line).strip()
+            for line in joined.splitlines()
+            if ".bin/codex" in line and " exec " in _flat(line)
+        ]
+        assert commands, f"{self.WORKFLOW} runs no `codex exec` command to check"
+        return commands
+
+    def test_neither_pass_passes_the_sandbox_flag(self) -> None:
+        for command in self._codex_commands():
+            assert "--sandbox" not in command, (
+                f"{self.WORKFLOW} passes --sandbox on a `codex exec` command line: "
+                f"{command!r}. The flag overrides the staged config.toml and "
+                "suppresses its `default_permissions` profile, so every filesystem "
+                "rule in that file stops being enforced while this argument is "
+                "present -- silently, because the lane still reports a read-only "
+                "sandbox and still produces a verdict"
+            )
+
+    def test_the_staged_config_pins_the_mode_explicitly(self, tmp_path: Path) -> None:
+        config = _fork_gpt_cli_config(tmp_path)
+        assert config.get("sandbox_mode") == "read-only", (
+            'the staged config.toml does not pin sandbox_mode = "read-only". With '
+            "no --sandbox argument on the command line, `codex exec` resolves the "
+            "mode from this file, so an absent or widened key hands the model's "
+            "shell more of the runner than reading the diff needs"
+        )
 
 
 class TestForkModelStepsDenyReadingTheEnvironment:
@@ -14077,3 +14350,2214 @@ class TestUxLensZeroIsIdenticalInBothLanes:
             assert "across the whole app, not one panel" in flat, name
             # "The issue asked for it here" is not a design decision.
             assert "is NOT a design decision and is itself a finding" in flat, name
+
+
+#: Every review lane's notice step, with the slot-lookup shape it is allowed to
+#: carry. ``defines_lookup`` says the step declares ``find_existing``; ``creates``
+#: says at least one branch in it CREATES a marker comment rather than only
+#: patching one that already exists. A create is the case that cannot be undone,
+#: so it is the case the gate exists for -- but the lookup is budgeted in both,
+#: because a swallowed read on a patch-only branch silently leaves an earlier
+#: revision's outcome standing in the slot.
+_NOTICE_LANES = (
+    ("claude-review.yml", "Post Opus 5 review summary", False, False),
+    ("codex-review.yml", "Post/update review comment", False, False),
+    ("design-review.yml", "Post design review summary", True, True),
+    ("first-principles-review.yml", "Post first-principles review summary", True, True),
+    ("fork-design-review.yml", "Post/update design review comment", False, False),
+    (
+        "fork-first-principles-review.yml",
+        "Post/update first-principles review comment",
+        True,
+        False,
+    ),
+    ("fork-gpt-review.yml", "Post/update summary comment", False, False),
+    ("fork-opus-review.yml", "Post/update summary comment", False, False),
+    ("fork-security-scope-review.yml", "Post/update the scope review comment", False, False),
+    ("fork-ux-review.yml", "Post UX review summary", True, False),
+    ("security-scope-review.yml", "Post the scope verdict", False, False),
+    ("ux-review.yml", "Post UX review summary", True, True),
+)
+
+_NOTICE_LANE_PARAMS = [
+    pytest.param(workflow, step, defines, creates, id=f"{workflow}-{int(defines)}{int(creates)}")
+    for workflow, step, defines, creates in _NOTICE_LANES
+]
+
+
+class TestNoticeSlotLookupLicensesEveryCreate:
+    """A notice comment is created only from a slot read that actually answered.
+
+    The verdict writes in these steps route through a guarded upsert that
+    pre-reads the slot and refuses an occupant. The override, no-contract and
+    skip notices in the same steps do not: they decide between PATCH and CREATE
+    from one marker lookup of their own. When that lookup is a single attempt
+    whose error is swallowed, an ordinary API flake is indistinguishable from an
+    empty slot, and the branch takes the CREATE arm against a slot that already
+    holds a comment. Two comments then share one marker: a later lookup patches
+    whichever id it picks first and the other keeps whatever line it carries,
+    with no run that reconciles them.
+    """
+
+    #: The arms a notice write may sit behind. A write runs only when the slot
+    #: read answered AND this PR's head is still the head the notice is about.
+    #: The third arm only REPORTS, so it carries no head licence: an unreadable
+    #: slot is a fact worth printing whatever the head now says, and requiring
+    #: the licence there would swallow it whenever both reads fail at once.
+    GATE = 'elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then'
+    UNREADABLE = 'elif [ "$lookup_ok" -eq 0 ]; then'
+    PATCH_GATE = (
+        'if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then'
+    )
+
+    def _notice_script(self, workflow: str, step: str) -> str:
+        return _step_script(_workflow(workflow), step)
+
+    def test_slot_lookup_is_one_budgeted_body_wherever_it_is_defined(self) -> None:
+        # Same invariant retry_comment_write already carries, applied to the
+        # lookup that gates the notice writes: one body, edited in every lane at
+        # once, so the budget cannot drift lane by lane.
+        bodies = set()
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            script = self._notice_script(workflow, step)
+            if not defines:
+                assert "find_existing() {" not in script, workflow
+                continue
+            bodies.add(_shell_function(script, "find_existing"))
+        assert len(bodies) == 1, (
+            "find_existing must stay byte-identical across every lane that "
+            "defines one; edit all copies together"
+        )
+        canonical = bodies.pop()
+        code = [line for line in canonical.splitlines() if not line.lstrip().startswith("#")]
+        # Bounded and budgeted on the same terms as the reads that gate a
+        # verdict: six attempts, 5s linear backoff, ~75s. The window this
+        # exists for is an API exhaustion lasting minutes, not one bad request.
+        assert any("for attempt in 1 2 3 4 5 6; do" in line for line in code)
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code)
+        assert any('if [ "$attempt" -lt 6 ]; then' in line for line in code)
+        # The failure is REPORTED, not swallowed. `|| true` on the read is the
+        # whole defect: it turns "the API refused" into "the slot is empty".
+        assert not any("|| true" in line for line in code), code
+        # Two separate facts, because only one of them licenses a create.
+        assert any(line.strip() == "lookup_ok=1" for line in code)
+        assert any(line.strip() == 'existing=""' for line in code)
+        # `awk 'NR == 1'`, not `head -n1`: a head in the pipeline SIGPIPEs the
+        # api call under pipefail, which is itself a swallowed read.
+        assert not any("head -n1" in line for line in code), code
+        assert any("| awk 'NR == 1'" in line for line in code)
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_every_notice_create_sits_behind_the_gate(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Enumerated per lane rather than spot-checked: the lanes that create a
+        # notice must gate every one of those creates, and the lanes that do not
+        # create must still not gain an ungated one later. A lane whose notices
+        # only patch reports an unreadable slot instead, because the comment
+        # left standing there describes an earlier revision.
+        script = self._notice_script(workflow, step)
+        lines = script.replace("\\\n", " ").splitlines()
+        # The guarded upsert's own writes are not notices: they are already
+        # pre-read and refused on an occupant, and they carry `write_rc` rather
+        # than `|| true`.
+        notice_creates = [
+            (n, line)
+            for n, line in enumerate(lines)
+            if not line.lstrip().startswith("#")
+            if "gh pr comment " in line
+            if "write_rc" not in line
+        ]
+        if not creates:
+            assert notice_creates == [], (
+                f"{workflow} gained a notice create; flip its _NOTICE_LANES "
+                f"'creates' flag to True and keep the gate below: {notice_creates}"
+            )
+        else:
+            assert notice_creates, workflow
+        for n, line in notice_creates:
+            assert lines[n - 1].strip() == self.GATE, (workflow, line, lines[n - 1])
+        if defines:
+            # Every branch that reads the slot accounts for the unreadable case:
+            # either it gates a create, or it says the notice did not land.
+            assert self.GATE in script or self.UNREADABLE in script, workflow
+            # This read names ITSELF in the log. The guarded upsert's own slot
+            # pre-read already prints "to find this lane's slot failed on
+            # attempt N"; reusing that sentence here makes a failed publish a
+            # column of identical lines and leaves the reader unable to tell
+            # which read gave up. Asserting on a phrase both reads share would
+            # pass without measuring anything, because both live in this step.
+            assert (
+                "Reading this PR's comments before writing this lane's notice" in script
+            ), workflow
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_no_notice_read_keeps_its_own_unbudgeted_copy(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # A second, private marker lookup inside one branch is what lets the
+        # override note read the slot on different terms from the rest of its own
+        # step. Every marker-filtered read in these steps belongs to the one
+        # budgeted body, so a lane may hold no other.
+        script = self._notice_script(workflow, step)
+        lines = script.splitlines()
+        inline_reads = [
+            line
+            for line in lines
+            if not line.lstrip().startswith("#")
+            if "issues/$PR/comments" in line
+            if "head -n1" in line
+        ]
+        assert inline_reads == [], (workflow, inline_reads)
+
+    def test_head_confirmation_is_one_body_wherever_a_notice_is_written(self) -> None:
+        # Same one-body rule the slot lookup carries, for the check that decides
+        # whether writing is still safe. A per-lane copy is how one lane keeps
+        # treating an unreadable head as a clear one.
+        bodies = set()
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            script = self._notice_script(workflow, step)
+            if not defines:
+                assert "confirm_head() {" not in script, workflow
+                continue
+            bodies.add(_shell_function(script, "confirm_head"))
+        assert len(bodies) == 1, (
+            "confirm_head must stay byte-identical across every lane that "
+            "writes a notice; edit all copies together"
+        )
+        code = [line for line in bodies.pop().splitlines() if not line.lstrip().startswith("#")]
+        # The head is read from the PR itself, not from the event payload, which
+        # names the head the run started on and need not still be current.
+        assert any("repos/$REPO/pulls/$PR" in line for line in code), code
+        assert any("'.head.sha'" in line for line in code), code
+        # Three outcomes, and only one of them licenses a write. An unreadable
+        # answer is treated as a moved head because writing is the direction
+        # that destroys something: the notice carries no verdict, so declining
+        # costs a stale line while writing costs a newer revision's verdict.
+        assert any(line.strip() == "head_unchanged=1" for line in code), code
+        assert sum(1 for line in code if line.strip() == "return 0") == 3, code
+        assert any('[ -n "$head_now" ]' in line for line in code), code
+        assert any('[ "$head_now" != "$HEAD" ]' in line for line in code), code
+        # Both refusals are visible in the run log, and each names the revision
+        # whose notice was withheld.
+        assert sum(1 for line in code if "::warning::" in line) == 2, code
+        assert sum(1 for line in code if "$HEAD" in line) >= 2, code
+        # The read carries the same budget as the slot read above it, because the
+        # two run inside one exhaustion window: a lane that has just spent up to
+        # 75s retrying the slot is the least likely to get this one answered
+        # first time, and an unbudgeted refusal here reads as a moved head.
+        assert any("for attempt in 1 2 3 4 5 6; do" in line for line in code), code
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code), code
+        assert any('[ "$attempt" -lt 6 ]' in line for line in code), code
+        # A moved head is a definite answer, so it is not retried: its `return`
+        # sits INSIDE the loop, ahead of the line that reports a failed attempt.
+        moved = next(n for n, line in enumerate(code) if '[ "$head_now" != "$HEAD" ]' in line)
+        retry = next(n for n, line in enumerate(code) if "failed on attempt $attempt" in line)
+        licensed = next(n for n, line in enumerate(code) if line.strip() == "head_unchanged=1")
+        assert moved < retry, code
+        assert licensed < retry, code
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_every_notice_write_is_licensed_by_a_confirmed_head(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Enumerated per lane, per arm. A notice PATCH is the arm that can bury
+        # a verdict: the slot read answered, so the branch holds a real comment
+        # id, and by the time it writes that comment can be the newer
+        # revision's. A notice CREATE is the weaker half -- it presents a
+        # superseded revision's line as the current one.
+        script = self._notice_script(workflow, step)
+        if not defines:
+            assert "confirm_head" not in script, workflow
+            return
+        lines = script.replace("\\\n", " ").splitlines()
+        bare = [line for line in lines if not line.lstrip().startswith("#")]
+        # Both questions are asked before every write, and the ORDER is the content
+        # of the rule, because the head check can spend over a minute on backoff:
+        #
+        #   creates  -- head first, slot read LAST. An empty slot means POST, so
+        #               deciding that from a minute-old read lets another run on
+        #               this same head fill the slot inside the gap. A write is
+        #               pending as soon as the head holds, so asking early is free.
+        #   replaces -- slot read first, head inside the occupant test. There is no
+        #               CREATE to misfire, and an empty slot means do nothing, so
+        #               asking the head first reports a notice the arm never had.
+        heads = [n for n, line in enumerate(bare) if line.strip() == "confirm_head"]
+        reads = [n for n, line in enumerate(bare) if line.strip() == "find_existing"]
+        assert heads and reads, workflow
+        assert len(heads) == len(reads), (workflow, heads, reads)
+        creating = replacing = 0
+        for n in heads:
+            following = bare[n + 1].strip()
+            if following == "find_existing":
+                # Head first, then slot: only legitimate where the arm can create.
+                assert bare[n + 2].strip() == self.PATCH_GATE, (workflow, bare[n + 2])
+                tail = "\n".join(bare[n : n + 12])
+                assert self.GATE in tail, (workflow, "reads last but never creates", tail)
+                creating += 1
+                continue
+            # Otherwise the head check sits inside the occupant test, which the
+            # slot read must therefore precede.
+            assert following == 'if [ "$head_unchanged" -eq 1 ]; then', (workflow, following)
+            opener = bare[n - 1].strip()
+            assert opener == 'if [ -n "$existing" ] && [ "$existing" != "null" ]; then', (
+                workflow,
+                opener,
+            )
+            assert bare[n - 2].strip() == "find_existing", (workflow, bare[n - 2])
+            # And it must NOT create, or deferring the question would skip it.
+            tail = "\n".join(bare[n - 2 : n + 14])
+            assert self.GATE not in tail, (workflow, "defers the question yet creates", tail)
+            replacing += 1
+        assert creating + replacing == len(heads), workflow
+        # And every notice write arm states its own licence rather than
+        # inheriting one from an enclosing branch. The verdict writes in the
+        # same step are not notices: they route through retry_comment_write and
+        # carry its `write_rc`, and the test below is what holds them out.
+        notice_writes = [
+            (n, line)
+            for n, line in enumerate(bare)
+            if "retry_comment_write" not in line
+            if "write_rc" not in line
+            if "issues/comments/$existing" in line or "gh pr comment " in line
+        ]
+        assert notice_writes, workflow
+        for n, line in notice_writes:
+            arm = next(
+                bare[m].strip()
+                for m in range(n, -1, -1)
+                if bare[m].strip().startswith(("if ", "elif "))
+            )
+            assert '"$head_unchanged" -eq 1' in arm, (workflow, line, arm)
+        # The complement, and the third case in the enumeration: the arm that
+        # only REPORTS an unreadable slot writes nothing, so it needs no licence
+        # and must not borrow one. Requiring it there loses the slot fact in the
+        # one run where both reads fail, which is the run most in need of it.
+        assert self.UNREADABLE in script, workflow
+        assert 'elif [ "$head_unchanged" -eq 1 ]; then' not in script, workflow
+
+    def test_the_verdict_path_does_not_take_the_notice_head_gate(self) -> None:
+        # The qualifier on the rule above, and the reason it says NOTICE rather
+        # than every write. A verdict withheld is the expensive direction: the
+        # slot is the only thing a freshness verifier reads, so a run that
+        # declines to publish leaves the revision indistinguishable from one no
+        # lane ever reviewed. The guarded upsert therefore writes on its first
+        # attempt whatever the head now says, and confirms the head only before
+        # a REPEAT, whose first write may already have landed.
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            upsert_step = _step_script(_workflow(workflow), step)
+            assert "retry_comment_write" in upsert_step, workflow
+            body = _shell_function(upsert_step, "retry_comment_write")
+            code = [line for line in body.splitlines() if not line.lstrip().startswith("#")]
+            assert not any("head_unchanged" in line for line in code), workflow
+            assert any('[ "$attempt" -gt 1 ]' in line for line in code), workflow
+            assert any('[ "$head_now" != "$HEAD" ]' in line for line in code), workflow
+            # The notice gate lives in the same step, so the two must not be
+            # confused for one another by a later edit.
+            assert "confirm_head() {" in script, workflow
+
+    def test_a_moved_head_leaves_the_newer_revision_verdict_in_the_slot(
+        self, tmp_path: Path
+    ) -> None:
+        # The behavioural half of the head gate, and the exact sequence the
+        # backoff above widened: this run's slot read fails, it sleeps, a newer
+        # revision publishes its verdict into the slot during that window, and
+        # this run's retry then succeeds and holds a real comment id. Writing
+        # that id replaces a verdict for a revision this run never reviewed,
+        # and no later run puts it back.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "a" * 40
+        newer_head = "b" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers and reports an occupant, so this run holds a\n"
+            "# real comment id. The PR's head has moved on while it was reading.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            f'  echo "{newer_head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo '4242'\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "false",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the slot read answered and gave a
+        # comment id, so without the head check this branch PATCHes its own
+        # notice over the newer revision's verdict.
+        assert not (calls_dir / "patch-calls.txt").exists()
+        assert not (calls_dir / "create-calls.txt").exists()
+        # The head was in fact consulted, once, and only after the slot read.
+        assert (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines() == ["head"]
+        # The log names both revisions, so a reader can tell which run gave way
+        # to which.
+        stdout = result.stdout.decode()
+        assert "::warning::" in stdout
+        assert newer_head in stdout
+        assert head in stdout
+
+    def test_an_unreadable_slot_creates_nothing_and_says_so(self, tmp_path: Path) -> None:
+        # The behavioural half. The lane has a no-contract notice to publish and
+        # the comments API refuses every read. The slot in fact already holds
+        # this lane's comment, so the create arm would produce the second comment
+        # that no run can take back out.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "f" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Records every mutation; refuses every comments read, which is the\n"
+            "# condition the gate exists for.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            "  echo 'gh: api rate limit exceeded' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo 'gh: api rate limit exceeded' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        # `sleep` is stubbed away so the six-attempt budget costs no wall clock.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            # The no-contract branch: the lane has reviewable surface and the
+            # contract step reported the rubric absent from the base commit.
+            "SURFACE": "true",
+            "CONTRACT": "false",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # Nothing was written on either arm. The create is the assertion that
+        # names the defect: with an unbudgeted, error-swallowing read this is the
+        # second comment under this lane's marker, and no run takes it back out.
+        # No PATCH either, against an id the failed read never produced.
+        assert not (calls_dir / "create-calls.txt").exists()
+        assert not (calls_dir / "patch-calls.txt").exists()
+        # And the read was budgeted, not attempted once.
+        reads = (calls_dir / "read-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(reads) == 6, reads
+        # So was the head check that follows it, and this run is why: one
+        # exhausted window refuses BOTH reads, so an unbudgeted head read would
+        # spend the slot budget and then treat its own first refusal as a moved
+        # head. It refuses here only after the same 6 attempts.
+        heads = (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(heads) == 6, heads
+        # The run says which notice did not land, naming the revision.
+        stdout = result.stdout.decode()
+        assert "::warning::" in stdout
+        assert "unreadable after 6 attempts" in stdout
+        assert head in stdout
+
+    def test_a_transient_head_read_is_retried_not_read_as_a_moved_head(
+        self, tmp_path: Path
+    ) -> None:
+        # The sequence the unbudgeted read turned into a withheld write: a human
+        # override is accepted, the slot holds this lane's prior blocking comment,
+        # and the head read blips twice before answering with the SAME head. One
+        # attempt makes that blip indistinguishable from a moved head, so nothing
+        # is written while `verdict=OVERRIDE` is still emitted -- the slot keeps a
+        # block over an override a human already accepted, and no later run in
+        # this lane clears it.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "c" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers at once and reports an occupant. The head\n"
+            "# read refuses twice, then answers with the head this run is about.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            '  attempts=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            '  if [ "$attempts" -lt 3 ]; then\n'
+            "    echo 'api blip' >&2\n"
+            "    exit 1\n"
+            "  fi\n"
+            f'  echo "{head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo '4242'\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "true",
+            "OVERRIDE_ACTOR": "someone",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the override note replaced the
+        # blocking comment, rather than the blip leaving it standing.
+        assert (calls_dir / "patch-calls.txt").exists()
+        assert (calls_dir / "patch-calls.txt").read_text(encoding="utf-8").splitlines() == [
+            "repos/o/r/issues/comments/4242"
+        ]
+        # It took three attempts to get there, and no second comment was made.
+        assert len((calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()) == 3
+        assert not (calls_dir / "create-calls.txt").exists()
+        # A retried blip is not reported as a withheld notice.
+        stdout = result.stdout.decode()
+        assert "::warning::" not in stdout, stdout
+        assert "failed on attempt 1" in stdout
+        assert (tmp_path / "gh-output.txt").read_text(encoding="utf-8").count(
+            "verdict=OVERRIDE"
+        ) == 1
+
+    def test_a_skip_arm_with_an_empty_slot_asks_nothing_about_the_head(
+        self, tmp_path: Path
+    ) -> None:
+        # The complement, and the case that made the head question premature: a
+        # skip arm only ever replaces a comment already in the slot. With the
+        # slot readable and empty there is no write to license, so asking makes
+        # a run annotate a notice this arm was never going to make -- the normal
+        # outcome on a docs-only revision whose head moved on.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "d" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers and reports the slot empty. Any head read\n"
+            "# is recorded and refused, so one taken here is visible as a call\n"
+            "# and as a warning.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            "  echo 'api blip' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            # The skip arm: this revision ships no reviewable capability.
+            "SURFACE": "false",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: no head was read at all, because
+        # no write was pending.
+        assert not (calls_dir / "head-calls.txt").exists()
+        # So the run says nothing about a notice it was never going to write.
+        stdout = result.stdout.decode()
+        assert "::warning::" not in stdout, stdout
+        assert "was not written" not in stdout, stdout
+        # And it wrote nothing, on either arm.
+        assert not (calls_dir / "patch-calls.txt").exists()
+        assert not (calls_dir / "create-calls.txt").exists()
+        # The slot was in fact consulted, and the lane still reported its skip.
+        assert (calls_dir / "read-calls.txt").exists()
+        assert "verdict=SKIPPED" in (tmp_path / "gh-output.txt").read_text(encoding="utf-8")
+
+    def test_a_create_arm_reads_the_slot_after_the_head_backoff(self, tmp_path: Path) -> None:
+        # The window the head budget opens, and the one arm it can hurt. The head
+        # check may spend over a minute retrying; a create decided from a slot read
+        # taken BEFORE that wait acts on a minute-old answer. Two runs of this lane
+        # on the SAME head both pass the head check -- a re-run, or a run cancelled
+        # by cancel-in-progress whose post step keeps executing -- so the second
+        # comment lands under one marker and no run takes it back out.
+        #
+        # The stub reports the slot empty on the first read and occupied on any
+        # later one, so an arm that reads before the wait creates and an arm that
+        # reads after it patches. The head answers only on its third attempt, which
+        # is what puts real backoff between the two reads.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "e" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            '  attempts=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            '  if [ "$attempts" -lt 3 ]; then\n'
+            "    exit 1\n"
+            "  fi\n"
+            f'  echo "{head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            "# The slot is empty until the head backoff has run, and taken after it.\n"
+            "# That is the race: another run on this same head publishes during the\n"
+            "# wait. An arm reading the slot BEFORE the wait sees empty and creates;\n"
+            "# one reading after sees the occupant and patches.\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  tries=0\n"
+            '  if [ -f "$STUB_CALLS/head-calls.txt" ]; then\n'
+            '    tries=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            "  fi\n"
+            '  if [ "$tries" -ge 3 ]; then\n'
+            "    echo '4242'\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        # A real sleep would make this test as slow as the backoff it proves; the
+        # ORDER of the two reads is what decides the outcome, not the wall clock.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            # The override-note arm, which is a creating arm.
+            "HUMAN_OVERRIDE": "true",
+            "OVERRIDE_ACTOR": "someone",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the arm saw the occupant the head
+        # backoff let arrive, so it patched instead of adding a second comment.
+        assert not (calls_dir / "create-calls.txt").exists()
+        assert (calls_dir / "patch-calls.txt").read_text(encoding="utf-8").splitlines() == [
+            "repos/o/r/issues/comments/4242"
+        ]
+        # And the order is the reason: the head was asked before the slot, and the
+        # slot read that decided the write came after the retries.
+        heads = (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()
+        reads = (calls_dir / "read-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(heads) == 3, heads
+        assert len(reads) == 1, reads
+
+    def test_a_replace_arm_still_writes_from_a_head_read_taken_before_the_write(self) -> None:
+        # The residual this enumeration leaves, pinned at its current answer so a
+        # later reading of the rule does not mistake it for solved.
+        #
+        # On a replace-only arm the order has to be slot-then-head, so the head
+        # answer is up to a minute old when the PATCH runs. The head check narrows
+        # that window and cannot close it: the slot holds one comment id whichever
+        # revision wrote it, so re-reading the id proves nothing about whose body is
+        # there now. Closing it needs a conditional write the API does not offer.
+        #
+        # The exposure is bounded where the create arms' is not: a stale PATCH
+        # overwrites one comment, while a stale CREATE adds a second under one
+        # marker that no run removes.
+        for workflow, step, defines, creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            bare = [
+                line
+                for line in script.replace("\\\n", " ").splitlines()
+                if not line.lstrip().startswith("#")
+            ]
+            for n, line in enumerate(bare):
+                if line.strip() != "confirm_head":
+                    continue
+                if bare[n + 1].strip() == "find_existing":
+                    continue  # a creating arm, covered by the test above
+                # The replacing arm: no read sits between the head answer and the
+                # write, so the head answer is as old as its own backoff.
+                window = bare[n + 1 : n + 10]
+                assert not any(entry.strip() == "find_existing" for entry in window), (
+                    workflow,
+                    window,
+                )
+                assert any("issues/comments/$existing" in entry for entry in window), (
+                    workflow,
+                    window,
+                )
+            # `creates` stays part of the table this residual is scoped by.
+            assert creates in (True, False)
+
+    def test_one_marker_serves_every_write_in_the_step(self) -> None:
+        # The invariant the added comments state, pinned rather than asserted in
+        # prose: a single marker is what makes the slot one slot. Two marker VALUES
+        # in one step would split it, so the notice writes and the verdict writes
+        # would read different comments and neither could see the other's.
+        #
+        # The value is the invariant, not the assignment count: a name re-assigned
+        # to the same string still names one slot, while a second name or a second
+        # value splits it however few times either is written.
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            assigns = [
+                line.strip()
+                for line in script.splitlines()
+                if not line.lstrip().startswith("#")
+                if re.match(r"^[A-Z_]*MARKER=", line.strip())
+            ]
+            assert assigns, workflow
+            names = {line.split("=", 1)[0] for line in assigns}
+            values = {line.split("=", 1)[1] for line in assigns}
+            assert names == {"MARKER"}, (workflow, names)
+            assert len(values) == 1, (workflow, values)
+            # No lane retains a second marker name it could read the slot with.
+            assert "OV_MARKER" not in script, workflow
+            # And no second marker STRING anywhere in the step. This is what a
+            # split slot looks like: the reads themselves spell the marker several
+            # ways -- `$MARKER` directly, or a positional the caller fills from it
+            # -- so the literal is the thing worth counting.
+            literals = set(re.findall(r"<!--[^>]*-->", script))
+            assert len(literals) == 1, (workflow, sorted(literals))
+            assert literals == {values.pop().strip('"')}, (workflow, literals)
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_no_notice_body_is_staged_at_a_hardcoded_host_path(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Every body a lane this change touches stages goes under the runner's own
+        # temp dir. A hardcoded `/tmp/...` path is shared state three ways: two
+        # lanes on one runner write the same file, a self-hosted runner keeps it
+        # between jobs, and a test that executes the arm writes it on the host.
+        #
+        # Both spellings are accepted. `$RUNNER_TEMP/x` is the stricter one and
+        # several fork lanes use it; `${RUNNER_TEMP:-/tmp}/x` adds a fallback for a
+        # context where the variable is unset. What is refused is the literal path.
+        del creates  # the rule is about where a body is staged, not who writes it
+        script = self._notice_script(workflow, step)
+        flat = script.replace("\\\n", " ")
+        offenders = [
+            line.strip()
+            for line in flat.splitlines()
+            if not line.lstrip().startswith("#")
+            if re.search(r"(?:>|--body-file|\bcat)\s+/tmp/", line)
+        ]
+        if defines:
+            # The five lanes this change owns: the rule holds outright.
+            assert not offenders, (workflow, offenders)
+            return
+        # Outside them, the current answer is recorded rather than assumed clean, so
+        # the one remaining instance is visible instead of quietly excluded by the
+        # lane filter. Fixing it should turn this red and update the record.
+        known_unfixed = {"claude-review.yml": ["/tmp/claude-summary.md"]}
+        expected = known_unfixed.get(workflow, [])
+        staged = sorted({m for m in re.findall(r"/tmp/[A-Za-z0-9_.-]+", " ".join(offenders))})
+        assert staged == sorted(expected), (workflow, staged, expected)
+
+
+# --------------------------------------------------------------------------
+# Description provenance: one capture, one digest, one stamp.
+#
+# A review lane that judges the author's stated intent has two ways to get the
+# description, and they are not equivalent. A grant that lets the MODEL fetch it
+# leaves the verdict with no revision to name: the model picks the moment, so the
+# verdict answers for whatever the text said then, and a reader cannot tell a
+# current verdict from one whose description-derived finding the author has since
+# corrected. A workflow step that captures it ONCE gives the verdict a single,
+# nameable input, and the digest of those bytes is what the verdict carries.
+#
+# The grant is also a live redirect. `--allowedTools` Bash grants are
+# PREFIX-matched, so `Bash(gh pr view:*)` equally admits
+# `gh pr view ... > <path>`: text injected into a diff can overwrite the lane's
+# own input files. These pins hold both properties at once, and they enumerate
+# every workflow from disk rather than a list, so a lane added later is covered
+# the day it lands.
+# --------------------------------------------------------------------------
+
+#: The one capture every description-reading lane sources.
+CAPTURE_SCRIPT = ROOT / ".github" / "scripts" / "pr-description-capture.sh"
+CAPTURE_SOURCE_LINE = '. "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"'
+#: The marker a published verdict carries to name the description it read.
+STAMP_MARKER = "[DESCRIPTION-READ]"
+STAMP_HEADING = 'echo "### Description read"'
+STAMP_GATE = 'if [ -n "$badge" ] && [ -n "${DESCRIPTION_DIGEST:-}" ]; then'
+STAMP_ECHO = 'echo "[DESCRIPTION-READ] $DESCRIPTION_DIGEST"'
+#: Lanes whose model is given no description at all, so a stamp would be a claim
+#: about an input they never received. Named rather than derived because the
+#: point of the assertion is that the asymmetry is deliberate.
+NO_DESCRIPTION_LANES = ("claude-review.yml", "fork-opus-review.yml")
+
+
+def _every_workflow() -> tuple[str, ...]:
+    """Every workflow file on disk, so a lane added later is covered."""
+    names = tuple(sorted(p.name for p in WORKFLOWS.glob("*.yml")))
+    assert len(names) > 10, names
+    return names
+
+
+def _sources_capture(name: str) -> bool:
+    return CAPTURE_SOURCE_LINE in _workflow(name)
+
+
+def _emits_stamp(name: str) -> bool:
+    return STAMP_ECHO in _workflow(name)
+
+
+def _capture_lanes() -> tuple[str, ...]:
+    return tuple(n for n in _every_workflow() if _sources_capture(n))
+
+
+def _stamp_block(name: str) -> list[str]:
+    """The stamp's own shell lines, from its gate to the closing `fi`."""
+    lines = _workflow(name).splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.strip() == STAMP_GATE]
+    assert len(starts) == 1, (name, starts)
+    start = starts[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    for end in range(start + 1, len(lines)):
+        if lines[end].strip() == "fi" and len(lines[end]) - len(lines[end].lstrip()) == indent:
+            return lines[start : end + 1]
+    raise AssertionError(f"{name}: the stamp gate is never closed")
+
+
+class TestBothBodyReadersShareOneRead:
+    """The two readers of the PR's mutable text read it ONCE per job.
+
+    Two independent fetches, in adjacent steps of one job, are the hazard:
+    pr-attachment-evidence.sh collects the description's attachments and
+    pr-description-capture.sh captures its prose. A description edited between
+    two such reads pairs the OLD attachments with the NEW prose, and the
+    manifest digest the lane publishes is taken over that pair -- a composite
+    revision that never existed, which a reader recomputing it reads as a match.
+    Nothing corrects it afterwards either, because the lanes fire on
+    `opened, synchronize, reopened` and a description edit starts no run.
+
+    The window was ordinary rather than adversarial: pushing a commit starts the
+    run, and pasting a screenshot or rewording the body in the next minute lands
+    inside it.
+
+    pr-body-snapshot.sh holds one fetch of both fields for the whole job. These
+    cases pin that structurally -- neither consumer calls the API itself -- and
+    then EXECUTE both consumers over a body that changes between them, which is
+    the only way to show the two halves name one revision.
+    """
+
+    def _job(self, tmp_path: Path) -> dict[str, str]:
+        """A fake `gh` that counts calls and serves the body live off disk.
+
+        Reading the body from a file on every call is what lets a case edit it
+        BETWEEN the two consumers, which is the defect's exact shape.
+        """
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo call >> "$GH_CALLS"\n'
+            'printf \'{"title":%s,"body":%s}\\n\' '
+            '"$(jq -Rs . < "$GH_TITLE")" "$(jq -Rs . < "$GH_BODY")"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        gh.chmod(0o755)
+        (tmp_path / "title.in").write_text("the title", encoding="utf-8", newline="")
+        (tmp_path / "calls").write_text("", encoding="utf-8")
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir(exist_ok=True)
+        return _child_env(
+            {
+                # bin_dir first so the stub wins; _stub_path resolves the host's
+                # real jq, which the Windows shards do not have on the defaults.
+                "PATH": os.pathsep.join([str(bin_dir), _stub_path(tmp_path)]),
+                "GH_CALLS": str(tmp_path / "calls"),
+                "GH_TITLE": str(tmp_path / "title.in"),
+                "GH_BODY": str(tmp_path / "body.in"),
+                "REPO": "o/r",
+                "PR": "1",
+                "GH_TOKEN": "t",
+                # The snapshot is keyed to the JOB, and this is what makes two
+                # separate consumer processes one job.
+                "RUNNER_TEMP": str(runner_temp),
+                "TMPDIR": str(tmp_path),
+                "TEMP": str(tmp_path),
+                "TMP": str(tmp_path),
+            }
+        )
+
+    def _source(
+        self, script: Path, tmp_path: Path, env: dict[str, str], extra: dict[str, str]
+    ) -> "subprocess.CompletedProcess[str]":
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the readers are Bash; skip where Bash is absent")
+        runner = tmp_path / f"run-{script.stem}.sh"
+        runner.write_text(f'. "{script}"\n', encoding="utf-8", newline="\n")
+        return subprocess.run(
+            [bash, str(runner)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+            env={**env, **extra},
+            cwd=tmp_path,
+        )
+
+    def _collect_evidence(
+        self, tmp_path: Path, env: dict[str, str]
+    ) -> "subprocess.CompletedProcess[str]":
+        """Run the attachment reader. Its downloads are not under test here, so
+        curl answers a definite 4xx; the READ is what these cases measure."""
+        curl = Path(env["PATH"].split(os.pathsep)[0]) / "curl"
+        curl.write_text(
+            "#!/usr/bin/env bash\nprintf 404\nexit 22\n", encoding="utf-8", newline="\n"
+        )
+        curl.chmod(0o755)
+        for name in ("shots", "map", "clips"):
+            (tmp_path / name).write_text("", encoding="utf-8")
+        return self._source(
+            ROOT / ATTACHMENT_SCRIPT,
+            tmp_path,
+            env,
+            {
+                "FETCH_DIR": str(tmp_path / "fetch"),
+                "DEST_DIR": str(tmp_path / "dest"),
+                "NAME_STEM": "shot",
+                "SHOTS": str(tmp_path / "shots"),
+                "SHOT_MAP": str(tmp_path / "map"),
+                "CLIPS": str(tmp_path / "clips"),
+                "MAX_SHOTS": "40",
+                "MAX_CLIPS": "4",
+            },
+        )
+
+    def _capture_prose(
+        self, tmp_path: Path, env: dict[str, str], intent: Path
+    ) -> "subprocess.CompletedProcess[str]":
+        return self._source(CAPTURE_SCRIPT, tmp_path, env, {"INTENT": str(intent)})
+
+    def _calls(self, tmp_path: Path) -> int:
+        return len((tmp_path / "calls").read_text(encoding="utf-8").split())
+
+    def test_neither_reader_calls_the_api_itself(self) -> None:
+        """Structural half: the snapshot is the ONLY place either reader's API
+        call can live, so a lane cannot acquire a second read by accident."""
+        for script in (_attachment_script(), CAPTURE_SCRIPT.read_text(encoding="utf-8")):
+            code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
+            assert not [ln for ln in code if "gh api" in ln], [ln for ln in code if "gh api" in ln]
+            assert any(SNAPSHOT_SOURCE_FRAGMENT in ln for ln in code), script[:400]
+        snapshot = _snapshot_script()
+        reads = [
+            ln for ln in snapshot.splitlines() if not ln.lstrip().startswith("#") and "gh api" in ln
+        ]
+        assert len(reads) == 1, reads
+        assert 'gh api "repos/$REPO/pulls/$PR"' in reads[0], reads[0]
+        # Both fields come out of that ONE response. Two `--jq` reads would be
+        # two revisions again, however adjacent the calls.
+        assert "jq -r '.title'" in snapshot
+        assert "jq -r '.body // \"\"'" in snapshot
+
+    def test_two_consumers_in_one_job_spend_one_api_read(self, tmp_path: Path) -> None:
+        env = self._job(tmp_path)
+        (tmp_path / "body.in").write_text("prose\n", encoding="utf-8", newline="\n")
+        evidence = self._collect_evidence(tmp_path, env)
+        assert evidence.returncode == 0, _proc_log(evidence)
+        assert self._calls(tmp_path) == 1, self._calls(tmp_path)
+        capture = self._capture_prose(tmp_path, env, tmp_path / "pr-intent.txt")
+        assert capture.returncode == 0, _proc_log(capture)
+        assert (
+            self._calls(tmp_path) == 1
+        ), f"the second consumer read the API again: {self._calls(tmp_path)} calls"
+        assert "no second API read" in capture.stdout, capture.stdout
+
+    def test_a_host_without_jq_fails_closed_instead_of_reading_twice(self, tmp_path: Path) -> None:
+        """Splitting one response needs a standalone `jq`, so a host without one
+        has to say so rather than quietly fall back.
+
+        The fallback that is NOT allowed is the defect: two `gh api --jq` reads
+        are two revisions however adjacent they are. A reader with no title and
+        no body is a visible failure the lane reports; a reader with a matching
+        pair drawn from two revisions is not. The review lanes run on
+        ubuntu-latest, where `jq` is present; the case that meets this branch in
+        practice is a Windows test shard, whose Git Bash keeps `jq` outside the
+        Unix default directories -- which is why every harness here resolves the
+        host's real `jq` onto the child PATH instead of assuming `/usr/bin`.
+        """
+        env = self._job(tmp_path)
+        (tmp_path / "body.in").write_text("prose\n", encoding="utf-8", newline="\n")
+        # Keep the `gh` stub reachable and drop everything else: the point is
+        # that a read is NOT attempted, so the stub must be able to record one.
+        env["PATH"] = env["PATH"].split(os.pathsep)[0]
+        out = self._source(ROOT / SNAPSHOT_SCRIPT, tmp_path, env, {})
+        assert "::error::jq is not available" in out.stdout, _proc_log(out)
+        assert self._calls(tmp_path) == 0, "it read the API before checking it could split it"
+        assert "no second API read" not in out.stdout, out.stdout
+
+    def test_an_edit_between_the_two_consumers_cannot_split_them(self, tmp_path: Path) -> None:
+        """The defect itself. The author edits the description after the
+        evidence step and before the capture step; the capture must still see
+        the revision the evidence was collected from, so the digest names one
+        revision rather than a composite of two."""
+        env = self._job(tmp_path)
+        body = tmp_path / "body.in"
+        body.write_text("v1 prose\n", encoding="utf-8", newline="\n")
+        assert self._collect_evidence(tmp_path, env).returncode == 0
+        body.write_text("v2 prose, edited mid-job\n", encoding="utf-8", newline="\n")
+        intent = tmp_path / "pr-intent.txt"
+        capture = self._capture_prose(tmp_path, env, intent)
+        assert capture.returncode == 0, _proc_log(capture)
+        captured = intent.read_text(encoding="utf-8")
+        assert "v1 prose" in captured, captured
+        assert "v2 prose" not in captured, captured
+
+    def test_a_later_job_reads_the_edit(self, tmp_path: Path) -> None:
+        """The snapshot is scoped to a job, not cached across them: a re-run
+        after an edit judges the new text, which is what the lanes have always
+        promised. Holding one revision across jobs would freeze the PR."""
+        first = self._job(tmp_path / "job-a")
+        (tmp_path / "job-a" / "body.in").write_text("v1 prose\n", encoding="utf-8", newline="\n")
+        intent_a = tmp_path / "job-a" / "pr-intent.txt"
+        assert self._capture_prose(tmp_path / "job-a", first, intent_a).returncode == 0
+        second = self._job(tmp_path / "job-b")
+        (tmp_path / "job-b" / "body.in").write_text("v2 prose\n", encoding="utf-8", newline="\n")
+        intent_b = tmp_path / "job-b" / "pr-intent.txt"
+        assert self._capture_prose(tmp_path / "job-b", second, intent_b).returncode == 0
+        assert "v1 prose" in intent_a.read_text(encoding="utf-8")
+        assert "v2 prose" in intent_b.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "body",
+        ["plain body", "", "one trailing\n", "two trailing\n\n", "a\ttab and a 'quote'"],
+        ids=["plain", "empty", "one-nl", "two-nl", "punctuation"],
+    )
+    def test_the_captured_bytes_match_the_old_single_read(self, body: str, tmp_path: Path) -> None:
+        """A digest published BEFORE the snapshot must still recompute to the
+        same value, or every stamp already on an open PR silently becomes a
+        mismatch -- which reads as "the description moved", the one thing the
+        stamp exists to report. Command substitution dropped the old `--jq`
+        template's trailing newline and drops `jq -r`'s here, so the composed
+        bytes are unchanged; these cases check that where the two forms could
+        differ, which is a body's trailing newlines.
+        """
+        env = self._job(tmp_path)
+        (tmp_path / "body.in").write_text(body, encoding="utf-8", newline="")
+        intent = tmp_path / "pr-intent.txt"
+        assert self._capture_prose(tmp_path, env, intent).returncode == 0
+        old_form = f"Title: the title\n\nDescription:\n{body}".rstrip("\n")
+        # The capture appends one newline of its own when it writes the file.
+        assert intent.read_text(encoding="utf-8").rstrip("\n") == old_form, (
+            intent.read_text(encoding="utf-8"),
+            old_form,
+        )
+
+    def test_a_read_that_never_succeeds_fails_each_consumer_closed(self, tmp_path: Path) -> None:
+        """Each consumer keeps its OWN fail-closed message, because what a
+        failed read costs is different: one lane collects no evidence, the
+        other judges a PR that appears to state no intent."""
+        for job, runner, needle in (
+            ("job-1", "evidence", "attachment evidence cannot be collected"),
+            ("job-2", "capture", "appears to state no intent"),
+        ):
+            here = tmp_path / job
+            env = self._job(here)
+            (here / "body.in").write_text("prose\n", encoding="utf-8", newline="\n")
+            dead = Path(env["PATH"].split(os.pathsep)[0]) / "gh"
+            dead.write_text(
+                '#!/usr/bin/env bash\necho call >> "$GH_CALLS"\nexit 1\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            dead.chmod(0o755)
+            if runner == "evidence":
+                result = self._collect_evidence(here, env)
+            else:
+                result = self._capture_prose(here, env, here / "intent.txt")
+            assert result.returncode != 0, _proc_log(result)
+            assert needle in result.stdout, result.stdout
+            # Three attempts, then closed -- the bound the snapshot owns now.
+            assert self._calls(here) == 3, self._calls(here)
+
+    def test_a_snapshot_of_another_pull_request_is_not_reused(self, tmp_path: Path) -> None:
+        """A job serves one PR, so this cannot differ in practice. It is pinned
+        because a snapshot that silently answered for another PR would be this
+        same corruption one level up."""
+        env = self._job(tmp_path)
+        (tmp_path / "body.in").write_text("pr-1 prose\n", encoding="utf-8", newline="\n")
+        assert self._capture_prose(tmp_path, env, tmp_path / "a.txt").returncode == 0
+        first = self._calls(tmp_path)
+        (tmp_path / "body.in").write_text("pr-2 prose\n", encoding="utf-8", newline="\n")
+        assert self._capture_prose(tmp_path, {**env, "PR": "2"}, tmp_path / "b.txt").returncode == 0
+        assert self._calls(tmp_path) == first + 1, (first, self._calls(tmp_path))
+        assert "pr-2 prose" in (tmp_path / "b.txt").read_text(encoding="utf-8")
+
+
+class TestNoLaneGrantsALiveDescriptionRead:
+    """No `--allowedTools` line anywhere grants a live description fetch.
+
+    `Bash(gh pr view:*)` is prefix-matched, so it admits every `gh pr view`
+    spelling including one that redirects its output over a file the job wrote.
+    A lane that needs the description reads it from the shared capture instead.
+
+    Scans every workflow rather than a named set: the grant is wrong in any lane,
+    including one that does not exist yet.
+    """
+
+    def test_no_workflow_grants_gh_pr_view(self) -> None:
+        offenders = []
+        granting = 0
+        for name in _every_workflow():
+            for line in _workflow(name).splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("--allowedTools"):
+                    continue
+                granting += 1
+                if "Bash(gh pr view" in stripped:
+                    offenders.append((name, stripped))
+        # A control: an empty scan would satisfy the assertion above for the
+        # wrong reason, so require that grant lines were actually examined.
+        assert granting >= 8, granting
+        assert offenders == [], offenders
+
+    def test_no_workflow_grants_any_bash_at_all(self) -> None:
+        """The invariant is about the MATCHER, not the verb.
+
+        Stating it as "no `Bash(gh pr view:*)`" was too narrow, because prefix
+        matching is a property of `--allowedTools` and not of the command named:
+        `Bash(git diff:*)` equally admits `git diff ... > pr-intent.txt`, and the
+        description digest is computed at capture time, so an overwrite AFTER
+        capture leaves the stamp naming the original bytes while a reader who
+        recomputes it is told the verdict is current.
+
+        No narrower grant closes that. Without `:*` a lane cannot pass a range,
+        and any form that accepts arguments accepts shell text; `--disallowedTools`
+        denies TOOLS rather than command substrings, so it cannot express "no
+        redirect" at all. The primitive therefore goes away with the last Bash
+        grant, not with a better one -- which is why every review lane reads its
+        diff from a data file instead.
+        """
+        offenders = []
+        granting = 0
+        for name in _every_workflow():
+            for line in _workflow(name).splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("--allowedTools"):
+                    continue
+                granting += 1
+                if "Bash(" in stripped:
+                    offenders.append((name, stripped))
+        assert granting >= 8, granting
+        assert offenders == [], offenders
+
+    def test_every_lane_that_reviews_a_diff_is_handed_one(self) -> None:
+        """Dropping the grant must not leave a lane with no diff at all.
+
+        Removing Bash and forgetting the prefetch would give the reviewer nothing
+        to review while every grant assertion still passed, so the two halves are
+        pinned together: a lane whose prompt names a patch data file must also
+        contain the step that writes one, and that step must fail closed.
+
+        The SIZE cap is asserted only where a lane states one.
+        `first-principles-review.yml` prefetches and fails closed on an empty diff
+        but sets no cap, which predates this change; asserting a cap everywhere
+        would impose a uniformity this change did not create and cannot verify.
+        Where a cap exists it must be the 1 MB one and must fail closed, so a
+        lane cannot acquire a cap that silently truncates instead.
+        """
+        checked = capped = 0
+        for name in _capture_lanes():
+            workflow = _workflow(name)
+            if "authentic.patch" not in workflow:
+                continue
+            checked += 1
+            assert 'git diff --no-color "$BASE' in workflow, name
+            assert "failing closed" in workflow, name
+            if "exceeds 1 MB" in workflow:
+                capped += 1
+                assert "1000000" in workflow, name
+        assert checked >= 6, checked
+        assert capped >= 5, capped
+
+    @pytest.mark.parametrize("name", ("design-review.yml", "ux-review.yml"))
+    def test_a_capped_lane_measures_this_change_not_the_base_branch(self, name: str) -> None:
+        """A size cap must be measured against the merge ref's own first parent.
+
+        `github.event.pull_request.base.sha` is fixed when the pull request
+        opens and does not track the base branch, while the checkout is a merge
+        ref minted at push time. Diffing one against the other counts every
+        commit the base gained in between, so on a busy base the cap fires on
+        other people's work and the reviewer reads the base's history as the
+        change under review. The first parent of the merge ref IS the base tip
+        it was minted against, which makes the diff the change itself.
+
+        Pinned on the two lanes that carry both a cap and a merge-ref checkout.
+        The fork lanes take the same shape from their own trigger and are not
+        this case's subject.
+        """
+        workflow = _workflow(name)
+        assert 'BASE="$BASE_SHA"' in workflow, name
+        assert "git rev-parse -q --verify HEAD^2" in workflow, name
+        assert 'BASE="$(git rev-parse HEAD^1)"' in workflow, name
+        assert 'git diff --no-color "$BASE...HEAD"' in workflow, name
+        assert 'git diff --no-color "$BASE_SHA...HEAD"' not in workflow, name
+
+
+class TestStampFollowsTheSharedCapture:
+    """A lane stamps a description digest exactly when it captures one.
+
+    The biconditional is the assertion. A lane that captures but does not stamp
+    keeps the provenance private to the job log; a lane that stamps without
+    capturing would be naming bytes it never read.
+    """
+
+    def test_capture_and_stamp_are_the_same_set(self) -> None:
+        capture = {n for n in _every_workflow() if _sources_capture(n)}
+        stamp = {n for n in _every_workflow() if _emits_stamp(n)}
+        assert capture == stamp, {"captures only": capture - stamp, "stamps only": stamp - capture}
+        assert len(capture) >= 6, sorted(capture)
+
+    @pytest.mark.parametrize("name", NO_DESCRIPTION_LANES)
+    def test_a_lane_given_no_description_makes_no_claim_about_one(self, name: str) -> None:
+        workflow = _workflow(name)
+        assert CAPTURE_SOURCE_LINE not in workflow, name
+        assert STAMP_MARKER not in workflow, name
+
+    def test_every_capture_lane_reads_the_shared_script_and_no_copy(self) -> None:
+        """No lane carries its own copy of the read, the strip or the cap.
+
+        Two implementations would make one digest mean two different things, so a
+        reader recomputing it could get a mismatch from a description nobody had
+        touched. The distinctive lines of the capture therefore appear in the
+        script and in no workflow -- and the READ's distinctive line lives one
+        level further down still, in the snapshot both body readers share, which
+        is what keeps the evidence half and the prose half on one revision.
+        """
+        owners = {
+            CAPTURE_SCRIPT.read_text(encoding="utf-8"): (
+                "[description TRUNCATED at 8000 bytes]",
+                'INTENT_DIGEST="$($_kc_sha',
+            ),
+            _snapshot_script(): (
+                # Named by the variables the values land in, because the bare
+                # forms are not distinctive: `ai-review-human-override.yml`
+                # reads the same endpoint for `head.sha`, and
+                # `deferred-findings-audit.yml` runs the same jq filter over an
+                # issue. Neither is a description read and neither is a copy.
+                '_kc_snap_json="$(gh api "repos/$REPO/pulls/$PR")"',
+                'jq -r \'.body // ""\' > "$KC_PR_BODY_FILE"',
+            ),
+        }
+        for script, needles in owners.items():
+            for needle in needles:
+                assert needle in script, needle
+        for name in _every_workflow():
+            workflow = _workflow(name)
+            for needles in owners.values():
+                for needle in needles:
+                    assert needle not in workflow, (name, needle)
+
+
+class TestStampIsWorkflowWrittenAndGatedOnARealVerdict:
+    """The digest reaches the comment from the capture step, never from the model.
+
+    Three properties, one per way the stamp could lie. It is gated on a parsed
+    verdict, so a "could not complete" notice cannot claim to have read a
+    description. It is written after the redaction pass, so that pass cannot
+    rewrite the digest into something a reader cannot reproduce. And its value
+    comes from the capture step's own output, so the model cannot supply it.
+    """
+
+    @pytest.mark.parametrize("name", _capture_lanes())
+    def test_gated_on_a_parsed_verdict_and_a_present_digest(self, name: str) -> None:
+        block = _stamp_block(name)
+        assert block[0].strip() == STAMP_GATE, (name, block[0])
+        assert any(STAMP_ECHO in ln for ln in block), name
+        assert any(STAMP_HEADING in ln for ln in block), name
+
+    @pytest.mark.parametrize("name", _capture_lanes())
+    def test_written_after_the_redaction_pass(self, name: str) -> None:
+        lines = _workflow(name).splitlines()
+        redactions = [i for i, ln in enumerate(lines) if "perl -i -pe" in ln]
+        stamps = [i for i, ln in enumerate(lines) if STAMP_ECHO in ln]
+        assert len(redactions) == 1, (name, redactions)
+        assert len(stamps) == 1, (name, stamps)
+        assert redactions[0] < stamps[0], (name, redactions, stamps)
+
+    @pytest.mark.parametrize("name", _capture_lanes())
+    def test_the_digest_comes_from_the_capture_step_output(self, name: str) -> None:
+        workflow = _workflow(name)
+        doc = yaml.safe_load(workflow)
+        binding = "DESCRIPTION_DIGEST: ${{ steps.intent.outputs.description_digest }}"
+        assert binding in workflow, name
+        # The step id the binding names must exist, and must be the step that
+        # sources the capture -- otherwise the digest describes another step.
+        sourcing_ids = set()
+        for job in (doc.get("jobs") or {}).values():
+            for step in job.get("steps") or []:
+                run = step.get("run")
+                if isinstance(run, str) and CAPTURE_SOURCE_LINE in run:
+                    sourcing_ids.add(step.get("id"))
+        assert sourcing_ids == {"intent"}, (name, sourcing_ids)
+
+
+class TestStampBlockIsByteIdenticalAcrossLanes:
+    """Lanes that cover the same thing publish the same stamp, down to the bytes.
+
+    A reader learns one shape and a verifier parses one shape. Only the comment
+    file each lane appends to differs, so compare the emitted lines and not the
+    redirect.
+
+    There are exactly TWO shapes, and the split is the point rather than drift: a
+    lane whose verdict reads only the prose names the prose, and a lane whose
+    verdict also reads the evidence downloaded from the description names that
+    evidence too. Collapsing them would force one of the two to lie -- either the
+    prose-only lanes claim coverage they do not have, or the evidence lanes send
+    a reader to recompute over inputs that are not what was judged. What this
+    forbids is a THIRD shape: within each class the bytes must match, so no
+    single lane can drift into bespoke wording, and both classes must be
+    non-empty so a shape cannot quietly lose all its members.
+    """
+
+    def test_emitted_lines_match_within_each_coverage_class(self) -> None:
+        by_class: dict[bool, dict[str, list[str]]] = {True: {}, False: {}}
+        for name in _capture_lanes():
+            block = _stamp_block(name)
+            emitted = [
+                ln.strip() for ln in block if ln.strip().startswith("echo") or ln.strip() == "echo"
+            ]
+            covers_evidence = "EVIDENCE_LIST" in _workflow(name)
+            by_class[covers_evidence][name] = emitted
+        # Both classes must exist, or the assertion below could pass on an empty
+        # one and the split would be unverified.
+        assert by_class[True], "no lane covers evidence"
+        assert by_class[False], "no prose-only lane remains"
+        for covers_evidence, lanes in by_class.items():
+            shapes = {tuple(v) for v in lanes.values()}
+            assert len(shapes) == 1, (covers_evidence, lanes)
+        prose_shape = next(iter({tuple(v) for v in by_class[False].values()}))
+        assert prose_shape[1] == STAMP_HEADING, prose_shape
+        assert prose_shape[3] == STAMP_ECHO, prose_shape
+        # The heading and marker line are what a verifier parses, so they must be
+        # common to BOTH shapes; only the explanatory sentence differs.
+        evidence_shape = next(iter({tuple(v) for v in by_class[True].values()}))
+        assert evidence_shape[1] == STAMP_HEADING, evidence_shape
+        assert evidence_shape[3] == STAMP_ECHO, evidence_shape
+
+
+class TestStampHeadingClosesTheConcernsCapture:
+    """Execute the real `concerns_digest` over a stamped body.
+
+    That awk captures to end-of-file once it is inside a `### Watch` section, so a
+    body whose last section is Watch would carry the stamp into the CONCERNS job
+    annotation. A `### ` heading that is not Watch closes the capture, which is
+    why the stamp has one. String-matching the heading proves nothing about the
+    awk, so run it.
+    """
+
+    def _digest_fn(self) -> str:
+        script = _step_script(_workflow("design-review.yml"), "Post design review summary")
+        return _shell_function(script, "concerns_digest")
+
+    def _run(self, tmp_path: Path, body: str) -> str:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("concerns_digest is Bash; skip where Bash is absent")
+        target = tmp_path / "comment.md"
+        target.write_text(body, encoding="utf-8", newline="\n")
+        script = tmp_path / "run.sh"
+        script.write_text(
+            self._digest_fn() + '\nconcerns_digest "$1" "Design-Verdict:" "[DESIGN-REVIEWED]"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        result = subprocess.run(
+            [bash, str(script), str(target)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, _proc_log(result)
+        return result.stdout
+
+    #: A body that ends in a Watch section, which is the case that leaks.
+    _WATCH_BODY = (
+        "<!-- design-review -->\n"
+        "## Design Review\n\n"
+        "Design-Verdict: CONCERNS\n\n"
+        "The premise holds but the surface is wider than the problem.\n\n"
+        "### Watch\n"
+        "- the retry budget on the second call\n"
+    )
+    _STAMP = (
+        "\n### Description read\n\n"
+        "[DESCRIPTION-READ] " + "a" * 64 + "\n\n"
+        "_That sha256 names the PR description this verdict read._\n"
+    )
+
+    def test_the_heading_keeps_the_stamp_out_of_the_annotation(self, tmp_path: Path) -> None:
+        digest = self._run(tmp_path, self._WATCH_BODY + self._STAMP)
+        assert "the retry budget on the second call" in digest
+        assert "DESCRIPTION-READ" not in digest, digest
+
+    def test_without_the_heading_the_stamp_leaks(self, tmp_path: Path) -> None:
+        """The control that makes the test above mean something.
+
+        Same body, same awk, stamp emitted with no heading: the digest swallows
+        it. That is what the heading prevents, so if this case ever stops leaking
+        the assertion above has stopped discriminating.
+        """
+        headless = self._STAMP.replace("### Description read\n\n", "")
+        digest = self._run(tmp_path, self._WATCH_BODY + headless)
+        assert "DESCRIPTION-READ" in digest, digest
+
+
+class TestCaptureDigestNamesTheModelsInput:
+    """Execute the shared capture and check what its digest covers.
+
+    The digest is only worth publishing if it names the bytes the model was
+    given. So it must equal the hash of the intent file as written -- after the
+    media strip and the cap -- and it must move when that file moves and hold
+    still when it does not. A digest taken over the raw API body instead would
+    report an image-URL swap as a description the verdict never saw, which is the
+    same false confidence in the other direction.
+    """
+
+    def _capture(
+        self,
+        tmp_path: Path,
+        body: str,
+        evidence: list[bytes] | None = None,
+        evidence_names: list[str] | None = None,
+        list_missing: bool = False,
+        pathlists: list[tuple[str, bytes]] | None = None,
+        pathlist_missing: bool = False,
+    ) -> tuple[str, str, bytes]:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the capture is Bash; skip where Bash is absent")
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        # The capture reaches the API through pr-body-snapshot.sh, which fetches
+        # the whole PR object ONCE and splits the title and the description out
+        # of it, so the stub answers with that object. The composed bytes are
+        # identical to what the old single `--jq` template returned, which is
+        # what keeps a digest published before the snapshot reproducible.
+        reply = tmp_path / "api-reply.json"
+        reply.write_text(
+            json.dumps({"title": "t", "body": body}) + "\n", encoding="utf-8", newline="\n"
+        )
+        gh = tmp_path / "gh"
+        gh.write_text(f'#!/bin/sh\ncat "{reply}"\n', encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        intent = tmp_path / "pr-intent.txt"
+        outputs = tmp_path / "gh-output"
+        outputs.write_text("", encoding="utf-8")
+        extra: dict[str, str] = {}
+        wants_list = (
+            evidence is not None or list_missing or pathlists is not None or pathlist_missing
+        )
+        if wants_list:
+            # Write the evidence files the lane would have collected, then the
+            # list naming them -- the same two-file shape the lanes build, so the
+            # pin exercises the real contract rather than a paraphrase of it.
+            names = evidence_names or [f"evidence-{i}.bin" for i in range(len(evidence or []))]
+            paths = []
+            for name, blob in zip(names, evidence or [], strict=True):
+                target = tmp_path / name
+                target.write_bytes(blob)
+                paths.append(target)
+            listing = tmp_path / "intent-evidence-list.txt"
+            # A lane lists the files whose own bytes are per-run paths FIRST and
+            # marks them `pathlist:`, then the evidence whose bytes ARE the
+            # evidence. Same order as the four real lanes, so an ordinal here
+            # means what it means there.
+            lines = []
+            for name, blob in pathlists or []:
+                target = tmp_path / name
+                target.write_bytes(blob)
+                lines.append(f"pathlist:{target}")
+            if pathlist_missing:
+                lines.append(f"pathlist:{tmp_path / 'never-written.txt'}")
+            lines += [str(p) for p in paths]
+            if list_missing:
+                lines.append(str(tmp_path / "never-written.bin"))
+            listing.write_text("".join(f"{ln}\n" for ln in lines), encoding="utf-8", newline="\n")
+            extra["EVIDENCE_LIST"] = str(listing)
+        runner = tmp_path / "run.sh"
+        runner.write_text(
+            f'. "{CAPTURE_SCRIPT}"\nprintf %s "$INTENT_DIGEST"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        env = _child_env(
+            {
+                "PATH": _stub_path(tmp_path),
+                "REPO": "o/r",
+                "PR": "1",
+                "GH_TOKEN": "t",
+                "INTENT": str(intent),
+                "GITHUB_OUTPUT": str(outputs),
+                # The capture takes an `mktemp` scratch for the pre-cap body, so
+                # without these it lands in the system temp dir rather than this
+                # test's own. `_child_env` uses `setdefault`, so naming TEMP/TMP
+                # here keeps the Windows passthrough from reinstating the host's.
+                "TMPDIR": str(tmp_path),
+                "TEMP": str(tmp_path),
+                "TMP": str(tmp_path),
+                **extra,
+            }
+        )
+        result = subprocess.run(
+            [bash, str(runner)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+            env=env,
+            cwd=tmp_path,
+        )
+        if list_missing or pathlist_missing:
+            # The fail-closed path is the subject of its own pin, so hand the
+            # caller the failure instead of asserting success here.
+            return (
+                str(result.returncode),
+                outputs.read_text(encoding="utf-8"),
+                result.stderr.encode(),
+            )
+        assert result.returncode == 0, _proc_log(result)
+        reported = result.stdout.strip().splitlines()[-1].strip()
+        return reported, outputs.read_text(encoding="utf-8"), intent.read_bytes()
+
+    def test_the_digest_is_the_hash_of_the_file_the_model_reads(self, tmp_path: Path) -> None:
+        reported, outputs, written = self._capture(tmp_path, "a plain description")
+        assert reported == hashlib.sha256(written).hexdigest(), (reported, written)
+        assert f"description_digest={reported}" in outputs, outputs
+
+    def test_a_changed_description_changes_the_digest(self, tmp_path: Path) -> None:
+        first, _, _ = self._capture(tmp_path / "a", "the original claim")
+        second, _, _ = self._capture(tmp_path / "b", "the corrected claim")
+        assert first != second, first
+
+    def test_a_stripped_image_does_not_move_the_digest(self, tmp_path: Path) -> None:
+        """What the strip erases cannot change the model's input, so it cannot
+        change the digest -- IN A LANE THAT READS PROSE ONLY, which is what
+        passing no evidence list models here. Two bodies differing only in an
+        image URL the strip replaces therefore hash the same, and a reader
+        recomputing after such an edit is told the verdict is current, which in
+        that lane it is. A lane whose verdict also reads what those URLs resolved
+        to hands over an evidence list and is covered by the pins below, because
+        there the same edit DOES change what was judged.
+        """
+        one, _, wrote_one = self._capture(
+            tmp_path / "a", "prose\n\n![shot](https://example.com/one.png)\n"
+        )
+        two, _, wrote_two = self._capture(
+            tmp_path / "b", "prose\n\n![shot](https://example.com/two.png)\n"
+        )
+        assert b"[image removed]" in wrote_one, wrote_one
+        assert wrote_one == wrote_two, (wrote_one, wrote_two)
+        assert one == two, (one, two)
+
+    def test_the_digest_is_bare_hex_when_the_path_needs_escaping(self, tmp_path: Path) -> None:
+        """`sha256sum <file>` escapes a name holding a backslash and prefixes the
+        whole line with one, so reading the hash off that line yields `\\<hex>`:
+        a stamp no reader can reproduce. A Windows path is all backslashes, so
+        the shard reproduced it and this board could not. A backslash is a legal
+        POSIX filename character, so digesting one here makes the class visible
+        wherever the suite runs, not only where the OS forces it.
+        """
+        reported, outputs, written = self._capture(tmp_path / "a\\b", "a plain description")
+        assert reported == hashlib.sha256(written).hexdigest(), (reported, written)
+        assert set(reported) <= set("0123456789abcdef"), reported
+        assert len(reported) == 64, reported
+        assert f"description_digest={reported}" in outputs, outputs
+
+    def test_an_unusable_digest_fails_the_step_closed(self, tmp_path: Path) -> None:
+        """The guard is a shape assertion, not an emptiness one. `\\<64 hex>` is
+        non-empty, so a guard testing only for empty publishes it; the step must
+        refuse anything that is not exactly 64 hex characters, because a stamp a
+        reader cannot reproduce is worse than no stamp at all.
+        """
+        script = CAPTURE_SCRIPT.read_text(encoding="utf-8")
+        guard = script[script.index("INTENT_DIGEST=") :]
+        assert "-ne 64" in guard, guard[:400]
+        assert "*[!0-9a-f]*" in guard, guard[:400]
+        assert guard.count("exit 1") >= 2, guard[:600]
+
+    def test_the_digest_reads_stdin_and_falls_back_to_shasum(self) -> None:
+        """Two portability properties of EVERY digest command in the script.
+
+        Reading stdin keeps a filename out of the output, so no path can escape
+        into the hash. The `shasum` fallback lets a reader on a Mac reproduce the
+        stamp by hand, which the verdict explicitly invites -- macOS ships no
+        `sha256sum`, and this repository already picks between the two the same
+        way in `cli.sh`, `playwright-cli.sh` and `ensure-node.sh`.
+
+        The property is per-SITE, not a count. The script takes more than one
+        digest -- the captured description, and the manifest that folds in a
+        lane's evidence -- and a count assertion fails on a new site that holds
+        the property just as loudly as on one that breaks it. So every site is
+        checked, with a lower bound as the control so an over-narrow filter
+        matching nothing cannot pass vacuously.
+        """
+        script = CAPTURE_SCRIPT.read_text(encoding="utf-8")
+        code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
+        digest = [ln for ln in code if "INTENT_DIGEST=" in ln and "cut" in ln]
+        assert len(digest) >= 1, digest
+        for line in digest:
+            assert " < " in line, line
+        assert "shasum -a 256" in "\n".join(code), digest
+        assert any("command -v sha256sum" in ln for ln in code), digest
+        # The bare `sha256sum "$INTENT"` spelling is the one whose escaped output
+        # produced a stamp no reader could reproduce; it must appear nowhere. The
+        # same goes for any other digest taken over a PATH rather than stdin.
+        assert not any('sha256sum "$INTENT"' in ln for ln in code), digest
+        hashed_paths = [ln for ln in code if "_kc_sha" in ln and "cut" in ln and " < " not in ln]
+        assert hashed_paths == [], hashed_paths
+
+    def test_evidence_the_verdict_read_moves_the_digest(self, tmp_path: Path) -> None:
+        """The defect this closes: the media strip replaces every attachment URL
+        with the same placeholder, so in a lane whose verdict also reads what
+        those URLs resolved to, swapping one attachment for another leaves the
+        captured prose byte-identical. A digest over the prose alone reports a
+        match on a verdict formed from other evidence. Same body, different
+        evidence bytes, so only the evidence can account for the difference.
+        """
+        one, _, wrote_one = self._capture(tmp_path / "a", "same prose", evidence=[b"pixels-A"])
+        two, _, wrote_two = self._capture(tmp_path / "b", "same prose", evidence=[b"pixels-B"])
+        assert wrote_one == wrote_two, (wrote_one, wrote_two)
+        assert one != two, one
+
+    def test_no_evidence_list_keeps_the_intent_only_digest(self, tmp_path: Path) -> None:
+        """The other direction, which is why the coverage is per-lane and not
+        global: a lane that judges prose only must keep naming the prose alone,
+        or a media-only edit it provably never saw would be reported as a
+        description that changed -- the same false confidence inverted.
+        """
+        reported, _, written = self._capture(tmp_path, "prose only")
+        assert reported == hashlib.sha256(written).hexdigest(), reported
+
+    def test_the_manifest_names_ordinals_not_paths(self, tmp_path: Path) -> None:
+        """A runner temp path is per-run, so digesting it would move the stamp on
+        a re-run that read byte-identical evidence and tell a reader the verdict
+        was stale. Identical bytes under different names must hash the same.
+        """
+        one, _, _ = self._capture(
+            tmp_path / "a", "same prose", evidence=[b"same"], evidence_names=["first.bin"]
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b", "same prose", evidence=[b"same"], evidence_names=["second.bin"]
+        )
+        assert one == two, (one, two)
+
+    def test_two_evidence_files_are_not_one_longer_one(self, tmp_path: Path) -> None:
+        """The manifest is per-file lines, not concatenated bytes, so splitting
+        the same total differently cannot collide."""
+        one, _, _ = self._capture(tmp_path / "a", "same prose", evidence=[b"ab", b"c"])
+        two, _, _ = self._capture(tmp_path / "b", "same prose", evidence=[b"a", b"bc"])
+        assert one != two, one
+
+    def test_an_unreadable_listed_evidence_file_fails_closed(self, tmp_path: Path) -> None:
+        """A stamp must never overstate its coverage. If the lane named evidence
+        the capture cannot read, silently hashing the rest would publish a digest
+        claiming to cover what it never saw, so the capture fails instead.
+        """
+        code, outputs, stderr = self._capture(
+            tmp_path, "prose", evidence=[b"present"], list_missing=True
+        )
+        assert code != "0", (code, stderr)
+        assert "description_digest=" not in outputs, outputs
+
+    def test_every_lane_reading_attachment_evidence_names_it_in_the_digest(self) -> None:
+        """Enumerated from source, because a named site is a sample. A lane whose
+        model is pointed at the evidence downloaded from the description must
+        hand that evidence to the capture, or its stamp names less than its
+        verdict read. The predicate is sourcing the attachment-evidence script:
+        that is what downloads the bytes, and every lane that does it feeds them
+        to its model either as images or as the rendered-evidence manifest.
+
+        The check is STRUCTURAL -- the capture step's own `env` must carry the
+        key -- not a substring search of the file. A substring is satisfied by a
+        mention in a comment, and by a renamed key: `EVIDENCE_LIST_DISABLED`
+        contains `EVIDENCE_LIST`, so a lane that had stopped handing its evidence
+        over would still read as covered.
+        """
+        offenders = []
+        covered = 0
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "pr-attachment-evidence.sh" not in text:
+                continue
+            if "pr-description-capture.sh" not in text:
+                continue
+            covered += 1
+            doc = yaml.safe_load(text)
+            named = False
+            for job in doc["jobs"].values():
+                for step in job.get("steps") or []:
+                    run = step.get("run") or ""
+                    if "pr-description-capture.sh" not in run:
+                        continue
+                    if "EVIDENCE_LIST" in (step.get("env") or {}):
+                        named = True
+            if not named:
+                offenders.append(name)
+        # A control: zero matches would pass the assertion vacuously, and the
+        # count is the census this pin exists to hold -- four lanes download
+        # attachment evidence AND capture the description.
+        assert covered == 4, covered
+        assert offenders == [], offenders
+
+    def test_a_list_file_holding_a_non_path_line_does_not_fail_the_capture(
+        self, tmp_path: Path
+    ) -> None:
+        """A UX lane hands over `ux-screenshots.txt`, whose lines are NOT all
+        paths: a `TRUNCATED: more than N images` prose notice is appended to it
+        when the cap drops evidence. Passing that prose as an evidence path trips
+        the capture's fail-closed readability guard, and the lane goes red on any
+        PR carrying more than the cap -- a guard firing correctly on input that
+        was never a path. So a lane lists the list FILE as content and only those
+        of its lines that are really files; this pin holds the capture's half of
+        that contract by proving a prose-bearing list file is digestible.
+        """
+        reported, outputs, _ = self._capture(
+            tmp_path,
+            "prose",
+            pathlists=[
+                (
+                    "shots.txt",
+                    b"/nonexistent/shot-01.png\n"
+                    b"TRUNCATED: more than 40 images; one was not listed\n",
+                )
+            ],
+        )
+        assert len(reported) == 64, reported
+        assert f"description_digest={reported}" in outputs, outputs
+
+    def test_a_dropped_evidence_notice_moves_the_digest(self, tmp_path: Path) -> None:
+        """Digesting the list file as CONTENT is what makes the truncation notice
+        load-bearing: an edit that changes WHICH evidence a cap drops changes that
+        list's bytes even when no kept file changed, so the verdict's stamp moves.
+        Filtering the notice out and digesting only real paths would lose this.
+
+        Held in the `pathlist:` form, which is what the four lanes list. The
+        notice does not start with `/`, so normalizing to basenames leaves it
+        whole and this property survives that change -- which is the point of
+        pinning it here rather than on the plain form.
+        """
+        kept = b"/x/_temp/shots/shot-01.png\n"
+        one, _, _ = self._capture(
+            tmp_path / "a",
+            "same prose",
+            pathlists=[
+                ("shots.txt", kept + b"TRUNCATED: more than 40 images; one was not listed\n")
+            ],
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b",
+            "same prose",
+            pathlists=[
+                ("shots.txt", kept + b"TRUNCATED: more than 40 images; two were not listed\n")
+            ],
+        )
+        assert one != two, one
+
+    def test_a_marked_lists_temp_root_stays_out_of_the_digest(self, tmp_path: Path) -> None:
+        """The screenshot list holds `"$DEST_DIR/$name"` lines and $DEST_DIR is
+        under `runner.temp`, so digesting its BYTES puts a per-run directory
+        inside the stamp: a re-run that read byte-identical evidence publishes a
+        different digest, and a reader recomputing is told a sound verdict is
+        stale. That is the same defect the manifest's ordinal labels exist to
+        prevent, one level down -- in a listed file's contents rather than in its
+        label. The `pathlist:` form reduces every line starting with `/` to its
+        basename, so the same evidence under two temp roots hashes the same.
+
+        The two renderings are asserted DIFFERENT first. Without that the pin
+        would also pass on a harness that fed identical bytes twice, which is how
+        an invariance test passes while measuring nothing.
+        """
+        one_bytes = b"/home/runner/work/_temp/ux-shots/shot-01.png\n"
+        two_bytes = b"/mnt/other/_work/_temp/ux-shots/shot-01.png\n"
+        assert one_bytes != two_bytes
+        one, _, _ = self._capture(
+            tmp_path / "a", "same prose", pathlists=[("shots.txt", one_bytes)]
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b", "same prose", pathlists=[("shots.txt", two_bytes)]
+        )
+        assert one == two, (one, two)
+
+    def test_a_marked_map_still_moves_when_an_attachment_is_swapped(self, tmp_path: Path) -> None:
+        """Normalizing must drop the directory and nothing else. The origin map is
+        `<opaque name>\\t<origin>` and does not start with `/`, so it survives
+        whole -- which is what keeps a swapped attachment nameable. The strip
+        replaces both URLs with the same placeholder, so the captured prose is
+        byte-identical across this edit and the map is the only thing that moves.
+        Had normalizing reduced the map too, the swap would go unstamped.
+        """
+        one, _, _ = self._capture(
+            tmp_path / "a",
+            "same prose",
+            pathlists=[("map.txt", b"shot-01.png\thttps://example.com/one.png\n")],
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b",
+            "same prose",
+            pathlists=[("map.txt", b"shot-01.png\thttps://example.com/two.png\n")],
+        )
+        assert one != two, one
+
+    def test_an_unreadable_marked_list_file_still_fails_closed(self, tmp_path: Path) -> None:
+        """The marker changes HOW a listed file is folded in, never WHETHER it has
+        to be readable. A stamp that quietly skipped a marked file it could not
+        open would overstate its coverage exactly as the plain form would.
+        """
+        code, outputs, stderr = self._capture(tmp_path, "prose", pathlist_missing=True)
+        assert code != "0", (code, stderr)
+        assert "description_digest=" not in outputs, outputs
+
+    def test_every_lane_marks_the_path_lists_it_hands_over(self) -> None:
+        """Enumerated from source, because a named site is a sample. Two shapes
+        carry absolute paths in their own bytes: the screenshot list a UX lane
+        hands over directly, and the rendered-evidence manifest a design lane
+        hands over, which embeds that list with `cat`. Each must be listed
+        `pathlist:` or this run's temp directory enters the stamp.
+
+        The converse is pinned in the same pass: a line appending ONE image must
+        NOT be marked. Those bytes are the evidence, and normalizing a PNG would
+        hash a reading of its lines instead of its content.
+        """
+        source_line = '. "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"'
+        marker = "printf 'pathlist:%s\\n'"
+        offenders = []
+        covered = 0
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "EVIDENCE_LIST" not in text or source_line not in text:
+                continue
+            doc = yaml.safe_load(text)
+            for job_id, job in doc["jobs"].items():
+                for step in job.get("steps") or []:
+                    run = step.get("run") or ""
+                    if source_line not in run or "EVIDENCE_LIST" not in run:
+                        continue
+                    covered += 1
+                    appends = 0
+                    for line in run.splitlines():
+                        stripped = line.strip()
+                        if not stripped.endswith('>> "$EVIDENCE_LIST" || :'):
+                            continue
+                        appends += 1
+                        marked = marker in stripped
+                        # `"$f"` is the UX loop over its three list files;
+                        # `"$DESIGN_EVIDENCE"` is the design lanes' manifest.
+                        # Anything else appending to the list is one file whose
+                        # bytes are the evidence.
+                        a_path_list = '"$f"' in stripped or '"$DESIGN_EVIDENCE"' in stripped
+                        if a_path_list and not marked:
+                            offenders.append((name, job_id, "path list unmarked", stripped))
+                        if marked and not a_path_list:
+                            offenders.append((name, job_id, "byte evidence marked", stripped))
+                    if appends == 0:
+                        offenders.append((name, job_id, "no append line found", ""))
+        # Control: exactly four lanes hand evidence to the capture -- two UX and
+        # two design. The two first-principles lanes read prose plus the diff and
+        # set no EVIDENCE_LIST, so a count other than four means this walk stopped
+        # matching the lanes rather than that they are clean.
+        assert covered == 4, covered
+        assert offenders == [], offenders
+
+    def test_every_ux_lane_covers_its_recording_list(self) -> None:
+        """The recording list is named in each UX lane's prompt as a data file the
+        model reads, so a recording-only description edit must move the digest. A
+        lane that hands over its images and map but not its recordings publishes a
+        stamp claiming coverage it lost. Enumerated from source: the predicate is
+        the lane naming a recordings file at all.
+        """
+        offenders = []
+        covered = 0
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "ux-recordings.txt" not in text:
+                continue
+            if "pr-description-capture.sh" not in text:
+                continue
+            covered += 1
+            doc = yaml.safe_load(text)
+            named = False
+            for job in doc["jobs"].values():
+                for step in job.get("steps") or []:
+                    run = step.get("run") or ""
+                    if "pr-description-capture.sh" not in run:
+                        continue
+                    env = step.get("env") or {}
+                    if "CLIPS" in env and "EVIDENCE_LIST" in env and "$CLIPS" in run:
+                        named = True
+            if not named:
+                offenders.append(name)
+        # Control: both UX lanes name a recordings file and capture a description.
+        assert covered == 2, covered
+        assert offenders == [], offenders
+
+    def test_no_lane_pipes_a_whole_list_file_into_the_evidence_list(self) -> None:
+        """The defect this forbids, stated structurally: `cat "$SHOTS" >>
+        "$EVIDENCE_LIST"` copies every line of a list file in as a path, and that
+        list carries prose. A lane must filter to real files instead, which is
+        what the `[ -f ` test below is.
+        """
+        offenders = []
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "EVIDENCE_LIST" not in text:
+                continue
+            if 'cat "$SHOTS" >> "$EVIDENCE_LIST"' in text:
+                offenders.append((name, "cats a list file in as paths"))
+            if "$SHOTS" in text and "[ -f " not in text:
+                offenders.append((name, "reads $SHOTS without a real-file test"))
+        assert offenders == [], offenders
+
+    def test_a_lane_that_names_evidence_says_so_where_the_verdict_is_read(self) -> None:
+        """A reader recomputes over whatever the stamp's sentence names. A lane
+        folding evidence in while still printing the description-only sentence
+        would send that reader to recompute over the description alone, get a
+        mismatch, and read a sound verdict as stale -- a false alarm the fix
+        itself manufactured. So the sentence must branch on the count.
+        """
+        offenders = []
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "EVIDENCE_LIST" not in text:
+                continue
+            if "EVIDENCE_COUNT" not in text or "names everything this verdict read" not in text:
+                offenders.append(name)
+        assert offenders == [], offenders
+
+
+class TestASourcedScriptNeverRunsWithCredentialsLive:
+    """Every sourced script in a review lane runs before that lane's credentials.
+
+    The invariant, as one sentence: in any workflow that both sources a script
+    from `.github/scripts/` and assumes a role, every source must appear before
+    every assume. It is stated over the WHOLE file rather than per lane, because
+    the reason is not local -- a session assumed once persists for every later
+    step in the job, so "before the model call" is not the same bar as "before
+    any credentials exist".
+
+    On a same-repo pull request the checkout is the PR's merge ref, so a sourced
+    script is the PR's own editable copy; running it after an assume executes
+    PR-authored shell with Bedrock credentials in its environment. The fork lanes
+    check out base_sha and so are not exposed today, but they are held to the same
+    order deliberately: an exception resting on which ref a lane checks out breaks
+    silently the day that ref changes, and this pin is what makes the property
+    independent of it.
+
+    `design-review.yml` documents this ordering in prose. Prose is not a gate: it
+    describes an order without holding it, and an order that must hold in six
+    lanes at once needs something that fails when one of them drifts. That is
+    what this test is.
+    """
+
+    #: A run: step's shell is the workflow's own code, so an `aws` call inside one
+    #: is not what this pin is about. What it looks for is the credential ACTION.
+    _ASSUME = "aws-actions/configure-aws-credentials"
+    _SOURCE = '. "$GITHUB_WORKSPACE/.github/scripts/'
+
+    def _positions(self, text: str) -> "tuple[list[int], list[int]]":
+        sources, assumes = [], []
+        for i, line in enumerate(text.splitlines()):
+            if line.lstrip().startswith("#"):
+                continue
+            if self._SOURCE in line:
+                sources.append(i + 1)
+            if self._ASSUME in line:
+                assumes.append(i + 1)
+        return sources, assumes
+
+    def test_the_invariant_holds_in_every_workflow_on_disk(self) -> None:
+        offenders = []
+        covered = 0
+        for name in _every_workflow():
+            sources, assumes = self._positions(_workflow(name))
+            if not sources or not assumes:
+                continue
+            covered += 1
+            if max(sources) > min(assumes):
+                offenders.append((name, sources, assumes))
+        # A control: the assertion below is only meaningful if the scan actually
+        # found files holding both halves. Zero would pass it vacuously.
+        assert covered >= 4, covered
+        assert offenders == [], offenders
+
+    @pytest.mark.parametrize("name", _capture_lanes())
+    def test_each_capture_lane_sources_before_it_assumes(self, name: str) -> None:
+        sources, assumes = self._positions(_workflow(name))
+        assert sources, name
+        if not assumes:
+            pytest.skip(f"{name} assumes no role")
+        assert max(sources) < min(assumes), (name, sources, assumes)
+
+
+class TestCaptureLanesKeepTheirTriggerSet:
+    """Capturing a description does not earn a lane an `edited` trigger.
+
+    A fresh reading of the description and a re-roll of the whole verdict are
+    different things. `edited` buys the first by paying for the second: with
+    `cancel-in-progress`, a body edit on an unchanged head discards the verdict
+    the lane already published and replaces it with another roll of a
+    non-deterministic reviewer. The stamp gives a reader the freshness signal
+    without that trade, so the trigger sets stay as they are.
+    """
+
+    @pytest.mark.parametrize("name", _capture_lanes())
+    def test_no_capture_lane_reruns_on_a_description_edit(self, name: str) -> None:
+        doc = yaml.safe_load(_workflow(name))
+        trigger = (doc.get(True) or doc.get("on") or {}).get("pull_request")
+        if trigger is None:
+            # The fork lanes are dispatched by a stage-1 gate, not by
+            # `pull_request` directly; they have no trigger set to hold.
+            assert "workflow_run" in (doc.get(True) or doc.get("on") or {}), name
+            return
+        types = trigger.get("types") or []
+        assert "edited" not in types, (name, types)
+        assert "synchronize" in types, (name, types)

@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
@@ -207,6 +208,29 @@ class HookResult:
         return HookResult(action=HOOK_INJECT_CONTEXT, text=text)
 
 
+#: Set by :func:`uncounted_gate`; read by ``ToolHookResult._count`` and
+#: ``_audit_governance``.
+_GATE_UNCOUNTED: ContextVar[bool] = ContextVar("kirocrew_gate_uncounted", default=False)
+
+
+@contextmanager
+def uncounted_gate():
+    """Consult the gate without emitting the approval-decision counter.
+
+    For a second consultation of a request whose first one was already counted
+    (the ACP transport's permission floor). The verdict is unaffected. The
+    governance tier writes no ``governance_decision`` audit row either: this
+    consultation carries no caller identity and its caller discards a policy
+    deny, so a row here would record a denial for a call that ran. The
+    consumer's own identity-bearing consultation writes that row.
+    """
+    token = _GATE_UNCOUNTED.set(True)
+    try:
+        yield
+    finally:
+        _GATE_UNCOUNTED.reset(token)
+
+
 @dataclass
 class ToolHookResult:
     action: str  # TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY
@@ -270,7 +294,13 @@ class ToolHookResult:
         ``action`` is one of three module constants and ``security_deny`` a bool,
         so the series is bounded by construction -- no reason string, tool name or
         command reaches the recorder.
+
+        A consultation made inside :func:`uncounted_gate` is not counted: the
+        transport floor re-asks the gate for a request its consumer already
+        counted, and counting both would report one request as two decisions.
         """
+        if _GATE_UNCOUNTED.get():
+            return
         try:
             from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
 
@@ -641,6 +671,7 @@ def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
         "mcp_server_name": getattr(event, "mcp_server_name", "") or "",
         "mcp_tool_name": getattr(event, "tool_name", "") or "",
         "mcp_identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
+        "spawn_target": getattr(event, "spawn_target", "") or "",
     }
     unknown = set(overrides) - set(kwargs)
     if unknown:
@@ -793,6 +824,7 @@ class HookManager:
         mcp_server_name: str = "",
         mcp_tool_name: str = "",
         mcp_identity_trusted: bool = False,
+        spawn_target: str = "",
         resolved_agent: str = "",
         classifier_only: bool = False,
     ) -> ToolHookResult:
@@ -1312,6 +1344,7 @@ class HookManager:
             diff_path=diff_path,
             mcp_ref=governance_mcp_ref,
             extra_titles=(mcp_tool_name,) if mcp_tool_name and mcp_tool_name != tool_name else (),
+            spawn_target=spawn_target,
         )
         if gov_reason:
             return ToolHookResult.deny_policy(gov_reason)
@@ -1845,8 +1878,17 @@ def _governance_denial(
     diff_path: str = "",
     mcp_ref: str = "",
     extra_titles: tuple[str, ...] = (),
+    spawn_target: str = "",
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
+
+    *spawn_target* is the agent a backend-stated sub-agent spawn will start (set
+    only from KAS's own ``_meta.kiro.consent``; see ``AcpEvent.spawn_target``).
+    When set, ``capabilities.spawn`` is judged too -- the gate on, and the target
+    in its ``agents`` scope -- on the SAME ceiling and profile this call resolved,
+    so a spawn costs no second profile resolution and cannot be judged against a
+    different profile snapshot. A spawn policy is not a ``tools`` rule, so the
+    title question alone cannot answer it.
 
     *mcp_ref* is an already-canonical ``@server`` / ``@server/tool`` reference
     for the trusted MCP identity, evaluated in addition to (or instead of) the
@@ -1898,6 +1940,8 @@ def _governance_denial(
             subject = getattr(decision, "item", "") or tool_name or mcp_ref
             _audit_governance(session_key, agent, subject, decision)
             return f"Blocked by governance policy: {decision.reason}"
+        if spawn_target:
+            return _spawn_policy_denial(ceiling, profile, spawn_target, session_key, agent)
         return None
     except PlatformCompositionError:
         raise
@@ -1913,6 +1957,37 @@ def _governance_denial(
         except Exception:
             logger.debug("governance degrade audit unavailable", exc_info=True)
         return None
+
+
+def _spawn_policy_denial(
+    ceiling: Any, profile: Any, target: str, session_key: str, agent: str
+) -> str | None:
+    """The ``capabilities.spawn`` verdict for a spawn of *target*, or None.
+
+    The two questions ``subagent._vet_spawn_governance`` asks -- is spawning on,
+    and is *target* in the ``agents`` scope -- put to a ceiling and profile the
+    caller already resolved. Fails CLOSED, unlike the ``tools`` question around
+    it: this is an authorization for a spawn, and an evaluation error that
+    permitted it would be the bypass the check exists to stop.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+    from kiro_crew.platform.governance import resolve
+
+    try:
+        gate = resolve(ceiling, profile, "capabilities.spawn", "")
+        if not gate.permitted:
+            _audit_governance(session_key, agent, target, gate)
+            return f"Blocked by spawn policy: {gate.reason}"
+        scoped = resolve(ceiling, profile, "capabilities.spawn", f"agents:{target}")
+        if not scoped.permitted:
+            _audit_governance(session_key, agent, target, scoped)
+            return f"Blocked by spawn policy: agent {target!r} is not permitted"
+        return None
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.warning("spawn policy could not be evaluated; refusing the spawn", exc_info=True)
+        return "Blocked by spawn policy: it could not be evaluated"
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:
@@ -2115,6 +2190,8 @@ def _cu_read_only_auto_approve(tool_name: str) -> bool:
 
 def _audit_governance(session_key: str, agent: str, tool_name: str, decision: object) -> None:
     """Best-effort SEL audit of a governance denial (records scope/rule/layer)."""
+    if _GATE_UNCOUNTED.get():
+        return
     try:
         from kiro_crew.sel import sel
 
@@ -4149,7 +4226,7 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
     # Same store, read read-only by
     # ``kiro_crew.apps.builtins.aws_control.backend.backup._export_cli_conversations``
-    # to copy ONLY the terminal conversation allowlist (``conversations_v2``) into
+    # to copy ONLY the terminal conversation allowlist (its chat tables) into
     # the off-host sessions archive. No token row is read and no credential value
     # leaves the function -- the export writes a fresh database of the allowlisted
     # tables alone -- but the file holds live bearer tokens whatever this reader
@@ -4725,11 +4802,15 @@ def _audit_governance_hook_decision(
 
 
 async def run_script_hook(
-    hook: ScriptHook, context: str = "", hook_event: dict | None = None
+    hook: ScriptHook,
+    context: str = "",
+    hook_event: dict | None = None,
+    cwd: str | None = None,
 ) -> ScriptHookResult:
     """Execute a script hook's command with timeout.
 
-    Passes hook event as JSON via STDIN (Kiro CLI compatible).
+    Passes hook event as JSON via STDIN (Kiro CLI compatible). ``cwd`` is the
+    directory the command runs in; ``None`` keeps the gateway's own.
     """
     start = time.monotonic()
     # Governance: the ``capabilities.script_hooks`` gate (default OFF) may forbid
@@ -4739,7 +4820,9 @@ async def run_script_hook(
     sk = ""
     if hook_event:
         sk = str(hook_event.get("parent_session_key") or hook_event.get("session_key") or "")
-    gov_denied = _script_hooks_capability_denied(sk)
+    # Offloaded: resolving the governance scope can walk the profile store, which
+    # must not run on the gateway's shared event loop.
+    gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
@@ -4821,6 +4904,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -4830,6 +4914,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -4963,7 +5048,7 @@ _HOOKS_FILE = "hooks.json"
 class ScriptHookStore:
     """Persist script hooks to ~/.kiro/crew/hooks.json."""
 
-    def __init__(self, config_dir: Path | None = None):
+    def __init__(self, config_dir: Path | None = None, *, load: bool = True):
         from kiro_crew.config.loader import config_dir as _cfg_dir
 
         self._dir = config_dir or _cfg_dir()
@@ -4980,7 +5065,8 @@ class ScriptHookStore:
         # snapshot taken BEFORE B's change and drops it. Re-entrant because the
         # persist path is called from inside the same held section.
         self._mutex = threading.RLock()
-        self._load()
+        if load:
+            self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -4990,6 +5076,9 @@ class ScriptHookStore:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load hooks: %s", exc)
             return
+        self._load_data(data)
+
+    def _load_data(self, data: object) -> None:
         # Deserialize each hook independently: a single malformed entry (a
         # non-dict, or a dict `from_dict` cannot coerce) must not take down the
         # whole store and drop every OTHER hook the user has. `from_dict` is
@@ -5262,10 +5351,32 @@ class ScriptHookStore:
         parent_session_key: str | None = None,
         agent_role: str | None = None,
         hook_continuation_count: int = 0,
+        extra_hooks: Sequence[ScriptHook] = (),
+        extra_hooks_cwd: str | None = None,
+        extra_hooks_tool_names: Sequence[str] | None = None,
+        tool_match_names: Sequence[str] | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
-        For PreToolUse/PostToolUse, matcher filters by tool name.
+        ``extra_hooks`` run after the stored ones, through the same matcher, gate
+        and spawn, and are never persisted: they belong to the caller (an agent
+        spec's own ``hooks`` on a backend that cannot run them, see
+        :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
+        ``extra_hooks_cwd`` -- the session's workspace, where the harness that
+        would otherwise run them runs them -- and their payload's ``cwd`` says so.
+        ``tool_match_names``, when given, are every name the call is known by (its
+        title, its canonical tool name, its ``@server/tool`` form); a tool matcher
+        then matches when it matches any of them. ``tool_name`` stays what the
+        payload says.
+
+        For PreToolUse/PostToolUse, matcher filters by tool name. When
+        ``extra_hooks_tool_names`` is given, an extra hook's tool matcher is
+        compared with those names instead: the tool's identity in the vocabulary
+        the extra hooks were written in, which ``tool_name`` (the call's title)
+        does not carry. It matches when any name does, and an empty sequence
+        leaves only an unscoped (``*``) extra hook matching. The first name is
+        also the ``tool_name`` an extra hook's stdin payload reports, so a script
+        that branches on it reads the same vocabulary its matcher is written in.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
 
         Optional ``subagent_id``, ``parent_session_key``, and ``agent_role`` are
@@ -5313,13 +5424,29 @@ class ScriptHookStore:
         if agent_role:
             hook_event["agent_role"] = agent_role
 
-        for hook in list(self._hooks.values()):
+        extra_ids = {id(h) for h in extra_hooks}
+        # The extra hooks' own payload: their workspace as ``cwd``, and on a tool
+        # event the tool named in their vocabulary rather than the call's title.
+        extra_event = dict(hook_event)
+        if extra_hooks_cwd:
+            extra_event["cwd"] = extra_hooks_cwd
+        if extra_hooks_tool_names:
+            extra_event["tool_name"] = extra_hooks_tool_names[0]
+        for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
             if hook.matcher:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
-                    if not _tool_matches(hook.matcher, tool_name):
+                    if extra_hooks_tool_names is not None and id(hook) in extra_ids:
+                        if hook.matcher != "*" and not any(
+                            _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
+                        ):
+                            continue
+                    elif not any(
+                        _tool_matches(hook.matcher, name)
+                        for name in (tool_match_names or (tool_name,))
+                    ):
                         continue
                 elif context:
                     # Offload to a thread: regex mode spawns a bounded subprocess
@@ -5345,7 +5472,9 @@ class ScriptHookStore:
                 # gate as command hooks — a disabled capabilities.script_hooks
                 # must not be bypassable by omitting the command field.
                 sk = parent_session_key or ""
-                gov_denied = _script_hooks_capability_denied(sk)
+                # Off the loop, as in run_script_hook: the scope lookup can walk
+                # the governance profile store.
+                gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
@@ -5389,7 +5518,12 @@ class ScriptHookStore:
                     len(hook.skills),
                 )
                 continue
-            result = await run_script_hook(hook, context, hook_event)
+            if id(hook) in extra_ids and extra_hooks_cwd:
+                result = await run_script_hook(hook, context, extra_event, cwd=extra_hooks_cwd)
+            elif id(hook) in extra_ids:
+                result = await run_script_hook(hook, context, extra_event)
+            else:
+                result = await run_script_hook(hook, context, hook_event)
             results.append(result)
             logger.info(
                 "Hook %s (%s): %s in %dms (exit=%d)",
@@ -5454,6 +5588,40 @@ def get_global_hook_store() -> ScriptHookStore | None:
     return _global_script_hook_store
 
 
+def persisted_hook_store() -> ScriptHookStore:
+    """The registered hook store, or the Hooks page's saved hooks read from disk.
+
+    A process that registers no store (the standalone ``kirocrew run`` task runner)
+    still has the user's saved hooks in ``hooks.json``. A gate that read them as
+    absent would let a covered call past a deny hook, so gates that must enforce
+    them read this instead of :func:`get_global_hook_store`.
+
+    Strict, unlike the store's own fail-soft load: a ``hooks.json`` that cannot be
+    read or parsed, or that holds an entry the store could not load, raises, so a
+    gate fails closed instead of reading a saved deny hook as absent.
+
+    The file is read ONCE, under the same ``hooks.json.lock`` its writers hold, and
+    that one snapshot is both validated and loaded, so an edit landing mid-read
+    cannot pair one version's shape check with another version's hooks. Blocking
+    I/O: an event-loop caller runs it in a worker thread.
+    """
+    store = get_global_hook_store()
+    if store is not None:
+        return store
+    store = ScriptHookStore(load=False)
+    if not store._path.exists():
+        return store
+    with webhooks.locked(store._path):
+        data = json.loads(store._path.read_text(encoding="utf-8"))
+    hooks_data = data.get("hooks", []) if isinstance(data, dict) else None
+    if not isinstance(hooks_data, list):
+        raise ValueError(f"{store._path} does not hold a hooks list")
+    store._load_data(data)
+    if store._unparsed_hook_entries or len(store._hooks) != len(hooks_data):
+        raise ValueError(f"{store._path} holds hooks that could not be loaded")
+    return store
+
+
 async def fire_tool_hooks(
     hook_store: ScriptHookStore | None,
     event_title: str,
@@ -5500,3 +5668,125 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+
+
+def pre_tool_match_names(
+    title: str,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """The names a PreToolUse matcher meets for one call: ``(all, spec)``.
+
+    *all* is every name the call is known by, for a Hooks-page hook: its *title*,
+    its canonical *tool_identity* (written by the harness, never the model), the
+    ``@server/tool`` and ``mcp__server__tool`` forms built from the trusted
+    *mcp_server*, and the names the harness's own *harness_tool_id* stands for
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`). *spec* is the
+    same without the title, for a spec hook, whose matcher names tools; ``None``
+    when the harness stated no id, so a spec hook keeps matching the title.
+    """
+    # circular import: spec_hooks imports this module at load time.
+    from kiro_crew.agent_sdk.spec_hooks import spec_hook_tool_names
+
+    harness_names = spec_hook_tool_names(harness_tool_id) or ()
+    trusted = [*harness_names, tool_identity]
+    if mcp_server and tool_identity:
+        trusted += [f"@{mcp_server}/{tool_identity}", f"mcp__{mcp_server}__{tool_identity}"]
+    every = tuple(dict.fromkeys(n for n in [title, *trusted] if n))
+    spec = tuple(dict.fromkeys(n for n in trusted if n)) if harness_names else None
+    return every, spec
+
+
+async def permission_pre_tool_block(
+    hook_store: ScriptHookStore | None,
+    spec_hooks: Sequence[ScriptHook],
+    spec_hooks_cwd: str | None,
+    event_title: str,
+    event_tool_input: str | None = None,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+    subagent_id: str | None = None,
+    parent_session_key: str | None = None,
+    agent_role: str | None = None,
+) -> str | None:
+    """Run the PreToolUse hooks on a subagent or task-runner permission request.
+
+    For a turn whose backend never receives the agent spec's ``hooks`` (see
+    :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`): on that backend the
+    projection turns every call a PreToolUse hook covers into a permission
+    request, so this is where the hooks gate. The Hooks page's hooks and the
+    spec's run together, as on the chat turn loop. Such a turn skips the
+    informational tool-call fire: KAS sends a call's tool-call frame BEFORE its
+    permission request, and every call a PreToolUse hook covers reaches this gate,
+    so firing there too would run each hook twice. Returns why the call is
+    blocked, or ``None``.
+
+    A hook matcher is compared with every name the call is known by: its title
+    (what the chat turn loop matches), its canonical *tool_identity*
+    (``LLMEvent.tool_name``, written by the harness, never the model) and, for an
+    MCP call, the ``@server/tool`` and ``mcp__server__tool`` forms built from the
+    trusted *mcp_server* (``LLMEvent.mcp_server_name``). When the harness stated
+    its own id for the call (*harness_tool_id*, KAS's ``_meta.kiro.toolId``), the
+    names that id stands for join them
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`), so a ``web_fetch``
+    hook meets KAS's "Fetch URL". A spec hook then matches those names and the
+    trusted identity only, never the title, as on the chat turn loop.
+
+    Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
+    deny, and any other nonzero exit or a fire that raises is a gate with no
+    verdict, which blocks. With no store registered in this process the saved
+    Hooks-page hooks are read from disk (:func:`persisted_hook_store`), and saved
+    hooks that cannot be read block.
+    """
+    if hook_store is None:
+        # No store registered in this process: the saved hooks still apply.
+        try:
+            # Off the loop: it reads and parses the whole saved file.
+            hook_store = await asyncio.to_thread(persisted_hook_store)
+        except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+            logger.warning("saved PreToolUse hooks could not be read; blocking tool", exc_info=True)
+            return f"saved PreToolUse hooks could not be read: {exc}"[:500]
+    tool_name = event_title or ""
+    if tool_name.startswith("Running: "):
+        tool_name = tool_name[9:]
+    match_names, spec_names = pre_tool_match_names(
+        tool_name,
+        tool_identity=tool_identity,
+        mcp_server=mcp_server,
+        harness_tool_id=harness_tool_id,
+    )
+    tool_input = None
+    if event_tool_input:
+        try:
+            tool_input = json.loads(event_tool_input)
+        except Exception:
+            pass
+    try:
+        results = await hook_store.fire(
+            HOOK_EVENT_PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            subagent_id=subagent_id,
+            parent_session_key=parent_session_key,
+            agent_role=agent_role,
+            extra_hooks=spec_hooks,
+            extra_hooks_cwd=spec_hooks_cwd,
+            extra_hooks_tool_names=spec_names,
+            tool_match_names=match_names,
+        )
+    except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+        logger.warning("PreToolUse hook fire failed; blocking tool", exc_info=True)
+        return f"PreToolUse hook could not run: {exc}"[:500]
+    for r in results:
+        if r.exit_code == 2:
+            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+        if r.exit_code != 0:
+            detail = (
+                r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")
+            )
+            return f"{r.hook_name}: {detail}"
+    return None

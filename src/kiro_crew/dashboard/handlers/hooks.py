@@ -26,6 +26,10 @@ from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, clear_session_execution
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import sanitize_string
 
@@ -1190,11 +1194,16 @@ async def _run_hook_inner(
             or prior.memory_mode != "persistent"
         ):
             raise ValueError("Hook session no longer matches its registered execution")
-        # Establishing: `execution` is the identity captured when the hook was
-        # registered, and the guard above refuses when the record disagrees with it,
-        # so a forged record raises here rather than being vouched.
+        # Publish the captured identity WITHOUT vouching. A vouched entry is only
+        # ever read for the CALLER slot of `create_session`'s own-store admission,
+        # and a hook session can never be that caller: its key is a `hook:` synthetic
+        # (see `_HOOK_SESSION_PREFIX`) belonging to an ephemeral session that
+        # `_run_hook_agent` destroys after the turn, so it is never a dashboard slot
+        # and `caller_slot_key` cannot resolve it. Vouching it would only occupy a
+        # slot in the capped vouched map for an entry nothing can read. Publishing the
+        # record still lets the hook turn run.
         bind_session_execution(
-            session_key, execution, replace_existing=True, expected=prior, vouch=True
+            session_key, execution, replace_existing=True, expected=prior, vouch=False
         )
 
     await asyncio.to_thread(bind_captured)
@@ -1331,7 +1340,7 @@ async def _run_hook_inner(
                             agent=agent or "kirocrew",
                             tool_name=event.title or "unknown",
                             tool_kind=event.tool_kind,
-                            outcome="auto_approved",
+                            outcome=OUTCOME_PENDING_APPROVAL,
                             source="webhook",
                             request_id=str(event.request_id),
                             critical=True,
@@ -1357,7 +1366,21 @@ async def _run_hook_inner(
                         logger.debug("denial record after audit failure also failed", exc_info=True)
                     await client.reject_tool(event.request_id)
                 else:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    outcome = (
+                        OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        if approval_sent is False
+                        else "auto_approved"
+                    )
+                    _sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        tool_name=event.title or "unknown",
+                        tool_kind=event.tool_kind,
+                        outcome=outcome,
+                        source="webhook",
+                        request_id=str(event.request_id),
+                    )
             else:
                 # Audit the denial BEFORE rejecting, for the same reason.
                 _sel().log_tool_invocation(

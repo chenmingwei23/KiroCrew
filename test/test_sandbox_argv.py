@@ -27,6 +27,8 @@ from kiro_crew.sandbox import (
     _build_seatbelt_profile,
     _resolve_agent_executable,
     _ssh_supports_accept_new,
+    _voice_runtime_parent_paths,
+    _voice_runtime_sandbox_paths,
     detect_backend,
     namespace_argv,
     reset_backend,
@@ -1019,6 +1021,34 @@ class TestWritableCarveouts:
         assert script.index("for d in READONLY_DIRS:") < script.index("for d in WRITABLE_DIRS:")
 
     @_POSIX_ONLY
+    @pytest.mark.parametrize("level", ["strict", "standard", "cc"])
+    def test_launcher_seals_before_hiding(self, monkeypatch, tmp_path, level):
+        """The READONLY seal must precede the SENSITIVE_DIRS hide.
+
+        Same kernel property as the carve-out pin above, in the other
+        direction: ``run/voice-runtime`` is hidden and its parent ``run`` is
+        sealed, and a non-recursive self-bind of ``run`` issued AFTER the hide
+        masks it -- the real leaf becomes readable through the new mount.
+        Seal first, then hide ON the sealed parent. The carve-out loop stays
+        last, so the three loops are seal < hide < carve-out. Every tier, since
+        all three emit the same launcher body.
+        """
+        home, probe = self._relocated_home(monkeypatch, tmp_path)
+        script = _build_launcher_script(level, extra_writable_dirs=(str(probe),))
+        seal = script.index("for d in READONLY_DIRS:")
+        hide = script.index("for d in SENSITIVE_DIRS:")
+        carve = script.index("for d in WRITABLE_DIRS:")
+        assert seal < hide < carve
+        # The pair this pin exists for is actually emitted: the leaf is hidden
+        # and its parent is sealed, in the lists the two loops consume.
+        voice_roots = _voice_runtime_sandbox_paths()
+        voice_parents = _voice_runtime_parent_paths()
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+        assert set(hidden) >= set(voice_roots)
+        assert set(readonly) >= set(voice_parents)
+
+    @_POSIX_ONLY
     def test_launcher_carveout_mounts_fail_open(self, monkeypatch, tmp_path):
         """The two carve-out mounts WIDEN access, so they must not route
         through ``_mount_or_die``: a host refusing them keeps the seal
@@ -1684,14 +1714,18 @@ class TestHardlinkScanBudget:
         # filesystem, so it must not enter the match set: when every
         # credential has nlink == 1 the CWD + /tmp walk is skipped and the
         # common healthy-host spawn pays nothing (and emits no truncation
-        # warning). Both collection loops (SENSITIVE_DIRS and
-        # SENSITIVE_FILES) carry the gate.
+        # warning). BOTH collection loops carry the gate: SENSITIVE_DIRS
+        # (depth 1) and SENSITIVE_FILES. The per-app credentials one level below
+        # a mask root reach the child as inodes the PARENT read -- it cannot stat
+        # them itself, because it masks that tree in this same process -- and the
+        # parent applies the same gate before sending one. The count is how this
+        # notices a third loop added without the gate.
         #
         # REGULAR FILES only, and that half is not cosmetic: every directory has
         # nlink >= 2, and SENSITIVE_FILES carries directories on purpose, so a bare
         # nlink test armed the walk on every spawn. Behaviour is covered in
-        # test_sandbox_hardlink_scan.py; this is the source-level pin that both
-        # collection loops still carry the gate.
+        # test_sandbox_hardlink_scan.py; this is the source-level pin that every
+        # collection loop still carries the gate.
         script = _build_launcher_script("strict")
         assert script.count("if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:") == 2
 

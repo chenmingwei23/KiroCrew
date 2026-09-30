@@ -57,6 +57,7 @@ from kiro_crew.messaging.commands import note_user_stop
 from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.queue_drain import register_drain, tag_entry
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.platform.interfaces import InterceptDecision
 from kiro_crew.safety_override import safety_override, yolo_policy_permits
@@ -124,6 +125,8 @@ if TYPE_CHECKING:
     from kiro_crew.slack.gateway import GatewayOrchestrator
 
 logger = logging.getLogger(__name__)
+#: Slack has no per-owner clear (its !stop clears the whole queue), so no owner.
+_SLACK_QUEUE_TAGS: dict[str, Any] = tag_entry({}, "slack", "")
 
 _skills_loader: SkillsLoader | None = None
 
@@ -1092,6 +1095,30 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         )
 
     orch._socket_client.socket_mode_request_listeners.append(_on_event)  # type: ignore[arg-type]
+    register_drain("slack", lambda session_key: _drain_slack_queue(orch, session_key))
+
+
+async def _drain_slack_queue(orch: GatewayOrchestrator, session_key: str) -> None:
+    """Start the next queued message when no turn's own tail will drain it.
+
+    One message per call; each dispatched turn calls this again when it ends.
+    """
+    if session_key in orch._session_tasks or not orch.sessions:
+        return
+    _next = orch.sessions.dequeue(session_key)
+    if not _next:
+        return
+    task = asyncio.ensure_future(_dispatch_queued(orch, session_key, *_next))
+    orch._session_tasks[session_key] = task
+    orch._handler_tasks.add(task)
+
+    def _after(done: asyncio.Task) -> None:  # type: ignore[type-arg]
+        orch._handler_tasks.discard(done)
+        if orch._session_tasks.get(session_key) is done:
+            del orch._session_tasks[session_key]
+        _spawn_tracked(_drain_slack_queue(orch, session_key))
+
+    task.add_done_callback(_after)
 
 
 # ---------------------------------------------------------------------------
@@ -1103,22 +1130,6 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
     """Build and publish the Block Kit Home Tab view."""
     try:
         blocks: list[dict] = []
-
-        # ── Data Handling Reminder ──
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        ":warning: *Do not enter sensitive or confidential data"
-                        " into Kiro Crew.* Follow your organization's data handling"
-                        " policy when using this tool."
-                    ),
-                },
-            }
-        )
-        blocks.append({"type": "divider"})
 
         # ── Status ──
         yolo = is_yolo_mode()
@@ -1141,7 +1152,11 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         # ── Capabilities ──
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": "🔌 Capabilities"}})
         try:
-            servers = list_servers()
+            # Only servers a session can actually use: ``disabled`` is the
+            # aggregate of the launch predicate over every scope, so a server
+            # switched off in the shared config -- or muted by a non-boolean
+            # ``disabled`` -- is not advertised as a capability here.
+            servers = [s for s in list_servers() if not s.disabled]
             skills = await asyncio.to_thread(lambda: _get_skills_loader().list_skills())
 
             # Slack caps a single section's text at 3000 chars. MCP servers and
@@ -2775,6 +2790,7 @@ async def _route_message(
             # Historical key; carries every attachment temp path for cleanup.
             image_temp_paths=list(_attachment_temp_paths),
             from_trusted_bot=from_trusted_bot,
+            **_SLACK_QUEUE_TAGS,
         )
         if not _queued:
             # Session object not created yet — stash on orch._pending_queue
@@ -2818,6 +2834,7 @@ async def _route_message(
         user_display_name=_sender_display,
         image_temp_paths=list(_attachment_temp_paths),
         from_trusted_bot=from_trusted_bot,
+        **_SLACK_QUEUE_TAGS,
     ):
         logger.info("Message %s queued for busy session %s", msg_ts, session_key)
         if orch.slack:

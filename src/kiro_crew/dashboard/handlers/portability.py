@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import tempfile
 import uuid
@@ -13,7 +14,12 @@ from aiohttp.multipart import BodyPartReader
 
 from kiro_crew.dashboard import part_stream
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.portability import apply_import_zip, create_export_zip, validate_import_zip
+from kiro_crew.portability import (
+    apply_import_zip,
+    create_export_zip,
+    unbundled_agent_templates,
+    validate_import_zip,
+)
 from kiro_crew.sel import sel as _sel_fn  # circular import — sel imports lazily
 from kiro_crew.snapshot import NamedStoresInUse, SourceComponentUnsound
 
@@ -30,6 +36,9 @@ logger = logging.getLogger(__name__)
 #: The cap exists only so an unbounded upload cannot fill the disk, and 2 GiB is
 #: the largest value consistent with the guard downstream.
 _MAX_IMPORT_BYTES = 2 * 1024**3
+
+#: Export response header naming the agent templates the bundle does not carry.
+UNBUNDLED_TEMPLATES_HEADER = "X-Kirocrew-Unbundled-Templates"
 
 
 def _sel():
@@ -102,14 +111,19 @@ async def api_portability_export(request: web.Request) -> web.Response:
         resources=f"size={len(zip_bytes)}",
     )
 
-    return web.Response(
-        body=zip_bytes,
-        content_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(zip_bytes)),
-        },
-    )
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Length": str(len(zip_bytes)),
+    }
+    # The body is the archive, so the warning rides a header: the agent templates
+    # the crews name, none of which the bundle carries. JSON with ASCII escapes, so
+    # a hand-edited name cannot break the header line.
+    # Bounded upstream (count and length), so the header stays small; the left-out
+    # count rides along as a trailing "+N".
+    unbundled, more = await asyncio.to_thread(unbundled_agent_templates)
+    if unbundled:
+        headers[UNBUNDLED_TEMPLATES_HEADER] = json.dumps(unbundled + ([f"+{more}"] if more else []))
+    return web.Response(body=zip_bytes, content_type="application/zip", headers=headers)
 
 
 async def api_portability_import(request: web.Request) -> web.Response:

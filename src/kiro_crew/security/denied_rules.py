@@ -1734,20 +1734,25 @@ _SELF_PROTECTION_FLOOR_NOTES: dict[str, str] = {
     ),
     "sandbox-escape-ssh-self": (
         "Matched structurally on the command's argv, not by the pattern text above: "
-        "the ssh/scp/sftp/rsync target resolves to THIS machine (localhost, a loopback "
-        "address, or this host's own name), which would re-enter the host outside the "
-        "agent sandbox. If this is the first command naming a DOTTED hostname in this "
-        "gateway process, this refusal means DNS classification is PENDING, not that "
-        "the host is blocked: retry this exact command — it succeeds as soon as the "
-        "off-loop check rules out a loopback alias. A hostname whose lookup keeps "
-        "FAILING stays refused on every retry (a failed lookup is never trusted as an "
-        "allow): use a name DNS can resolve, or the host's IP address, instead of an "
-        "ssh_config-only alias. The port is part of the target, so a FORWARDED port on "
-        "a loopback address (a container or VM behind `ssh -p 2222 localhost`) is "
-        "denied like the host itself — sshd on this machine could listen on that port "
-        "too, and a text check cannot tell the two apart. Operator recourse for "
-        "container/VM workflows is the per-rule toggle in Settings until a port-scoped "
-        "exemption ships."
+        "the ssh/scp/sftp/rsync target is THIS machine or is not classified yet; reaching "
+        "this machine would re-enter the host outside the agent sandbox. (1) PENDING, "
+        "retry: the first command naming a new DOTTED hostname in this gateway process is "
+        "refused while a background DNS check runs, and on Linux a non-loopback IP address "
+        "is refused until this machine's address list loads. Wait a few seconds and retry "
+        "this exact command. If it is still refused, wait a minute, retry, and retry again "
+        "a few seconds later: a retry after that wait can start a new check and be refused "
+        "while it runs. The command runs once the target is classified as remote. (2) Still "
+        "refused after those retries: a name that "
+        "did not resolve (a failed lookup is never trusted as an allow), so use a name DNS "
+        "can resolve or the host's IP address instead of an ssh_config-only alias; an IP "
+        "address while this machine's address list cannot be read, so use a resolvable "
+        "name; or the target is this machine (localhost, a loopback address or alias, or "
+        "one of this host's own names or addresses), which is never allowed. (3) FORWARDED "
+        "port: the "
+        "port is part of the target, so a forwarded port on a loopback address (a container "
+        "or VM behind `ssh -p 2222 localhost`) is denied like the host, since sshd here "
+        "could listen on that port too. Operator recourse for container/VM workflows is "
+        "the per-rule toggle in Settings until a port-scoped exemption ships."
     ),
 }
 
@@ -2203,6 +2208,69 @@ _DENY_EXCEPTIONS: dict[str, list[str]] = {
     "rm -rf /.*": list(_INERT_SEARCH_GLOBS),
     "rm -rf ~.*": list(_INERT_SEARCH_GLOBS),
 }
+
+
+# ── Permission-verb rules that an INERT MENTION may narrow (argv-structural) ──
+#
+# The rules below are the ``chmod``/``chown`` rows -- most naming a system
+# path, one naming the world-writable mode.  They are authored as
+# ``<verb>.*<target>.*`` and evaluated with ``re.search`` over
+# the WHOLE command text, which cannot tell a verb in PROGRAM position from the
+# same word handed to a search tool as a pattern.  So an ordinary audit of these
+# very rules is refused:
+#
+#     git show origin/main:src/x.py | grep -nE 'chmod|chown|/etc/' | head -50
+#     grep -rnE 'os\.chown|/etc/cron' src/ 2>/dev/null | head -60
+#     grep -n 'chmod 777' src/kiro_crew/security/denied_rules.py
+#
+# Neither changes a permission.  Denying them prevents nothing (the same search
+# completes by spelling the verb some other way) and surfaces to the agent as
+# ``User denied tool execution``, indistinguishable from a human cancelling.
+#
+# ``_DENY_EXCEPTIONS`` cannot reach these.  It is a TEXT glob gated by
+# :func:`_exception_eligible`, which requires the view to hold no shell-active
+# character at all -- and both commands above carry ``|`` or ``>``.  Widening
+# that glob table is the wrong instrument twice over: a glob cannot express
+# "this word sits at an argument position", and relaxing
+# ``_exception_eligible`` would relax it for the ``rm`` carve-out too.
+#
+# The narrowing therefore lives at the ARGV layer
+# (:func:`~.perm_verb_mention._perm_verb_mention_only`) and is consulted ONLY
+# for the patterns named here, so no other rule's behaviour can change.
+#
+# Derived, never hand-listed: the catalog is the single source of truth for
+# which rows exist, and a hand-maintained copy of those regex literals would
+# silently stop covering a row that is renamed or added.  The selector is
+# "``local-destructive`` row whose pattern BEGINS with a permission verb".
+#
+# It is deliberately blind to what the row matches AFTER the verb.  An earlier
+# revision of this selector required a rooted path, which excluded the mode row
+# and left an ordinary search for that very rule denied.  The mode row's own
+# pattern is also under revision to admit flag spellings, so a selector keyed on
+# the pattern's TAIL would drop the row on that rebase with no test noticing.
+# The verb anchor is the one part a row cannot change and still be the same rule.
+_PERM_VERB_RULE_RE = re.compile(r"^(ch(?:mod|own|grp))\b")
+
+_PERM_VERB_MENTION_RULES: tuple[DeniedCommandRule, ...] = tuple(
+    rule
+    for rule in BUILTIN_DENIED_RULES
+    if rule.category == "local-destructive" and _PERM_VERB_RULE_RE.match(rule.pattern)
+)
+
+#: Patterns whose deny an inert mention may narrow.  Membership is checked by
+#: ``is_denied`` before the argv predicate is consulted at all.
+_PERM_VERB_MENTION_PATTERNS: frozenset[str] = frozenset(
+    rule.pattern for rule in _PERM_VERB_MENTION_RULES
+)
+
+#: The verbs those rules are anchored on, taken from the same match.  The argv
+#: predicate looks for exactly these words, so a catalog row for a new verb
+#: brings its own vocabulary with it.
+_PERM_VERB_MENTION_VERBS: frozenset[str] = frozenset(
+    match.group(1)
+    for match in (_PERM_VERB_RULE_RE.match(rule.pattern) for rule in _PERM_VERB_MENTION_RULES)
+    if match is not None
+)
 
 
 # ── ReDoS mitigation for the regex deny tier ──

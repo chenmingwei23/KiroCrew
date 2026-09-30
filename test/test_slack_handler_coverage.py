@@ -694,6 +694,38 @@ class TestKeywordCommands:
         saver.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_spawn_keyword_says_queued_for_a_deferred_row(
+        self, slack, sessions, owner, monkeypatch
+    ):
+        """The gate parked the row (memory floor): the channel reply relays the
+        gate's reason instead of announcing a start that did not happen."""
+        monkeypatch.setattr(h, "save_conversation_turn_off_loop", AsyncMock())
+        mgr = MagicMock(max_concurrent=4)
+        mgr.spawn.return_value = MagicMock(
+            id="a1",
+            queued=True,
+            queued_reason="low_memory",
+            queued_reason_detail="low memory: 3.2 GB available, need 4 GB",
+        )
+        handled = await h.maybe_handle_keyword_command(
+            "spawn audit the docs",
+            slack,
+            sessions,
+            "C1",
+            "t1",
+            "msg1",
+            "t1",
+            "U1",
+            MagicMock(),
+            subagent_manager=mgr,
+        )
+        assert handled is True
+        text = _texts(slack)
+        assert "Queued subagent" in text
+        assert "low memory: 3.2 GB available, need 4 GB" in text
+        assert "Spawned subagent" not in text
+
+    @pytest.mark.asyncio
     async def test_spawn_keyword_skips_log_when_incognito(
         self, slack, sessions, owner, monkeypatch
     ):
@@ -1266,14 +1298,6 @@ class TestSharedPrivacyDelegation:
 
 
 class TestPrivacyModifiers:
-    def test_token_strippers(self):
-        assert h._strip_temporary_token("hi there") == ("hi there", False)
-        assert h._strip_temporary_token("!temporary  do  it") == ("do it", True)
-        assert h._strip_incognito_token("hi") == ("hi", False)
-        assert h._strip_incognito_token("!INCOGNITO now") == ("now", True)
-        # Embedded in a larger token — must not match.
-        assert h._strip_incognito_token("x!incognito")[1] is False
-
     @pytest.mark.asyncio
     async def test_temporary_only_returns_early(self, slack, sessions, owner):
         text, cmd, only = await h.maybe_apply_privacy_modifiers(
@@ -1318,13 +1342,6 @@ class TestPrivacyModifiers:
         assert not slack.actions
 
     @pytest.mark.asyncio
-    async def test_repeat_application_is_idempotent(self, slack, sessions, owner):
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        posts = len(slack.actions)
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        assert len(slack.actions) == posts
-
-    @pytest.mark.asyncio
     async def test_flags_are_persisted_on_the_session_map(
         self, slack, sessions, owner, tmp_path, monkeypatch
     ):
@@ -1333,8 +1350,12 @@ class TestPrivacyModifiers:
         from kiro_crew.session_map import SessionMap
 
         sessions._session_map = SessionMap()
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        await h._apply_incognito_modifier("t1", "U1", "C1", slack, sessions, "t1")
+        await h._apply_privacy_mode(
+            privacy_mode.MODE_TEMPORARY, "t1", "U1", "C1", slack, sessions, "t1"
+        )
+        await h._apply_privacy_mode(
+            privacy_mode.MODE_INCOGNITO, "t1", "U1", "C1", slack, sessions, "t1"
+        )
         # Assert real durability rather than that set_flag was called: a FRESH
         # map must read both flags back off disk, which is the property the
         # restart path actually depends on. Loop-side mutations defer their
@@ -1344,18 +1365,54 @@ class TestPrivacyModifiers:
         assert fresh.get_flag("t1", "temporary") is True
         assert fresh.get_flag("t1", "incognito") is True
 
+    @pytest.mark.asyncio
+    async def test_a_refused_modifier_leaves_nothing_to_run(
+        self, slack, sessions, owner, tmp_path, monkeypatch
+    ):
+        """The map is at its private-conversation cap: ``!incognito summarize``
+        is refused fail-closed. The user is told the message was NOT processed,
+        one SEL denial is written, no flag or mark lands, and the shared applier
+        answers ``only_modifier=True`` -- the contract both Slack callers already
+        honour by returning without a turn -- so the message is never run with
+        the mode dropped. Mutation: drop the gate in ``SessionMap.set_flag`` --
+        the flag is written, ``only_modifier`` is False and the turn would run."""
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+        import kiro_crew.session_map as session_map_mod
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr(session_map_mod, "PRIVACY_ROW_CAP", 1)
+        sessions._session_map = SessionMap()
+        sessions._session_map.set_flag("slack:other-thread", "incognito", True)
+        events: list[dict] = []
+        fake = MagicMock()
+        fake.log_api_access = lambda **kw: events.append(kw)
+        monkeypatch.setattr(privacy_mode, "sel", lambda: fake)
+
+        text, cmd, only = await h.maybe_apply_privacy_modifiers(
+            "!incognito summarize", "!incognito summarize", "t1", "U1", "C1", slack, sessions, "t1"
+        )
+        assert only is True, "a refused modifier must leave nothing to run"
+        assert h.is_thread_incognito("t1") is False
+        assert sessions._session_map.get_flag("t1", "incognito") is False
+        sessions.set_slack_link.assert_not_called()
+        posted = _texts(slack)
+        assert "NOT processed" in posted and "Incognito mode ON" not in posted, posted
+        assert [e["outcome"] for e in events] == ["denied"]
+        assert events[0]["resources"] == "private_session_refused:limit:C1:t1"
+
     def test_hydrate_conv_flags_without_session_map(self, sessions):
         h._hydrate_conv_flags(sessions, "t1")
         assert not h.is_thread_temporary("t1")
 
-    def test_conv_state_map_rejects_auto_attribute_stub(self, sessions):
+    def test_hydrate_ignores_an_auto_attribute_stub(self, sessions):
         """An auto-attribute stub must NOT be mistaken for a real SessionMap.
 
         ``MagicMock().get_flag(...)`` returns a truthy mock, so accepting one
         here would mark every session both temporary and incognito.
         """
         sessions._session_map = MagicMock()
-        assert h._conv_state_map(sessions) is None
         h._hydrate_conv_flags(sessions, "t1")
         assert not h.is_thread_temporary("t1")
         assert not h.is_thread_incognito("t1")
@@ -1796,6 +1853,7 @@ class TestRequestApproval:
         # TestApprovalTimeoutInbandNotice (a bare MagicMock auto-attribute would
         # be truthy and route through the steer-failure path instead).
         provider.supports_steer = False
+        provider.supports_refusal_steer = False
         provider.reject_tool = AsyncMock()
         outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
         assert outcome == h._OUTCOME_REJECTED
@@ -1811,6 +1869,7 @@ class TestRequestApproval:
         )
         provider = MagicMock()
         provider.supports_steer = False
+        provider.supports_refusal_steer = False
         provider.reject_tool = AsyncMock()
         await h._request_approval(slack_client, provider, "C1", "t1", _perm_event())
         assert "🚫 Rejected" in _texts(slack_client)
@@ -1821,6 +1880,8 @@ class _SteerRecordingProvider:
 
     def __init__(self, *, supports_steer: bool = True, steer_exc: BaseException | None = None):
         self.supports_steer = supports_steer
+        # The deny paths read the refusal answer; a steer-capable double has both.
+        self.supports_refusal_steer = supports_steer
         self.calls: list[tuple[str, str]] = []
         self._steer_exc = steer_exc
         self.pending_during_steer: dict[str, object] = {}

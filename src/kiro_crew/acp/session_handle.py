@@ -26,7 +26,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from kiro_crew import acp_tool_gate, model_registry
+from kiro_crew import acp_tool_gate, model_registry, permission_floor
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
@@ -63,8 +63,11 @@ from kiro_crew.acp.client import (
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _jsonrpc_error_code,
+    _loggable_request_id,
     _push_model_via_effort_split,
     _raise_acp_error,
+    advertised_model_ids,
+    catalog_row_would_drop,
     compaction_failure_detail,
     compaction_failure_is_transient,
     format_command_result,
@@ -105,6 +108,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -147,6 +151,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
+    TERMINAL_TOOL_STATUSES,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_CURRENT_MODE,
@@ -159,6 +164,7 @@ from kiro_crew.acp.types import (
     effort_config_option_id,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
+from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F401 - raised here
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
@@ -188,6 +194,33 @@ _KAS_HOOKS_METHODS = frozenset(
 )
 
 # ── Constants ──
+
+# Read-path entitlement revalidation (see
+# ``AcpSessionHandle.maybe_refresh_available_models``). These bound how eagerly
+# the dashboard picker re-asks the backend what the account can run; they are a
+# scheduling policy, never an entitlement decision.
+#
+# A session-init snapshot captured within this many seconds of the runtime's
+# spawn fell inside the startup window where the degraded (free-tier default)
+# answer is resolved, so it is treated as suspect and revalidated.
+_READ_PATH_SPAWN_RACE_SECS = 90.0
+# A session probes on the read path at most once per this interval, so a hot
+# dashboard poll does not re-probe on every runtime-probe TTL expiry forever.
+# The interval binds a probe-CONFIRMED snapshot and every non-auto-only
+# snapshot; an UNCONFIRMED auto-only snapshot may re-probe (it always earns a
+# probe), bounded by the runtime's own single-flight probe TTL — which now
+# covers the failure/empty path too, so even a failing probe is re-asked at
+# most once per that TTL, not on every read.
+_READ_PATH_REPROBE_MIN_INTERVAL_SECS = 300.0
+# The picker read path awaits the probe at most this long, then raises
+# EntitlementRevalidating so the endpoint returns its degraded (503) response
+# and the frontend keeps its last-good list and polls again; the shielded probe
+# keeps running and the next read serves its landed result. Kept under the
+# remote-hub cold-path budget (DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+# instances/constants.py: 5 + 10 + 3 < 20) so proxied /api/models never times
+# out mid-revalidation.
+_READ_PATH_PROBE_DEADLINE_SECS = 3.0
+
 
 # The stopReason values the pre-turn drain may NAME in its warning: the closed
 # protocol values (``types.STOP_REASON_*``) only. A discarded terminal whose
@@ -474,6 +507,39 @@ def _watchdog_evidence_class(evidence: str) -> str:
 # AcpClient's _CANCEL_GRACE_SECS floor without the process-kill (which is
 # impossible on a multiplexed runtime).
 _CANCEL_GRACE_SECS = 10.0
+# codex-acp's ``_session/steering`` request (``ACP_BACKENDS_STEERING_REQUEST``) and
+# the two outcomes that decide delivery.
+METHOD_SESSION_STEERING = "_session/steering"
+STEERING_INJECTED = "injected"
+STEERING_STARTED_NEW_TURN = "startedNewTurn"
+# Bounds on what a session holds for codex steers it has sent and not settled: at
+# most this many at once, each at most this long. A steer past either bound takes
+# the caller's queue path instead, which has its own limits.
+_MAX_STEERING_ANSWERS = 16
+# How long a new prompt waits for codex steering answers still owed from the
+# previous turn, so an adapter-owned turn one of them started is cancelled before
+# our prompt goes out (``_settle_abandoned_steering``).
+_STEERING_SETTLE_SECS = 5.0
+# How long a codex steer waits for the adapter's answer. The dashboard composer
+# awaits the steer inside its send request, which the browser aborts after 10s
+# (``SEND_ABORT_MS``), so an answer slower than this sends the steer down the
+# caller's queue path instead of leaving the request to time out.
+_STEERING_ANSWER_WAIT_SECS = 8.0
+_MAX_STEERING_TEXT_CHARS = 64_000
+
+
+def _steering_outcome(result: object) -> str:
+    """The ``outcome`` of a ``_session/steering`` answer; "" for any other shape.
+
+    The answer is adapter-authored JSON: a result that is not an object is read as
+    no outcome (undelivered) rather than trusted to have ``.get``.
+    """
+    if not isinstance(result, dict):
+        return ""
+    outcome = result.get("outcome")
+    return outcome if isinstance(outcome, str) else ""
+
+
 # Commands that must stay on the PROMPT transport even where native
 # commands/execute is available: kiro-cli 2.14.0 exits rc=0 WITHOUT a response
 # on commands/execute for these (live-probe recorded in compact()'s docstring;
@@ -742,6 +808,27 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     @property
+    def spawn_monotonic(self) -> float | None:
+        """Monotonic time the process was spawned, or ``None`` before spawn.
+
+        The read-path entitlement revalidation uses it to tell a snapshot
+        captured inside the startup race window (when the degraded free-tier
+        answer is resolved) from one captured well after the process settled.
+        """
+        ...
+
+    @property
+    def entitlement_probe_result_at(self) -> float:
+        """Monotonic time the stored probe answer arrived (0.0 before any).
+
+        Whether :meth:`probe_advertised_models` served a fresh answer or replayed
+        the stored one, the answer is dated by this clock; the handle dates the
+        snapshot it stores from here so its own freshness floor never rises above
+        the data it holds.
+        """
+        ...
+
+    @property
     def acp_backend(self) -> str:
         """Which ACP backend the process speaks.
 
@@ -772,12 +859,28 @@ class AcpRuntimeProtocol(Protocol):
 
     async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
 
-    async def probe_advertised_models(self) -> list[dict[str, str]]:
+    async def probe_advertised_models(
+        self, *, force: bool = False, not_before: float = 0.0
+    ) -> list[dict[str, str]]:
         """Fresh advertised-model snapshot from a throwaway ``session/new``
-        (``[]`` = probe failed / advertised nothing — never evidence)."""
+        (``[]`` = probe failed / advertised nothing — never evidence).
+
+        ``force=True`` skips the failed/empty attempt-clock replay (a user action
+        earns a fresh probe); a recent non-empty success is still replayed.
+        ``not_before`` is the monotonic capture time of the caller's snapshot: a
+        replayed result is served only if it is at least as new as that."""
         ...
 
     async def send_notification(self, method: str, params: dict[str, Any]) -> None: ...
+
+    async def send_request_for_answer(
+        self,
+        method: str,
+        params: dict[str, Any],
+        on_registered: "Callable[[asyncio.Future[dict[str, Any]]], None] | None" = None,
+    ) -> "asyncio.Future[dict[str, Any]]": ...
+
+    def forget_request(self, future: "asyncio.Future[dict[str, Any]]") -> None: ...
 
     async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None: ...
 
@@ -838,6 +941,39 @@ class AcpSessionHandle:
         # Strong references to in-flight hook executions: the loop holds only a
         # weak one, and a collected task would leave its request unanswered.
         self._hook_tasks: set[asyncio.Task[None]] = set()
+        # Same reason, for the ``session/cancel`` a late ``startedNewTurn`` steering
+        # answer sends from a done-callback (see ``_steer_via_steering_request``).
+        self._steering_cancel_tasks: set[asyncio.Future[None]] = set()
+        # codex ``_session/steering`` answers awaiting settlement by the turn they
+        # were aimed at: ``(answer, prompt generation, echo text)``.
+        self._steering_answers: list[tuple[asyncio.Future[dict[str, Any]], int, str]] = []
+        # Per answer in ``_steering_answers``: resolved True when the dispatch loop
+        # settles it inside its turn, False when it is dropped unsettled. The steer
+        # call returns this, so True always means "settled before the terminal".
+        self._steering_settled: dict[asyncio.Future[dict[str, Any]], asyncio.Future[bool]] = {}
+        # Answers still awaited after their turn ended, kept only so a late
+        # ``startedNewTurn`` can be cancelled. Counted against the same bound as
+        # ``_steering_answers`` and forgotten on ``destroy``, so the runtime's
+        # registration of an answer that never comes is bounded too.
+        self._abandoned_steering: list[asyncio.Future[dict[str, Any]]] = []
+        # Set by a denied approval on a codex turn: nothing injected after it can
+        # survive the cancel, so no later answer in the turn settles as consumed.
+        self._turn_steering_denied: bool = False
+        # Wrapped text of this turn's codex steers proven read before its
+        # terminal; reported consumed only if the turn ends cleanly
+        # (``_release_proven_steers``).
+        self._steers_proven: list[str] = []
+        # Wrapped text of this turn's codex steers whose ``steer()`` call has
+        # already returned True. Only these are released as consumed: the
+        # caller persists the steer's row synchronously on that return, so a
+        # consumption report can never clear a pending entry whose row does
+        # not exist yet. Matched by identity (``_release_proven_steers``).
+        self._steers_accepted: list[str] = []
+        # True once this turn's prompt has been written to the adapter. A codex
+        # steer before that point reaches an adapter with no turn of ours and is
+        # answered ``startedNewTurn``, whose untargeted cancel could then land on
+        # the prompt about to go out, so no steer is sent until it is set.
+        self._prompt_written: bool = False
         self.native_context_documents: dict[str, str] = {}
         self._queue = queue
         self._runtime = runtime
@@ -873,9 +1009,11 @@ class AcpSessionHandle:
         # submitting a second job, so a wedged walk cannot stack blocked workers
         # in the shared subprocess_executor().
         self._consult_future: asyncio.Future[tuple[str, str]] | None = None
-        # Snapshot of the most recent EVENT_TOOL_CALL (title/redacted input/
-        # dispatch time/shell flag) — the oracle's attribution key. Cleared on
-        # EVENT_TOOL_RESULT alongside _tool_dispatched.
+        # Parallel calls can finish in either order; retain each attribution
+        # until its terminal result so the oracle never inspects a finished call.
+        self._active_tool_calls: dict[
+            str, tuple[ToolCallState, InteractiveClassification | None]
+        ] = {}
         self._inflight_tool: ToolCallState | None = None
         # Pre-dispatch interactive classification of the in-flight SHELL tool
         # (``classify_interactive_command``); ``None`` when no shell tool is in
@@ -928,6 +1066,10 @@ class AcpSessionHandle:
         self._cancel_grace_secs = _CANCEL_GRACE_SECS
         self._turn_done = asyncio.Event()
         self._turn_done.set()
+        # Count of prompts this handle has started. A codex steering answer reads
+        # it to tell "the turn the steer was aimed at" from a newer one of ours
+        # (see ``_steer_via_steering_request``).
+        self._prompt_starts = 0
         self._stale_eligible = False
         # Latched on this session's FIRST text chunk or tool_call and never
         # cleared: the registration-throttle death classification is refused
@@ -1052,10 +1194,24 @@ class AcpSessionHandle:
         # ``_deny_spec_disabled_tool`` a single falsy read on those sessions.
         # Mirrors ``AcpClient._spec_denied_tools``.
         self.spec_denied_tools: frozenset[tuple[str, str]] = frozenset()
+        # The capabilities the agent batch this session registered auto-approves
+        # (see ``kas_agents.projected_auto_approved``); None when no batch was sent.
+        self.kas_auto_approved: frozenset[str] | None = None
+        # The agent this session runs: the one the batch was registered for, then
+        # whichever a KAS mode switch moves it to ("" with no batch). A turn that
+        # names no agent runs this one, so its spec hooks are this agent's.
+        self.kas_projected_agent: str = ""
+        # The agent batch this session registered, so a mode switch can answer
+        # what the agent it moves to auto-approves.
+        self.kas_registered_agents: list[dict[str, Any]] = []
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
         self._permission_options: dict[str | int, dict[str, str]] = {}
+        # Request id -> the permission event built for it, so approve_tool can
+        # put the request through the security floor (``permission_floor``)
+        # whichever consumer answers it.
+        self._permission_gate_events: dict[str | int, AcpEvent] = {}
         # req_ids of in-flight _wait_for_response calls (send_command /
         # set_config_option / compact). The prompt dispatch loop shares this
         # session's queue, so when it dequeues one of these responses it uses
@@ -1073,6 +1229,29 @@ class AcpSessionHandle:
         self._resolved_model_id: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
+        # Read-path revalidation bookkeeping (see maybe_refresh_available_models).
+        # The session-init snapshot is one unconfirmed answer captured at one
+        # instant, and the read path (the dashboard picker filter) has no
+        # explicit-pick refusal to trigger the refresh-before-refuse path — so it
+        # must decide for itself whether a snapshot that would NARROW the catalog
+        # is trustworthy. These three fields are the staleness signals it reads;
+        # each is a monotonic timestamp or a confirmation flag, never entitlement
+        # evidence (the keep/drop verdict stays with ``catalog_row_would_drop``).
+        # 0.0 = never captured (no session/new stored a list yet).
+        self._available_models_captured_at: float = 0.0
+        # True once a probe (refresh_available_models) has confirmed the snapshot
+        # against the live backend — the strongest "trust it" signal.
+        self._available_models_probe_confirmed: bool = False
+        # Monotonic time the read-path heuristic last kicked a probe for THIS
+        # session, so a hot dashboard poll cannot re-probe every TTL expiry
+        # forever once a legitimately-narrow snapshot has been confirmed.
+        self._available_models_read_probe_at: float = 0.0
+        # Single in-flight read-path refresh task per handle. The read path
+        # shields it, so a deadline miss raises EntitlementRevalidating (the
+        # endpoint answers 503 and the client re-polls) WITHOUT cancelling the
+        # probe — the task keeps running to completion so its throwaway session
+        # is cleaned up and the next read serves its result.
+        self._read_refresh_task: asyncio.Task[list[dict[str, str]]] | None = None
         # Last KAS mode id seen on a current_mode_update, so a re-assert of the
         # already-current mode does not surface a spurious agent-switch echo
         # (kiro-cli only emits on a real _kiro.dev/agent/switched). None = unseen.
@@ -1301,10 +1480,18 @@ class AcpSessionHandle:
         # turn state and losing events. Each caller should use its own handle.
         if not self._turn_done.is_set():
             raise AcpRuntimeError("A turn is already active on this session handle")
+        # An abandoned answer leaves ``_abandoned_steering`` in its own
+        # done-callback, before the cancel it scheduled is written, so a scheduled
+        # cancel alone must still hold the prompt back until it has gone out.
+        if getattr(self, "_abandoned_steering", None) or getattr(
+            self, "_steering_cancel_tasks", None
+        ):
+            await self._settle_abandoned_steering()
 
         self._cancelled = False
         self._cancel_ts = 0.0
         self._turn_done.clear()
+        self._prompt_starts += 1
         # Reset the stored stop_reason: only a real `complete` response sets it,
         # and the synthetic-terminal paths (cancel-unacked / stale / tool-stall /
         # timeout) call _turn_done.set() WITHOUT updating it. Without this reset,
@@ -1320,6 +1507,7 @@ class AcpSessionHandle:
         # A new turn starts with no infrastructure verdict carried over.
         self.last_infra_error = None
         self._tool_dispatched = False
+        self._active_tool_calls.clear()
         self._inflight_tool = None
         self._inflight_interactive = None
         self._inflight_tool_call_id = ""
@@ -1334,6 +1522,10 @@ class AcpSessionHandle:
         self._parked_total = 0.0
         self._parked_since = None
         self._awaiting_permission = False
+        self._turn_steering_denied = False
+        self._steers_proven = []
+        self._steers_accepted = []
+        self._prompt_written = False
         self._retire_liveness_state()
         self._working_logged_ts = _WORKING_NEVER_LOGGED
         self._tool_call_inputs.clear()
@@ -1345,6 +1537,7 @@ class AcpSessionHandle:
         self._tool_call_tool_name.clear()
         self._native_child_tool_call_ids.clear()
         self._permission_options.clear()
+        self._permission_gate_events.clear()
         # Per-turn reset (parity with kiro-cli's authoritative full subagent_list
         # each turn): otherwise a completed sub-agent from a prior turn stays in
         # the roster and is re-emitted in the next turn's EVENT_SUBAGENT_LIST,
@@ -1455,8 +1648,20 @@ class AcpSessionHandle:
                 for _owed in _stale_owed:
                     self._queue.put_nowait(_owed)
                 _stale_owed.clear()
+                # Audit FIRST (off-loop, so it never delays the answer): the
+                # reject below is a bounded wire write that can fail, and a
+                # permission decision must leave its SEL record either way.
+                self._audit_handle_reject(
+                    stale.id,
+                    str(_stale_title),
+                    "stranded_request_pre_turn_drain",
+                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
+                )
                 try:
                     await self.reject_tool(stale.id)
+                    # A stale request belongs to no turn of ours, so its reject
+                    # says nothing about the steers of the turn starting now.
+                    self._turn_steering_denied = False
                 except asyncio.CancelledError:
                     # The prompt was cancelled mid-drain: put the request back
                     # for the NEXT drain instead of dropping it un-answered
@@ -1483,7 +1688,7 @@ class AcpSessionHandle:
                     "rejected permission request id=%s stranded in the "
                     "pre-turn drain (abandoned turn or between-turns child "
                     "frame) — answering so the backend cannot hang",
-                    stale.id,
+                    _loggable_request_id(stale.id),
                 )
                 # Crew-card notice ONLY for a child-origin strand: the card
                 # keys on sub_session_id, so the parent's own session id (an
@@ -1492,12 +1697,6 @@ class AcpSessionHandle:
                 # covered by the WARNING + SEL record.
                 if _stale_sid and _stale_sid != self._session_id:
                     self._pending_reject_notices.append((_stale_sid, str(_stale_title)))
-                self._audit_handle_reject(
-                    stale.id,
-                    str(_stale_title),
-                    "stranded_request_pre_turn_drain",
-                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
-                )
             else:
                 # Everything that is not a permission request is DISCARDED, which
                 # is correct (it belongs to a turn nobody is reading any more) but
@@ -1598,6 +1797,7 @@ class AcpSessionHandle:
             if _mark is not None:
                 _mark(self._session_id, True)
             req_id = await self._runtime.send_request(_method, _params)
+            self._prompt_written = True
         except BaseException:
             self._turn_done.set()
             _mark = getattr(self._runtime, "mark_turn_active", None)
@@ -1793,7 +1993,7 @@ class AcpSessionHandle:
 
     # ── Tool Approval ──
 
-    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> None:
+    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> bool:
         """Approve a pending permission request.
 
         ``option_id`` overrides the auto-resolved id when provided. Otherwise the
@@ -1803,7 +2003,30 @@ class AcpSessionHandle:
         literals when nothing was recorded. This keeps kiro-cli
         ("allow_once"/"allow_always") and claude-agent-acp ("allow"/"allow_always")
         working without the caller knowing the backend.
+
+        Every approval first passes the security floor
+        (:mod:`kiro_crew.permission_floor`): a request the deny floor or the
+        sensitive-path checks refuse is REJECTED here, whichever consumer asked
+        to approve it and whether or not that consumer consulted the gate.
         """
+        gate_event = self._permission_gate_events.pop(request_id, None)
+        # No recorded event means no request this transport built, so there is
+        # nothing the floor could judge: refuse rather than approve unjudged.
+        if gate_event is None:
+            reason: str | None = permission_floor.REASON_NO_EVENT
+        else:
+            reason = await asyncio.to_thread(permission_floor.refusal_for, gate_event)
+        if reason is not None:
+            logger.warning(
+                "approve_tool: security floor rejected req=%s: %s",
+                _loggable_request_id(request_id),
+                permission_floor.loggable_reason(reason),
+            )
+            await asyncio.to_thread(
+                permission_floor.audit_refusal, gate_event, reason, request_id=request_id
+            )
+            await self.reject_tool(request_id)
+            return False
         resolved_id = option_id
         recorded = self._permission_options.pop(request_id, None)
         # Answered — the turn is no longer waiting on a human. Also closes the
@@ -1823,6 +2046,7 @@ class AcpSessionHandle:
             request_id,
             {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
         )
+        return True
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending permission request.
@@ -1836,8 +2060,10 @@ class AcpSessionHandle:
         later tool call in it without prompting.
         """
         recorded = self._permission_options.pop(request_id, None)
+        self._permission_gate_events.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
         self._end_human_wait()
+        self._note_steering_denial()
         reject_id = recorded.get("reject") if recorded else None
         if reject_id:
             await self._runtime.send_response(
@@ -1852,7 +2078,7 @@ class AcpSessionHandle:
                 "reject_tool: no deny option advertised for req=%s; answering "
                 "'cancelled', which the backend may treat as cancelling the "
                 "remainder of the turn's tool calls",
-                request_id,
+                _loggable_request_id(request_id),
             )
             await self._runtime.send_response(
                 request_id,
@@ -1880,8 +2106,8 @@ class AcpSessionHandle:
         would answer it without a human, and a human offered the choice is being
         asked to re-decide something the spec already settled.
 
-        The reject is sent before the audit, and the audit runs off the loop, so an
-        audit failure cannot undo or delay the refusal.
+        The audit is recorded first and runs off the loop, so it can neither delay
+        the refusal nor be lost when the (bounded) reject write fails.
         """
         if not self.spec_denied_tools:
             return False
@@ -1897,13 +2123,13 @@ class AcpSessionHandle:
             server,
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             f"mcp__{server}__{tool}",
             "spec_disabled_tool",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _tripwire_spec_disabled_tool(self, result: AcpEvent, msg: JsonRpcMessage) -> None:
@@ -1989,13 +2215,13 @@ class AcpSessionHandle:
             "checked against that, while a consumer may auto-approve it [session=%s]",
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             "mcp__unidentified",
             "spec_disabled_tool_unidentified_call",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _audit_handle_reject(
@@ -2018,13 +2244,16 @@ class AcpSessionHandle:
         that never reach a consumer, so no consumer-side audit fires — every
         permission decision must still leave a SEL record (repo convention;
         the runtime's unregistered-session auto-reject does the same).
-        Off-loop (``asyncio.to_thread``) and AFTER the reject was sent: sel()
-        may do blocking filesystem work on first use, and an audit failure
-        must not undo or delay the already-made decision. Title is
-        backend/LLM-authored: bounded then redacted before it is stored.
+        Off-loop (``asyncio.to_thread``) and BEFORE the reject goes on the
+        wire: sel() may do blocking filesystem work on first use, so the audit
+        never delays the answer, and the reject is a bounded write that can
+        fail -- the decision must leave its SEL record whether or not the wire
+        accepted it (the same audit-first ordering chat_runner's deny paths
+        keep). Title is backend/LLM-authored: bounded then redacted before it
+        is stored.
         """
         safe_title = redact_text(str(title)[:4096])[:120] if title else "<unknown>"
-        rid = request_id if isinstance(request_id, (str, int)) else ""
+        rid = request_id if isinstance(request_id, (str, int, float)) else ""
         # Hang-resilience series: handle-owned denials (fail-close fidelity
         # gate, pre-turn drain). CHILD-origin only — the pre-turn drain also
         # answers abandoned PARENT-turn requests (sub_session_id empty), and
@@ -2186,7 +2415,7 @@ class AcpSessionHandle:
                         MODEL_CONFIG_ID,
                     )
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self._runtime.acp_backend):
                     raise
                 last_exc = exc
                 continue
@@ -2237,18 +2466,26 @@ class AcpSessionHandle:
         return ""
 
     async def steer(self, message: str) -> bool:
-        """Inject a mid-turn steer into the running turn via kiro-cli's
-        ``_session/steer`` ext-method. Fire-and-forget (mirrors AcpClient.steer).
+        """Inject a mid-turn steer into the running turn.
 
-        The reply streams back inside the SAME in-flight session/prompt; the
-        authoritative signal is the steering_consumed notification (surfaced as
-        EVENT_STEER_CONSUMED). We do not await the request response — the
-        reader resolves/pops it harmlessly. Returns False for an empty message
-        or no active session.
+        Two transports. kiro-cli takes its ``_session/steer`` ext-method
+        fire-and-forget (mirrors AcpClient.steer): the reply streams back inside
+        the SAME in-flight session/prompt, the steering_consumed notification is
+        the authoritative signal (surfaced as EVENT_STEER_CONSUMED), and the
+        request response is not awaited. A backend in
+        ``ACP_BACKENDS_STEERING_REQUEST`` (codex) is delivered by
+        :meth:`_steer_via_steering_request`, which awaits only the adapter's
+        answer: True means codex accepted the steer, not that the turn consumed
+        it. Consumption is reported separately, as EVENT_STEER_CONSUMED at the
+        turn's clean terminal, and a steer never reported consumed is queued by
+        the caller. Returns False for an empty message or no active session on
+        either transport.
         """
         text = (message or "").strip()
         if not text or not self._session_id:
             return False
+        if self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST:
+            return await self._steer_via_steering_request(text)
         wrapped = f"<user_message>\n{text}\n</user_message>"
         await self._runtime.send_request(
             "_session/steer",
@@ -2261,6 +2498,367 @@ class AcpSessionHandle:
         # per-transport wiring. See ``last_steer_monotonic``.
         self._last_steer_monotonic = time.monotonic()
         return True
+
+    async def _steer_via_steering_request(self, text: str) -> bool:
+        """Deliver a user steer over codex-acp's ``_session/steering`` request.
+
+        See ``ACP_BACKENDS_STEERING_REQUEST`` for what was measured. The adapter
+        sends no ``steering_consumed`` echo, so the request's own answer is the
+        only delivery evidence. It is awaited until it arrives, the turn it was
+        aimed at ends, or ``_STEERING_ANSWER_WAIT_SECS`` pass, whichever is first;
+        the bound exists because the dashboard composer awaits this call inside a
+        send request the browser aborts.
+
+        * ``injected`` -- True is returned, which means accepted, not consumed:
+          the caller keeps its pending entry for the text. The answer stays
+          registered with the turn it was aimed at, whose dispatch loop proves it
+          was read before the terminal (at a between-frames point with nothing
+          buffered, see :meth:`_take_injected_steers`) and reports it as
+          ``EVENT_STEER_CONSUMED`` only when that turn ends cleanly and this call
+          has already returned True (see :meth:`_release_proven_steers`). A turn that ends on a denied approval,
+          a cancel, a refusal or an error reports nothing, and the caller's
+          teardown queues the pending text, so a steer codex dropped with its
+          turn runs again instead of being lost. An ``injected`` answered after
+          its turn ended returns False.
+        * ``startedNewTurn`` -- no turn was running by the time the adapter looked,
+          so it began one that no ``session/prompt`` of ours owns. That turn is
+          cancelled and False is returned, which sends the caller down its queue
+          path: the text runs once, as the next turn Crew starts itself.
+        * ``failed``, an error answer, or an answer of any other shape -- False, and
+          the caller queues it.
+        * the turn ends before any answer -- False, and the caller queues it. A late
+          ``startedNewTurn`` is still cancelled.
+
+        This is at-least-once, not exactly-once. codex-acp guarantees no ordering
+        between the steering answer and the prompt's terminal, and ``injected`` is
+        an ack that the text entered the turn's input, not a consumption receipt.
+        When the terminal is read first, or is already buffered when the answer
+        is looked at, or the turn ends in a way that may have dropped the text,
+        the steer is not reported consumed and the caller queues it, so a steer
+        codex did act on in that window runs a second time -- visibly, as its
+        own turn. That is the requeue path's documented cost
+        (``_requeue_unconsumed_steers``), preferred to the silent loss the
+        opposite choice produces.
+
+        The ``is_turn_active`` and ``_prompt_written`` checks are what keep
+        ``startedNewTurn`` rare: a steer is only sent once a prompt of ours has been
+        written and is still in flight, so the adapter can only start a turn of its
+        own when ours ends inside the request's round trip, and never while our
+        prompt is still being built.
+
+        Nothing is sent while the turn is parked on an approval. codex answers that
+        request ``injected``, but its only reject option cancels the turn and drops
+        what was injected with it (see ``ACP_BACKENDS_STEER``), so a steer settled
+        there would be reported delivered and never run. Returning False sends it
+        down the queue path instead, and it runs as the next turn. The same goes
+        for a steer past ``_MAX_STEERING_TEXT_CHARS`` or while
+        ``_MAX_STEERING_ANSWERS`` are held (the cap counts unanswered, abandoned
+        and proven-but-unreported steers).
+        """
+        if not self.is_turn_active or not self._prompt_written or self._awaiting_permission:
+            return False
+        held = (
+            len(self._steering_answers) + len(self._abandoned_steering) + len(self._steers_proven)
+        )
+        if len(text) > _MAX_STEERING_TEXT_CHARS or held >= _MAX_STEERING_ANSWERS:
+            return False
+        session_id = self._session_id
+        aimed_at = self._prompt_starts
+        turn_done = self._turn_done
+        # Registered from inside the write, before its drain() can suspend: the
+        # reader may resolve the answer during that suspension, and the dispatch
+        # loop must already hold it when the turn's next frame arrives.
+        entry: list[tuple[asyncio.Future[dict[str, Any]], int, str]] = []
+
+        def _register(fut: "asyncio.Future[dict[str, Any]]") -> None:
+            entry.append((fut, aimed_at, f"<user_message>\n{text}\n</user_message>"))
+            self._steering_answers.append(entry[0])
+            self._steering_settled[fut] = asyncio.get_running_loop().create_future()
+
+        def _unregister() -> None:
+            # Every exit that does not return True revokes the steer, wherever the
+            # dispatch loop has put it: still registered, or already proven and
+            # waiting for the clean-terminal report. A proven entry left behind
+            # would be reported consumed to a caller that never saw True. Matched
+            # by identity, so an identical text sent twice keeps the other one.
+            if not entry:
+                return
+            if entry[0] in self._steering_answers:
+                self._steering_answers.remove(entry[0])
+            else:
+                for i, proven in enumerate(self._steers_proven):
+                    if proven is entry[0][2]:
+                        del self._steers_proven[i]
+                        break
+            self._steering_settled.pop(entry[0][0], None)
+
+        try:
+            answer = await self._runtime.send_request_for_answer(
+                METHOD_SESSION_STEERING,
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+                on_registered=_register,
+            )
+        except BaseException as exc:
+            # The request may already be registered (``_register`` runs before the
+            # write, and the write's ``drain()`` can suspend). Drop that registration
+            # on every exit, cancellation included, or its answer would later settle
+            # this steer as consumed while the caller, which never saw True, has
+            # already moved on: the text would run with no transcript row and no
+            # requeue. Unsettled, the caller's own bookkeeping queues it instead.
+            if entry:
+                self._runtime.forget_request(entry[0][0])
+            _unregister()
+            if not isinstance(exc, Exception):
+                raise
+            logger.debug("steering request not written for %s: %s", session_id, type(exc).__name__)
+            return False
+
+        def _cancel_unowned_turn() -> None:
+            # The turn the adapter started runs outside any prompt of ours, so
+            # nothing would read or bound it; the caller queues the text instead.
+            # ``session/cancel`` names no turn, so once a NEWER prompt of ours is
+            # running it would cancel that one instead -- the user's queued turn.
+            # ``_settle_abandoned_steering`` resolves these answers before the next
+            # prompt starts, so this branch is a backstop, not the normal path.
+            if self._prompt_starts != aimed_at and self.is_turn_active:
+                logger.warning(
+                    "steer on %s started an adapter-owned turn after our next prompt "
+                    "began; not cancelling, it would hit ours",
+                    session_id,
+                )
+                return
+            logger.info(
+                "steer on %s started an adapter-owned turn; cancelling it and queueing",
+                session_id,
+            )
+
+            async def _send_cancel() -> None:
+                # Best-effort: a dead adapter has no turn left to cancel, and the
+                # failure must not surface as an unhandled task exception.
+                try:
+                    await self._runtime.send_notification(METHOD_CANCEL, {"sessionId": session_id})
+                except Exception as exc:
+                    logger.warning(
+                        "cancel of adapter-owned turn on %s failed: %s",
+                        session_id,
+                        type(exc).__name__,
+                    )
+
+            task = asyncio.ensure_future(_send_cancel())
+            self._steering_cancel_tasks.add(task)
+            task.add_done_callback(self._steering_cancel_tasks.discard)
+
+        def _late_answer(fut: "asyncio.Future[dict[str, Any]]") -> None:
+            if fut.cancelled() or fut.exception() is not None:
+                return
+            outcome = _steering_outcome(fut.result())
+            if outcome == STEERING_STARTED_NEW_TURN:
+                _cancel_unowned_turn()
+            elif outcome == STEERING_INJECTED:
+                logger.warning("steering answer on %s: injected after its turn ended", session_id)
+
+        def _abandon() -> None:
+            # Stop tracking this answer for settlement, but keep it awaited within
+            # the bound so a late ``startedNewTurn`` is still cancelled and the
+            # runtime's registration of it stays counted until it resolves.
+            _unregister()
+            if answer.done():
+                # Already answered (a cancelled caller can unwind in the same loop
+                # iteration the answer resolved in): act on it now, so a
+                # ``startedNewTurn`` still gets its cancel.
+                _late_answer(answer)
+                return
+            self._abandoned_steering.append(answer)
+
+            def _release(fut: "asyncio.Future[dict[str, Any]]") -> None:
+                if fut in self._abandoned_steering:
+                    self._abandoned_steering.remove(fut)
+
+            answer.add_done_callback(_release)
+            answer.add_done_callback(_late_answer)
+
+        ended = asyncio.ensure_future(turn_done.wait())
+        try:
+            waiters: set[asyncio.Future[Any]] = {answer, ended}
+            await asyncio.wait(
+                waiters, timeout=_STEERING_ANSWER_WAIT_SECS, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            # A cancelled caller cannot settle this steer, but the runtime still
+            # owes its answer, so the answer moves to the abandoned set.
+            _abandon()
+            raise
+        finally:
+            ended.cancel()
+        if not answer.done():
+            # The turn ended first, or the answer outlasted the bound the caller's
+            # own request can wait: the caller queues the text.
+            _abandon()
+            return False
+        if answer.cancelled() or answer.exception() is not None:
+            # An error answer: an adapter build without the method answers -32601.
+            _unregister()
+            # The class only: the error text is the adapter's, and a log line is not
+            # the place to carry whatever it chose to put there.
+            logger.info(
+                "steering request on %s refused: %s",
+                session_id,
+                "cancelled" if answer.cancelled() else type(answer.exception()).__name__,
+            )
+            return False
+        outcome = _steering_outcome(answer.result())
+        if outcome == STEERING_STARTED_NEW_TURN:
+            _unregister()
+            _cancel_unowned_turn()
+            return False
+        if outcome != STEERING_INJECTED:
+            _unregister()
+            return False
+        if turn_done.is_set() or self._prompt_starts != aimed_at:
+            # Answered, but its turn is already over: nothing will report it
+            # consumed, so the caller queues the text.
+            _unregister()
+            return False
+        # ``injected``: accepted. The entry stays registered for this turn's
+        # dispatch loop, which reports it consumed only when the turn ends
+        # cleanly (see ``_release_proven_steers``); on a denial, a cancel or any
+        # other ending it reports nothing, and the caller's pending entry for the
+        # text is queued by the turn's teardown instead of being lost.
+        self._steering_settled.pop(answer, None)
+        self._steers_accepted.append(entry[0][2])
+        self._last_steer_monotonic = time.monotonic()
+        return True
+
+    async def _settle_abandoned_steering(self) -> None:
+        """Resolve codex steering answers owed from the last turn before a new prompt.
+
+        A steer whose turn ended before its answer can still be answered
+        ``startedNewTurn``: the adapter then runs a turn of its own on this
+        session. Its cancel is sent from the answer's callback, and
+        ``session/cancel`` names no turn, so it is only safe while no prompt of
+        ours is running. This runs before the next prompt starts, waits up to
+        ``_STEERING_SETTLE_SECS`` for those answers, and waits for the cancels
+        they schedule, so an adapter-owned turn is stopped before our prompt is
+        written and none of its updates reach that prompt's queue. An answer
+        still missing after the bound is forgotten and one ``session/cancel`` is
+        sent in its place, which stops a turn it may already have started.
+        """
+        pending = [a for a in self._abandoned_steering if not a.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=_STEERING_SETTLE_SECS)
+        # Let the answers' callbacks run and schedule their cancels.
+        await asyncio.sleep(0)
+        unanswered = [a for a in self._abandoned_steering if not a.done()]
+        for answer in unanswered:
+            self._runtime.forget_request(answer)
+        self._abandoned_steering = []
+        if unanswered:
+            logger.warning(
+                "%d steering answer(s) on %s never arrived; cancelling before the next prompt",
+                len(unanswered),
+                self._session_id,
+            )
+            try:
+                await self._runtime.send_notification(
+                    METHOD_CANCEL, {"sessionId": self._session_id}
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pre-prompt cancel on %s failed: %s", self._session_id, type(exc).__name__
+                )
+        if self._steering_cancel_tasks:
+            await asyncio.gather(*list(self._steering_cancel_tasks), return_exceptions=True)
+
+    def _take_injected_steers(self, can_settle: bool = True) -> list[str]:
+        """Echo text for every codex steer this turn now knows was ``injected``.
+
+        Called by the prompt dispatch loop between frames: after the previous
+        frame is fully handled and before the next is dequeued. ``can_settle`` is
+        True only while nothing is buffered on the session queue. Kiro's
+        reader resolves an answer inline and routes frames into that queue
+        inline, one stdout line at a time, so an answer that is done while the
+        queue is empty was read after every frame already handled and before
+        the terminal, which would otherwise have ended the turn. Anywhere
+        else the order cannot be read, so nothing settles: the entries stay, and
+        a turn that ends with them unsettled has its steers queued by the caller
+        (a visible duplicate at worst, never a steer marked delivered to a turn
+        that had finished). Entries aimed at an earlier prompt are dropped
+        unsettled: that turn's teardown already requeued them, and settling one
+        against a newer turn would mark a steer delivered that this turn never
+        received. Unanswered entries stay registered.
+        """
+        if (
+            not self._steering_answers
+            or not can_settle
+            or self._turn_steering_denied
+            or self._cancelled
+        ):
+            return []
+        flags = getattr(self, "_steering_settled", {})
+        settled: list[str] = []
+        waiting: list[tuple["asyncio.Future[dict[str, Any]]", int, str]] = []
+        for answer, aimed_at, wrapped in self._steering_answers:
+            flag = flags.get(answer)
+            ok = False
+            if aimed_at != self._prompt_starts:
+                pass
+            elif not answer.done():
+                waiting.append((answer, aimed_at, wrapped))
+                continue
+            elif not answer.cancelled() and answer.exception() is None:
+                ok = _steering_outcome(answer.result()) == STEERING_INJECTED
+            if ok:
+                settled.append(wrapped)
+            if flag is not None and not flag.done():
+                flag.set_result(ok)
+        self._steering_answers = waiting
+        return settled
+
+    def _release_proven_steers(self, reason: str, refusal: Any) -> list[str]:
+        """Echo text for this turn's proven codex steers, at a clean terminal only.
+
+        codex's reject and ``session/cancel`` both end the turn and drop what was
+        injected into it, so a steer is reported consumed only once the turn it
+        entered has ended normally: no denied approval, no cancel, and a stop
+        reason of exactly ``end_turn``. That is an allowlist on purpose: a bare
+        wire ``refusal`` carries no ``RefusalInfo``, and error reasons such as a
+        tool stall are not clean endings either. On any other ending the
+        proven steers are dropped here unreported, and the caller's pending entry
+        for each is queued by the turn's teardown, so the text runs again rather
+        than being lost. The list is emptied either way.
+
+        A proven steer whose ``steer()`` call has not yet returned True is not
+        released either, even at a clean ``end_turn``. The caller writes the
+        steer's transcript row synchronously on that return, so a report ahead
+        of it would clear the pending entry before any row exists, and a
+        shutdown landing in between would lose both. Held back, the entry stays
+        pending: the caller resumes after the turn is done and returns False,
+        and the teardown queues the text. That is the requeue path's visible
+        duplicate, not a loss, and nothing on the terminal path waits on it.
+        """
+        proven, self._steers_proven = self._steers_proven, []
+        accepted, self._steers_accepted = self._steers_accepted, []
+        if (
+            self._cancelled
+            or self._turn_steering_denied
+            or refusal
+            or reason != STOP_REASON_END_TURN
+        ):
+            return []
+        return [p for p in proven if any(p is a for a in accepted)]
+
+    def _note_steering_denial(self) -> None:
+        """Record that an approval in this codex turn was denied.
+
+        codex offers no per-tool reject: its reject cancels the turn and drops
+        what was injected into it. Nothing in the turn is then reported consumed
+        (see ``_release_proven_steers``), so every steer injected into it is
+        queued by the caller. A no-op on every other backend, whose reject does
+        not discard injected text.
+        """
+        if self._runtime.acp_backend not in ACP_BACKENDS_STEERING_REQUEST:
+            return
+        self._turn_steering_denied = True
 
     # Monotonic stamp of the last steer handed to the backend, 0.0 when this
     # session has never been steered. Read by the dashboard's keepalive route to
@@ -2281,17 +2879,45 @@ class AcpSessionHandle:
 
     @property
     def supports_steer(self) -> bool:
-        """True when this session's host implements ``_session/steer``.
+        """True when this session's host takes a user's mid-turn message.
 
-        Membership in ``ACP_BACKENDS_STEER`` (harness-parity H6), read from the
-        runtime's own backend id -- the same answer, from the same table, that
-        ``AcpClient.supports_steer`` gives. A capability is granted by opt-in
-        membership, so a host the runtime learns to drive does not inherit an
-        extension it never demonstrated: answering True for one would advertise
-        the steer affordance and then meet the user's mid-turn correction with
-        ``-32601``.
+        Membership in ``ACP_BACKENDS_STEER`` (harness-parity H6) or in
+        ``ACP_BACKENDS_STEERING_REQUEST``, read from the runtime's own backend id.
+        The first is kiro-cli's ``_session/steer``, the same answer, from the same
+        table, that ``AcpClient.supports_steer`` gives; the second is codex-acp's
+        ``_session/steering``, which only this handle speaks. A capability is
+        granted by opt-in membership, so a host the runtime learns to drive does
+        not inherit an extension it never demonstrated: answering True for one
+        would advertise the steer affordance and then meet the user's mid-turn
+        correction with ``-32601``.
+        """
+        backend = self._runtime.acp_backend
+        return backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when a deny notice steered into the refused turn reaches the model.
+
+        Narrower than :attr:`supports_steer`: only ``ACP_BACKENDS_STEER``. codex
+        takes a user's steer, but its approval answer cancels the turn and the
+        injected text goes with it, so a deny notice there keeps the recovery
+        continuation instead.
         """
         return self._runtime.acp_backend in ACP_BACKENDS_STEER
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when an accepted steer can still be dropped with its turn.
+
+        codex (``ACP_BACKENDS_STEERING_REQUEST``) drops injected text when a later
+        approval in the turn is denied or the turn is cancelled, so an accepted
+        steer is reported consumed only at a clean terminal and the caller must
+        keep and requeue it otherwise. Only the dashboard composer, whose pending
+        entry the turn's teardown requeues, steers such a session; the
+        provider-wrapper surfaces (messaging channels, Side Chat, ``spawn_steer``)
+        read this and queue instead.
+        """
+        return self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST
 
     # ── Commands & Config ──
 
@@ -2826,6 +3452,7 @@ class AcpSessionHandle:
                 self._available_models = parse_advertised_models(
                     {"models": {"availableModels": avail}}
                 )
+                self._mark_available_models_captured()
             # A backend may advertise its model list without echoing
             # ``currentModelId`` (it is best-effort in the ACP shape). When it
             # names exactly one model that IS the served model unambiguously, so
@@ -2839,6 +3466,7 @@ class AcpSessionHandle:
                 self._resolved_model_id = self._available_models[0]["modelId"]
         elif isinstance(models, list):
             self._available_models = parse_advertised_models({"availableModels": models})
+            self._mark_available_models_captured()
 
     async def ensure_served_default(self) -> None:
         """Move an inheriting pooled session off a backend default it cannot run.
@@ -2913,7 +3541,7 @@ class AcpSessionHandle:
             )
         return captured
 
-    async def refresh_available_models(self) -> list[dict[str, str]]:
+    async def refresh_available_models(self, *, force: bool = False) -> list[dict[str, str]]:
         """Re-resolve the advertised-model snapshot against the live backend.
 
         ``_available_models`` is otherwise written once, from this session's own
@@ -2929,11 +3557,191 @@ class AcpSessionHandle:
         empty probe is not evidence about entitlement, so the prior snapshot is
         kept. Returns the probe result either way, so callers can distinguish
         "revalidated" from "could not revalidate".
+
+        ``force`` is forwarded to the runtime probe: a user action (the
+        explicit-pick refusal heal, the spawn-time pin withhold) passes
+        ``force=True`` so it earns a fresh probe instead of being refused on a
+        recent no-evidence failure replay. The read path leaves it False.
         """
-        fresh = await self._runtime.probe_advertised_models()
+        # The floor is this snapshot's capture time, so a non-empty return is
+        # always at least as new as the snapshot it replaces: a broader answer
+        # cached on the shared runtime before this session captured a narrower
+        # one is never replayed over it. The stored snapshot is then dated by the
+        # ANSWER's own clock (the runtime's result clock, which is the arrival
+        # time of a fresh answer and the original arrival time of a replayed
+        # one), never by this call's time: dating a replay by the call would
+        # raise this handle's floor above the data it holds, so its next refresh
+        # within the TTL would open a real session/new instead of replaying, and
+        # a replay captured inside the spawn-race window would be re-dated past
+        # it and marked confirmed, disabling the read-path heal for this handle.
+        asked_at = time.monotonic()
+        fresh = await self._runtime.probe_advertised_models(
+            force=force, not_before=self._available_models_captured_at
+        )
         if fresh:
+            served_at = self._runtime.entitlement_probe_result_at
             self._available_models = list(fresh)
+            # A runtime that answered without stamping its result clock (a probe
+            # seam that bypasses the store) is dated by the call instead, which
+            # is still never later than the answer.
+            self._available_models_captured_at = served_at if served_at > 0.0 else asked_at
+            self._available_models_probe_confirmed = True
         return fresh
+
+    def _mark_available_models_captured(self) -> None:
+        """Stamp the session-init snapshot's capture time (an unconfirmed
+        answer). A snapshot written from ``session/new`` is NOT probe-confirmed:
+        only :meth:`refresh_available_models` sets that flag, because only a live
+        re-probe proves the answer is not the startup-race default."""
+        self._available_models_captured_at = time.monotonic()
+        self._available_models_probe_confirmed = False
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the snapshot on the READ path when it would narrow the catalog.
+
+        The dashboard picker filter narrows the ``--list-models`` catalog through
+        the newest live session's ``availableModels`` snapshot. When that snapshot
+        is the startup-race default (an entitlement lookup racing a token refresh
+        answered with the free tier), the picker hides models the account has and
+        ``auto`` chats silently inherit the degraded default — and because no
+        explicit pick is ever refused, the refresh-before-refuse path never fires.
+        This is the read-path counterpart: revalidate the snapshot BEFORE the
+        picker trusts it to hide anything.
+
+        ``catalog_ids`` is the full ``--list-models`` catalog (the ids the picker
+        would offer unfiltered). The verdict of what to keep/drop is NOT decided
+        here — it is :func:`catalog_row_would_drop`, the same per-row verdict the
+        picker endpoint applies, built on ``model_is_unusable`` (the single
+        spelling of "what this account can run") and ``resolve_pin_spelling``.
+        This method only decides WHETHER
+        the snapshot is trustworthy enough to narrow with, and reuses the existing
+        :meth:`refresh_available_models` heal path when it is not (no second
+        probe, no second parser).
+
+        Staleness heuristic (a scheduling decision, never an entitlement one):
+        probe only when the snapshot would actually narrow the catalog (some row
+        drops and the endpoint does not fail open to the full catalog) AND one of
+
+        * it was never probe-confirmed, or
+        * it was captured within ``_READ_PATH_SPAWN_RACE_SECS`` of runtime spawn
+          (the exact window the degraded answer is resolved in), or
+        * it advertises only ``auto`` against a richer catalog — the strongest
+          staleness signal.
+
+        Rate limit: a probe is skipped when this session probed on the read path
+        within ``_READ_PATH_REPROBE_MIN_INTERVAL_SECS`` AND the snapshot is either
+        probe-confirmed or not auto-only, so a hot poll does not re-probe on every
+        runtime TTL expiry forever. An UNCONFIRMED auto-only snapshot is exempt
+        from the interval — it always gets to probe — while a probe-CONFIRMED
+        auto-only snapshot (a genuine free-tier account really is ``auto``-only)
+        honours the interval like any other rather than re-probing forever. The
+        runtime's own single-flight probe TTL bounds the cost of the exempt case.
+
+        Fast path: the probe runs as a single in-flight task per handle, shielded
+        under ``_READ_PATH_PROBE_DEADLINE_SECS``. On deadline expiry this RAISES
+        :class:`EntitlementRevalidating` while the task KEEPS RUNNING to
+        completion — so its throwaway probe session is cleaned up and a later
+        read serves the corrected list, and the endpoint returns its degraded
+        response (rather than serving the un-revalidated snapshot as a live 200
+        the frontend caches). A subsequent read while the same task is still in
+        flight awaits it too, so it never bypasses the raise. A probe FAILURE
+        (as opposed to a timeout) NEVER makes the picker worse: the current
+        snapshot is returned unchanged (fail open).
+        """
+        snapshot = list(self._available_models)
+        advertised = advertised_model_ids(snapshot)
+        if not advertised:
+            # No live list to narrow with — nothing to revalidate, fail open.
+            return snapshot
+        # Count only rows the picker would actually hide AND a fresher snapshot
+        # could restore, using the endpoint's own per-row verdict
+        # (``catalog_row_would_drop``): ``auto`` is always kept, an advertised or
+        # ``ns::``-foldable row is kept, and an empty id drops against every
+        # snapshot, so none of those can justify a probe.
+        dropped = [
+            cid for cid in catalog_ids if cid.strip() and catalog_row_would_drop(cid, advertised)
+        ]
+        survivors = [
+            cid
+            for cid in catalog_ids
+            if cid.strip()
+            and cid.strip().lower() not in ("auto", "default")
+            and not catalog_row_would_drop(cid, advertised)
+        ]
+        advertises_auto = any(a.strip().lower() in ("auto", "default") for a in advertised)
+        # The endpoint FAILS OPEN — serves the whole catalog unfiltered — when the
+        # snapshot does not advertise ``auto`` and no non-``auto`` row survives
+        # (a namespace mismatch rather than an entitlement answer). A snapshot in
+        # that state hides nothing, so it is not narrowing either.
+        fails_open = not advertises_auto and not survivors
+        would_narrow = bool(dropped) and not fails_open
+        if not would_narrow:
+            # The snapshot keeps the whole catalog, so a stale snapshot cannot
+            # currently hide anything — do not spend a probe.
+            return snapshot
+        auto_only = len(advertised) == 1 and advertised[0].strip().lower() == "auto"
+        now = time.monotonic()
+        spawn_at = self._runtime.spawn_monotonic
+        within_spawn_race = (
+            spawn_at is not None
+            and self._available_models_captured_at > 0.0
+            and (self._available_models_captured_at - spawn_at) <= _READ_PATH_SPAWN_RACE_SECS
+        )
+        suspect = not self._available_models_probe_confirmed or within_spawn_race or auto_only
+        if not suspect:
+            return snapshot
+        # An in-flight probe from an earlier read (its deadline expired but the
+        # shielded task kept running) MUST be awaited, not bypassed: on the
+        # frontend's degraded re-poll the interval gate below would otherwise
+        # return the un-revalidated snapshot as a normal answer, the endpoint
+        # would serve it as a live 200, and the corrected list this very probe is
+        # fetching would never reach the picker. So when a task is still running,
+        # skip the interval gate and fall through to await it — the poll gets the
+        # landed result or raises EntitlementRevalidating again.
+        task = self._read_refresh_task
+        in_flight = task is not None and not task.done()
+        if not in_flight:
+            recently_probed = (
+                self._available_models_read_probe_at > 0.0
+                and (now - self._available_models_read_probe_at)
+                < _READ_PATH_REPROBE_MIN_INTERVAL_SECS
+            )
+            # The interval applies to a probe-CONFIRMED snapshot and to every
+            # non-auto-only snapshot: a genuine free-tier account is legitimately
+            # auto-only, so once confirmed it must not re-probe on every poll. An
+            # UNCONFIRMED auto-only snapshot is exempt from the interval — it
+            # always gets to probe (its docstring promise), and the runtime's own
+            # single-flight probe TTL still bounds the cost of a burst.
+            if recently_probed and (self._available_models_probe_confirmed or not auto_only):
+                return snapshot
+            self._available_models_read_probe_at = now
+            task = asyncio.ensure_future(self.refresh_available_models())
+            self._read_refresh_task = task
+        # Non-None in both branches: in-flight reused an existing task, else one
+        # was just started above.
+        assert task is not None
+        try:
+            # Shield so a timeout leaves the task RUNNING (it finishes the probe
+            # and cleans up its throwaway session); we just stop waiting on it.
+            await asyncio.wait_for(asyncio.shield(task), timeout=_READ_PATH_PROBE_DEADLINE_SECS)
+        except (TimeoutError, asyncio.TimeoutError):
+            # The probe did not land inside the deadline and is STILL RUNNING.
+            # We must not return the un-revalidated snapshot as a normal answer:
+            # the picker endpoint serves that as a live HTTP 200 that the
+            # frontend caches with no refetch, so the corrected list this probe
+            # is fetching would never be served. Signal "revalidation in flight"
+            # so the endpoint returns its degraded response and the frontend
+            # keeps its last-good list and polls again; the next read (once the
+            # task has landed) serves the corrected list.
+            raise EntitlementRevalidating from None
+        except Exception:
+            # Fail open exactly as today: no evidence never worsens the picker.
+            logger.debug("read-path entitlement revalidation failed", exc_info=True)
+            return list(self._available_models)
+        # refresh_available_models already replaced the snapshot in place on a
+        # non-empty probe and kept it on an empty one; either way the live
+        # snapshot is the answer to narrow with.
+        return list(self._available_models)
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set (parity
@@ -2993,6 +3801,19 @@ class AcpSessionHandle:
         # of these files, and every survivor is permanent: nothing else deletes
         # an ephemeral session's transcript.
         self._cancel_hook_tasks()
+        # Answers this session will never read again must not stay registered on a
+        # runtime that outlives it. ``getattr``: a handle can be torn down before
+        # (or without) ``__init__`` having run, and teardown must not raise then.
+        held = [a for a, _gen, _text in getattr(self, "_steering_answers", ())]
+        held += list(getattr(self, "_abandoned_steering", ()))
+        if held:
+            for _answer in held:
+                self._runtime.forget_request(_answer)
+            self._steering_answers = []
+            self._abandoned_steering = []
+        for _flag in list(getattr(self, "_steering_settled", {}).values()):
+            if not _flag.done():
+                _flag.set_result(False)
         try:
             await self._runtime.terminate_session(self._session_id)
         finally:
@@ -3256,6 +4077,18 @@ class AcpSessionHandle:
                 if _now - _last_yield >= DRAIN_YIELD_AFTER_S:
                     await asyncio.sleep(0)
                     _last_yield = time.monotonic()
+
+                # A codex steer the adapter answered ``injected`` is proven read
+                # before the terminal here, where every frame dequeued so far is
+                # fully handled, and only with nothing buffered: the reader
+                # enqueues frames and resolves answers inline in stdout order, so
+                # with the queue empty a terminal read before the answer would
+                # already have ended the turn (see ``_take_injected_steers``).
+                # A proven steer is reported consumed only at a clean terminal
+                # (``_release_proven_steers``).
+                self._steers_proven.extend(
+                    self._take_injected_steers(can_settle=self._queue.qsize() == 0)
+                )
 
                 try:
                     msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))
@@ -3648,6 +4481,8 @@ class AcpSessionHandle:
                     reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
+                    for _injected in self._release_proven_steers(reason, _refusal):
+                        yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_injected)
                     self._turn_done.set()
                     yield AcpEvent(
                         kind=EVENT_COMPLETE,
@@ -3674,7 +4509,10 @@ class AcpSessionHandle:
                         self._queue.put_nowait(msg)
                         await asyncio.sleep(0)
                     else:
-                        logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
+                        logger.debug(
+                            "Dropping stray response frame id=%s (no waiter)",
+                            _loggable_request_id(msg.id),
+                        )
                     continue
 
                 # The backend's hooks requests, answered here rather
@@ -3698,6 +4536,10 @@ class AcpSessionHandle:
 
                 if action == "permission":
                     _perm_event = self._build_permission_event(msg)
+                    if _perm_event is None:
+                        if msg.id is not None:
+                            await self._runtime.send_error(msg.id, -32600, "invalid request id")
+                        continue
                     # Before the fidelity gate: a tool the spec switched off is
                     # refused whether or not this consumer opted into the child
                     # contract, and naming that reason in the audit is more use
@@ -3717,16 +4559,16 @@ class AcpSessionHandle:
                         logger.warning(
                             "rejecting low-fidelity child permission request "
                             "id=%s for fidelity-unaware consumer (child=%s)",
-                            _perm_event.request_id,
-                            _perm_event.sub_session_id,
+                            _loggable_request_id(_perm_event.request_id),
+                            _loggable_request_id(_perm_event.sub_session_id),
                         )
-                        await self.reject_tool(_perm_event.request_id)
                         self._audit_handle_reject(
                             _perm_event.request_id,
                             _perm_event.title or "",
                             "child_low_fidelity_unaware_consumer",
                             sub_session_id=_perm_event.sub_session_id or "",
                         )
+                        await self.reject_tool(_perm_event.request_id)
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
                             sub_session_id=_perm_event.sub_session_id,
@@ -3791,12 +4633,19 @@ class AcpSessionHandle:
                     _upd = _upd if isinstance(_upd, dict) else {}
                     _disc = str(_upd.get("sessionUpdate") or "")
                     _text = redact_text(str(_upd.get("content") or _upd.get("message") or ""))
+                    # An echo that named no session and was fanned out to
+                    # co-tenants is not this session's own (``runtime_global``).
+                    _ownerless = msg.fanout_no_owner
                     if _disc in ("steering_queued", "AgentExecutionUserMessageQueued"):
-                        yield AcpEvent(kind=EVENT_STEER_QUEUED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_QUEUED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc in ("steering_consumed", "AgentExecutionSteeringInjected"):
-                        yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_CONSUMED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc == "steering_cleared":
-                        yield AcpEvent(kind=EVENT_STEER_CLEARED)
+                        yield AcpEvent(kind=EVENT_STEER_CLEARED, runtime_global=_ownerless)
                 elif action == "metadata":
                     self._track_metadata(msg)
                 elif action == "compaction":
@@ -3820,7 +4669,9 @@ class AcpSessionHandle:
                     # the subagent roster already draws (runtime_global=).  A lone
                     # session's frame is left unmarked and genuinely is its own,
                     # so a single-session run is unaffected.  The event still
-                    # surfaces either way — only the mutations are gated.
+                    # surfaces either way, carrying that provenance
+                    # (``runtime_global``) so a consumer measuring this session's
+                    # own activity can tell; only the mutations are gated.
                     owns_frame = not msg.fanout_no_owner
                     if status_type == "completed" and owns_frame:
                         # The pre-compaction counts (and their authoritative
@@ -3843,15 +4694,27 @@ class AcpSessionHandle:
                             self._compaction_failed_at = time.monotonic()
                             self.last_compaction_transient = compaction_failure_is_transient(params)
                         summary = compaction_failure_detail(params)
-                    yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
+                    yield AcpEvent(
+                        kind=EVENT_COMPACTION_STATUS,
+                        text=status_type,
+                        title=summary,
+                        runtime_global=not owns_frame,
+                    )
                 elif action == "clear":
-                    yield AcpEvent(kind=EVENT_CLEAR_STATUS)
+                    # Same provenance as the compaction notice: one that named
+                    # no session and was fanned out to co-tenants is not this
+                    # session's own.
+                    yield AcpEvent(kind=EVENT_CLEAR_STATUS, runtime_global=msg.fanout_no_owner)
                 elif action == "agent_switched":
                     saw_agent_switch = True
                     params = msg.params or {}
                     name = params.get("agentName", "")
                     self.active_agent = name if isinstance(name, str) else ""
-                    yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
+                    yield AcpEvent(
+                        kind=EVENT_AGENT_SWITCHED,
+                        text=params.get("agentName", ""),
+                        runtime_global=msg.fanout_no_owner,
+                    )
                 elif action == "subagent_list":
                     params = msg.params or {}
                     subs = params.get("subagents")
@@ -4722,7 +5585,7 @@ class AcpSessionHandle:
         except Exception:
             logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
 
-    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
+    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
         """Build an AcpEvent for a permission request via the shared parser.
 
         Delegates to _dispatch.build_permission_event so this transport reads the
@@ -4745,9 +5608,14 @@ class AcpSessionHandle:
             # parent toolCallId to inherit trusted params for a different
             # operation, while same-origin repeat frames still resolve.
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
+            kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         )
+        if event is None:
+            return None
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
+        if event.request_id != "":
+            self._permission_gate_events[event.request_id] = event
         # A frame the runtime routed here for a backend-internal subagent
         # carries the CHILD's sessionId, not this handle's. Mark the origin so
         # the policy consumer can tell reduced-fidelity requests apart. Child
@@ -4784,6 +5652,14 @@ class AcpSessionHandle:
             if mode_id == self._last_kas_mode_id:
                 return []
             self._last_kas_mode_id = mode_id
+            # The session now runs this agent, so a turn that names none meets
+            # this agent's spec hooks, not the one the batch was built for, and
+            # what it auto-approves is this agent's entry in the registered batch.
+            if self.kas_projected_agent:
+                from kiro_crew.acp.kas_agents import switched_auto_approved
+
+                self.kas_projected_agent = mode_id
+                self.kas_auto_approved = switched_auto_approved(self.kas_registered_agents, mode_id)
             return [AcpEvent(kind=EVENT_AGENT_SWITCHED, text=mode_id)]
         if session_update == UPDATE_SESSION_INFO:
             return self._handle_kas_session_info(update)
@@ -5260,7 +6136,7 @@ class AcpSessionHandle:
             filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
-                self._stale_eligible = True
+                self._stale_eligible = not self._active_tool_calls
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
@@ -5316,16 +6192,32 @@ class AcpSessionHandle:
                     tool_name=ev.tool_name,
                     interactive_risk=(interactive.risk if interactive else INTERACTIVE_NONE),
                 )
+                self._active_tool_calls[self._inflight_tool_call_id] = (
+                    self._inflight_tool,
+                    interactive,
+                )
                 self._retire_liveness_state()
             elif ev.kind == EVENT_TOOL_RESULT:
                 if not ev.tool_final and ev.tool_call_id:
                     # Streamed partial output: the command has acted, so any
                     # later non-interactive retry of it is not a safe replay.
                     self._tool_output_seen.add(ev.tool_call_id)
-                self._tool_dispatched = False
-                self._inflight_tool = None
-                self._inflight_interactive = None
-                self._inflight_tool_call_id = ""
+                if ev.tool_status in TERMINAL_TOOL_STATUSES:
+                    self._active_tool_calls.pop(ev.tool_call_id or "", None)
+                    self._tool_dispatched = bool(self._active_tool_calls)
+                    self._stale_eligible = not self._active_tool_calls
+                    if self._inflight_tool_call_id not in self._active_tool_calls:
+                        if self._active_tool_calls:
+                            self._inflight_tool_call_id = next(reversed(self._active_tool_calls))
+                            self._inflight_tool, self._inflight_interactive = (
+                                self._active_tool_calls[self._inflight_tool_call_id]
+                            )
+                        else:
+                            self._inflight_tool = None
+                            self._inflight_interactive = None
+                            self._inflight_tool_call_id = ""
+                        self._input_wait_emitted = False
+                        self._retire_liveness_state()
                 # L1 of the recovery ladder: classify the result text ONCE, at
                 # the layer that owns the protocol. A ``-32001 capacity``
                 # refusal from the MCP stub or a gateway ``recoverable_infra``

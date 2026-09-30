@@ -63,6 +63,12 @@ and collapses them, honoring their very different costs:
 | **venv** | ~1 min, idempotent | `pod up` **auto-builds** it on demand |
 | **dist** | minutes (Vite SPA build) | only on **explicit consent** |
 
+The venv is built with Python 3.12, found as `python3.12` in the usual POSIX
+locations and then on `PATH`. A python.org install on Windows ships `python.exe`
+and never a `python3.12.exe`, so there the `py` launcher is asked next
+(`py -3.12`): it is the platform's own index of installed interpreters, and it
+picks the right one on a host that has several.
+
 So plain `pod up <wt>` builds the cheap venv for you but **fails loud** if the
 dist is missing — pointing you at the slow build — while `pod up <wt> --provision`
 (or `pod provision <wt>`) runs the full chain: venv + `npm run build` in
@@ -218,14 +224,29 @@ response text and transport failures never include the authenticated URL.
 - **Payload** — the booted pod *is* the worktree's `.venv/bin/kirocrew gateway`. If
   the worktree's gateway can't start (bad import, broken config, unbuilt dist), the
   pod can't come up — **and that is correct**. `pod up` detects the crash fast,
-  prints the gateway's own journal, stops the half-started unit, and tells you this
-  is the worktree build failing — not the pod tool.
+  prints the gateway's own journal, and tells you this is the worktree build failing
+  — not the pod tool. It stops a unit it started itself, so a crash-looping gateway
+  is not left respawning; it reclaims the isolated home only when it created that
+  home too, and a pod it did not start is left alone for `pod down` to retire. If a
+  stop itself fails the message says so rather than claiming the pod was handled.
+
+Inside this package the control plane is `kiro_crew.pod.runtime`, the one namespace
+the verbs, Dev Fleet and the tests use. It holds the core — names, the per-pod env
+file, worktree resolution, the `systemd --user` adapter and platform dispatch, the
+lifecycle locks, seed sanitization and the pod environment — and re-exports six
+owners that build on it: `runtime_ports`, `runtime_attestation`, `runtime_client`,
+`runtime_home`, `runtime_lifecycle` and `runtime_boot`. A patch of a function or
+constant as `kiro_crew.pod.runtime.<name>` reaches the module that reads it; a
+module the runtime imports is patched by attribute (`runtime.time.sleep`), and
+rebinding it there is refused. What each owner
+holds is mapped in the Dev Fleet spec's
+[Pod runtime ownership](../../../docs/system-specs/modules/dev-fleet.md#pod-runtime-ownership).
 
 ## Mechanism (Linux `systemd --user`)
 
 `kirocrew pod install` writes a template unit `kirocrew-pod@.service` whose
 `ExecStart` re-enters `kirocrew pod _run <wt>` (boot logic lives in
-`kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
+`kiro_crew.pod.runtime_boot.boot`, reached as `kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
 drop-in that replaces the template's `ExecStart` with the resolved checkout's
 own `.venv/bin/kirocrew`; it refuses to fall back to a global install that may
 not understand the requested seed. `pod down` removes that drop-in and reloads
@@ -239,7 +260,7 @@ recreated the directory by reopening their audit log in append mode — and it a
 fired on the stop half of a `Restart=`, bringing the pod back on a home stripped
 of its sessions and config. So `kirocrew pod down` owns reclamation on every
 platform: it stops the service, waits for the unit's cgroup to drain, deletes the
-HOME through `runtime.cleanup_home` (which re-validates the name and refuses
+HOME through `runtime.cleanup_home` (defined in `runtime_home`; it re-validates the name and refuses
 `..`/absolute/empty, since teardown safety must not rely on systemd `%i`
 semantics), then VERIFIES the directory is gone and fails loudly if it is not.
 The trade is that a pod which goes away without a `down` — a crash, a raw

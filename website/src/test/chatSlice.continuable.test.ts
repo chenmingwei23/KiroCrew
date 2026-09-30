@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
+import reducer, { appendMessage, confirmOptimisticSend, selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
 import { slotIsRemoteBound } from '../store/dashboardSlice'
 import type { ChatMessage } from '../types'
 
@@ -363,10 +363,80 @@ describe('selectTurnInterrupted', () => {
     }
   })
 
-  it('reads past an injected recovery row to the real floor beneath it', () => {
+  it('reads an injected recovery row as a turn opener', () => {
     expect(selectTurnInterrupted(state({
-      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume')],
+      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume', { injectKind: 'recovery' })],
     }))).toBe(true)
+  })
+
+  it('does not let an older Stop mask a newer interrupted inject turn', () => {
+    for (const injectKind of ['cron', 'recovery', 'user_replay', 'synthesis']) {
+      expect(selectTurnInterrupted(state({
+        messages: [
+          msg('user', 'first'),
+          msg('system', 'Stopped', { kind: 'stop_event' }),
+          msg('inject', 'continue queued work', { injectKind }),
+          msg('tool', 'read complete'),
+        ],
+      }))).toBe(true)
+    }
+  })
+
+  it('treats an answered dispatching inject as finished', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user'), msg('inject', 'go on', { injectKind: 'user_replay' }), msg('assistant', 'done')],
+    }))).toBe(false)
+  })
+
+  it('looks through an untagged inject (note, hook halt, refusal notice) to the real floor', () => {
+    // These rows dispatch nothing, so a trailing one is not an unanswered turn
+    // and a deliberately halted run must not offer Resume.
+    for (const meta of [undefined, { noteSession: 'dashboard:front' }, { injectKind: 'unknown' }, { injectKind: 7 }]) {
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('inject', 'halted', meta)],
+      }))).toBe(false)
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('inject', 'halted', meta)],
+      }))).toBe(true)
+    }
+  })
+
+  // The composer mints its bubble with `meta.optimistic`, and only the send's
+  // own receipt or a correlated echo clears it. Until one does, nothing proves
+  // the server ever received the text, so no turn was opened and none was
+  // interrupted: a Resume offered here posts a bare continue against a
+  // transcript that never held this message, and the agent answers the
+  // request before it. The flag is client-minted and never sent, so the
+  // backend mirror `is_turn_interrupted` never sees a row carrying it and
+  // needs no matching branch.
+  it('is false while the trailing user row is an unconfirmed optimistic send', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+  })
+
+  it('does not let a send-failure error row behind the unconfirmed send read as an interruption', () => {
+    // A `transport-error` appends its error row after the bubble and leaves the
+    // bubble standing; the error is about the send, not about a reply that died.
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' }), msg('error', 'Connection error')],
+    }))).toBe(false)
+  })
+
+  it('reads the same row as an interrupted turn once confirmOptimisticSend clears the flag', () => {
+    // The receipt path of a delivered send: the flag goes, the row is the
+    // server's, and an unanswered one is an interruption exactly as before.
+    let chat = { ...reducer(undefined, { type: '@@INIT' }), activeSlot: 'slot-1' }
+    chat = reducer(chat, appendMessage({ role: 'user', content: 'did this arrive?', cls: '', meta: { sendId: 's-1' } }))
+    expect(chat.messages[0].meta?.optimistic).toBe(true)
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(false)
+
+    chat = reducer(chat, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-1' }))
+    expect(chat.messages[0].meta?.optimistic).toBeUndefined()
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(true)
   })
 })
 

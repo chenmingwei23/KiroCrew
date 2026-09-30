@@ -26,7 +26,8 @@ update a tag (rename, recolor, status flag), and add or remove tags on a live
 session — no tag delete, so nothing here can strip a label from every session
 at once, and the assignment is a DELTA the endpoint applies compare-and-set
 against the revision this server read, so an agent never clobbers a tag the
-person clicked on meanwhile. Every tool is a thin proxy over the dashboard's
+person clicked on meanwhile. It can pin or unpin a live session with the same
+ownership rules as tagging one. Every tool is a thin proxy over the dashboard's
 existing endpoints (loopback +
 ``X-Internal-Secret``); the endpoints keep owning every tree invariant, and the
 gateway audits each write with the caller's declared component name — this
@@ -70,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import re as _re
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -77,6 +79,8 @@ from urllib.parse import quote
 # to the gateway lives in ``mcp_core``. Importing it costs 341ms/40MB in this
 # process (measured) — under ``mcp_computer``'s own import cost, because
 # mcp_core's heavy dependencies are function-local.
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.sections import FOLDER_SORT_DEFAULT, FOLDER_SORT_MODES
 from kiro_crew.dashboard.chat_folders import (
     _folder_owner_app,
     _subtree_holds_foreign_folder,
@@ -90,25 +94,33 @@ from kiro_crew.mcp_core import (
     require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.validation import (
+    BROADCAST_RESPONSE_MARGIN_SECS,
+    BROADCAST_TARGET_ALLOWANCE_SECS,
     CHAT_FOLDER_CREATE_SCHEMA,
     CHAT_FOLDER_FILE_SELF_SCHEMA,
     CHAT_FOLDER_MOVE_SCHEMA,
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
+    CHAT_SESSION_PIN_SCHEMA,
     CHAT_TAG_ASSIGN_SCHEMA,
     CHAT_TAG_CREATE_SCHEMA,
     CHAT_TAG_LIST_SCHEMA,
     CHAT_TAG_UPDATE_SCHEMA,
+    MAX_BROADCAST_TARGETS,
     MCP_DASHBOARD_SCHEMAS,
     SESSION_ADOPT_SCHEMA,
+    SESSION_BROADCAST_SCHEMA,
     SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
     SESSION_FORK_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
     SESSION_RELEASE_SCHEMA,
     SESSION_SEND_SCHEMA,
+    SESSION_SET_MODEL_SCHEMA,
+    SESSION_STATUS_SCHEMA,
     SESSION_STOP_SCHEMA,
     validate_tool_args,
 )
@@ -128,8 +140,11 @@ SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
     "session_fork",
     "session_stop",
+    "session_set_model",
     "session_close",
     "session_send",
+    "session_broadcast",
+    "session_status",
     "session_adopt",
     "session_release",
     "session_read_message",
@@ -155,10 +170,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Show the user's SIDEBAR folder tree — the folders they organize "
                 "their chat sessions in — with the live sessions filed in each one. "
-                "Folders are listed in the SAME ORDER the sidebar draws them (each "
-                "parent's children in their stored order), so the sequence you read "
-                "here is the one the person sees — which is what makes it safe to "
-                "pick a ``before``/``after`` anchor for chat_folder_move. Returns per "
+                "Folders are listed in the SAME ORDER the sidebar draws them, in the "
+                "person's folder sort mode (custom = their stored positions, name = "
+                "natural alphabetical, created = newest first); the header line names "
+                "the active mode. In custom mode the sequence you read here is the "
+                "one the person sees, which is what makes it safe to pick a "
+                "``before``/``after`` anchor for chat_folder_move. In name or created "
+                "mode the listing says so and warns that an anchor sets the stored "
+                "position without changing the displayed order. Returns per "
                 "folder: id, human path, project directory, default "
                 "agent, and how many archived (history) sessions are filed there; "
                 "then one line per live session (slot key + title) nested under it, "
@@ -217,7 +236,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "``new_parent`` the anchor chooses the parent, which is how you "
                 "reorder a folder without moving it. chat_folder_tree lists folders "
                 "in the same order the sidebar draws them, so read it first to pick "
-                "the anchor. An app agent may move only a folder it created itself, "
+                "the anchor. A position is a STORED position: the sidebar shows it "
+                "in its custom folder order, and when the person has sorted folders "
+                "by name or creation date (chat_folder_tree's header says which) an "
+                "anchor changes nothing they see until they switch back. An app "
+                "agent may move only a folder it created itself, "
                 "and only to the top level or under another of its own; positioning "
                 "is refused outright when it would renumber siblings the app does "
                 "not own. A crew member is bound by the same own-folders-only rule."
@@ -417,6 +440,34 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "chat_session_pin",
+            "description": (
+                "Pin or unpin a LIVE chat session in the sidebar. ``session`` is a slot "
+                "key or 'dashboard:<slot>' session key from chat_folder_tree, or a "
+                "session's exact title when that title is unique. ``pinned`` is true to "
+                "pin, false to unpin; asking for the state the session already has "
+                "writes nothing and reports it. chat_folder_tree marks pinned sessions "
+                "``[pinned]``. Metadata only: the transcript, model and any running "
+                "turn are untouched. ARCHIVED (history) sessions cannot be pinned — "
+                "revive one into the sidebar first. An app agent may pin only its own "
+                "sessions; a crew member may pin only a session it owns or created."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Slot key, 'dashboard:<slot>' session key, or exact unique session title.",
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "true to pin, false to unpin.",
+                    },
+                },
+                "required": ["session", "pinned"],
+            },
+        },
+        {
             "name": "session_create",
             "description": (
                 "Open a NEW chat session, pre-named and bound to the agent you pick, so a "
@@ -458,6 +509,19 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "creation — a folder id or a '/'-separated human path. Missing "
                             "path segments are created (mkdir -p), like chat_folder_create's "
                             "`parent`. Omit to leave the session at the top level."
+                        ),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Model the new session starts on, pinned exactly as if the "
+                            "person had picked it in the session's model dropdown: an id "
+                            "from that same list, or 'auto'. Omit to use the agent's or "
+                            "the global default. A well-formed id the account cannot serve "
+                            "is accepted here but withheld at the session's first turn: "
+                            "the turn succeeds on the account's default model, and the only "
+                            "signal is a notice in that session's transcript. The person "
+                            "can still change it later."
                         ),
                     },
                 },
@@ -552,6 +616,37 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_set_model",
+            "description": (
+                "Change the model another session runs on. Only an IDLE session takes "
+                "the change: if the target has a turn or sub-agents in flight the call "
+                "fails with 'session busy, model not changed' and nothing changes. To "
+                "force it, stop the target with session_stop first, then retry. The "
+                "model is applied when the target's next turn starts, after the same "
+                "permission check runs again; if the target has become channel-linked "
+                "or otherwise out of reach by then, the change is dropped. The "
+                "conversation is kept. 'auto', 'Auto (Jev)' and sessions bound to a "
+                "remote crew are refused."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Model to switch to: a canonical key or provider id, e.g. "
+                            "'sonnet' or 'opus'. 'auto' is owner-only."
+                        ),
+                    },
+                },
+                "required": ["target", "model"],
+            },
+        },
+        {
             "name": "session_close",
             "description": (
                 "Close another session — the same thing as pressing the ✕ on that tab. "
@@ -620,6 +715,96 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 },
                 "required": ["target", "message"],
             },
+        },
+        {
+            "name": "session_broadcast",
+            "description": (
+                "Send ONE message to several peer sessions at once — the fan-out "
+                "counterpart of session_send, for when the thing you have to say "
+                "is true of every worker rather than of one. Omit `targets` and it "
+                "goes to every session YOU created, which is the usual case for a "
+                "conductor; name them to reach a subset. `mode` picks the delivery "
+                "and is required, because the two are different instructions: "
+                "`queue` waits for each target's current turn to end (use it for "
+                "'the base moved, rebase before you push'), while `steer` cuts "
+                "into every running turn so each target reads it mid-work (use it "
+                "for 'stop, that issue is already fixed'). Every target is checked "
+                "the same way a single session_send is, so this can reach nothing "
+                "a session_send could not. PARTIAL DELIVERY IS NORMAL and the "
+                "result says so per target: a session that was closed, went "
+                "incognito, or belongs to an app is one refused row and the rest "
+                "still get the message — read the rows rather than assuming all or "
+                "nothing. Poll the targets afterwards with session_read_message, "
+                "or take the roster with session_status."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "The message every target receives. It becomes each "
+                            "one's next user-role turn and is tagged as a "
+                            "broadcast in their transcripts, so a worker can tell "
+                            "an instruction its siblings also got from one aimed "
+                            "at it alone. Write it so it is true for all of them."
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["queue", "steer"],
+                        "description": (
+                            "`queue`: each target runs the message when its "
+                            "current turn ends (an idle one starts immediately). "
+                            "`steer`: cut into the turn already running so the "
+                            "target reads it mid-work; on an idle target it starts "
+                            "a turn either way, and where mid-turn injection is "
+                            "unavailable that target falls back to its queue "
+                            "rather than being dropped. No default — say which."
+                        ),
+                    },
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Session keys or exact titles, as session_send takes "
+                            "them. Omit to reach every session you created. A "
+                            "repeated target is delivered to once."
+                        ),
+                    },
+                },
+                "required": ["message", "mode"],
+            },
+        },
+        {
+            "name": "session_status",
+            "description": (
+                "List the sessions YOU stood up and what each one is doing right "
+                "now — the roster a conductor patrols. Each row is `working` (a "
+                "turn is in flight, wait), `queued` (idle with messages waiting), "
+                "`idle` (open and doing nothing — this is the one that needs a "
+                "decision), `gone` (the crew log remembers the session and the "
+                "dashboard no longer holds it: closed, archived, or lost with the "
+                "process that ran it — re-dispatch it or drop it, there is nothing "
+                "left to message), or `unknown` (birth metadata records that you "
+                "created it, but neither a live session nor an attested crew-log "
+                "edge exists — it was created and its fate is not recorded, so "
+                "read it before you re-dispatch it). `gone` is the reason to use "
+                "this instead of "
+                "reading sessions one at a time: a worker that vanished is absent "
+                "from any live list, so a live list cannot tell a worker that died "
+                "from one you never dispatched. Read both quality fields before "
+                "trusting the count: `tree` describes the crew-log roster and "
+                "`history` describes transcript birth metadata. For either one, "
+                "`readable` means that source was read completely, `incomplete` "
+                "means its rows may be missing, and `unreadable` means that "
+                "durable source was unavailable. `roster_omitted` is separate "
+                "again: it counts rows this reply dropped because the three "
+                "sources' union exceeded the row bound, which no source's quality "
+                "field describes. The result caveats each gap "
+                "under its own source name. READ-only."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "session_adopt",
@@ -716,7 +901,7 @@ def _list_tools() -> list[dict[str, Any]]:
     Reaching this process at all means an agent spec referenced this server, so
     the assignment already happened; there is nothing left to gate here.
     """
-    return _tool_definitions()
+    return with_titles(SERVER_NAME, _tool_definitions())
 
 
 def _get_rows(path: str) -> tuple[list[dict], str | None]:
@@ -738,6 +923,46 @@ def _get_rows(path: str) -> tuple[list[dict], str | None]:
         if err:
             return [], str(err)
     return [], f"unexpected response shape from {path}"
+
+
+def _read_folder_sort_setting() -> object:
+    """The raw ``dashboard.folder_sort`` value from the gateway's config on disk.
+
+    Read the way the other MCP tools read a dashboard setting (the probe timeout
+    in ``mcp_discovery``, the quarantine threshold in ``mcp_quarantine``):
+    through the loader from ``config.json``, NOT through ``GET
+    /api/config/kirocrew``. That route is cookie-authenticated only -- it is in
+    neither internal-secret allowlist -- and admitting it to read one enum would
+    open the whole config surface, PATCH included, to every secret-bearing
+    caller. The sidebar menu's PATCH persists to the same file before it
+    answers, so this read sees the menu's last choice; the loader has reduced
+    the stored value to the known set, and the local overlay file is merged the
+    same way for both readers.
+    """
+    return KiroCrewConfig.load().dashboard.folder_sort
+
+
+def _chat_folder_sort_mode() -> tuple[str, str | None]:
+    """The person's sidebar folder sort mode.
+
+    ``dashboard.folder_sort`` is the ONE stored copy of the preference: the
+    sidebar menu writes it through the config PATCH allowlist, the sidebar reads
+    it back through its config query, and the tree tool reads the same file, so
+    the two cannot draw the tree in different orders. Returns ``(mode, None)``,
+    or ``("custom", error)`` when the read itself failed -- ``custom`` being the
+    stored-order listing every earlier build produced. A value outside the known
+    set also reads as ``custom``, without an error: the loader has already
+    reduced the stored value to a known one, so that can only be a build skew,
+    not a broken read. The caller decides what to say about an error: the tree
+    is still worth listing when only its ordering is in doubt.
+    """
+    try:
+        raw = _read_folder_sort_setting()
+    except Exception as exc:  # noqa: BLE001 -- said in the header, not raised
+        return FOLDER_SORT_DEFAULT, f"{type(exc).__name__}: {exc}"
+    if isinstance(raw, str) and raw in FOLDER_SORT_MODES:
+        return raw, None
+    return FOLDER_SORT_DEFAULT, None
 
 
 # Sidebar folder ids are minted as ``uuid.uuid4().hex[:12]``
@@ -886,14 +1111,109 @@ def _chat_folder_name_key(folder: dict) -> bytes:
     return text.translate(_ASCII_FOLD).encode("utf-16-be", "surrogatepass")
 
 
-def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
+def _chat_folder_created(folder: dict) -> float | None:
+    """A folder's creation stamp as the sidebar reads it, or ``None`` when it has none.
+
+    ``created_at`` is epoch seconds written by every folder creator since the
+    sidebar's ``created`` sort existed; a row from before that carries no key. The
+    acceptance rule is ``_chat_folder_order``'s, for the same reason: this value
+    orders the ``created`` mode on both sides, so only a real, finite JSON number
+    counts and everything else reads as "no stamp" identically here and in the
+    sidebar's ``folderCreated``. Both sides clamp to the range JavaScript holds
+    exactly, and an unbounded int is clamped BEFORE the ``float`` call because
+    ``float(10**400)`` raises -- and this is a sort key, so nothing here may.
+    """
+    value = folder.get("created_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int):
+        value = max(-_CHAT_FOLDER_ORDER_LIMIT, min(_CHAT_FOLDER_ORDER_LIMIT, value))
+    stamp = float(value)
+    if stamp != stamp or stamp in (_POS_INF, _NEG_INF):  # NaN, ±Infinity
+        return None
+    return max(-float(_CHAT_FOLDER_ORDER_LIMIT), min(float(_CHAT_FOLDER_ORDER_LIMIT), stamp))
+
+
+_DIGIT_RUNS = _re.compile(r"[0-9]+|[^0-9]+")
+
+
+def _chat_folder_natural_key(folder: dict) -> tuple[tuple[Any, ...], ...]:
+    """The ``name`` sort mode's key: case-folded natural order, ``01.`` < ``02.`` < ``10.``.
+
+    The folded name is cut into maximal runs of ASCII digits and of everything
+    else, and the runs are compared position by position. A digit run compares by
+    its integer value -- leading zeros stripped, then length, then the digits, so
+    the value is compared without ever being converted to a number and an
+    arbitrarily long run cannot overflow on either side. A text run compares as
+    ``_chat_folder_name_key`` does (UTF-16 code units of the ``A``-``Z``-folded
+    text). Where a digit run meets a text run, the digit run sorts first; where
+    every compared run is equal, the shorter name sorts first.
+
+    Only ``0``-``9`` is a digit, deliberately: ``str.isdigit`` reads the
+    interpreter's Unicode tables where the sidebar's ``/[0-9]/`` does not, and a
+    key that agrees with ``folderTree.naturalNameCompare`` by construction is the
+    whole point -- ``chat_folder_tree`` in this mode must list what the sidebar
+    draws. Ties (``01`` against ``1``) fall through to the ``custom`` key.
+    """
+    name = folder.get("name")
+    text = (name if isinstance(name, str) else "").translate(_ASCII_FOLD)
+    key: list[tuple[Any, ...]] = []
+    for run in _DIGIT_RUNS.findall(text):
+        if "0" <= run[0] <= "9":
+            digits = run.lstrip("0")
+            key.append((0, len(digits), digits.encode("ascii")))
+        else:
+            key.append((1, run.encode("utf-16-be", "surrogatepass")))
+    return tuple(key)
+
+
+def _chat_folder_sort_key(mode: str) -> Callable[[dict], tuple[Any, ...]]:
+    """The sibling sort key for one folder sort mode.
+
+    ``custom`` is the stored ``order`` then the folded name -- the only order that
+    existed before the mode did, and the one every placement (``before``/``after``)
+    is computed in. ``name`` and ``created`` are VIEW orders layered on top: each
+    ends in the ``custom`` key so two folders the mode cannot separate keep the
+    order the person arranged, and so the whole key stays total on both sides.
+    ``created`` is newest first, the direction the sidebar's session list already
+    reads in; a folder with no stamp sorts as older than every stamped one.
+
+    An unknown mode reads as ``custom`` rather than raising, because this is
+    called from a listing an agent depends on and the loader has already reduced
+    the stored value to a known one.
+    """
+
+    def custom(folder: dict) -> tuple[Any, ...]:
+        return (_chat_folder_order(folder), _chat_folder_name_key(folder))
+
+    if mode == "name":
+        return lambda f: (_chat_folder_natural_key(f), *custom(f))
+    if mode == "created":
+
+        def created(folder: dict) -> tuple[Any, ...]:
+            stamp = _chat_folder_created(folder)
+            return (1, 0.0, *custom(folder)) if stamp is None else (0, -stamp, *custom(folder))
+
+        return created
+    return custom
+
+
+def _chat_folder_siblings(
+    folders: list[dict], parent_id: str, mode: str = FOLDER_SORT_DEFAULT
+) -> list[dict]:
     """Direct children of ``parent_id``, in the order the sidebar renders them.
 
-    The comparator mirrors the sidebar's own (``folderTree.bySidebarOrder`` sorts
-    each parent's children by ``order`` then name), because a caller saying "put
-    this after that" means after what the PERSON SEES. Sorting by ``order`` alone
-    would disagree with the rendered list wherever two siblings share a number,
-    which the store permits.
+    The comparator mirrors the sidebar's own (``folderTree.folderComparator``
+    sorts each parent's children by the person's folder sort mode -- stored
+    ``order`` then name in ``custom``), because a caller saying "put this after
+    that" means after what the PERSON SEES. Sorting by ``order`` alone would
+    disagree with the rendered list wherever two siblings share a number, which
+    the store permits.
+
+    ``mode`` defaults to ``custom`` because that is the order a POSITION lives in:
+    the placement helpers call this to find the gap a ``before``/``after`` anchor
+    names, and a gap only exists in the stored order. The tree LISTING passes the
+    person's mode instead, so it shows what the sidebar shows.
 
     The name key is ``_chat_folder_name_key``, which folds ``A``-``Z`` and compares
     the UTF-16 encoding, so ``Apple`` sorts between ``alpha`` and ``apricot``.
@@ -902,7 +1222,7 @@ def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
     for which mappings are left alone and why.
     """
     kids = [f for f in folders if f.get("id") and str(f.get("parent_id") or "") == parent_id]
-    return sorted(kids, key=lambda f: (_chat_folder_order(f), _chat_folder_name_key(f)))
+    return sorted(kids, key=_chat_folder_sort_key(mode))
 
 
 # ``ChatSidebar``'s ``renderFolderBlock`` returns nothing for ``depth > 10``, so a
@@ -914,14 +1234,19 @@ def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
 _SIDEBAR_MAX_DRAWN_DEPTH = 10
 
 
-def _chat_folder_render_order(folders: list[dict]) -> list[tuple[str, int]]:
-    """``(folder_id, depth)`` in sidebar render order — pre-order, siblings by order.
+def _chat_folder_render_order(
+    folders: list[dict], mode: str = FOLDER_SORT_DEFAULT
+) -> list[tuple[str, int]]:
+    """``(folder_id, depth)`` in sidebar render order — pre-order, siblings by ``mode``.
 
     Depth-first from the top level, so a child always follows its parent, which
-    is the shape the sidebar draws. Two defences the sidebar also carries: a row
-    whose ``parent_id`` names a folder absent from this list renders at the top
-    level rather than being dropped, and a parent cycle can neither loop the walk
-    nor swallow the folders caught in it (those are appended at the end).
+    is the shape the sidebar draws. Siblings sort with ``_chat_folder_sort_key``
+    for the person's folder sort mode, at every depth, because the sidebar applies
+    its comparator to every parent's children alike. Two defences the sidebar also
+    carries: a row whose ``parent_id`` names a folder absent from this list renders
+    at the top level rather than being dropped, and a parent cycle can neither
+    loop the walk nor swallow the folders caught in it (those are appended at the
+    end).
 
     Depth is clamped to ``_SIDEBAR_MAX_DRAWN_DEPTH`` so the indentation cannot claim
     a level the sidebar does not draw. Every row is still listed at that depth: an
@@ -936,8 +1261,9 @@ def _chat_folder_render_order(folders: list[dict]) -> list[tuple[str, int]]:
             continue
         parent = str(folder.get("parent_id") or "")
         by_parent.setdefault(parent if parent in known else "", []).append(folder)
+    sort_key = _chat_folder_sort_key(mode)
     for kids in by_parent.values():
-        kids.sort(key=lambda f: (_chat_folder_order(f), _chat_folder_name_key(f)))
+        kids.sort(key=sort_key)
 
     out: list[tuple[str, int]] = []
     seen: set[str] = set()
@@ -1641,6 +1967,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return fld_err
         if fld_id:
             payload["folder_id"] = fld_id
+        if args.get("model"):
+            payload["model"] = args["model"]
         resp = _post(
             "/api/session-control/create",
             payload,
@@ -1649,8 +1977,9 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if resp.get("error"):
             return redact(f"Error: could not create a session: {resp['error']}{made_note}")
         filed = f" filed in `{folder_label}`" if folder_label else ""
+        on_model = f" on model `{resp['model']}`" if resp.get("model") else ""
         return redact(
-            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}.{made_note} "
+            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}{on_model}.{made_note} "
             "It is empty and waiting in the user's sidebar; watch it with "
             "session_read_message."
         )
@@ -1705,6 +2034,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
         return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
 
+    if name == "session_set_model":
+        args = validate_tool_args(args, SESSION_SET_MODEL_SCHEMA)
+        resp = _post(
+            "/api/session-control/set-model",
+            {"target": args["target"], "model": args["model"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not change that session's model: {resp['error']}"
+        target = resp.get("target", args["target"])
+        model = resp.get("model") or "auto"
+        return redact(f"\U0001f501 `{target}` will switch to `{model}` when its next turn starts.")
+
     if name == "session_close":
         args = validate_tool_args(args, SESSION_CLOSE_SCHEMA)
         resp = _post(
@@ -1754,6 +2096,163 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"\U0001f4e8 Queued for `{target}` — it is mid-turn, so your message runs "
             f"when the current turn ends.{queued_note} Poll with session_read_message."
         )
+
+    if name == "session_broadcast":
+        args = validate_tool_args(args, SESSION_BROADCAST_SCHEMA)
+        payload = {"message": args["message"], "mode": args["mode"]}
+        # The VALUE decides, not the key: the validator keeps an explicit JSON
+        # `null` as the field's `None` default, so a presence test would send
+        # `None` into `list()`. `None` and omission both select the default
+        # audience, while an explicitly empty list is still forwarded for the
+        # backend to refuse rather than widened to that audience here.
+        if args.get("targets") is not None:
+            payload["targets"] = list(args["targets"])
+        resp = _post(
+            "/api/session-control/broadcast",
+            payload,
+            # The backend delivers SEQUENTIALLY, so one request covers up to
+            # `MAX_BROADCAST_TARGETS` deliveries and the 30-second default would
+            # expire mid-fleet: the client then reports a failure for a broadcast
+            # the server went on to deliver, discarding the per-target report that
+            # is this verb's whole contract, and the caller's natural retry
+            # delivers the whole message twice.
+            #
+            # The same per-target allowance the backend ENFORCES per delivery, read
+            # from one name so the two cannot drift. Multiplied by the cap because
+            # the deliveries are sequential, then given the shared response margin:
+            # the client budget must EXCEED the backend's worst-case delivery time,
+            # never merely equal it, or the per-target report can still be lost.
+            timeout=(
+                MAX_BROADCAST_TARGETS * BROADCAST_TARGET_ALLOWANCE_SECS
+                + BROADCAST_RESPONSE_MARGIN_SECS
+            ),
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not broadcast: {resp['error']}"
+        rows = resp.get("results") or []
+        requested = int(resp.get("requested", len(rows)) or 0)
+        delivered = int(resp.get("delivered", 0) or 0)
+        mode = str(resp.get("mode", args["mode"]))
+        if resp.get("audience_empty"):
+            # Not an error, and said plainly: a conductor before its first dispatch
+            # is in this state, and "delivered to 0 of 0" reads like a failure.
+            return (
+                "\U0001f4e3 Nothing to broadcast to — you have not created any "
+                "session that is still open. Name `targets` to reach a session you "
+                "did not create, or open one with session_create."
+            )
+        verb = "Steered" if mode == "steer" else "Queued for"
+        lines = [f"\U0001f4e3 {verb} {delivered}/{requested} session(s):"]
+        for row in rows:
+            target = str(row.get("target", ""))
+            if not row.get("ok"):
+                lines.append(
+                    f"  \u274c `{target}` — {row.get('error', 'refused')} "
+                    f"({row.get('code', 'unknown')})"
+                )
+            elif row.get("steered"):
+                lines.append(f"  \u2705 `{target}` — cut into its running turn")
+            elif row.get("started"):
+                lines.append(f"  \u2705 `{target}` — started a turn on it")
+            else:
+                # A steer that could not be injected lands here, for the reason
+                # session_send spells out: reporting a plain queue would leave the
+                # caller believing that target was interrupted.
+                fell_back = " (steer fell back to the queue)" if mode == "steer" else ""
+                lines.append(f"  \u2705 `{target}` — queued until its turn ends{fell_back}")
+        if delivered < requested:
+            lines.append(
+                "Some targets were not reached — the rows above say which and why. "
+                "Nothing retries them for you."
+            )
+        return redact("\n".join(lines))
+
+    if name == "session_status":
+        validate_tool_args(args, SESSION_STATUS_SCHEMA)
+        resp = _get("/api/session-control/status", caller_key)
+        if resp.get("error"):
+            return f"Error: could not read your session roster: {resp['error']}"
+        rows = resp.get("sessions") or []
+        tree = str(resp.get("tree", "unreadable"))
+        history = str(resp.get("history", "readable"))
+        quality_notes: list[str] = []
+        if tree == "incomplete":
+            quality_notes.append(
+                "The crew-log roster read was INCOMPLETE, so this count is a floor: "
+                "a session you created may be missing from it."
+            )
+        elif tree == "unreadable":
+            quality_notes.append(
+                "The crew-log roster was unreadable (crew log off, or not seeded "
+                "yet), so this lists only sessions that are still open — a worker "
+                "that was lost would not appear."
+            )
+        if history == "incomplete":
+            quality_notes.append(
+                "The transcript-metadata roster read was INCOMPLETE, so a session "
+                "created before its first crew-log edge may be missing."
+            )
+        elif history == "unreadable":
+            quality_notes.append(
+                "The transcript-metadata roster was unreadable, so archived birth "
+                "records could not complete this answer."
+            )
+        # The union cut, caveated under its OWN name. Three states, not two: the
+        # field ABSENT (an older backend that does not compute it) says nothing and
+        # must not claim a cut, zero says the union was retained whole, and a
+        # published value that will not read as a number is a cut whose size is
+        # unknown -- which is not the same as no cut and gets its own sentence.
+        omitted_raw = resp.get("roster_omitted")
+        if omitted_raw is not None:
+            try:
+                roster_cut = int(omitted_raw)
+            except (TypeError, ValueError):
+                roster_cut = -1
+            if roster_cut > 0:
+                quality_notes.append(
+                    f"{roster_cut} more session(s) you created are NOT listed: the "
+                    "three rosters' union exceeded this reply's row bound. Name a "
+                    "session directly to read it."
+                )
+            elif roster_cut < 0:
+                quality_notes.append(
+                    "Sessions you created may be missing: this reply reported a "
+                    "roster overflow without a readable count."
+                )
+        if not rows:
+            empty = "\U0001f4cb You have no sessions open or on record."
+            if quality_notes:
+                empty += " " + " ".join(quality_notes)
+            return empty
+        status_lines = [f"\U0001f4cb {len(rows)} session(s) you stood up:"]
+        for row in rows:
+            target = str(row.get("target", ""))
+            status = str(row.get("status", ""))
+            if status == "gone":
+                status_lines.append(
+                    f"  \U0001faa6 `{target}` — gone (the crew log has it, the "
+                    "dashboard does not: closed, archived, or lost)"
+                )
+                continue
+            title = str(row.get("title", ""))
+            depth = int(row.get("queue_depth", 0) or 0)
+            queued = f", {depth} queued" if depth else ""
+            if status == "unknown":
+                # Its OWN mark, not the glyph map's default. Falling through to that
+                # default draws idle's sleep glyph -- "open and doing nothing", the
+                # one status that means no decision is needed -- for a row whose
+                # actual meaning is the opposite: nothing here knows whether this
+                # session finished or was lost.
+                status_lines.append(
+                    f"  \u2753 `{target}` ({title}) — unknown (you created it; "
+                    "neither a live session nor the crew log accounts for it)"
+                )
+                continue
+            mark = {"working": "\U0001f503", "queued": "\u23f8\ufe0f"}.get(status, "\U0001f4a4")
+            status_lines.append(f"  {mark} `{target}` ({title}) — {status}{queued}")
+        status_lines.extend(quality_notes)
+        return redact("\n".join(status_lines))
 
     if name == "session_adopt":
         args = validate_tool_args(args, SESSION_ADOPT_SCHEMA)
@@ -1805,6 +2304,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         queued = resp.get("queue_depth", 0)
         if queued:
             state_line += f", {queued} message(s) queued"
+        if resp.get("model"):
+            state_line += f", model {redact(str(resp['model']))}"
+        if resp.get("pending_model"):
+            state_line += f", pending model {redact(str(resp['pending_model']))} for its next turn"
         head_line = (
             f"\U0001f4d6 `{resp.get('target', '')}` — {resp.get('title', '')} "
             f"({state_line}; total={resp.get('total', 0)})"
@@ -1854,6 +2357,11 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         chat_slots, slots_err = _visible_chat_slots()
         if slots_err:
             return f"Error: {slots_err}"
+        # Read AFTER the two rows reads, which are the ones that can legitimately
+        # refuse (a filtered caller, a gone slot). A failed mode read does not
+        # abort the listing -- the header says the order is assumed instead -- so
+        # the tree stays readable when only its ordering is in doubt.
+        sort_mode, mode_err = _chat_folder_sort_mode()
         tree_paths = _chat_folder_paths(chat_folders)
         # Group live sessions by folder up front so an id that no longer has a
         # folder row (a slot pointing at a deleted folder) still surfaces under
@@ -1879,12 +2387,40 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         tree_lines = [
             f"\U0001f5c2\ufe0f Sidebar folder tree — {len(chat_folders)} folder"
             f"{'' if len(chat_folders) == 1 else 's'}, {len(chat_slots)} live session"
-            f"{'' if len(chat_slots) == 1 else 's'}:"
+            f"{'' if len(chat_slots) == 1 else 's'} (folder order: {sort_mode}"
+            f"{'' if not mode_err else ', assumed — could not read the dashboard settings: ' + mode_err}):"
         ]
-        # Sidebar ORDER, not alphabetical. This tool is how an agent reads the
-        # tree before repositioning a folder, so listing it by path would show a
+        if sort_mode != FOLDER_SORT_DEFAULT:
+            # The listing below is what the person sees, but a POSITION is a
+            # stored-order concept: in a name or created sort the before/after
+            # anchors chat_folder_move takes still write the stored (custom)
+            # position, which this view does not display. Say so up front, or an
+            # agent will "move A after B", re-read the tree, and see nothing move.
+            tree_lines.append(
+                f"Folders are sorted by {sort_mode}, so a before/after anchor passed "
+                "to chat_folder_move sets the stored (custom) position without "
+                "changing the order shown here; it becomes visible when the person "
+                "switches the sidebar back to the custom folder order."
+            )
+        if sort_mode == "created":
+            # A folder from before the ``created_at`` stamp existed has none, so
+            # the created key puts it after every stamped row, in the stored order
+            # -- the same rule the sidebar's ``folderCreated`` applies, and the
+            # sidebar's menu says the same thing under its rows. An agent reading
+            # a tree whose tail is in stored order must not take that tail for a
+            # date order.
+            unstamped = sum(1 for f in chat_folders if _chat_folder_created(f) is None)
+            if unstamped:
+                tree_lines.append(
+                    f"{unstamped} folder{'' if unstamped == 1 else 's'} with no created_at "
+                    "(made before the stamp existed) list last, in the stored (custom) "
+                    "order, not by date."
+                )
+        # Sidebar ORDER, not alphabetical (unless the person's mode IS by name).
+        # This tool is how an agent reads the tree before repositioning a folder,
+        # so listing it in any order the sidebar does not draw would show a
         # sequence the person never sees and make `before`/`after` a guess.
-        for fid, depth in _chat_folder_render_order(chat_folders):
+        for fid, depth in _chat_folder_render_order(chat_folders, sort_mode):
             fpath = tree_paths.get(fid, "?")
             row = next((f for f in chat_folders if str(f.get("id")) == fid), {})
             meta_bits = []
@@ -2513,6 +3049,83 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if removed:
             parts.append(f"removed {removed}")
         return redact(f"Session `{slot_key}`: {'; '.join(parts)}. Tags now: {shown}.")
+    if name == "chat_session_pin":
+        args = validate_tool_args(args, CHAT_SESSION_PIN_SCHEMA)
+        want = args["pinned"]
+        # Like chat_folder_move_session, this writes to a session OTHER than the
+        # caller's, so identity is resolved STRICTLY and the verified key rides
+        # on the write unchanged — see that tool for why the lenient walk is
+        # unsafe here.
+        caller_key, strict_err = require_strict_session_key(
+            "Error: cannot verify which session is calling, so this pin change is "
+            "refused — pinning another session requires a caller identity the "
+            "gateway can vouch for.",
+            server=SERVER_NAME,
+        )
+        if not caller_key:
+            return strict_err
+        # Channel containment is enforced HERE, at dispatch, and not only by the
+        # CHANNEL_AGENT_BLOCKED_TOOLS name match: that match runs at the
+        # permission prompt, which an auto-approved call never reaches. A
+        # channel agent acts on thread text other people wrote, and nothing at
+        # the route refuses a ``channel:`` caller, so it is refused before any
+        # session is listed.
+        if caller_key.startswith("channel:"):
+            try:
+                from kiro_crew.sel import sel
+
+                sel().log_tool_invocation(
+                    session_key=caller_key,
+                    source="mcp",
+                    tool_name=name,
+                    tool_kind=SERVER_NAME,
+                    outcome="rejected_blocked_tool",
+                )
+            except Exception:
+                # Stdio-silent: stderr would corrupt the JSON-RPC stream. The
+                # refusal below holds either way.
+                pass
+            return (
+                "Error: chat_session_pin is not available to channel agents — "
+                "pinning rearranges the person's sidebar, and a channel agent acts "
+                "on thread text other people wrote."
+            )
+        chat_slots, slots_err = _visible_chat_slots()
+        if slots_err:
+            return f"Error: {slots_err}"
+        slot_key, slot_err = _resolve_chat_slot_key(args["session"], chat_slots)
+        if slot_err:
+            return redact(f"Error: {slot_err}")
+        verb = "Pinned" if want else "Unpinned"
+        slot_row = next((s for s in chat_slots if str(s.get("key") or "") == slot_key), {})
+        # No client-side "already in that state" shortcut: the list read above
+        # can be stale, so the route decides under its lock, after the
+        # generation and ownership re-checks, and reports ``changed``.
+        # ``expected_created`` pins the write to the slot generation resolved
+        # above, the same token chat_folder_file_self sends; the endpoint
+        # checks it under its lock, so a slot key recreated for a different
+        # conversation in between is refused instead of pinned.
+        pin_body: dict[str, Any] = {"pinned": want}
+        slot_created = str(slot_row.get("created") or "")
+        if slot_created:
+            pin_body["expected_created"] = slot_created
+        d = _patch(
+            f"/api/chat/slots/{quote(slot_key, safe='')}/pin",
+            pin_body,
+            session_key=caller_key,
+        )
+        if d.get("error"):
+            if d.get("code") == "session_gone":
+                return redact(
+                    f"Error: session `{slot_key}` closed or was replaced after it was "
+                    "resolved. Nothing was written — call chat_folder_tree to see "
+                    "the current sessions."
+                )
+            return redact(f"Error: {d['error']}")
+        if d.get("changed") is False:
+            state_word = "pinned" if want else "not pinned"
+            return redact(f"No change: session `{slot_key}` is already {state_word}.")
+        return redact(f"{verb} session `{slot_key}`.")
     return f"Error: unknown tool '{name}'"
 
 

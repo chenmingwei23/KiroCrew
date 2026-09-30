@@ -20,7 +20,7 @@ pins every roster hand-off to a guard call, not by assertion -- the unexamined
 claim about backend coverage is the defect the mirrors folder exists to stop.
 
 **It lives in the SDK rather than in the ACP layer because the question is not an
-ACP question.** Given a spec, the server array a session is about to receive and
+ACP question.** Given a spec, the server array Crew is about to send a session and
 a backend id, "which refs resolve to nothing" is answerable from plain data --
 which is what lets ``kirocrew doctor`` ask it without importing the backend at
 all (the agent-sdk-boundary gate refuses a consumer a new ACP edge). Nothing here
@@ -34,9 +34,12 @@ kiro-cli is handed ``--agent`` and reads the spec itself; KAS receives the spec'
 servers as a projected agent definition in ``_meta`` -- so for it a ref is
 satisfied by the spec's OWN definition, and the array it gets carries broker
 stubs at most. Reading a member's refs against the wire would report every single
-one as unresolved on the healthiest install there is. Every other harness mounts
-exactly the array it is sent, so the wire array is the whole MCP surface of the
-session and the only thing that can satisfy a ref. A session-injected broker stub
+one as unresolved on the healthiest install there is. Every other harness is
+reached only through the array it is sent, so the wire array is the only channel
+Crew has onto the session and the only thing that can satisfy a ref -- what the
+harness mounts from a configuration of its own beside it is not Crew's to see,
+which is why the log line's verdict is a separate question
+(:mod:`kiro_crew.acp.mcp_ref_guard`). A session-injected broker stub
 satisfies a ref on either kind, because it arrives on the wire under the same
 name as the entry it wraps.
 
@@ -165,7 +168,10 @@ def _spec_server_names(spec: Any) -> set[str]:
 
 
 def unresolved_server_refs(spec: Any, wire_servers: Any, *, backend: str) -> list[str]:
-    """The spec's ``@server`` refs that no server this session gets can satisfy.
+    """The spec's ``@server`` refs that no server in Crew's projection can satisfy.
+
+    Crew's claim, not the session's: the harness may still mount a same-named
+    server from a configuration of its own, which this resolver never reads.
 
     *spec* is the agent spec as read from disk (``tools``, ``mcpServers``, and
     the per-entry ``disabledTools`` inside them); *wire_servers* is the FINAL

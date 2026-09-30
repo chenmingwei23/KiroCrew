@@ -23,7 +23,7 @@ import { useIsMobile } from '../hooks/useIsMobile'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import ArtifactFolderDeleteDialog from '../components/ArtifactFolderDeleteDialog'
-import { DndDraggable, DndDroppable } from '../components/dnd'
+import { DndActiveProbe, DndDraggable, DndDroppable } from '../components/dnd'
 import { useArtifactFolders, useInvalidateArtifactFolders, useMoveArtifactToFolder, type MoveArtifactOptions } from '../hooks/useArtifactFolders'
 import useMoveUndo from '../hooks/useMoveUndo'
 import MoveUndoBar from '../components/MoveUndoBar'
@@ -36,6 +36,7 @@ import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_ARTIFACT_DEPLOY } from '../utils/previewFlags'
 import { markJustCreatedBlank } from '../lib/blankHandoff'
 import { IMPORT_ACCEPT, IMPORTABLE_EXT_LIST, MAX_IMPORT_BYTES, planFileImport, wasContentRedacted, type ImportPlan, type ImportRejection } from '../lib/artifactImport'
+import { haptic } from '../lib/haptic'
 import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifact, SessionDoc } from '../types'
 import { KIND_BADGE, isoToTs, docFileType, FolderColorSwatches, FolderGlyph, FolderNameInput, FolderMenu, SessionDocStar, LibraryTable, LibraryTree } from '../components/library/LibraryTable'
 import SessionDocPreview from '../components/library/SessionDocPreview'
@@ -181,7 +182,7 @@ function FolderMiniThumb({ a }: { a: Artifact }) {
   const content = full?.content || ''
   return (
     <div className="h-[84px] rounded-md border border-border overflow-hidden bg-bg-elevated pointer-events-none" title={a.name}>
-      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
+      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} mini />}
     </div>
   )
 }
@@ -1278,13 +1279,20 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     const o = e.over?.data.current as { type?: string; folderId?: string } | undefined
     setOverFolderId(o?.type === 'folder-drop' ? (o.folderId ?? '') : null)
   }, [])
+  // The one place the drag mirror is torn down: end, cancel and the
+  // reconciler below all go through it so none can leave a piece behind.
+  const resetLibraryDrag = useCallback(() => {
+    setActiveDrag(null)
+    setOverFolderId(null)
+  }, [])
   const handleDragStart = useCallback((e: DragStartEvent) => {
+    // Past the sensor's hold/distance constraint: the card is really picked up.
+    haptic('medium')
     const d = e.active.data.current as LibraryDrag | undefined
     if (d?.type === 'artifact' || d?.type === 'folder') setActiveDrag(d)
   }, [])
   const handleDragEnd = useCallback((e: DragEndEvent) => {
-    setActiveDrag(null)
-    setOverFolderId(null)
+    resetLibraryDrag()
     const a = e.active.data.current as LibraryDrag | undefined
     const o = e.over?.data.current as { type?: string; folderId?: string } | undefined
     if (!a || o?.type !== 'folder-drop') return
@@ -1295,6 +1303,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       // folder the artifact already sits in arms (and moves, and dismisses)
       // nothing.
       if ((a.folderId || '') === target) return
+      // Past the guards: the move really arms, so the drop seats here and a
+      // same-folder release is felt as nothing, like a release over empty space.
+      haptic('light')
       dismissFolderMove()
       armArtifactMove({
         itemKey: a.slug,
@@ -1315,6 +1326,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     const dragged = folders.find(f => f.id === a.id)
     if (!dragged) return
     if ((dragged.parent_id || '') === target) return
+    haptic('light')
     dismissArtifactMove()
     armFolderMove({
       itemKey: a.id,
@@ -1324,8 +1336,24 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       toFolderColor: dest?.color,
       itemTitle: dragged.name,
     })
-  }, [folders, armArtifactMove, armFolderMove, dismissArtifactMove, dismissFolderMove])
-  const handleDragCancel = useCallback(() => { setActiveDrag(null); setOverFolderId(null) }, [])
+  }, [folders, armArtifactMove, armFolderMove, dismissArtifactMove, dismissFolderMove, resetLibraryDrag])
+  const handleDragCancel = resetLibraryDrag
+  // Which DndContexts hold an active drag, as reported by DndActiveProbe. A
+  // ref, not state: the probe writes it from a layout effect and the
+  // reconciler reads it from a passive effect in the same commit.
+  const dndActiveContexts = useRef(new Set<string>())
+  const reportDndActive = useCallback((id: string, active: boolean) => {
+    if (active) dndActiveContexts.current.add(id)
+    else dndActiveContexts.current.delete(id)
+  }, [])
+  // Reconcile the mirror with dnd-kit's store after every commit: a live
+  // mirror with no context reporting a drag is a gesture whose end dnd-kit
+  // never delivered. Deliberately dependency-free, and two ref reads wide.
+  useEffect(() => {
+    if (activeDrag === null && overFolderId === null) return
+    if (dndActiveContexts.current.size > 0) return
+    resetLibraryDrag()
+  })
 
   const allTags = useMemo(() => {
     const s = new Set<string>()
@@ -1901,6 +1929,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             onDragEnd={handleDragEnd}
             onDragCancel={handleDragCancel}
           >
+            <DndActiveProbe report={reportDndActive} />
             {/* Everything between the chrome and the gallery is capped and
               * scrolls itself once the gallery owns the page's scroll axis.
               *
@@ -2165,8 +2194,8 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
 
 
 /** Browse one publish provider's remote artifacts (provider-routed; vendor
- * copy comes from the provider's own display_name). Renders nothing while
- * loading/failed so the library page never blocks on a remote. */
+ * copy comes from the provider's own display_name). Loading stays quiet so a
+ * remote cannot block the library; failures use a bounded inline notice. */
 function RemoteBrowseSection({ provider, onForked, onCloned }: {
   provider: PublishProviderDescriptor
   onForked: (slug: string) => void
@@ -2207,18 +2236,26 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
   // Your Artifacts above, so listing them here too would be a duplicate.
   const notLocal = items.filter(a => !a.local_slug)
   if (isLoading && !notLocal.length) return null
-  // A failed provider browse must not make the whole section vanish — say so,
-  // and offer the retry. The filter box holds a query, not a draft, so the
-  // hand-off is safe.
+  // Remote discovery is optional to the local library, but its failure must
+  // remain actionable without recreating the full-width provider card.
   if (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
     return (
-      <Card className="mt-4">
-        <CardTitle>{i18nT('pages.artifactsPage.on')} {provider.display_name}</CardTitle>
-        <div className="flex items-start gap-2">
-          <ErrorNotice message={error instanceof Error ? error.message : String(error)} askAgent className="flex-1" />
-          <Btn onClick={() => refetch()} className="shrink-0">{i18nT('pages.artifactsPage.retry')}</Btn>
-        </div>
-      </Card>
+      <div className="mt-3 flex max-w-lg items-start gap-2">
+        <ErrorNotice
+          variant="inline"
+          title={provider.display_name}
+          message={errorMessage}
+          askAgent
+          className="min-w-0 flex-1"
+          messageClassName="line-clamp-2"
+          messageTooltip={errorMessage}
+          testId={`remote-browse-error-${provider.name}`}
+        />
+        <Btn onClick={() => refetch()} className="shrink-0">
+          {i18nT('pages.artifactsPage.retry')}
+        </Btn>
+      </div>
     )
   }
   if (!notLocal.length && !search) return null

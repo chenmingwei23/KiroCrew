@@ -10,6 +10,7 @@ and that no entry point bypasses them.
 """
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -64,6 +65,725 @@ async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, 
     assert len(reads) == 1
     assert reads[0][0] != loop_thread
     assert reads[0][1] == KEY
+
+
+class TestTheLineIsValidatedWithTheRows:
+    """The consolidator's privacy check reads the line, then snapshots rows.
+
+    A writer can tighten the line in between -- a same-key hand-over landing a
+    restricted tab's rows under a line that was persistent a moment ago. The
+    snapshot therefore re-reads the line under the SAME lock as the rows and
+    refuses them together, at both the pre-turn snapshot and the write-boundary
+    one, so no rows a restricted line governs reach the model or memory.
+    """
+
+    @staticmethod
+    def _tighten_before(log, method_name, monkeypatch, *, mode="incognito"):
+        """Tighten KEY's line the first time the seam takes its lock set on ``log``.
+
+        The gated snapshot acquires through ``locked_stems`` (the seam's hold), so
+        that is the seam the tightening writer is modelled as beating to the lock.
+        """
+        real = type(log).locked_stems
+        fired = {"done": False}
+
+        def _tighten_then_call(self, stems):
+            if not fired["done"]:
+                fired["done"] = True
+                with history_mod.allow_on_loop_persist():
+                    self.update_metadata(KEY, {"memory_mode": mode})
+            return real(self, stems)
+
+        monkeypatch.setattr(type(log), "locked_stems", _tighten_then_call)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary", "Incognito"])
+    async def test_a_line_tightened_before_the_snapshot_refuses_without_a_model_turn(
+        self, tmp_path, monkeypatch, mode
+    ):
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        c._call_llm = AsyncMock(return_value={"history_entry": "leaked"})
+        # ``_locked`` is the snapshot's own lock acquisition: the line flips just
+        # before the rows are read under it, after the privacy pre-checks ran.
+        self._tighten_before(log, "_locked", monkeypatch, mode=mode)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._call_llm.assert_not_awaited()
+        c._memory.append_history.assert_not_called()
+        assert log.consolidation_counts(KEY)[1] == 3, "the span was marked consolidated"
+        assert log.get_metadata(KEY).get("consolidation_attempts", 0) in (
+            0,
+            None,
+        ), "a refusal was charged as a failed attempt"
+
+    @pytest.mark.asyncio
+    async def test_a_line_tightened_during_the_model_turn_discards_the_result(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+
+        async def response(_prompt, **_kwargs):
+            with history_mod.allow_on_loop_persist():
+                log.update_metadata(KEY, {"memory_mode": "incognito"})
+            return {"history_entry": "derived from rows now under a restricted line"}
+
+        with patch.object(c, "_call_llm", AsyncMock(side_effect=response)):
+            outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._memory.append_history.assert_not_called()
+        assert log.consolidation_counts(KEY)[1] == 3, "the span was marked consolidated"
+
+    @staticmethod
+    def _tighten_at_publication(log, monkeypatch):
+        """Tighten the line immediately before the first publication hold enters."""
+        real_hold = log.publication_hold
+        fired = {"done": False}
+
+        @contextlib.contextmanager
+        def tighten_then_hold(key):
+            if not fired["done"]:
+                fired["done"] = True
+                with history_mod.allow_on_loop_persist():
+                    log.update_metadata(KEY, {"memory_mode": "incognito"})
+            with real_hold(key):
+                yield
+
+        monkeypatch.setattr(log, "publication_hold", tighten_then_hold)
+        return fired
+
+    @pytest.mark.asyncio
+    async def test_a_line_tightened_before_history_publication_refuses_the_write(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        c._call_llm = AsyncMock(return_value={"history_entry": "must not persist"})
+        fired = self._tighten_at_publication(log, monkeypatch)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert fired["done"], "the history publication interleaving did not occur"
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._memory.append_history.assert_not_called()
+        assert int(log.get_metadata(KEY).get("last_consolidated", 0)) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_line_tightened_before_member_publication_refuses_the_atomic_write(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        vectors = MagicMock()
+        vectors.algorithm_version = "v2"
+        vectors.consolidation_receipt.return_value = None
+        vectors.get_all_semantic.return_value = []
+        vectors.with_record_metadata.return_value = []
+        execution = ExecutionContext(
+            "member-id",
+            MemoryStoreRef("member-store", "member-id"),
+            "member",
+            "kirocrew",
+            "persistent",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.execution_context.read_session_execution", lambda _key: execution
+        )
+        monkeypatch.setattr("kiro_crew.memory_stores.memory_store_version", lambda _store: 2)
+        monkeypatch.setattr(ContextBuilder, "ensure_store", AsyncMock(return_value=vectors))
+        c = _make_consolidator(log)
+        monkeypatch.setattr(ContextBuilder, "get_memory_for", lambda **_kwargs: c._memory)
+        c._call_llm = AsyncMock(return_value={"history_entry": "must not persist"})
+        fired = self._tighten_at_publication(log, monkeypatch)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert fired["done"], "the member publication interleaving did not occur"
+        assert outcome is _CONSOLIDATION_REFUSED
+        vectors.apply_consolidation.assert_not_called()
+        assert int(log.get_metadata(KEY).get("last_consolidated", 0)) == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_line_under_the_snapshot_lock_refuses(self, tmp_path, monkeypatch):
+        """Fail closed: rows whose contract cannot be read are not derived from."""
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        c._call_llm = AsyncMock(return_value={"history_entry": "leaked"})
+        # Unreadable only from the snapshot's own lock hold onward, so the
+        # pre-checks (which read the line too) pass and the snapshot is the gate.
+        real_locked_stems = type(log).locked_stems
+        real_status = type(log)._read_metadata_status
+        inside = {"lock": False}
+
+        def _locked_then_unreadable(self, stems):
+            inside["lock"] = True
+            return real_locked_stems(self, stems)
+
+        def _status(self, key):
+            if inside["lock"] and key == KEY:
+                return {}, False
+            return real_status(self, key)
+
+        monkeypatch.setattr(type(log), "locked_stems", _locked_then_unreadable)
+        monkeypatch.setattr(type(log), "_read_metadata_status", _status)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._call_llm.assert_not_awaited()
+
+    def test_the_snapshot_is_ungated_unless_asked(self, tmp_path):
+        """Other callers keep the plain three-tuple; only the consolidator asks."""
+        log = _seed_log(tmp_path)
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(KEY, {"memory_mode": "incognito"})
+        rows, total, generation = log.snapshot_for_consolidation(KEY)
+        assert (len(rows), total) == (3, 3)
+        with pytest.raises(history_mod.TranscriptWithheld):
+            log.snapshot_for_consolidation(KEY, withhold_restricted=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    (
+        {"history_entry": "must not persist"},
+        {"preferences_update": "# User Preferences\n- dark mode"},
+        {"projects_update": "# Active Projects\n- Kiro Crew"},
+    ),
+    ids=("history", "preferences", "projects"),
+)
+async def test_persistence_disabled_after_extraction_refuses_before_marking(
+    tmp_path, monkeypatch, result
+):
+    from kiro_crew import history_consolidation
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    disabled = False
+
+    async def response(_prompt, **_kwargs):
+        nonlocal disabled
+        disabled = True
+        return result
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(side_effect=response)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is _CONSOLIDATION_REFUSED
+    mark_consolidated.assert_not_called()
+    c._memory.append_history.assert_not_called()
+    c._memory.write_preferences.assert_not_called()
+    c._memory.write_projects.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+@pytest.mark.asyncio
+async def test_persistence_flip_after_first_commit_finishes_the_run(tmp_path, monkeypatch):
+    from kiro_crew import history_consolidation
+
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    disabled = False
+
+    def append_history(_entry):
+        nonlocal disabled
+        disabled = True
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(
+        return_value={
+            "history_entry": "committed history",
+            "preferences_update": "# User Preferences\n- dark mode",
+        }
+    )
+    c._memory.append_history.side_effect = append_history
+    c._memory.write_preferences.return_value = True
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is None
+    c._memory.append_history.assert_called_once_with("committed history")
+    c._memory.write_preferences.assert_called_once_with(
+        "# User Preferences\n- dark mode", expected_baseline=""
+    )
+    mark_consolidated.assert_called_once()
+    assert log.consolidation_counts(KEY)[1] == 0
+
+
+@pytest.mark.asyncio
+async def test_cas_refused_first_publication_does_not_arm_commit_latch(tmp_path, monkeypatch):
+    from kiro_crew import history_consolidation
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    disabled = False
+
+    def refuse_preferences(*_args, **_kwargs):
+        nonlocal disabled
+        disabled = True
+        return False
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(
+        return_value={
+            "preferences_update": "# User Preferences\n- dark mode",
+            "projects_update": "# Active Projects\n- Kiro Crew",
+        }
+    )
+    c._memory.write_preferences.side_effect = refuse_preferences
+    c._memory.write_projects.return_value = True
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is _CONSOLIDATION_REFUSED
+    c._memory.write_preferences.assert_called_once_with(
+        "# User Preferences\n- dark mode", expected_baseline=""
+    )
+    c._memory.write_projects.assert_not_called()
+    c._memory.append_history.assert_not_called()
+    mark_consolidated.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+def _refuse_holds_after(log, monkeypatch, first_refused: int, exc: Exception) -> dict:
+    """Let the first ``first_refused - 1`` publication holds enter; refuse the rest.
+
+    The refusal is raised where ``publication_hold`` raises its own: on entry,
+    before the guarded body runs, so the write under a refused hold never happens.
+    """
+    real_hold = log.publication_hold
+    calls = {"n": 0}
+
+    @contextlib.contextmanager
+    def counted_hold(key, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= first_refused:
+            raise exc
+        with real_hold(key, **kwargs):
+            yield
+
+    monkeypatch.setattr(log, "publication_hold", counted_hold)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    (
+        history_mod.TranscriptBusy("transcript lock not acquired in time"),
+        history_mod.TranscriptWithheld("transcript is restricted"),
+    ),
+    ids=("busy", "withheld"),
+)
+async def test_a_refused_hold_after_the_first_commit_marks_the_span(
+    tmp_path, monkeypatch, caplog, refusal
+):
+    """History committed, then a later hold is refused: the span is still marked.
+
+    Refusing the run at that point leaves the span pending, the idle sweep runs
+    it again and ``append_history`` -- which carries no receipt -- appends the
+    same entry twice. The later outputs are skipped with a warning instead.
+    """
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    c._call_llm = AsyncMock(
+        return_value={
+            "history_entry": "committed history",
+            "preferences_update": "# User Preferences\n- dark mode",
+            "projects_update": "# Active Projects\n- Kiro Crew",
+        }
+    )
+    c._memory.write_preferences.return_value = True
+    c._memory.write_projects.return_value = True
+    calls = _refuse_holds_after(log, monkeypatch, first_refused=2, exc=refusal)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    with caplog.at_level("WARNING", logger="kiro_crew.history"):
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is None
+    assert calls["n"] == 2, "publication continued past the refused hold"
+    c._memory.append_history.assert_called_once_with("committed history")
+    c._memory.write_preferences.assert_not_called()
+    c._memory.write_projects.assert_not_called()
+    mark_consolidated.assert_called_once_with(KEY, 3, 0)
+    assert log.consolidation_counts(KEY)[1] == 0, "the span was left pending"
+    assert log.get_metadata(KEY).get("consolidation_attempts", 0) in (0, None)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "stopped at the preferences stage" in warnings[0].getMessage()
+    assert str(refusal) in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    (
+        history_mod.TranscriptBusy("transcript lock not acquired in time"),
+        history_mod.TranscriptWithheld("transcript is restricted"),
+    ),
+    ids=("busy", "withheld"),
+)
+async def test_a_refused_hold_before_the_first_commit_still_refuses_the_run(
+    tmp_path, monkeypatch, refusal
+):
+    """Nothing committed, so nothing can be duplicated: refuse, mark nothing."""
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    c._call_llm = AsyncMock(
+        return_value={
+            "history_entry": "must not persist",
+            "preferences_update": "# User Preferences\n- dark mode",
+        }
+    )
+    calls = _refuse_holds_after(log, monkeypatch, first_refused=1, exc=refusal)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is _CONSOLIDATION_REFUSED
+    assert calls["n"] == 1
+    c._memory.append_history.assert_not_called()
+    c._memory.write_preferences.assert_not_called()
+    mark_consolidated.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_marker_failure_after_a_refused_later_hold_is_charged(tmp_path, monkeypatch):
+    """The busy stem can also fail the marker write: it is charged like any post-LLM failure."""
+    log = _seed_log(tmp_path)
+    c = _make_consolidator(log)
+    c._migrated = False
+    c._call_llm = AsyncMock(
+        return_value={
+            "history_entry": "committed history",
+            "preferences_update": "# User Preferences\n- dark mode",
+        }
+    )
+    _refuse_holds_after(
+        log, monkeypatch, first_refused=2, exc=history_mod.TranscriptBusy("held elsewhere")
+    )
+    monkeypatch.setattr(
+        log, "mark_consolidated", MagicMock(side_effect=history_mod.HistoryLockTimeout("held"))
+    )
+
+    with pytest.raises(history_mod.HistoryLockTimeout):
+        await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    c._memory.append_history.assert_called_once_with("committed history")
+    assert int(log.get_metadata(KEY).get("consolidation_attempts", 0)) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistence_rechecked_inside_member_publication_hold(tmp_path, monkeypatch):
+    from kiro_crew import history_consolidation
+    from kiro_crew.context import ContextBuilder
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    vectors = MagicMock()
+    vectors.algorithm_version = "v2"
+    vectors.consolidation_receipt.return_value = None
+    vectors.get_all_semantic.return_value = []
+    vectors.with_record_metadata.return_value = []
+    execution = ExecutionContext(
+        "member-id",
+        MemoryStoreRef("member-store", "member-id"),
+        "member",
+        "kirocrew",
+        "persistent",
+    )
+    monkeypatch.setattr(
+        "kiro_crew.execution_context.read_session_execution", lambda _key: execution
+    )
+    monkeypatch.setattr("kiro_crew.memory_stores.memory_store_version", lambda _store: 2)
+    monkeypatch.setattr(ContextBuilder, "ensure_store", AsyncMock(return_value=vectors))
+    c = _make_consolidator(log)
+    monkeypatch.setattr(ContextBuilder, "get_memory_for", lambda **_kwargs: c._memory)
+    disabled = False
+
+    async def response(_prompt, **_kwargs):
+        nonlocal disabled
+        disabled = True
+        return {"history_entry": "must not persist"}
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(side_effect=response)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is _CONSOLIDATION_REFUSED
+    vectors.apply_consolidation.assert_not_called()
+    mark_consolidated.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "blocked_writer"),
+    (
+        (
+            {"lessons": [{"rule": "Always verify the durable write", "category": "knowledge"}]},
+            "write_lesson",
+        ),
+        (
+            {
+                "episodic": [
+                    {"text": "The durable write was verified before publication.", "tags": []}
+                ]
+            },
+            "write_episodic",
+        ),
+    ),
+    ids=("lesson", "episodic"),
+)
+async def test_persistence_rechecked_inside_v1_vector_publication_hold(
+    tmp_path, monkeypatch, result, blocked_writer
+):
+    from kiro_crew import history_consolidation
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    vectors = MagicMock()
+    vectors.algorithm_version = "v1"
+    vectors.get_all_semantic.return_value = []
+    vectors.space_generation = 1
+    vectors.embed_lesson.return_value = [0.1]
+    vectors.embed_episodic.return_value = [0.1]
+    c = _make_consolidator(log, vector_store=vectors)
+    disabled = False
+
+    async def response(_prompt, **_kwargs):
+        nonlocal disabled
+        disabled = True
+        return result
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(side_effect=response)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert outcome is _CONSOLIDATION_REFUSED
+    getattr(vectors, blocked_writer).assert_not_called()
+    vectors.write_lesson.assert_not_called()
+    vectors.write_episodic.assert_not_called()
+    mark_consolidated.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+@pytest.mark.asyncio
+async def test_persistence_rechecked_inside_skill_publication_hold(tmp_path, monkeypatch):
+    from kiro_crew import history_consolidation
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    loader = MagicMock()
+    loader.list_auto_skills.return_value = []
+    loader.list_pending_skills.return_value = []
+    loader.find_similar.return_value = None
+    c = _make_consolidator(
+        log,
+        skills_loader=loader,
+        auto_skills_enabled=True,
+        auto_min_tool_calls=0,
+        approval_required=True,
+    )
+    disabled = False
+    calls = 0
+
+    async def response(_prompt, **_kwargs):
+        nonlocal calls, disabled
+        calls += 1
+        if calls == 1:
+            return {"lessons": []}
+        disabled = True
+        return {
+            "new_skill": {
+                "slug": "checked-publication-hold",
+                "description": "Verify a publication hold before writing",
+                "triggers": "publication, persistence",
+                "procedure_md": "## When to use\nBefore a durable write.\n\n## Steps\nVerify the switch.\n\n## Gotchas\nDo not bypass the hold.",
+            }
+        }
+
+    monkeypatch.setattr(history_consolidation, "_persistence_disabled", lambda: disabled)
+    c._call_llm = AsyncMock(side_effect=response)
+    mark_consolidated = MagicMock(wraps=log.mark_consolidated)
+    monkeypatch.setattr(log, "mark_consolidated", mark_consolidated)
+
+    outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    assert calls == 2, "the skill-candidate publication interleaving did not occur"
+    assert outcome is _CONSOLIDATION_REFUSED
+    loader.stage_skill_candidate.assert_not_called()
+    loader.create_auto_skill.assert_not_called()
+    loader.update_auto_skill.assert_not_called()
+    mark_consolidated.assert_not_called()
+    assert log.consolidation_counts(KEY)[1] == 3
+
+
+@pytest.mark.asyncio
+async def test_consolidate_refuses_a_channel_thread_whose_map_entry_was_pruned(
+    tmp_path, monkeypatch
+):
+    """The transcript header is the record a memory reader consults.
+
+    ``privacy_mode.apply_mode`` stamps ``memory_mode`` into the header, the record
+    ``_consolidate`` refuses on, so a channel thread's mode survives the pruning
+    of its session-map entry. Driven the way production runs it: the real
+    modifier path over a real ``SessionMap``, then a consolidator that holds NO
+    session map at all (a header-only reader), with the process-local trackers
+    emptied (the restart), through the session-end hook's entry point.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)  # three turns before the modifier
+    sm = SessionMap()
+    sessions = SimpleNamespace(_session_map=sm, channel_key_for_stem=sm.channel_key_for_stem)
+    privacy_mode.reset()
+    try:
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            live_key,
+            source="telegram",
+            sessions=sessions,
+        )
+        sm.flush()
+        assert log.get_metadata(live_key).get("memory_mode") == "incognito", "premise: stamped"
+        privacy_mode.reset()  # the fresh gateway's trackers start empty
+        c = _make_consolidator(log, sessions=None)  # no map: the header must answer
+        c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        c.consolidate_session(live_key)
+        tasks = list(c._tasks)
+        assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
+        result = await asyncio.wait_for(tasks[0], 10)
+    finally:
+        privacy_mode.reset()
+
+    assert (
+        c._call_llm.await_count == 0
+    ), "a channel thread marked incognito was consolidated without its session map"
+    assert result is _CONSOLIDATION_REFUSED
+    assert log.unconsolidated_count(live_key) == 3
+    assert log.get_metadata(live_key).get("last_consolidated", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_privacy_flag_is_kept_by_prune_and_stamped_by_the_startup_sweep(
+    tmp_path, monkeypatch
+):
+    """A thread flagged before the header carried the mode: the map entry is all it has.
+
+    Pre-upgrade installs hold private threads whose flag was written straight to
+    the session map, with no header stamp, and ``apply_mode`` returns early for a
+    mode already marked, so nothing re-stamps them. Two facts pinned in one
+    lifecycle: the startup ``prune()`` keeps such an entry (clearing only its
+    dead ``sid``) and never reads a transcript for it; and the startup path's
+    off-loop step then copies the mode into the existing transcript's header
+    while the row STAYS (it is what the channel gate hydrates from), after which
+    the consolidator -- a header reader, holding no map -- refuses the thread.
+    """
+    import threading
+
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)
+    assert "memory_mode" not in log.get_metadata(live_key), "premise: legacy header, no mode"
+    sm = SessionMap()
+    sm.set(live_key, "sid-reclaimed-by-kiro-cli")  # the provider session, since reclaimed
+    sm.set_flag(live_key, "incognito", True)  # the legacy flag: map only, no header stamp
+    sm.flush()
+    privacy_mode.reset()
+    loop_thread = threading.current_thread()
+    header_reads: list[threading.Thread] = []
+    real_get_metadata = ConversationLog.get_metadata
+
+    def _recording_get_metadata(self, key):
+        header_reads.append(threading.current_thread())
+        return real_get_metadata(self, key)
+
+    monkeypatch.setattr(ConversationLog, "get_metadata", _recording_get_metadata)
+    try:
+        # The restart: startup prunes stale entries on the loop -- no transcript read.
+        pruned = sm.prune()
+        sm.flush()
+        assert pruned == 0
+        assert sm.get_flag(live_key, "incognito") is True
+        assert header_reads == [], "prune read a transcript header on the loop"
+
+        # The startup path's off-loop step: the mode moves into the header, the
+        # row stays, and neither happened on the loop thread.
+        assert await sm.stamp_privacy_headers() == 1
+        assert header_reads, "premise: the header was probed"
+        assert [t for t in header_reads if t is loop_thread] == []
+        assert sm.get_flag(live_key, "incognito") is True
+        assert real_get_metadata(log, live_key).get("memory_mode") == "incognito"
+        assert log.unconsolidated_count(live_key) == 3
+
+        # From here the header answers: a consolidator with no map refuses.
+        privacy_mode.reset()
+        header_only = _make_consolidator(log, sessions=None)
+        header_only._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        assert (
+            await asyncio.wait_for(header_only._consolidate(live_key), 10) is _CONSOLIDATION_REFUSED
+        )
+        header_only._call_llm.assert_not_awaited()
+    finally:
+        privacy_mode.reset()
 
 
 @pytest.mark.asyncio
@@ -180,6 +900,21 @@ def _seed_log(tmp_path, key: str = KEY, count: int = 3) -> ConversationLog:
     return log
 
 
+def _seed_default_log(key: str, count: int = 3) -> ConversationLog:
+    """Like :func:`_seed_log`, in the DEFAULT sessions directory.
+
+    For a test that drives ``privacy_mode.apply_mode``: its header stamp goes
+    through a default ``ConversationLog``, so the transcript under test has to
+    live where that instance writes (the conftest pins the directory per test).
+    """
+    log = ConversationLog()
+    log.init()
+    with history_mod.allow_on_loop_persist():
+        for i in range(count):
+            log.append(key, "user", f"m{i}")
+    return log
+
+
 def _make_consolidator(log: ConversationLog, **kw: Any) -> HistoryConsolidator:
     memory = MagicMock()
     memory.read_preferences.return_value = ""
@@ -252,6 +987,11 @@ class _FakeRequest(dict):
     def __init__(self, state: Any, body: dict) -> None:
         super().__init__()
         self.app = {"state": state}
+        # The owner's dashboard claims: the manual trigger is an owner-gated write.
+        # The subject is ``state.owner_id`` when one is configured, else the signed
+        # local bootstrap subject.
+        self["app"] = ""
+        self["user"] = str(getattr(state, "owner_id", "") or "") or "local-app"
         # The handler's session-recognition gate refuses a request with no
         # X-Session-Key; the browser UI's static key is the recognised caller.
         self.headers: dict[str, str] = {"X-Session-Key": "dashboard:ui"}

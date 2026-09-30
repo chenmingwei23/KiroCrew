@@ -38,7 +38,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.apps.builtins.spec_builder import backend as backend_package
-from kiro_crew.apps.builtins.spec_builder.backend.handlers import _ClientClaim
+from kiro_crew.apps.builtins.spec_builder.backend.orchestration.request_identity import (
+    _ClientClaim,
+)
 from kiro_crew.apps.builtins.spec_builder.tests.routes_facade import (
     BACKEND_MODULES,
     backend_namespace,
@@ -3561,7 +3563,7 @@ async def test_abort_cleanup_spares_a_replacement_nudge_loop(monkeypatch):
         def get_by_slot(self, key):
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -3788,7 +3790,7 @@ async def test_pinned_halt_spares_a_replacement_loop_and_slot(tmp_path, monkeypa
         def get_by_slot(self, key):
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -4095,7 +4097,7 @@ async def test_handoff_unwinds_when_the_index_commit_raises(tmp_path, monkeypatc
             self.armed = True
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
             removed.append(loop_id)
 
@@ -4260,7 +4262,7 @@ async def test_failed_handoff_keeps_a_pre_existing_conversation(tmp_path, monkey
             self.armed = True
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -5645,7 +5647,7 @@ async def test_second_handoff_is_refused_while_executing(tmp_path, monkeypatch):
         def get_by_slot(self, key):
             return None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             pass
 
     # The autonudge service must be available: it is checked before the claim (it
@@ -5805,7 +5807,7 @@ async def test_authorization_failure_reverts_the_recorded_execution_state(tmp_pa
         def get_by_slot(self, key):
             return None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             pass
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -5884,7 +5886,7 @@ async def test_deletion_during_authorization_removes_the_armed_loop(tmp_path, mo
         def get_by_slot(self, key):
             return _Loop() if self.armed and key == captured_slot_key else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
             removed.append(loop_id)
 
@@ -14232,12 +14234,13 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
         def get_by_slot(self, key):
             return loop if key == orphan_slot and not removed else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
+            stop_reasons.append(stopped_reason)
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
             loop.active = False
 
@@ -14247,6 +14250,7 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
         state.slot = None
         return True
 
+    stop_reasons: list[str | None] = []
     service = _Svc()
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: service)
     monkeypatch.setattr(routes, "_AutoNudgeService", _maintenance_loader(service))
@@ -14257,6 +14261,7 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
     assert await routes._remove_orphaned_executions(state) == {orphan_slot}
 
     assert removed == [loop.id]
+    assert stop_reasons == ["orphaned_worker"]
     assert torn_down == [orphan_slot_state]
     token = routes._reserve_pending_dispatch("/new/spec", "spec-builder-n-deadbeef", "n")
     assert token
@@ -14299,13 +14304,13 @@ async def test_create_cleanup_rechecks_a_slot_materialized_while_its_loop_quiesc
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             state.slot = published
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             assert loop_id == loop.id
 
     async def _teardown(_state, _name, *, only_slot, require_archive):
@@ -14352,12 +14357,12 @@ async def test_create_cleanup_keeps_a_quiesced_loop_until_worker_archive_succeed
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     async def _failed_archive(*_args, **_kwargs):
@@ -14400,12 +14405,12 @@ async def test_create_cleanup_loads_durable_loops_when_autonudge_is_disabled(tmp
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     offline = _OfflineSvc()
@@ -15167,6 +15172,7 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
         stop_sentinel_path=Path(spec_dir) / "STOP",
     )
     removed: list[str] = []
+    reasons: list[str] = []
 
     class _Svc:
         def list_all(self):
@@ -15175,8 +15181,9 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
         def get_by_slot(self, key):
             return loop if key == old_slot_key and loop.active else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
+            reasons.append(stop_reason)
             loop.active = False
 
     class _State:
@@ -15226,6 +15233,7 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
 
     assert response.status == 200, payload
     assert removed == [loop.id]
+    assert reasons == ["spec_stopped" if operation == "stop" else "spec_deleted"]
     assert loop.active is False
     if operation == "delete":
         assert old_slot_key not in routes._OBSERVED_SPEC_DIRS
@@ -15265,7 +15273,7 @@ async def test_stop_arriving_during_authorization_unwinds_before_dispatch(tmp_pa
         def get_by_slot(self, _key):
             return loop if loop.active else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
             loop.active = False
 
@@ -15497,7 +15505,7 @@ async def test_an_alias_mid_turn_blocks_a_handoff(tmp_path, monkeypatch):
 
     released: list = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15547,7 +15555,7 @@ async def test_a_completed_alias_turn_during_authorization_blocks_a_handoff(tmp_
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15590,7 +15598,7 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_authorization(tmp
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15638,7 +15646,7 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_the_final_repin(
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)

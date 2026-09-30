@@ -21,7 +21,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from kiro_crew import mcp_apps_render, session_directive
 from kiro_crew.acp.types import (
@@ -64,6 +64,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.acp_backends import ACP_BACKENDS_META_IDENTITY
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.credential_sources import tool_output_fingerprints
 
 logger = logging.getLogger(__name__)
 
@@ -728,6 +729,55 @@ def redact_text(text: str) -> str:
     return _redact(text)
 
 
+# Display cap for a backend-authored JSON-RPC id in a log line / exception
+# text. Applied AFTER redaction (redact-before-bound): a slice taken before the
+# redactor ran could sever a credential at the cut and leak the fragment.
+_REQUEST_ID_LOG_CAP = 256
+# Cap on the text handed to the redactor. A frame is bounded only by the 10 MB
+# stdout line limit, and the credential scan slides a window byte-by-byte over
+# base64-alphabet runs, so an unbounded id could hold the event loop for a
+# value that is then cut to 256 chars anyway. An id over the cap is NOT
+# truncated -- a cut can sever a credential into a fragment no pattern matches,
+# and an earlier redaction (a collapsed URL) can pull that fragment back inside
+# the display cap -- it is replaced by a fixed marker carrying only its length.
+_REQUEST_ID_REDACT_INPUT_CAP = 16 * _REQUEST_ID_LOG_CAP
+
+
+def _loggable_request_id(request_id: object) -> str:
+    """A JSON-RPC id from the backend, made safe for a log line or error text.
+
+    The id is backend-authored: ``repr`` keeps control characters and newlines
+    out of the line, the shared ``redact_text`` scrub (exfil URLs, then
+    credentials) keeps a URL- or credential-shaped id out of the gateway log,
+    ``/api/logs`` and any session card an exception message rides into, and the
+    result is length-capped after redaction. An id over
+    ``_REQUEST_ID_REDACT_INPUT_CAP`` is replaced by a length-only marker rather
+    than truncated, so a multi-MB id cannot stall the loop and a cut can never
+    hand the redactor a severed secret. ``repr`` also makes a non-string id (a
+    numeric ``toolCallId``) safe for the regexes. Every ACP log line that
+    carries a backend-authored id -- JSON-RPC request ids and tool-call ids, in
+    client, runtime, session handle and dispatch -- goes through it.
+    """
+    return redact_backend_text(repr(request_id))[:_REQUEST_ID_LOG_CAP]
+
+
+def redact_backend_text(text: str) -> str:
+    """Redact one backend-authored string whole, or refuse it by length.
+
+    The single policy behind every retained or logged backend string (ids,
+    session ids, methods): the text is handed to ``redact_text`` UNCUT, so no
+    credential is ever severed at a slice before the redactor sees it. A string
+    over ``_REQUEST_ID_REDACT_INPUT_CAP`` is not truncated -- a cut can leave a
+    fragment no pattern matches -- it is replaced by a marker carrying only its
+    length. Callers apply their own display or retention cap to the RESULT.
+    """
+    if len(text) > _REQUEST_ID_REDACT_INPUT_CAP:
+        # No content survives: a truncation could hand the redactor a severed
+        # secret that matches none of its patterns. Only the size is kept.
+        return f"<id too long: {len(text)} chars>"
+    return redact_text(text)
+
+
 def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
     """Extract text from an ``agent_message_chunk`` / ``agent_thought_chunk`` update.
 
@@ -1255,6 +1305,84 @@ def is_mcp_tool_approval(msg: JsonRpcMessage, event: AcpEvent | None = None) -> 
     return bool(event is not None and event.mcp_identity_trusted and event.mcp_server_name)
 
 
+#: KAS toolId of a tool whose permission request is a consent question about a
+#: call that runs no host command -> (the ``_meta.kiro.consent.capability`` KAS
+#: stamps on that request, the Crew tool name the same tool goes by). A sub-agent
+#: spawn is the case that needs it: its ``tool_call`` frame is taken for the
+#: sub-agent roster and never reaches the shared parser, and its toolCallId is
+#: synthetic (``invoke_subagent_<id>``), so every toolCallId-keyed cache misses.
+#: The child's own tool calls raise their own permission requests, so this
+#: classification waives nothing about them.
+_KAS_NON_COMMAND_TOOLS: dict[str, tuple[str, str]] = {
+    "invoke_sub_agent": ("subagent", "use_subagent"),
+}
+
+
+def kas_consent_tool(params: object) -> tuple[str, str]:
+    """The Crew tool and target a KAS permission request's own ``_meta.kiro`` names.
+
+    Returns ``(crew_tool_name, target)``, or ``("", "")``. ``_meta`` is written by
+    the KAS engine, not the model -- the same channel Crew already trusts for MCP
+    identity on ``tool_call`` frames. A non-empty answer means "not a shell call,
+    this is the tool, and this is the agent it starts", and is given only when
+    every field agrees: the toolId is on :data:`_KAS_NON_COMMAND_TOOLS`, the
+    consent capability is the one KAS assigns that toolId, ``consent.resource``
+    names the target, and no ``command`` rides along (KAS sets that field only for
+    a shell call). Anything else -- an unknown toolId, a missing or different
+    capability, a ``shell`` capability, no target, a command -- returns
+    ``("", "")`` and leaves the request unclassified, which keeps the refusal.
+
+    The name returned is Crew's (``use_subagent``), not KAS's, because it is the
+    name a deny rule or a ``tools`` ceiling is written against. The target is what
+    ``capabilities.spawn``'s ``agents`` scope is judged on, so a spawn with no
+    stated target is not classified at all rather than vetted as "no agent".
+    """
+    if not isinstance(params, dict):
+        return "", ""
+    meta = params.get("_meta")
+    kiro = meta.get("kiro") if isinstance(meta, dict) else None
+    if not isinstance(kiro, dict) or "command" in kiro:
+        return "", ""
+    tool_id = kiro.get("toolId")
+    known = _KAS_NON_COMMAND_TOOLS.get(tool_id) if isinstance(tool_id, str) else None
+    if known is None:
+        return "", ""
+    capability, crew_name = known
+    consent = kiro.get("consent")
+    if not isinstance(consent, dict) or consent.get("capability") != capability:
+        return "", ""
+    target = consent.get("resource")
+    if not isinstance(target, str) or not target.strip():
+        return "", ""
+    return crew_name, target.strip()
+
+
+#: Bound on a harness tool id. KAS's are short snake_case names; anything longer
+#: is not one and is dropped rather than cut.
+_MAX_HARNESS_TOOL_ID_LEN = 128
+
+_HARNESS_TOOL_ID_RE = re.compile(r"[A-Za-z0-9_.\-/@:]+")
+
+
+def _permission_tool_id(params: dict[str, Any]) -> str:
+    """``_meta.kiro.toolId`` of a permission request, or "" when absent or malformed.
+
+    Only an identifier is kept: word characters, ``.``, ``-`` and the ``/``, ``@``
+    and ``:`` separators an MCP tool's spelling uses. No glob metacharacter or
+    whitespace survives, so the value is matched as a name and logged unescaped.
+    """
+    meta = params.get("_meta")
+    kiro = meta.get("kiro") if isinstance(meta, dict) else None
+    tool_id = kiro.get("toolId") if isinstance(kiro, dict) else None
+    if (
+        not isinstance(tool_id, str)
+        or len(tool_id) > _MAX_HARNESS_TOOL_ID_LEN
+        or not _HARNESS_TOOL_ID_RE.fullmatch(tool_id)
+    ):
+        return ""
+    return tool_id
+
+
 def build_permission_event(
     msg: JsonRpcMessage,
     *,
@@ -1267,12 +1395,20 @@ def build_permission_event(
     cache_scope: str = "",
     diff_path_cache: dict[str, str] | None = None,
     gate_envelope_nonce: str | None = None,
-) -> tuple[AcpEvent, dict[str, str] | None]:
+    kas_consent_meta: bool = False,
+) -> tuple[AcpEvent | None, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
     ``gate_envelope_nonce`` is set only by a caller whose session runs Kiro Crew's
     gate extension (``Routing.VERIFIED_GATE_EXTENSION``); see :func:`gate_envelope`
     for what it unlocks and why the default consults nothing.
+
+    ``kas_consent_meta`` is set only by a caller whose session runs on KAS. It lets a
+    shell-cache MISS be resolved to "not a shell call" from the request's own
+    ``_meta.kiro`` block (see :func:`kas_consent_tool`), and to carry that tool's
+    Crew name as ``tool_name`` so deny and governance rules bind to it; it never sets
+    ``is_shell`` True and never overrides a cache hit. Every other backend leaves it
+    False, so its payloads are read exactly as before.
 
     Single source of truth shared by ``AcpClient`` and ``AcpSessionHandle`` so
     the two transports cannot drift on the kiro/claude permission payload shape:
@@ -1292,7 +1428,14 @@ def build_permission_event(
     permission payload's own ``kind`` is agent-influenced and must not waive the
     tool-name length cap).
     """
-    request_id = msg.id if msg.id is not None else ""
+    if not isinstance(msg.id, (str, int, float)) or isinstance(msg.id, bool):
+        logger.debug(
+            "Ignoring permission request with unsupported id type: %s",
+            type(msg.id).__name__,
+        )
+        return None, None
+    # A float id is kept exactly as the frame sent it, so the answer echoes it.
+    request_id = cast("str | int", msg.id)
     params = msg.params or {}
     tool_call = params.get("toolCall", {})
     tool_call = tool_call if isinstance(tool_call, dict) else {}
@@ -1309,11 +1452,13 @@ def build_permission_event(
             "kind": envelope["kind"],
             "input": envelope["input"],
         }
-    title = _redact(tool_call.get("title", "unknown"))
+    raw_title = tool_call.get("title", "unknown")
+    title = _redact(raw_title if isinstance(raw_title, str) else "")
     # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/…).
     # Carry it onto the event as display/telemetry metadata only — the is_shell
     # length-cap exemption resolves from shell_cache below, never this field.
-    tool_kind = tool_call.get("kind", "")
+    raw_tool_kind = tool_call.get("kind", "")
+    tool_kind = raw_tool_kind if isinstance(raw_tool_kind, str) else ""
 
     # ACP spec uses optionId/name + kind ("allow_once"|"allow_always"|
     # "reject_once"|"reject_always"); kiro-cli uses id/label with id
@@ -1380,7 +1525,8 @@ def build_permission_event(
     # Resolve full tool input — the preceding tool_call notification carries the
     # complete params cached by toolCallId; the permission message only has a
     # truncated human-readable title.
-    tool_call_id = tool_call.get("toolCallId", "")
+    raw_tool_call_id = tool_call.get("toolCallId", "")
+    tool_call_id = raw_tool_call_id if isinstance(raw_tool_call_id, str) else ""
     # ORIGIN-BOUND cache key. toolCallIds are backend/LLM-authored: without
     # scoping, a child session could replay a consumed parent toolCallId and
     # inherit the parent's trusted provenance (params/shell/MCP identity) for
@@ -1441,13 +1587,21 @@ def build_permission_event(
         # own agent-influenced ``kind``, which the deny-by-default rule above is
         # about; that field described the dialog and was discarded.
         cached_shell = is_shell_kind(envelope["kind"])
+    _kas_tool, _spawn_target = "", ""
+    if cached_shell is None and kas_consent_meta:
+        # A KAS sub-agent spawn's tool_call frame never reaches the caches; its
+        # request's engine-written ``_meta.kiro`` is the classification instead.
+        # Resolves to False only: a request it cannot read stays unclassified.
+        _kas_tool, _spawn_target = kas_consent_tool(params)
+        if _kas_tool:
+            cached_shell = False
     is_shell = bool(cached_shell)
     if cached_shell is None and tool_input:
         logger.info(
             "Permission event resolved tool_input but missed is_shell cache "
             "(req=%s tool_call_id=%s)",
-            request_id,
-            tool_call_id,
+            _loggable_request_id(request_id),
+            _loggable_request_id(tool_call_id),
         )
 
     # Resolve the STRUCTURED raw params for governance enforcement. The keystone
@@ -1482,7 +1636,7 @@ def build_permission_event(
             _raw_params_trusted = envelope is not None and not envelope["truncated"]
 
     # Trusted MCP server + tool identity recovered from the preceding tool_call
-    # (the permission payload carries no _meta). .get() (not .pop()) mirrors the
+    # (identity is never read off the permission payload). .get() (not .pop()) mirrors the
     # is_shell cache: a later tool_call_update for the same id re-reads it; the
     # per-turn dispatch .clear() handles cleanup. Empty on a miss (fail-closed
     # for the app-own-server auto-approve). The tool name lets the app-own-server
@@ -1497,7 +1651,10 @@ def build_permission_event(
         tool_name_cache.get(_ck) if (tool_name_cache is not None and tool_call_id) else None
     )
     _mcp_server_name = _cached_server or ""
-    _tool_name = _cached_tool or ""
+    # The Crew name of a KAS consent-classified tool, so the deny floor and the
+    # governance ceiling are asked about it and not about its title alone. It
+    # does NOT set ``_mcp_identity_trusted`` below: that flag records a cache hit.
+    _tool_name = _cached_tool or _kas_tool
     # Explicit identity-provenance flag (mirrors _raw_params_trusted): True iff
     # BOTH cache reads above actually HIT — a written entry may legitimately be
     # "" for a non-MCP tool, so the hit is distinguished from a miss by the
@@ -1520,6 +1677,11 @@ def build_permission_event(
         (diff_path_cache.get(_ck) or "") if (diff_path_cache is not None and tool_call_id) else ""
     )
 
+    # The engine's own id for the tool it asks about (KAS writes it into
+    # ``_meta.kiro.toolId``). Not read under a gate envelope: the frame's _meta
+    # then describes the dialog, not the call the envelope names.
+    _harness_tool_id = _permission_tool_id(params) if envelope is None else ""
+
     event = AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
         request_id=request_id,
@@ -1537,6 +1699,8 @@ def build_permission_event(
         tool_name=_tool_name,
         mcp_identity_trusted=_mcp_identity_trusted,
         diff_path=_diff_path,
+        spawn_target=_spawn_target,
+        harness_tool_id=_harness_tool_id,
     )
     return event, recorded
 
@@ -1836,29 +2000,6 @@ def tool_call_content_text(entry: Any) -> str | None:
     return str(text) if text else None
 
 
-def redacted_tool_id(tool_use_id: Any) -> str:
-    """A frame's ``toolCallId``, made safe to put in a log line.
-
-    Three hazards, all from the same fact -- the id is whatever JSON the backend
-    sent, not a validated string:
-
-    * ``str()`` first because it need not BE a string. A numeric ``toolCallId``
-      reaches :func:`redact_text`'s regexes as an int and raises ``TypeError``,
-      which would abort the active turn from inside a diagnostic warning -- a
-      logging path must never be able to kill the thing it is reporting on.
-    * Redact before bounding, never the reverse: a cut taken first can split a
-      credential into fragments no pattern matches. Same ordering as the tool
-      output join below.
-    * Bound it, because the id is unbounded input and this warning is retained in
-      the log ring ``/api/logs`` serves. 200 chars keeps a real id (they are
-      short) while refusing a frame that pads it to megabytes.
-
-    The caller still formats the result with ``%r`` -- bounding does not
-    neutralise a newline, so escaping stays the caller's job.
-    """
-    return redact_text(str(tool_use_id))[:200]
-
-
 def _rendered_shape_type(value: Any) -> str:
     """A frame-supplied ``type`` made safe to put in the shape diagnostic.
 
@@ -1996,12 +2137,12 @@ def log_unrenderable_content(log: logging.Logger, tool_use_id: Any, content: Any
     if not shapes:
         return
     log.warning(
-        "tool_call_update %r: no content entry could be rendered, so this tool "
+        "tool_call_update %s: no content entry could be rendered, so this tool "
         "shows no output at all. Unrecognised entry shapes: %s. ACP expects "
         "{'type': 'content', 'content': {'type': 'text', 'text': ...}}; a bare "
         "{'type': 'text', 'text': ...} block is also read. Shapes only -- entry "
         "VALUES are withheld from this log.",
-        redacted_tool_id(tool_use_id),
+        _loggable_request_id(tool_use_id),
         shapes,
     )
 
@@ -2114,7 +2255,17 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
             # only when Path 1 found nothing, which is what keeps a content block
             # winning over the raw envelope.
             if raw_output and "items" not in raw_output:
-                output_parts.append(_dumps_degraded(raw_output, default=str))
+                # Codex returns the MCP response inside result/error. Preserve
+                # its text framing; attribution still comes from the call.
+                mcp_result = raw_output.get("result")
+                mcp_text = (
+                    _mcp_content_text(mcp_result)
+                    if isinstance(mcp_result, dict) and raw_output.get("error") is None
+                    else None
+                )
+                output_parts.append(
+                    mcp_text if mcp_text is not None else _dumps_degraded(raw_output, default=str)
+                )
     tool_status = str(update.get("status") or "")
     if not output_parts:
         if tool_status not in TERMINAL_TOOL_STATUSES:
@@ -2158,6 +2309,9 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
         tool_output=final_output,
         tool_output_digest=tool_output_digest,
         tool_output_bytes=tool_output_bytes,
+        # Only a result the redactor changed can hold a credential worth a
+        # fingerprint, so an ordinary result pays nothing extra.
+        tool_output_credentials=tool_output_fingerprints(joined) if _redacted != joined else (),
         tool_final=update.get("status") == "completed",
         tool_status=str(update.get("status") or ""),
     )

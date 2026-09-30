@@ -57,6 +57,7 @@ from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
+from kiro_crew.agent_files import GUEST_AGENT_FILENAME as _GUEST_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import (
@@ -110,7 +111,14 @@ from kiro_crew.hooks import (
     safe_read_file_bytes_nolink,
     unc_probe_allowed,
 )
-from kiro_crew.mcp_cleanup import prune_dangling_tool_refs, purge_deleted_proxy_from_config
+from kiro_crew.mcp_cleanup import (
+    invalid_disabled_flag,
+    mcp_entries_muted,
+    mcp_entry_is_muted,
+    prune_dangling_tool_refs,
+    purge_deleted_proxy_from_config,
+    warn_invalid_disabled,
+)
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
     command_is_ours,
@@ -142,7 +150,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -1831,9 +1839,9 @@ def _all_skill_paths() -> list[str]:
                     current_event = ""
                     if manifest.is_file():
                         try:
-                            current_event = json.loads(manifest.read_text(encoding="utf-8")).get(
-                                "currentEventId", ""
-                            )
+                            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+                            if isinstance(manifest_data, dict):
+                                current_event = manifest_data.get("currentEventId", "")
                         except (json.JSONDecodeError, OSError):
                             pass
                     for sub in pkg.iterdir():
@@ -3459,15 +3467,33 @@ _NATIVE_PROMPT_STUB = (
 )
 
 
+def _is_managed_prompt_pointer(prompt: str) -> bool:
+    """Recognise an older managed URI after its install or data home moved."""
+    if not prompt.startswith("file://"):
+        return False
+    managed_prompt = _prompt_path()
+    if prompt == f"file://{managed_prompt}":
+        return True
+    norm = prompt[len("file://") :].replace("\\", "/")
+    managed_suffixes = (
+        "/.kiro/crew/prompt.md",
+        "/.kirocrew/prompt.md",
+        "/site-packages/kiro_crew/prompt.md",
+        "/site-packages/kiro_crew/config/prompt.md",
+        "/dist-packages/kiro_crew/prompt.md",
+        "/dist-packages/kiro_crew/config/prompt.md",
+    )
+    return any(norm.endswith(suffix) for suffix in managed_suffixes)
+
+
 def is_managed_prompt(prompt: str) -> bool:
     """Whether a spec ``prompt`` is the managed operating contract.
 
     context.py injects that contract at session start, so the readers that must
-    not deliver it twice recognise it here. It has two spellings: the ``file://``
-    pointer a not-yet-healed fork or an older spec carries, and
-    ``_NATIVE_PROMPT_STUB``.
+    not deliver it twice recognise it here. A spec may carry the native stub,
+    the current managed file URI, or a URI from an older install.
     """
-    return prompt == _NATIVE_PROMPT_STUB or prompt == f"file://{_prompt_path()}"
+    return prompt == _NATIVE_PROMPT_STUB or _is_managed_prompt_pointer(prompt)
 
 
 def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
@@ -3623,28 +3649,12 @@ def _refresh_dynamic_fields(
     # too, so name matching would silently and irrecoverably rewrite real user
     # references. A custom pointer that goes stale is left alone — not healing
     # preserves the user's path; healing destroys it.
-    managed_prompt = _prompt_path()
-    managed_uri = f"file://{managed_prompt}"
     if not fork:
         config["prompt"] = _NATIVE_PROMPT_STUB
     else:
         current = str(config.get("prompt") or "")
-        if current.startswith("file://"):
-            norm = current[len("file://") :].replace("\\", "/")
-            managed_homes = (
-                "/.kiro/crew/",
-                "/.kirocrew/",
-                # Installed-package spellings ONLY: a bare "/kiro_crew/" also
-                # matches a source CHECKOUT of this repo, where prompt.md is a
-                # user's custom file the heal would irreversibly overwrite.
-                "/site-packages/kiro_crew/",
-                "/dist-packages/kiro_crew/",
-            )
-            if current == managed_uri or (
-                norm.rsplit("/", 1)[-1] == managed_prompt.name
-                and any(spelling in norm for spelling in managed_homes)
-            ):
-                config["prompt"] = _NATIVE_PROMPT_STUB
+        if _is_managed_prompt_pointer(current):
+            config["prompt"] = _NATIVE_PROMPT_STUB
 
     # Managed MCP servers — ensure present and up-to-date.
     # Only refresh command/args; preserve user customizations (e.g. autoApprove).
@@ -4475,14 +4485,9 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     resolution, and every writer that receives one refuses rather than
     serializing JSON over a markdown file.
 
-    *name* is validated against the shared agent-name grammar BEFORE it reaches
-    the path join, so a caller passing a traversal (``../../something``) gets
-    ``None`` rather than a path outside the agents directory. The check lives
-    here, at the resolver, so every caller inherits it instead of each one
-    remembering: this function returns a path that :func:`reset_agent_model`
-    then WRITES, and the CLI takes the name from a user-supplied ``--agent``.
-    A symlinked or otherwise unsafe candidate is refused for the same reason --
-    see :func:`_spec_path_is_safe`.
+    A malformed or path-shaped *name* returns ``None``, so a traversal such as
+    ``../../something`` cannot escape the agents directory. Symlinked and other
+    unsafe candidates are also refused; see :func:`_spec_path_is_safe`.
 
     A DECLARED ``name`` wins over a matching filename, which is the order the
     other two resolvers already use (``_resolve_named_agent_model`` and the
@@ -4497,7 +4502,7 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     iterates the directory unordered, so which of them is live is undefined, and
     a writer cannot pick without risking clearing the pin nothing is reading.
     """
-    if not _AGENT_NAME_RE.match(name or ""):
+    if not is_registered_agent_name(name):
         return None
     agents_dir = agents_dir if agents_dir is not None else kiro_agents_dir_path()
     if not agents_dir.is_dir():
@@ -6455,13 +6460,27 @@ def rebuild_agent_config(
     # collision sibling remains mounted. Grant revocation is intentionally looser:
     # every disabled source denies auto-approval to its canonical alias family,
     # because ``allowedTools`` bypasses the PreToolUse gate.
+    #
+    # "Disabled" is ``mcp_entry_is_muted``, the launch predicate the gateway
+    # rewriter, the session projections and the dashboard listing share: a
+    # non-boolean ``disabled`` (``"false"``, ``null``) is read FAIL-CLOSED here
+    # too, so a server the listing shows as Disabled is never mounted by this
+    # rebuild -- truthiness would have mounted one muted with ``null`` or ``0``.
     _shared_source_entries = tuple(
         itertools.chain(extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items())
     )
+    # The rebuild strips a mount on a non-boolean ``disabled`` exactly as the
+    # listing withholds the row, so it reports the value the same way -- through
+    # the shared bounded warn-once ledger -- rather than silently. A headless
+    # install rebuilds without a dashboard read, and would otherwise never say
+    # why a server the operator meant to switch on is not mounted.
+    for _scope_label, _scope_map in _scopes:
+        for _srv, _srv_spec in _scope_map.items():
+            _invalid, _flag = invalid_disabled_flag(_srv_spec)
+            if _invalid:
+                warn_invalid_disabled(_srv, _flag, _scope_label)
     _disabled_source_names = {
-        srv
-        for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        srv for srv, srv_spec in _shared_source_entries if mcp_entry_is_muted(srv_spec)
     }
     _disabled_mounted_aliases = {
         mounted
@@ -6472,7 +6491,7 @@ def rebuild_agent_config(
     _disabled_grant_families = {
         mcp_server_alias(srv)
         for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        if mcp_entry_is_muted(srv_spec)
     }
 
     def _grant_ref_is_in_alias_family(ref: object, base: str) -> bool:
@@ -6537,7 +6556,29 @@ def rebuild_agent_config(
             lst[:] = kept
             return True
 
-        if spec.get("disabled") or alias in _disabled_mounted_aliases:
+        # Muted when ANY scope's entry for this alias mutes it -- the shared
+        # multi-scope predicate, so this arm and the dashboard row answer alike.
+        # ``spec`` is the merge's winner; the other sources are read too, because
+        # a higher-priority ``false`` must never argue a lower scope's mute away.
+        muted_here = mcp_entries_muted(
+            itertools.chain(
+                (spec,),
+                (
+                    s
+                    for srv, s in _shared_source_entries
+                    if _mounted_alias_by_source.get(srv) == alias
+                ),
+            )
+        )
+        if muted_here or alias in _disabled_mounted_aliases:
+            # The rendered entry says ``true`` whenever the server is muted --
+            # over a merged ``false`` from a higher-priority scope as much as over
+            # a raw ``null``/``0``/``"false"``. The file kiro-cli parses must
+            # agree with the listing: a selective ``@srv/tool`` ref this arm keeps
+            # would otherwise launch a server every surface calls muted.
+            rendered = valid_servers.get(alias)
+            if isinstance(rendered, dict):
+                rendered["disabled"] = True
             for key in ("tools", "allowedTools"):
                 if (
                     _strip_owned_refs(key, strip_per_tool=key == "allowedTools")
@@ -7714,6 +7755,47 @@ def _install_aim_capabilities() -> None:
     still written.
     """
     _install_lite_agent_fallback()
+    _install_guest_agent()
+
+
+#: What a non-operator channel sender's agent is told. Conversational, because a
+#: human is on the other end; explicit about having no tools, because the spec
+#: mounts none and the model should not promise to act.
+GUEST_AGENT_PROMPT = (
+    "You are answering a guest: a person the operator allowed to message this "
+    "account, not the operator. Reply to what they ask, briefly and helpfully, "
+    "from the conversation alone. You have no tools: you cannot run commands, read "
+    "or write files, browse, or act on anything, so never claim to have done so. "
+    "If a request needs any of that, say the account owner has to do it."
+)
+
+
+def _install_guest_agent() -> None:
+    """Write the tool-less ``kirocrew-guest`` config a non-operator sender talks to.
+
+    Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
+    helper (titles, extraction) and may one day need a tool; this one is a trust
+    boundary and never may. Same model as the operator's chat so an admitted
+    sender gets an ordinary answer, never a background worker's minimal default.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        model = KiroCrewConfig.load().agent.model or "auto"
+    except Exception:
+        model = "auto"
+    guest_path = kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
+    guest_config = {
+        "name": "kirocrew-guest",
+        "model": model,
+        "tools": [],
+        "mcpServers": {},
+        # Pinned: kiro-cli defaults this to True and would spawn every server in
+        # the user-level mcp.json for a session that must mount nothing.
+        "includeMcpJson": False,
+        "prompt": GUEST_AGENT_PROMPT,
+    }
+    _atomic_json_write(guest_path, guest_config)
 
 
 def _install_lite_agent_fallback() -> None:
@@ -7898,7 +7980,7 @@ dispatch, verify and report on.
 
 **Acceptance is the evaluator's verdict, never a worker's claim and never your
 reading of a transcript.** Shell access exists to run the `goal-conductor`
-skill's one bundled script, `scripts/accept_eval.py`.
+skill's bundled scripts, `scripts/accept_eval.py` and `scripts/patrol_budget.py`.
 
 ## Dispatch, in this order
 
@@ -7939,8 +8021,13 @@ it.
 ## Patrol
 
 Arm a loop on your own session with `monitor_start`, carrying the cycle
-instructions AND the exit condition, then end the turn. A reply saying
-*requested* is success — do not retry it. If arming is refused outright, say no
+instructions AND the exit condition, then end the turn. Take its bounds from
+the goal-conductor skill's `patrol_budget.py check`, and on every cycle whose
+nudge's `[patrol budget: ...]` line ends `10% or less left`, run `patrol_budget.py
+renew` and apply what it prints with `monitor_update` — a spent loop cannot be
+renewed later. A reply saying
+*requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
 loop is running and drive that one round with `wait`. Call `autonudge_stop` when
 you stop. (The loop is on a timer today. When `monitor_start` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
@@ -8123,9 +8210,24 @@ handle immediately.
 #:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
 #:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
 #:   Ingested content could re-label any persistent same-workspace session.
+#: * ``chat_session_pin`` — WITHHELD. Writes another session's ``pinned`` flag:
+#:   the PATCH goes to ``/api/chat/slots/<target>/pin`` where the target is the
+#:   session named in the ARGUMENTS, the same shape as ``chat_tag_assign``, and
+#:   no conductor step needs it.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
+#: * ``session_broadcast`` — WITHHELD, on ``session_send``'s reason multiplied by
+#:   the fleet: one call runs ingested text as a user-role turn in every session
+#:   this agent created. Nothing about the fan-out narrows what is sent, so the
+#:   verb inherits the withholding rather than earning its own argument.
+#: * ``session_status`` — GRANTED (below). A pure READ, and a narrower one than
+#:   ``session_read_message``, which is already granted: it returns the caller's own
+#:   children with a liveness word each and no transcript content at all. The
+#:   patrol cycle is exactly where it is needed — the cycle runs unattended, and its
+#:   first question every round is which workers are still alive — so gating it
+#:   would put an approval prompt in the loop with nobody at the keyboard, which is
+#:   the cost this list exists to avoid.
 #: * ``session_adopt`` — WITHHELD, on the invariant rather than on a judgement about
 #:   how bad it would be. It MUTATES workspace state that already exists and is not
 #:   the caller's own: where another session hangs in the tree, which is what the
@@ -8158,6 +8260,7 @@ _CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
     "@kirocrew-dashboard/chat_folder_file_self",
     "@kirocrew-dashboard/session_create",
     "@kirocrew-dashboard/session_read_message",
+    "@kirocrew-dashboard/session_status",
 )
 
 #: The dashboard verbs a CREW MEMBER's DM session may call without an approval
@@ -8171,8 +8274,17 @@ _CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
 #: these two the dispatch loop this feature exists for (create → seed → patrol
 #: → stop) stalls on an approval prompt at its second step with nobody at the
 #: keyboard.
+#: ``session_broadcast`` joins on exactly ``session_send``'s argument rather than a
+#: new one, and the fan-out does not widen it: the verb's DEFAULT audience is read
+#: from the same ``created_by`` field the ownership fence reads, and every delivery
+#: re-runs that fence per target, so a member's broadcast reaches the worker
+#: sessions it opened and nothing else — the same confinement, applied to each of
+#: several targets instead of one. A member telling its whole fleet "the base moved"
+#: is the ordinary case of the dispatch loop these grants exist for, and the
+#: alternative is one approval prompt per worker on an unattended cycle.
 _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
     "@kirocrew-dashboard/session_send",
+    "@kirocrew-dashboard/session_broadcast",
     "@kirocrew-dashboard/session_stop",
 )
 
@@ -9122,7 +9234,8 @@ in that case.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 
@@ -9201,11 +9314,17 @@ _PIPELINE_CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
 #: the operator arming the conductor's own session in trust mode (the same
 #: explicit, session-scoped human grant the worker sessions already require),
 #: not via a standing spec-level bypass.
+#: ``session_status`` rides along for the reason the goal conductor holds it: a pure
+#: read of the caller's own children, narrower than the ``session_read_message`` grant
+#: beside it, and asked on every unattended cycle. ``session_broadcast`` does NOT,
+#: on ``session_send``'s withholding — the fan-out changes how many sessions ingested
+#: text reaches, not whether anything bounds it.
 _PIPELINE_CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
     "@kirocrew-dashboard/chat_folder_tree",
     "@kirocrew-dashboard/chat_folder_create",
     "@kirocrew-dashboard/session_create",
     "@kirocrew-dashboard/session_read_message",
+    "@kirocrew-dashboard/session_status",
 )
 
 #: The security conductor's dashboard grants: the pipeline conductor's plus
@@ -9264,6 +9383,94 @@ open pull requests. Nothing is withheld, because anything withheld would be
 something some work item needs.
 
 """
+
+
+def _foreign_worker_spec_reason(spec: dict[str, Any] | None) -> str | None:
+    """Why *spec*, read from the mirror path, is not this derivation's own, or ``None``.
+
+    Takes the PARSE rather than the path, so a caller that must also use those bytes
+    does not read the file twice: two reads are two observations, and the second could
+    describe a different generation than the one that was attributed.
+
+    PROVENANCE, not existence, and the distinction is the whole point. Existence is
+    what the freshness check reasons about, and a file at this path that the
+    derivation did not write is not stale against the default: replacing it destroys
+    whatever put it there.
+
+    ``None`` -- meaning "ours to write" -- covers three states, and the third is
+    deliberate:
+
+    * the file is ABSENT, so there is nothing to attribute;
+    * it carries both marks every derivation writes (see below);
+    * it does not parse as an agent spec object at all. A broken file at this path
+      is not somebody's work to protect, and refusing to replace it would leave the
+      worker permanently undispatchable on a host with one truncated write behind it.
+      A bundle's spec is digest-verified before install and therefore parses, so this
+      does not reach the case the refusal exists for.
+
+    The two marks are the declared ``name`` and a reference to the ``kirocrew-work``
+    server -- the mount that IS this agent, and the reason it exists at all. Both have
+    been written by every release that produced a mirror, which is what keeps an
+    upgrade from turning into a refusal: ``test_worker_agent.py`` pins that a mirror
+    left by an older build is HEALED rather than needing a hand-edit, and a mark chosen
+    from the current spec's shape (the exact prompt, the mounted server map) would
+    refuse those files instead of repairing them. So the reference is accepted wherever
+    a release put it -- the server map, ``tools``, or a per-tool grant.
+
+    Neither mark is a secret and a spec could forge them; forging them volunteers the
+    forger's own file to be replaced, which costs nothing. What cannot happen is the
+    reverse: an ordinary shared crew -- its own prompt, its own servers, its own name
+    -- being read as a mirror.
+    """
+    if not isinstance(spec, dict):
+        return None
+    declared = spec.get("name")
+    if declared != Path(_WORKER_AGENT_FILENAME).stem:
+        return f"it declares the agent name {declared!r}"
+    servers = spec.get("mcpServers")
+    mounts_work = isinstance(servers, dict) and "kirocrew-work" in servers
+    # Each container is shape-checked before it is iterated, not only its elements: a
+    # hand-edited spec holding ``"tools": 1`` would otherwise raise ``TypeError`` out of
+    # an attribution, which is not a ``DerivedSpecStale`` and so reaches the spawn
+    # callers as an unhandled error instead of a declined dispatch. The same discipline
+    # ``_WORKER_MIRRORED_SHAPES`` applies to the default spec's keys. A value of the
+    # wrong type carries no reference, so it contributes nothing rather than refusing on
+    # its own -- the verdict stays about the marks, not about the file's tidiness.
+    refs_work = any(
+        ref == "@kirocrew-work" or ref.startswith("@kirocrew-work/")
+        for key in ("tools", "allowedTools")
+        for ref in (spec[key] if isinstance(spec.get(key), list) else ())
+        if isinstance(ref, str)
+    )
+    if not mounts_work and not refs_work:
+        return "it does not reference the kirocrew-work server that defines this agent"
+    return None
+
+
+def _refuse_foreign_worker_spec(path: Path, spec: dict[str, Any] | None) -> None:
+    """Raise :class:`ForeignAgentSpec` when *spec*, read from *path*, is not ours.
+
+    *path* is carried for the message and the log only; the verdict is about the bytes
+    the caller already read.
+    """
+    reason = _foreign_worker_spec_reason(spec)
+    if reason is None:
+        return
+    # ERROR, not debug: the boot installer's own caller swallows the exception at debug
+    # level, so without this line the one event an operator needs -- "your shared crew
+    # is occupying the mirror's filename" -- would be invisible at any ordinary level.
+    logger.error(
+        "Refusing to overwrite %s: %s, so it was not written by this derivation. A crew "
+        "installed under this filename is served from %s instead; a hand-placed spec "
+        "must be moved or renamed before the worker can be derived again.",
+        path,
+        reason,
+        path.parent / f"crew-{path.stem}.json",
+    )
+    raise ForeignAgentSpec(
+        f"{path} holds a spec this derivation did not write ({reason}); refusing to "
+        f"overwrite it with the derived {_WORKER_AGENT_FILENAME} mirror"
+    )
 
 
 def _install_worker_agent() -> None:
@@ -9361,7 +9568,19 @@ def _write_worker_spec(config: dict, path: Path, *, template_grants: list[str]) 
     statement rather than a long indented block -- the transform is pure dict work on
     small maps, so holding both locks across it costs nothing and is what makes the
     mirror a SNAPSHOT rather than a read that may already be stale by the write.
+
+    Raises :class:`ForeignAgentSpec` when *path* already holds a spec this derivation
+    did not write, INSIDE the critical section: the attribution and the write it
+    guards have to be one locked step, or a spec landing between them is refused on
+    the previous file's provenance and overwritten anyway.
     """
+    # ONE read of the existing mirror, serving both things this function needs from it:
+    # whether the file is ours to replace at all, and the frozen ``model`` further down.
+    # Reading it twice would be two observations of a file this critical section is about
+    # to overwrite, and the attribution would then vouch for bytes other than the ones
+    # the model pin came from.
+    existing = _read_spec_capped(path)
+    _refuse_foreign_worker_spec(path, existing)
     # Stat BEFORE the read, so the bookkeeping below can prove the file did not move
     # while this derivation mirrored it.
     default_identity_before = default_spec_identity()
@@ -9469,7 +9688,6 @@ def _write_worker_spec(config: dict, path: Path, *, template_grants: list[str]) 
     # which nothing reads there. The shared writer version-gates it.
     _write_derived_permissions(config, config["allowedTools"], _WORKER_AGENT_FILENAME)
 
-    existing = _read_spec_capped(path)
     if isinstance(existing, dict) and "model" in existing and _worker_model_is_user_pinned():
         # An explicit per-agent pick outranks the mirror, and it has to be read back
         # off the file: the template the mirror falls back to carries the shipped
@@ -9578,6 +9796,31 @@ class DerivedSpecStale(RuntimeError):
     whose mirror predates a trust revocation still has the revoked server mounted
     and auto-approved, so starting it runs ungoverned grants; a refused dispatch is
     recoverable and reportable, which is the whole point of the work ledger.
+    """
+
+
+class ForeignAgentSpec(DerivedSpecStale):
+    """A spec at a path this derivation owns was written by somebody else.
+
+    The mirror path ``kirocrew-worker.json`` is a NAME, and a name can be claimed. A
+    crew shared through the Fargate runtime installs its own spec into the same
+    directory, so a file sitting at that path is not necessarily a mirror. A
+    re-derivation that read one anyway would judge it a stale mirror of the default
+    and replace the shared crew's prompt and tool surface with Kiro Crew's own, with
+    no error and nothing in the logs naming the crew.
+
+    A :class:`DerivedSpecStale` rather than a sibling of it, and the subclassing is
+    load-bearing rather than tidy: every spawn-path caller catches that class BY NAME
+    (``acp/client.py``, ``acp/runtime.py``, ``acp/harness/kas.py``) and turns it into a
+    refused dispatch, so a separate exception type would reach them as an unhandled
+    error and end the session instead of declining the spawn. What the subclass adds is
+    a message and a log line naming the real fault; what it inherits is every caller's
+    existing decision about a spec that cannot be vouched for.
+
+    Both raise sites sit under callers that report rather than crash. The boot
+    installer's failure costs the mirror, and the spawn gate then refuses the dispatch
+    loudly rather than running an unverified spec; the spawn path's own re-derive
+    returns ``False``.
     """
 
 
@@ -9910,6 +10153,16 @@ def _require_fresh_worker_spec(work_dir: str | Path | None) -> None:
             f"{_WORKER_AGENT_FILENAME} mirror cannot be verified or rebuilt; refusing "
             "to start the worker on a mirror of unknown generation"
         )
+    # Attributed BEFORE freshness is judged, because "stale" is a statement about a
+    # mirror and this file may not be one. A spec somebody else wrote is not stale
+    # against the default and cannot be repaired by re-deriving over it, so asking the
+    # freshness question first would make overwriting it look correct. The refusal is
+    # raised here rather than left to the re-derive below so the message names the file
+    # and the crew namespace: ``rederive_worker_agent`` never raises, so a refusal
+    # reaching the spawn through it would arrive as "could not be re-derived", which
+    # sends an operator looking for the wrong fault.
+    mirror_path = agents_dir / _WORKER_AGENT_FILENAME
+    _refuse_foreign_worker_spec(mirror_path, _read_spec_capped(mirror_path))
     if not _derived_spec_matches_default(agent):
         logger.info("Worker spec predates the default agent spec; re-deriving before spawn")
         if not rederive_worker_agent("a stale mirror observed on the spawn path"):
@@ -10076,7 +10329,8 @@ gate is the correct state; assuming its answer is not.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 

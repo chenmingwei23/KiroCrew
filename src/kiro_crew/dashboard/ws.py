@@ -21,11 +21,14 @@ from kiro_crew.dashboard.state import (
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_CAPABILITY, SLOT_PATCH_WS_FLAG
 from kiro_crew.dashboard.ws_event_scope import (
+    DASHBOARD_USER_AUDITEE,
     _audit_allow,
     _audit_deny,
     effective_allowed_events,
     filter_slots_for_app,
+    global_event_declared,
     load_declared_events_for_connect,
     slots_envelope_extras,
 )
@@ -145,7 +148,11 @@ def _audit_grant_quietly(app: str, event: str) -> None:
     envelope field), the periodic ``dashboard`` status frame, and the
     ``subscribe_logs`` ring replay -- so ``ws_event_allowed`` never sees them
     and none of them would otherwise leave an SEL record, even though each is
-    a permission decision ``AUTOSDE.yaml`` requires one for.
+    a permission decision ``AUTOSDE.yaml`` requires one for. The same three
+    sends reach a dashboard-user socket on identical grounds, so each site
+    records the grant for BOTH socket kinds, under :func:`_grant_auditee`'s
+    label -- a dashboard user has an empty app claim, and recording it as the
+    app would file the owner's grants under ``<unknown>``.
 
     One helper rather than the same ``try``/``except`` inlined at each site:
     the swallow is the load-bearing part and needs to behave identically
@@ -158,6 +165,21 @@ def _audit_grant_quietly(app: str, event: str) -> None:
         _audit_allow(app or "<unknown>", event)
     except Exception:
         logger.debug("ws: SEL audit for %s grant failed", event, exc_info=True)
+
+
+def _grant_auditee(ws: web.WebSocketResponse, ws_app: str) -> str:
+    """Return the SEL ``caller`` a grant on this socket is recorded under.
+
+    A dashboard-user socket is identified by the positive ``_is_dashboard_user``
+    flag and carries an empty app claim, so it gets the reserved
+    ``DASHBOARD_USER_AUDITEE`` label -- the same one the broadcast chokepoint
+    (``WebSocketHub._ws_client_allowed``) uses, so one socket kind has one
+    identity in the trail whichever path delivered the frame. Every other
+    socket is recorded as its app.
+    """
+    if ws.get("_is_dashboard_user", False):
+        return DASHBOARD_USER_AUDITEE
+    return ws_app
 
 
 def broadcast_side_result(
@@ -518,6 +540,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     ws["_app"] = ws_app
     ws["_is_dashboard_user"] = request.get("is_dashboard_user", False)
     ws["_allowed_events"] = allowed_events
+    # A tab whose bundle applies ``slot_patch`` frames says so in ``?caps=``;
+    # without the declaration (an older bundle, a companion window, an app
+    # token) the socket keeps receiving the full ``slots`` list for every
+    # metadata edit. Dashboard users only: the frame bypasses the app scope gate.
+    # ``getattr``: request doubles in the suite are plain dicts with no query.
+    query = getattr(request, "query", None) or {}
+    declared_caps = {cap.strip() for cap in str(query.get("caps", "")).split(",")}
+    ws[SLOT_PATCH_WS_FLAG] = bool(ws["_is_dashboard_user"]) and (
+        SLOT_PATCH_CAPABILITY in declared_caps
+    )
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
@@ -576,12 +608,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # never receives the tree, so its generation would describe data the
             # app does not have.
             envelope_extras["foldersGeneration"] = state.folders_generation()
-        if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
-            # Handing an app token the live blanket-approval override is a
-            # grant of operator security posture, not slot data, and this
-            # initial push writes to the socket directly -- so record it here
-            # or it goes unrecorded entirely.
-            _audit_grant_quietly(ws_app, "slots_yolo")
+        if "yolo" in envelope_extras:
+            # Handing a socket the live blanket-approval override is a grant
+            # of operator security posture, not slot data, and this initial
+            # push writes to the socket directly -- so record it here or it
+            # goes unrecorded entirely. Dashboard users included: they always
+            # receive the field, and until this was ungated the owner's own
+            # socket was the one kind whose grant left no record.
+            _audit_grant_quietly(_grant_auditee(ws, ws_app), "slots_yolo")
         snapshot_frame = {
             "type": "slots",
             "data": slots_data,
@@ -678,12 +712,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # dashboard-user tokens and keep the full snapshot.
                     for _owner_only in ("branch", "commit"):
                         data.pop(_owner_only, None)
-                    # Tier 0 admits every app unconditionally, but the decision
-                    # is still a grant per ``AUTOSDE.yaml`` -- this frame is
-                    # sent directly rather than through the broadcast
-                    # chokepoint, so nothing else records it. The dedup window
-                    # already bounds the 5-second interval to one record.
-                    _audit_grant_quietly(ws_app, "dashboard")
+                # Tier 0 admits every socket unconditionally, but the decision
+                # is still a grant per ``AUTOSDE.yaml`` -- this frame is sent
+                # directly rather than through the broadcast chokepoint, so
+                # nothing else records it. Outside the app-token narrowing
+                # above on purpose: the dashboard user receives the full frame
+                # and that is a grant too. The dedup window already bounds the
+                # 5-second interval to one record.
+                _audit_grant_quietly(_grant_auditee(ws, ws_app), "dashboard")
                 try:
                     await ws.send_json({"type": "dashboard", "data": data})
                 except Exception:
@@ -784,6 +820,73 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     # provider subprocess. App tokens never render status either way.
     _run_status_driver = owner_request
     check_task = asyncio.create_task(_refresh_check_loop()) if _run_status_driver else None
+
+    # Background task, ONLY for a connection that declared the `sessions` scope:
+    # recompute session health on a timer so `session_health_changed` fires for a
+    # verdict that moves with the CLOCK. Same shape of bug as the frozen PR chips
+    # above: the verdict is computed only when `GET /api/sessions/health` is
+    # requested, so a turn crossing the stall threshold, a queue draining, or a
+    # cap being cut produces no signal unless somebody happens to poll -- and the
+    # subscriber that most needs the signal is exactly the one whose manifest does
+    # not list that path, so it cannot poll.
+    #
+    # Gated on the declaration rather than started for every socket because the
+    # driver exists solely to feed this event: a host where no app declared
+    # `sessions` has no possible recipient, so it should run no driver at all
+    # instead of recomputing health forever for nobody. A dashboard user carries
+    # no declaration set (it is not gated by declarations) and no dashboard
+    # surface subscribes to this signal -- it reads the endpoint directly, which
+    # it is entitled to -- so it drives nothing either.
+    #
+    # This is work avoidance, not the permission decision: delivery is still
+    # judged per frame by `_send_ws_all` -> `ws_event_allowed` against the LIVE
+    # scope, so a declaration revoked mid-connection stops the frames even though
+    # this connect-time reading already started the driver.
+    #
+    # refresh_session_health is TTL-gated and single-flighted, so every declaring
+    # socket together still costs at most one computation per interval; it spends
+    # no credentials and reads no provider, which is why this is not owner-only
+    # like the check driver.
+    async def _refresh_health_loop() -> None:
+        # Function-local import: ws.py is imported by handlers/side.py (via the
+        # handlers package), so importing handlers.sessions at module scope closes
+        # a ws -> handlers.sessions -> handlers/__init__ -> handlers.side -> ws
+        # cycle. The cadence is the handler's OWN cache TTL rather than a second
+        # constant, so the driver cannot drift out of step with the gate it
+        # depends on for single-flighting.
+        from kiro_crew.dashboard.handlers.sessions import (
+            _HEALTH_REFRESH_SECS,
+            refresh_session_health,
+        )
+
+        while not ws.closed and not shutdown_event.is_set():
+            # Guard the BODY, not the loop: one transient failure must log and
+            # keep the driver alive rather than silently reverting to the
+            # signal-only-on-poll behaviour this loop exists to fix.
+            #
+            # Refresh FIRST, then sleep. The first computation in a process is
+            # the silent baseline, so a driver that slept before its first tick
+            # would let a verdict that moved during that sleep BECOME the
+            # baseline and never signal it; computing at connect time pins the
+            # baseline to what the subscriber sees when it connects. TTL-gated,
+            # so a burst of connects still costs one computation. The sleep sits
+            # OUTSIDE the guard so a refresh that keeps failing waits out the
+            # interval like a successful one instead of spinning.
+            try:
+                await refresh_session_health(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("session health refresh tick failed; continuing", exc_info=True)
+            await asyncio.sleep(_HEALTH_REFRESH_SECS)
+
+    # Function-local import for the same boot-path reason the loop above imports
+    # its handler seam locally: `session_health` is not otherwise on ws.py's
+    # import graph, and ws.py is imported while the gateway is starting.
+    from kiro_crew.dashboard.session_health import SESSION_HEALTH_EVENT
+
+    _run_health_driver = global_event_declared(SESSION_HEALTH_EVENT, allowed_events)
+    health_task = asyncio.create_task(_refresh_health_loop()) if _run_health_driver else None
     # The resume prefetch this socket's most recent slot_focused frame armed.
     # Tracked per connection so a focus change (or blur/disconnect) cancels
     # only this socket's speculation, never another window's.
@@ -826,11 +929,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     exc_info=True,
                                 )
                             continue
-                        if not ws.get("_is_dashboard_user", False):
-                            # Mirror the deny branch above: the grant is a
-                            # permission decision too, and only the deny side
-                            # left an SEL record before this.
-                            _audit_grant_quietly(ws_app, "subscribe_logs")
+                        # Mirror the deny branch above: the grant is a
+                        # permission decision too, and only the deny side left
+                        # an SEL record before this. Not gated on the socket
+                        # kind: the dashboard user is admitted to the ring
+                        # replay on the same grounds, and skipping the record
+                        # for that socket left the privileged log history the
+                        # one hand-over the trail never showed.
+                        _audit_grant_quietly(_grant_auditee(ws, ws_app), "subscribe_logs")
                         state.subscribe_logs(ws)
                         # Replay log ring buffer
                         for entry in list(_log_ring):
@@ -1059,6 +1165,8 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         status_task.cancel()
         if check_task is not None:
             check_task.cancel()
+        if health_task is not None:
+            health_task.cancel()
         # A prefetch still debouncing for a closed dashboard serves nobody.
         if _focus_task is not None and not _focus_task.done():
             _focus_task.cancel()

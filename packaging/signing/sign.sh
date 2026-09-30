@@ -12,6 +12,20 @@
 #   AWS_SIGNER_ROLE_ARN    — Role ARN the signing service assumes to read/write S3
 #   CDSIGNER_API_ENDPOINT  — signing service API Gateway endpoint URL
 #
+# Environment variables (optional):
+#   SIGN_KEY_SUFFIX        — appended to the app slug in BOTH bucket keys
+#                            (pre-signed/.../<slug><suffix>.tar.gz and
+#                            signed/.../<slug><suffix>.zip). The keys are
+#                            otherwise derived from the .app name alone, so
+#                            two builds of the same app for the same
+#                            channel+version -- the universal and a
+#                            single-arch DMG signed in one run -- would
+#                            overwrite each other's request and read back
+#                            whichever finished last. sign-and-notarize.yml
+#                            passes "-arm64" / "-x64" on the single-arch
+#                            legs and nothing on the universal one, so the
+#                            universal keys are byte-identical to before.
+#
 # The script:
 #   1. Packages the .app into a tar.gz with entitlements metadata
 #   2. Uploads to pre-signed/{channel}/{version}/ in S3
@@ -27,7 +41,7 @@
 #   2 — packaging failed
 #   3 — upload failed
 #   4 — signing request failed
-#   5 — signing timed out (>15 min)
+#   5 — signing timed out (>45 min)
 #   6 — verification failed
 set -euo pipefail
 
@@ -56,7 +70,7 @@ fi
 APP_NAME="$(basename "$APP_PATH" .app)"
 # Space-free slug for bucket keys: the nightly bundle is "KiroCrew Nightly.app"
 # and these keys flow into the CDSigner request JSON and URL paths.
-APP_SLUG="${APP_NAME// /-}"
+APP_SLUG="${APP_NAME// /-}${SIGN_KEY_SUFFIX:-}"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -157,9 +171,13 @@ SIGN_TASK_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(s
 log "Sign task submitted: ${SIGN_TASK_ID}"
 
 # ── 4. Poll for completion ──────────────────────────────────────────────────
-log "Polling for completion (timeout: 15 min)..."
+log "Polling for completion (timeout: 45 min)..."
 
-MAX_WAIT=900  # 15 minutes
+# Sized for a GB-scale payload: the mac zip carries the bundled kiro-cli on top
+# of the two backend trees, and the signing service's turnaround grows with the
+# payload. The sign job's timeout-minutes in sign-and-notarize.yml leaves room
+# for the upload ahead of this poll.
+MAX_WAIT=2700  # 45 minutes
 POLL_INTERVAL=30
 ELAPSED=0
 SIGNED_OK=0

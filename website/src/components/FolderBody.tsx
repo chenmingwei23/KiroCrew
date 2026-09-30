@@ -71,7 +71,20 @@ export function FolderBody({
       }}
     >
       <div style={{
-        overflow: 'hidden',
+        // `clip`, not `hidden`: `hidden` makes this div a scroll container, and a
+        // `position: sticky` descendant sticks to its NEAREST scroll container.
+        // That pinned a nested folder header to this non-scrolling box, so it
+        // scrolled away with the list instead of sticking to the sidebar lane.
+        // `clip` clips identically without becoming a scroll container.
+        overflow: 'clip',
+        // `clip` also means this grid item is no longer a scroll container, so
+        // its automatic minimum size is its content size again, on BOTH axes.
+        // Height: the `0fr` track would stop collapsing. Width: the rows'
+        // single-line titles would set this box's min-content width, so every
+        // row in the folder grew to the longest title and pushed its timestamp
+        // and hide button past the sidebar's edge. Explicit zeros restore both.
+        minHeight: 0,
+        minWidth: 0,
         visibility: open ? 'visible' : 'hidden',
         contentVisibility: layoutSuppressed ? 'hidden' : 'visible',
         padding: open ? padding : 0,

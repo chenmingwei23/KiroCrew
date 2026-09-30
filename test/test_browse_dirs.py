@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers import api_browse_dirs
@@ -21,7 +22,7 @@ from kiro_crew.dashboard.handlers.files import (
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/browse-dirs", api_browse_dirs)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -105,6 +106,35 @@ class TestBrowseDirs:
                 assert data["dirs"] == []
         finally:
             restricted.chmod(0o755)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_sibling_does_not_collapse_listing(self, tmp_path, mock_sel):
+        """A child raising PermissionError on is_dir() (a TCC-protected dir,
+        a permission-denied entry) is skipped while healthy siblings still
+        list, instead of aborting the loop with a partial result."""
+        (tmp_path / "alpha").mkdir()
+        (tmp_path / "zebra").mkdir()
+
+        class _Entry:
+            def __init__(self, name):
+                self.name = name
+                self.path = str(tmp_path / name)
+
+            def is_dir(self, follow_symlinks: bool = True) -> bool:
+                if self.name == "docker":
+                    raise PermissionError(1, "Operation not permitted")
+                return True
+
+        entries = [_Entry("alpha"), _Entry("docker"), _Entry("zebra")]
+        with patch(
+            "kiro_crew.dashboard.handlers.files.os.scandir",
+            return_value=entries,
+        ):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/browse-dirs?path={tmp_path}")
+                assert resp.status == 200
+                data = await resp.json()
+                assert [d["name"] for d in data["dirs"]] == ["alpha", "zebra"]
 
     @pytest.mark.asyncio
     async def test_scan_does_not_run_on_the_event_loop(self, tmp_path, mock_sel):

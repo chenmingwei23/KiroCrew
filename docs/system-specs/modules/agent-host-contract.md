@@ -299,21 +299,36 @@ credentials occupy. An unknown provider defaults to *not* self-sandboxing.
 `agent_sdk/mcp_refs.py` compares the spec's `@server` tool refs against the FINAL
 `mcpServers` array, and `acp/mcp_ref_guard.py` logs one structured warning plus a
 row on the session's MCP report (`unresolved_refs`) at the one point that array is
-composed, when a ref names nothing the session receives — the §5 failure this
-bucket keeps describing, made visible instead of re-diagnosed. Satisfaction is per
+composed, when a ref names nothing in Crew's projection for the session — the §5
+failure this bucket keeps describing, made visible instead of re-diagnosed. Satisfaction is per
 backend, by membership in `ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE`: kiro-cli reads the
 spec itself via `--agent` and KAS receives it as a projected agent definition in
 `_meta`, so their refs resolve against the spec's own `mcpServers`, while a harness
-that mounts exactly the array it is sent is satisfied only by that array (a broker
-stub counts on either, since it arrives under the name it wraps). It never alters
+that Crew reaches only through the array it is sent is satisfied, as far as Crew
+can see, only by that array (a broker stub counts on either, since it arrives under
+the name it wraps). What the line CLAIMS about an unresolved ref is the same on
+every backend, and it is only what the wire proves: its leading clause says the ref
+names no server in Crew's projection for the session, and its verdict is that Crew's
+projection delivers none of those servers, and the harness may mount a same-named
+server from its own configuration, so a listed ref may still be served and the line
+cannot tell which. "Absent" would be the strong claim, and no backend's array is
+provably the session's whole MCP surface — Claude Code mounts its own user- and
+project-scope `mcpServers` and plugins beside the array, codex-acp merges the array
+on top of `~/.codex/config.toml`, and kiro-cli loads the global
+`~/.kiro/settings/mcp.json` into every agent by default (a spec may opt out of the
+global file with `includeMcpJson: false`). Crew reads
+no harness configuration to subtract those servers: the list stays what the wire
+proves, and only the verdict stops short of what the wire cannot prove. It never alters
 the array and never fails the session, and it adds
 no `await` to any construction path — the snapshot rides in the `mkdir` hop
 `_spawn` already had (H13). `kirocrew doctor` runs the same resolver per selectable
 backend through `agent_sdk.drivers.acp.agent_spec_mcp_refs`, which reads the mirror
 seam — so a backend projecting outside `providers/mirrors/` (KAS) reads as
-unprojected there. KAS is also the one backend the RUNTIME detector does not reach:
-it composes its array on `AcpRuntime`, not at `AcpClient`'s call sites, so its refs
-are checked statically only.
+unprojected there — and its no-mirror row carries the same hedged verdict. KAS is
+checked at runtime as well as statically: it composes its array on `AcpRuntime`,
+not at `AcpClient`'s call sites, and `AcpRuntime._guard_unresolved_mcp_refs`, the
+runtime-path twin of `AcpClient`'s, runs the same guard from
+`_finish_create_session` and `load_session`.
 
 **A provider must declare:** its injection channel and precedence rule, its
 server shape, its env-expansion semantics, its loader strictness, which field (if
@@ -568,6 +583,8 @@ channel could add something the turn loop cannot, and today no stored hook maps 
 either, so both answer an empty list. `AcpSessionHandle` routes `executeHook` only
 while the handshake announces `hooks`, so a backend that sends it unasked is
 answered `-32601`.
+
+The agent spec's own `hooks` field takes the same turn-loop path. The `customAgents` wire schema has no slot for it, so for a backend in `ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS` (KAS only) `agent_sdk/spec_hooks.py` turns the field into script hooks that `_fire` passes to `ScriptHookStore.fire` beside the stored ones, never persisted. kiro-cli is not a member, because it runs the field itself. A spec that cannot be read blocks every PreToolUse, as an uninitialized store does. `toolsSettings` and `slashCommand` still reach no KAS session; a new session whose spec sets one gets one `notice` row saying so, and so does one whose spec carries `confirm: true` hook documents, which Crew skips. An auto-approved call raises no permission request, so the KAS projection adds an `ask` rule for every auto-approvable capability a PreToolUse hook's matcher covers (spec or Hooks page), and `ask` outranks `allow` there. The KAS harness records what each session's registered batch auto-approves (`AcpSessionHandle.kas_auto_approved`) through the `record_session_projection` harness seam, whose base default records nothing, so the shared runtime carries no KAS branch; before a chat turn, a kept subagent claim or a task step claims the session, `spec_hooks.invalidate_stale_kas_session` resets it when a PreToolUse hook now covers one of those capabilities, so the claim re-projects. That reset is declined for a session another turn holds, so `spec_hooks.reproject_claimed_session` decides again on the claimed session under its lease: a stale one is reset and re-claimed, and one still stale after two resets refuses the turn. Subagent and task-runner turns read their own agent's spec hooks through `spec_hooks.turn_spec_hooks`, keyed on their own provider's `crew_fires_spec_hooks`, and gate each permission request with `hooks.permission_pre_tool_block` (stored and spec PreToolUse hooks together, matched on the call's title, its canonical `tool_name` and, for an MCP call, its `@server/tool` form, fail closed), and skip the informational tool-call fire on such a turn, because KAS sends that frame before the permission request and every call a PreToolUse hook covers reaches the gate; a process that registers no hook store (`kirocrew run`) reads the saved Hooks-page hooks strictly from disk (`hooks.persisted_hook_store`), and an unreadable file fails closed; a subagent also passes the spec hooks to PostToolUse, and its per-run shared session is checked right after creation (`spec_hooks.replace_stale_shared_session`).
 
 If the flag is ever set, send the covenant's shape and no `v2` sub-flag: `v2` selects
 the agent's own disk loader, which spawns the command itself. Without `v2` the agent

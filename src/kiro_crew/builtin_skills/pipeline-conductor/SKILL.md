@@ -961,7 +961,7 @@ carry **metadata only** — the probe never emits transcript text:
 
 ```
 🔔 <key>  <age>s <TAG> i=<index> d=<digest12>
-BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s scope=suite|paths|unknown
+BANNED pid=<pid> rule=<regex|argv:<shape>> cwd=fleet|unknown age=<secs|?>s scope=suite|paths|unknown cmd=<program,flags,+withheld>
 OK <n> watched, <m> fired | load/cpu <x> (ok|hot) | mem <n>G | banned <n> | foreign <n> | deliver init-timeout <a>, watchdog <b>
 ```
 
@@ -969,6 +969,39 @@ A tail with no protocol tag reads as `-` and never fires on its own, and a
 protocol word inside a tool card is quoted text rather than a report — so a worker
 whose only "status" is in a tool call is silent as far as the probe is concerned,
 and ages into `IDLE`.
+
+`cmd=` on a `BANNED` line is the matched command reduced to what cannot hold a
+secret: a recognised runner or launcher name, recognised option names with their
+values dropped, `+<n>` for the arguments withheld, and a trailing `~` on any single
+token long enough to be clipped. NO option value is printed, the cap flag's
+included — `-n0` prints as `-n`, because a custom rule can point this scan at a
+program whose `-n` value is a numeric secret and nothing tells that apart from a
+worker count. Recognised means drawn from a fixed list, so a program or long option
+the list does not name is counted rather than printed — a word that looks like a
+program name is also exactly what an opaque credential looks like. One program
+spelling is recognised by SHAPE instead: a versioned pytest alias, which prints as
+the fixed label `pytest-<version>` or `py.test-<version>` rather than as itself, so
+the version it carried never reaches the line. An inline
+`KEY=value` in front of the command is withheld whole. Read it before stopping
+anyone — it is what separates a real uncapped run from a command that merely names
+one, and no argv is echoed. When the program itself is withheld, `rule=` is what
+identifies the command: it is the rule that selected this pid.
+
+`rule=` carries one of two vocabularies. A value that reads as a regex is the
+banned-process rule whose match selected the pid. A value prefixed `argv:` names a
+shape the probe recognises from the argv tokens instead, because the joined command
+line cannot express it: `argv:pytest-runner-uncapped` is a runner spelling that is
+also a well-formed filename or path component — a versioned alias (`pytest-3`),
+`py.test`, or `pytest.exe` — standing in the program position with an explicit numeric
+worker count of two or more among its own arguments (the budget-bypassing form). There
+is no regex to look up for such a row, so `cmd=` is the corroborating field: the runner
+name prints there, because an `argv:` row has no rule text to identify it by. An
+`argv:` shape is offered whatever the rule list
+holds, because rule ORIGIN is what carries built-in authority here — the same basis
+the wrapper exemption is written against — so a `banned_process_res` edit cannot
+switch it off. What can is the named opt-out `argv_runner_detection: false`, which
+disables this shape and nothing else. The two settings are independent: replacing the
+rule list leaves the shape on, and disabling the shape leaves the rules in force.
 
 The handled set keeps the last dispositioned PAYLOAD report as `settled`, so a
 later `IDLE` or `NOPROGRESS` mark on the same session cannot resurrect a ruling
@@ -1276,13 +1309,18 @@ line, recorded while the evidence still exists. That is also why the legacy-line
 fallback above is a bounded best effort and not the mechanism: it attempts the
 same read, expects it to fail, and declines to guess an owner when it does.
 
-What the pytest rule flags is **a run whose worker count is not explicitly
-chosen**, not "an unbounded `-n`". A bare `pytest` is therefore flagged: it
-inherits the project's `addopts`, so it is not a single-process run and its
-worker count was decided by the config rather than by the person who typed it.
-`-n0` satisfies the rule; so does any explicit number, which is why the brief
-also forbids a small `-n <N>` on grounds the probe cannot check. The other
-banned shape is a full-suite runner invoked with no file argument.
+What the pytest rule flags is **a run whose worker pool bypasses the budget**:
+an explicit numeric `-n` of two or more (`-n 4`, `-n=4`, `-n4`, `-n 32`,
+`--numprocesses 2`), because `xdist_budget.py`'s hook only ever sizes `auto`, so
+a number is a count the host's memory and the other runs on it are never
+consulted about. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
+bare form inherits the project's `addopts`, which supply `-n auto`, so its pool
+is budgeted by the same hook. `-n0` and `-n 1` are quiet too, as single-process
+runs with xdist inactive. Where `-n` is given twice the last one wins, as pytest
+resolves it. The brief still mandates `-n0` on a worker's own test runs -- a
+budgeted pool is still a pool -- but the probe only reports the shape that
+escapes the budget. The other banned shape is a full-suite runner invoked with
+no file argument.
 
 Standing constants: `session_ceiling` machine-wide, `-n0` on every worker test
 run, targeted tests only, ≤2 subagents per worker. `-n0` rather than a small

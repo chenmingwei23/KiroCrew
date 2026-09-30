@@ -39,6 +39,47 @@ _SLACK_FILE_DOMAIN = "slack.com"
 _FILE_DOWNLOAD_TIMEOUT_SECS = 60
 
 
+#: Block Kit fields and block types that make SLACK'S OWN SERVERS fetch remote
+#: media, which the `unfurl_*` flags do not govern: they suppress previews Slack
+#: derives from links in `text`, not media a block names directly.
+#:
+#: The predicate and the refusal live HERE, at the client seam every outbound
+#: Block Kit tree must pass through, rather than only at the dashboard/MCP entry
+#: that agents reach: the gateway has ~20 direct `post_blocks` callers, and a
+#: check that sits one layer above them is a check each of them can forget. No
+#: in-repo caller constructs an image or video block, so nothing legitimate is
+#: refused. The `image_url` returned by `get_user_profile` is read-only profile
+#: metadata, not an outbound tree, so it is unaffected.
+_BLOCK_REMOTE_MEDIA_KEYS = frozenset({"image_url", "thumbnail_url", "video_url"})
+_BLOCK_REMOTE_MEDIA_TYPES = frozenset({"image", "video"})
+
+#: Error code shared by the client refusal and the dashboard/MCP 400 response,
+#: so a caller sees one name for one rule wherever it is enforced.
+BLOCKS_REMOTE_MEDIA_ERROR = "blocks_remote_media_disabled"
+
+
+def blocks_request_remote_media(blocks: Any) -> bool:
+    """Whether a Block Kit tree can make Slack fetch remote media."""
+    pending: list[Any] = [blocks]
+    while pending:
+        obj = pending.pop()
+        if isinstance(obj, dict):
+            if any(key in _BLOCK_REMOTE_MEDIA_KEYS for key in obj):
+                return True
+            if obj.get("type") in _BLOCK_REMOTE_MEDIA_TYPES:
+                return True
+            pending.extend(obj.values())
+        elif isinstance(obj, list):
+            pending.extend(obj)
+    return False
+
+
+def _refuse_remote_media(blocks: Any) -> None:
+    """Fail closed on a Block Kit tree that would trigger a server-side fetch."""
+    if blocks and blocks_request_remote_media(blocks):
+        raise ValueError(BLOCKS_REMOTE_MEDIA_ERROR)
+
+
 class SlackClientOps(ABC):
     """Core Slack operations needed by KiroCrew."""
 
@@ -48,10 +89,11 @@ class SlackClientOps(ABC):
         channel: str,
         text: str,
         thread_ts: str | None = None,
-        unfurl_links: bool | None = None,
-        unfurl_media: bool | None = None,
     ) -> str:
-        """Post a message, return its ts."""
+        """Post a message, return its ts. Implementations must never enable
+        Slack link/media unfurls: an unfurl is a zero-click fetch of a URL
+        that may be agent-written (see rfc-redaction-explain-and-reveal §5),
+        which is why the interface deliberately carries no unfurl parameters."""
 
     @abstractmethod
     async def post_blocks(
@@ -60,10 +102,9 @@ class SlackClientOps(ABC):
         blocks: list[dict],
         text: str,
         thread_ts: str | None = None,
-        unfurl_links: bool | None = None,
-        unfurl_media: bool | None = None,
     ) -> str:
-        """Post a Block Kit message, return its ts."""
+        """Post a Block Kit message, return its ts. Same no-unfurl contract
+        as :meth:`post_message`."""
 
     @abstractmethod
     async def update_message(
@@ -118,7 +159,12 @@ class SlackClientOps(ABC):
 
     @abstractmethod
     async def post_ephemeral(
-        self, channel: str, user_id: str, text: str, blocks: list[dict] | None = None, thread_ts: str | None = None
+        self,
+        channel: str,
+        user_id: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        thread_ts: str | None = None,
     ) -> None:
         """Post an ephemeral message visible only to the specified user."""
 
@@ -199,6 +245,21 @@ class SlackClientOps(ABC):
         """
         return None
 
+    async def fetch_message_detail(self, channel: str, ts: str) -> dict[str, str] | None:
+        """Fetch a single message's text AND who posted it.
+
+        Returns ``{"text", "user", "bot_id", "bot_name"}`` (missing parts are
+        empty strings), or None on failure or when the message has no text.
+        ``text`` is extracted exactly as :meth:`fetch_message` extracts it.
+
+        The default asks :meth:`fetch_message` and knows no author, so a client
+        that only implements the text fetch still answers here.
+        """
+        text = await self.fetch_message(channel, ts)
+        if not text:
+            return None
+        return {"text": text, "user": "", "bot_id": "", "bot_name": ""}
+
     async def probe_channel_history(self, channel: str) -> str | None:
         """Probe whether the bot token can read *channel*'s history.
 
@@ -212,7 +273,9 @@ class SlackClientOps(ABC):
         """
         return None
 
-    async def fetch_thread_replies(self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True) -> list[dict]:
+    async def fetch_thread_replies(
+        self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True
+    ) -> list[dict]:
         """Fetch thread replies. Returns list of message dicts with 'user'/'bot_id' and 'text'."""
         return []
 
@@ -306,7 +369,8 @@ class RealSlackClient(SlackClientOps):
             home = str(ch.get("context_team_id") or "")
         except Exception:
             logger.info(
-                "could not resolve the home workspace of channel %s", channel,
+                "could not resolve the home workspace of channel %s",
+                channel,
                 exc_info=True,
             )
             home = ""
@@ -334,17 +398,24 @@ class RealSlackClient(SlackClientOps):
         channel: str,
         text: str,
         thread_ts: str | None = None,
-        unfurl_links: bool | None = None,
-        unfurl_media: bool | None = None,
         reply_broadcast: bool | None = None,
     ) -> str:
+        """Post a message with link/media previews always OFF.
+
+        Bot-posted text routinely carries agent-written URLs, and a Slack
+        unfurl is a zero-click fetch: Slack requests the URL without anyone
+        tapping it, so a URL whose query smuggles conversation data exfiltrates
+        on delivery. There is deliberately NO opt-in parameter: every caller of
+        this client is reachable from agent-authored content (the send_message
+        tool, cron notifications, approval cards), so a flag here would hand a
+        prompt-injected agent the one bit it needs to re-enable the fetch. See
+        docs/request-for-change/rfc-redaction-explain-and-reveal.md §5.
+        """
         kwargs: dict[str, Any] = {"channel": channel, "text": text}
         if thread_ts is not None:
             kwargs["thread_ts"] = thread_ts
-        if unfurl_links is not None:
-            kwargs["unfurl_links"] = unfurl_links
-        if unfurl_media is not None:
-            kwargs["unfurl_media"] = unfurl_media
+        kwargs["unfurl_links"] = False
+        kwargs["unfurl_media"] = False
         if reply_broadcast and thread_ts is not None:
             kwargs["reply_broadcast"] = True
         self._inject_team(channel, kwargs)
@@ -357,17 +428,22 @@ class RealSlackClient(SlackClientOps):
         blocks: list[dict],
         text: str,
         thread_ts: str | None = None,
-        unfurl_links: bool | None = None,
-        unfurl_media: bool | None = None,
         reply_broadcast: bool | None = None,
     ) -> str:
+        """Post Block Kit content with text/link unfurls always OFF.
+
+        A tree naming remote media is refused HERE, not one layer up: the
+        `unfurl_*` flags do not govern media a block names directly, and this
+        seam is the one every caller passes through. The profile ``image_url``
+        returned by :meth:`get_user_profile` is read-only metadata, not outbound
+        Block Kit, so it is unaffected.
+        """
+        _refuse_remote_media(blocks)
         kwargs: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text}
         if thread_ts is not None:
             kwargs["thread_ts"] = thread_ts
-        if unfurl_links is not None:
-            kwargs["unfurl_links"] = unfurl_links
-        if unfurl_media is not None:
-            kwargs["unfurl_media"] = unfurl_media
+        kwargs["unfurl_links"] = False
+        kwargs["unfurl_media"] = False
         if reply_broadcast and thread_ts is not None:
             kwargs["reply_broadcast"] = True
         self._inject_team(channel, kwargs)
@@ -377,6 +453,19 @@ class RealSlackClient(SlackClientOps):
     async def update_message(
         self, channel: str, ts: str, text: str = "", blocks: list[dict] | None = None
     ) -> None:
+        # The edit path is the same boundary as the send path: a clean tree
+        # posted first and remote media edited in afterwards would otherwise
+        # reach Slack's fetchers unchecked.
+        #
+        # This path sends no unfurl flags, deliberately: chat.update accepts no
+        # unfurl_links/unfurl_media argument (nor does chat.postEphemeral), and
+        # an unknown argument earns invalid_arg_name, so passing them turns
+        # every streamed edit into an API error. The renderer delivers streamed
+        # agent text through here, so a URL arriving in a later chunk is edited
+        # into a message posted without it; whether Slack unfurls that is a
+        # property of their fetchers, established by live check rather than by a
+        # flag this code can set. See the messaging spec's preview invariant.
+        _refuse_remote_media(blocks)
         kwargs: dict[str, Any] = {"channel": channel, "ts": ts, "text": text}
         if blocks:
             kwargs["blocks"] = blocks
@@ -459,8 +548,19 @@ class RealSlackClient(SlackClientOps):
         return resp["channel"]["id"]
 
     async def post_ephemeral(
-        self, channel: str, user_id: str, text: str, blocks: list[dict] | None = None, thread_ts: str | None = None
+        self,
+        channel: str,
+        user_id: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        thread_ts: str | None = None,
     ) -> None:
+        # Every method on this seam that accepts a blocks tree refuses remote
+        # media, this one included: Slack's servers fetch media a block names
+        # whatever the caller intended, and an ephemeral post reaches those
+        # fetchers exactly like a channel post does. A seam where one method out
+        # of three checks is a seam callers can route around by accident.
+        _refuse_remote_media(blocks)
         kwargs: dict = {"channel": channel, "user": user_id, "text": text}
         if blocks:
             kwargs["blocks"] = blocks
@@ -739,49 +839,92 @@ class RealSlackClient(SlackClientOps):
         Prefers content extracted from Block Kit ``blocks`` and falls back
         to the top-level ``text`` field when blocks yield nothing.
         """
+        message = await self._fetch_single_message(channel, ts)
+        return self._message_text(message) if message is not None else None
+
+    async def fetch_message_detail(self, channel: str, ts: str) -> dict[str, str] | None:
+        """Fetch a single message's text and author with one history read.
+
+        ``bot_name`` is the posting app's display name (``bot_profile.name``,
+        else the legacy ``username``) and is set only for app-posted messages.
+        """
+        message = await self._fetch_single_message(channel, ts)
+        if message is None:
+            return None
+        text = self._message_text(message)
+        if not text:
+            return None
+        bot_id = str(message.get("bot_id") or "")
+        bot_profile = message.get("bot_profile")
+        bot_name = ""
+        if bot_id:
+            if isinstance(bot_profile, dict):
+                bot_name = str(bot_profile.get("name") or "")
+            bot_name = bot_name or str(message.get("username") or "")
+        return {
+            "text": text,
+            "user": str(message.get("user") or ""),
+            "bot_id": bot_id,
+            "bot_name": bot_name,
+        }
+
+    async def _fetch_single_message(self, channel: str, ts: str) -> dict[str, Any] | None:
+        """The raw message at *ts* in *channel*, or None on failure."""
         try:
-            resp = await self._web.conversations_history(
-                channel=channel, oldest=ts, latest=ts, inclusive=True, limit=1
-            )
+            kwargs: dict[str, Any] = {
+                "channel": channel,
+                "oldest": ts,
+                "latest": ts,
+                "inclusive": True,
+                "limit": 1,
+            }
+            self._inject_team(channel, kwargs)
+            resp = await self._web.conversations_history(**kwargs)
             messages: list[dict[str, Any]] = resp.get("messages", [])
             if messages:
-                message = messages[0]
-                text = message.get("text", "")
-                parts: list[str] = []
-                for block in message.get("blocks", []):
-                    block_type = block.get("type")
-                    if block_type == "section":
-                        text_obj = block.get("text")
-                        if text_obj:
-                            section_text = text_obj.get("text", "")
-                            if section_text:
-                                parts.append(section_text)
-                    elif block_type == "rich_text":
-                        for rich_text_element in block.get("elements", []):
-                            # rich_text_list has children that are each rich_text_section;
-                            # rich_text_preformatted and rich_text_quote have inline
-                            # elements directly, so the else branch handles them correctly.
-                            leaves = (
-                                rich_text_element.get("elements", [])
-                                if rich_text_element.get("type") == "rich_text_list"
-                                else [rich_text_element]
-                            )
-                            for leaf in leaves:
-                                inline_texts = self._extract_inline_texts(
-                                    leaf.get("elements", [])
-                                )
-                                if inline_texts:
-                                    parts.append("".join(inline_texts))
-                return "\n".join(parts) or text or None
+                return messages[0]
         except (SlackClientError, aiohttp.ClientError, asyncio.TimeoutError):
             logger.debug("fetch_message failed for %s/%s", channel, ts, exc_info=True)
         return None
 
-    async def fetch_thread_replies(self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True) -> list[dict]:
+    @classmethod
+    def _message_text(cls, message: dict[str, Any]) -> str | None:
+        """A message's readable text: Block Kit content first, then ``text``."""
+        text = message.get("text", "")
+        parts: list[str] = []
+        for block in message.get("blocks", []):
+            block_type = block.get("type")
+            if block_type == "section":
+                text_obj = block.get("text")
+                if text_obj:
+                    section_text = text_obj.get("text", "")
+                    if section_text:
+                        parts.append(section_text)
+            elif block_type == "rich_text":
+                for rich_text_element in block.get("elements", []):
+                    # rich_text_list has children that are each rich_text_section;
+                    # rich_text_preformatted and rich_text_quote have inline
+                    # elements directly, so the else branch handles them correctly.
+                    leaves = (
+                        rich_text_element.get("elements", [])
+                        if rich_text_element.get("type") == "rich_text_list"
+                        else [rich_text_element]
+                    )
+                    for leaf in leaves:
+                        inline_texts = cls._extract_inline_texts(leaf.get("elements", []))
+                        if inline_texts:
+                            parts.append("".join(inline_texts))
+        return "\n".join(parts) or text or None
+
+    async def fetch_thread_replies(
+        self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True
+    ) -> list[dict]:
         """Fetch parent message + replies via conversations.replies API."""
         try:
             resp = await self._web.conversations_replies(
-                channel=channel, ts=thread_ts, limit=limit,
+                channel=channel,
+                ts=thread_ts,
+                limit=limit,
             )
             data: dict = resp.data if hasattr(resp, "data") else dict(resp)  # type: ignore[assignment,call-overload]
             messages: list[dict] = data.get("messages", [])
@@ -789,7 +932,9 @@ class RealSlackClient(SlackClientOps):
             if warn_on_pagination and meta.get("next_cursor"):
                 logger.warning(
                     "Thread %s/%s has more messages than limit=%d; import is incomplete",
-                    channel, thread_ts, limit,
+                    channel,
+                    thread_ts,
+                    limit,
                 )
             return messages
         except (SlackClientError, aiohttp.ClientError, asyncio.TimeoutError):

@@ -314,6 +314,12 @@ async def steer_into_running_turn(
     client = getattr(slot, "_acp_client", None)
     if client is None or not getattr(client, "supports_steer", False):
         return STEER_UNAVAILABLE
+    if not user_origin and getattr(client, "steer_needs_loss_recovery", False) is True:
+        # codex can drop a steer it already took when a later approval in the turn
+        # is denied. That limit is accepted only for the composer, where the
+        # session's own human watches the turn and can resend; a peer's text
+        # takes the caller's queue path instead.
+        return STEER_UNAVAILABLE
 
     # Register as pending BEFORE the await: ``steer()`` suspends on
     # ``stdin.drain()``, and if the turn's finally runs during that suspension
@@ -1005,4 +1011,18 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
     attachments = attachment_meta(item.get("meta"))
     if attachments:
         view["meta"] = attachments
+    # The structural kind tag rides in ``meta`` so the queue card can classify
+    # a system entry (an MCP-App message, for one) without parsing its text —
+    # the same enqueue-time source the server's own drain reads, and the same
+    # ``meta.kind`` spelling transcript rows use (e.g. compaction). Omitted for
+    # a plain user prompt so its shape is unchanged.
+    kind = item.get("kind")
+    if isinstance(kind, str) and kind:
+        view.setdefault("meta", {})["kind"] = kind
+    # The display label the producer stamped beside the containment snapshot
+    # rides with the kind — without it a reloaded queue card renders the
+    # generic "app" attribution instead of the app's own name.
+    label = (item.get("meta") or {}).get("appLabel")
+    if isinstance(label, str) and label:
+        view.setdefault("meta", {})["appLabel"] = label
     return view

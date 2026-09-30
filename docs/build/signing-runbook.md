@@ -40,6 +40,7 @@ notarize  (macOS)   notarize.sh submit + bounded polling with transient-error
   |
 publish   (ubuntu)  copy the gated artifact to the public distribution bucket,
                     then write feed/<channel>/latest-mac.yml
+                    (feed/<channel>/<arch>/latest-mac.yml on a single-arch leg)
 ```
 
 Key properties, each load-bearing:
@@ -99,6 +100,18 @@ even though the nightly bundle is `KiroCrew Nightly.app`. CDN keys and the
 latest-DMG permalink (`desktop/<channel>/latest/KiroCrew.dmg`) are a public
 contract, so deriving filenames from the bundle name would silently rename keys
 and break the permalink. The DMG's **volume** name does follow the bundle.
+
+The single-arch legs (`mac_variant: arm64 | x64`, nightly only today) run the
+same three jobs once more per DMG and append the arch to every name the legs
+would otherwise share: the signing-bucket keys (`SIGN_KEY_SUFFIX`, read by
+`sign.sh`), `notarized/…/KiroCrew-<arch>.zip`, the gated artifact
+`KiroCrew-notarized-<channel>-<version>-<arch>`, the public
+`desktop/<channel>/<version>/KiroCrew-<arch>.{zip,dmg}` and alias
+`desktop/<channel>/latest/KiroCrew-<arch>.dmg`, and the channel file directory
+`feed/<channel>/<arch>/`. Three legs of one channel+version therefore never
+touch each other's keys, and with the variant empty the universal leg's names
+are unchanged. A single-arch app follows its directory because
+`packaging/build-desktop.sh` stamps `desktopDistArch` into its `package.json`.
 
 ## The signing manifest is generated, never hand-maintained
 
@@ -264,7 +277,7 @@ generic scan rejection. The known trigger is macOS tar metadata: `bsdtar` embeds
 probe matrix (vary the manifest and the input tarball independently) before
 blaming the manifest.
 
-**Signing times out.** `sign.sh` polls for 15 minutes (`MAX_WAIT`, 30s interval)
+**Signing times out.** `sign.sh` polls for 45 minutes (`MAX_WAIT`, 30s interval)
 and gates on the explicit `success` status flag rather than elapsed time, so a
 success arriving on the final tick is not misread as a timeout. Exit code 5 is a
 genuine timeout and carries the sign-task id.

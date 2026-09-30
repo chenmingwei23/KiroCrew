@@ -55,7 +55,10 @@ notification_channel_settings IS attributable -- its channel is `<app>.<id>` or
 `system.<kind>` -- so own-channel settings ride `notification`, system channels
 ride `notification:system`, and foreign channels need `notification:all`.
 notification:all        All notifications regardless of source (broad).
-sessions                sessions_restarting
+sessions                sessions_restarting, session_health_changed
+                        (``session_health_changed`` is a bare ``{"ts": ...}``
+                        refresh signal -- it reports THAT the health verdict
+                        moved, never what it says)
 yolo                    yolo_expired
 artifacts               artifact_update ({slug, version, deleted}; metadata only)
 workflow_run_event      Declared by its own literal name -- already the correct
@@ -117,6 +120,18 @@ logger = logging.getLogger(__name__)
 _SEL_DEDUP_WINDOW_SECS = 300.0  # 5 minutes
 #: (app, event_type, reason) -> (last emitted monotonic ts, denies suppressed since)
 _sel_last_audit: dict[tuple[str, str, str], tuple[float, int]] = {}
+
+#: SEL ``caller`` for a grant made to a socket authenticated as the dashboard
+#: user. Such a socket carries an EMPTY app claim (``ws["_app"] == ""``), so
+#: keyed by app its grants would land in the ``<unknown>`` bucket next to an
+#: unnamed app token's and the operator could not tell the two apart -- which
+#: is the one thing the record exists to tell them. Angle brackets keep the
+#: label outside the app-id namespace (``manifest.KEBAB_RE`` admits only
+#: ``[a-z0-9-]``), so no manifest can claim it. Also the dedup key, so all
+#: dashboard sockets share one window per event type; the per-frame decision
+#: is the highest-volume class in the trail and one record per window is what
+#: ``_audit_decision``'s contract already promises for grants.
+DASHBOARD_USER_AUDITEE = "<dashboard-user>"
 
 
 def _audit_decision(app: str, event_type: str, outcome: str, dedup_reason: str) -> None:
@@ -280,6 +295,9 @@ _SUBAGENT_BATCH_ITEM_KEY = {
 _OWNER_ONLY_EVENTS = frozenset({
     "member_projection",   # types.WS_MEMBER_PROJECTION
     "members_subscribed",  # types.WS_MEMBERS_SUBSCRIBED
+    # Per-row slot metadata edits. Sent only to dashboard-user sockets that
+    # declared the capability; an app token gets its filtered full list.
+    "slot_patch",
 })
 
 
@@ -363,6 +381,14 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
     # the notification events themselves, so it rides the same declaration.
     "notification_channel_settings": "notification",
     "sessions_restarting": "sessions",
+    # A bare {"ts": ...} refresh signal -- no slot, no session key, no counts.
+    # It says the session-health verdict moved and nothing about what it says, so
+    # it rides the declaration that already governs the session domain rather
+    # than inventing a scope. `events` and `api` are independent manifest fields,
+    # so a holder of `sessions` is NOT thereby a reader of
+    # `GET /api/sessions/health`; the frame discloses nothing that endpoint
+    # would, and a holder of nothing still gets neither.
+    "session_health_changed": "sessions",
     "yolo_expired": "yolo",
     # Artifact metadata only ({slug, version, deleted}) -- no content, no slot.
     "artifact_update": "artifacts",
@@ -403,6 +429,29 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
 #: SDK reads it, so it is withheld from app tokens outright instead of growing
 #: the grant surface for a field with no consumer.
 _YOLO_SCOPE = _GLOBAL_EVENT_DECLARATIONS["yolo_expired"]
+
+
+def global_event_declared(event_type: str, allowed_events: frozenset[str]) -> bool:
+    """Does *allowed_events* carry the declaration that governs *event_type*?
+
+    A work-avoidance predicate, NOT the security gate: it lets a caller skip
+    producing an event no connection can receive. The gate stays
+    :func:`ws_event_allowed`, which every broadcast still passes through, so a
+    True here never admits a frame on its own -- and it deliberately does not
+    audit, because answering "would this connection ever want the event" is not a
+    grant and recording it as one would bury the real decisions.
+
+    Reads the same table and accepts the same ``<decl>`` / ``<decl>:all`` spelling
+    as the global-declaration branch of :func:`_decide_ws_event`, so the two
+    cannot drift. An unknown event is False, matching that branch's
+    deny-by-default. A dashboard user is also False: its socket carries no
+    declaration set at all (it is not gated by declarations), so a caller that
+    means "someone asked for this" must not read an empty set as consent.
+    """
+    required_decl = _GLOBAL_EVENT_DECLARATIONS.get(event_type)
+    if required_decl is None:
+        return False
+    return required_decl in allowed_events or f"{required_decl}:all" in allowed_events
 
 
 def slots_envelope_extras(

@@ -68,7 +68,11 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    redact_for_display,
+    safe_split_offset,
+    severs_a_credential,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -76,6 +80,7 @@ from kiro_crew.messaging.outbound_files import (
     extract_local_refs_off_loop,
     hide_local_refs,
     protected_ref_spans,
+    seam_carries_markup_debt,
 )
 from kiro_crew.messaging.renderer import (
     Renderer,
@@ -87,7 +92,10 @@ from kiro_crew.messaging.renderer import (
     session_provenance_tag,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import (
+    split_markdown_safe,
+    split_markdown_safe_with_tier,
+)
 from kiro_crew.messaging.status_reactions import (
     PHASE_QUEUED,
     PHASE_THINKING,
@@ -218,6 +226,20 @@ def _strip_steering(text: str) -> str:
     cleaned = re.sub(r"\[STEERING\b[^\]\r\n]*$", "", cleaned)  # unclosed, streaming
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
+
+
+def _delivered_form(source: str) -> str:
+    """*source* as the reader will actually see it, for grading a cut.
+
+    ``safe_split_offset`` grades both sides of a candidate boundary through this,
+    and its contract names surrounding whitespace as one of the things a renderer
+    removes on the way out. Trimming matters more than it looks: a cut placed just
+    after a trailing space leaves each raw half safe while the delivered halves sit
+    flush together, and Discord shows the reader the trimmed form. Modelling MORE
+    trimming than a path happens to perform only makes the grade stricter, which is
+    the safe direction; modelling less is what lets a boundary through.
+    """
+    return _strip_steering(source).strip()
 
 
 def _transform_buries_refs(canonical: str, presented: str) -> bool:
@@ -939,6 +961,48 @@ class DiscordRenderer(Renderer):
                 if await asyncio.to_thread(protected_ref_spans, candidate):
                     return
             chunks = await asyncio.to_thread(split_markdown_safe, candidate, limit)
+            # Card text is model text, and this branch cuts it on the same length
+            # budget, so its boundaries carry the same hazard as the source path's.
+            # A presentation snapshot reaches the reader without protocol handling,
+            # but the splitter still rstrips each chunk and the sink trims what it
+            # sends, so the boundary is graded through the same delivered form the
+            # source path uses. Modelling trimming a path may not perform only makes
+            # the grade stricter, and ONE rule across the sites is what stops the
+            # next one being added with a weaker transform.
+            if await asyncio.to_thread(severs_a_credential, chunks, _redact_all, _delivered_form):
+                # Carve until the REMAINDER fits the budget, not once. This branch
+                # is terminal: its last piece is parked as ``_delivery_text`` with
+                # no further rotation ahead of it, so the only thing that bounds an
+                # over-budget piece is ``_seal_current``'s own re-split -- and that
+                # cut is made on length alone, with no credential grade. Taking a
+                # single graded offset would therefore buy ONE safe boundary by
+                # handing every later boundary in the same text to an ungraded cut,
+                # which is the leak this gate exists to close. Each step grades its
+                # head against the whole remainder, which is exactly the
+                # per-boundary reading ``severs_a_credential`` applies to the
+                # finished list. The cost is confined to text that already severs:
+                # a candidate the splitter cut safely never reaches this loop.
+                graded: list[str] = []
+                rest = candidate
+                while len(rest) > limit:
+                    offset = await asyncio.to_thread(
+                        safe_split_offset, rest, limit, _redact_all, _delivered_form
+                    )
+                    if not offset:
+                        return
+                    graded.append(rest[:offset])
+                    rest = rest[offset:]
+                chunks = [*graded, rest]
+                # The per-step grades are pairwise, and the whole-sequence reading
+                # -- every piece redacted alone, then joined -- is not implied by
+                # them: canonicalising DROPS a link target, so markup spanning a
+                # middle piece can collapse two distant pieces together in a way no
+                # single boundary check sees. Ask for that reading once and deliver
+                # nothing rather than a list it rejects.
+                if await asyncio.to_thread(
+                    severs_a_credential, chunks, _redact_all, _delivered_form
+                ):
+                    return
             for chunk in chunks[:-1]:
                 self._buf = []
                 self._delivery_text = chunk
@@ -963,15 +1027,107 @@ class DiscordRenderer(Renderer):
             sealed = chunks
         else:
             split_source = raw
-            chunks = await asyncio.to_thread(split_markdown_safe, split_source, limit)
+            chunks, degraded = await asyncio.to_thread(
+                split_markdown_safe_with_tier, split_source, limit
+            )
             sealed, tail = chunks[:-1], chunks[-1] if chunks else ""
-            probe_at = len(prefix := raw.removesuffix(tail))
-            probe = prefix + "![x](/tmp/x.png)" + " ".join(re.findall(r"`+", prefix)) + tail
-            spans = await asyncio.to_thread(protected_ref_spans, probe) if sealed else []
-            lost = bool(sealed) and raw.endswith(tail) and probe_at not in dict(spans)
-            dirty_cut = any(len(line) > limit for line in split_source.splitlines(True))
-            if dirty_cut or lost:
+            if not degraded and len(chunks) > 1:
+                # No synthetic probe: re-derive the split-tier signal from the
+                # split output. A clean line cut still moves a reference across a
+                # literalness boundary two ways: a chunk scanned alone carries a
+                # span the full text never had (an opener orphaned into the
+                # tail), or the sealed prefix leaves markup debt that flips how
+                # the live tail's own first marker classifies at the semantic
+                # seal.
+                for chunk in chunks:
+                    if await asyncio.to_thread(protected_ref_spans, chunk):
+                        degraded = True
+                        break
+                if not degraded:
+                    # ONE seam-aware check for all markup-debt families. The
+                    # tail is later scanned ALONE by the extraction reader, so a
+                    # leak is exactly a marker on the tail's first line that the
+                    # reader classifies differently with the sealed prefix
+                    # present than without it -- an unclosed inline-code run, an
+                    # odd backslash escape, an open fence, or a four-wide indent
+                    # opened in the sealed prefix (full literal, tail real -> a
+                    # source-literal file uploaded), or a mid-line cut leaving
+                    # the tail tab-led (full real, tail literal -> the raw local
+                    # path shipped as text). ``seam_carries_markup_debt`` asks
+                    # the extraction reader itself at a probe marker placed where
+                    # the tail's first content sits, so every family -- and any
+                    # future one -- is judged with the reader's own segmentation
+                    # rather than re-derived per opener kind at the seam.
+                    #
+                    # Only meaningful when the tail is the source's own
+                    # remainder (``split_source.endswith(tail)``). When a fenced
+                    # block crosses the limit the splitter builds
+                    # ``tail = reopener + remainder`` with a synthetic
+                    # ``"```lang\n"`` the source never had, so ``source_head +
+                    # tail`` is not the real source and the concatenation's fence
+                    # structure is fabricated; that seam sits inside an open
+                    # fence, literal in BOTH readings, and the fence-aware
+                    # per-chunk span scan above already owns it -- so skip the
+                    # seam check when the tail carries a reopener.
+                    if split_source.endswith(tail):
+                        source_head = split_source[: len(split_source) - len(tail)]
+                        if await asyncio.to_thread(seam_carries_markup_debt, source_head, tail):
+                            degraded = True
+            if degraded:
                 self._segment_uploads_safe = False
+        # The splitter cuts the RAW buffer on a length budget and each chunk is
+        # redacted alone, so a key written with markup through the cut matches
+        # nothing in any one chunk while the reader's client renders the markup away
+        # and reads them as one key down the screen. The retained tail is graded with
+        # the sealed chunks because the splitter never sees the pair: ``tail`` is the
+        # remainder this rotation keeps, not one of the chunks it produced. Grade
+        # what would actually be DELIVERED, through the SAME transform the offset
+        # search below uses -- this gate decides whether that search runs at all, so
+        # a gate reading a weaker form than the search hides exactly the boundaries
+        # the search exists to move. Trimming can only reveal more severs, never
+        # fewer.
+        if await asyncio.to_thread(
+            severs_a_credential, [*sealed, tail], _redact_all, _delivered_form
+        ):
+            # Cut where the reader cannot rejoin rather than where the budget lands.
+            # The head and the retained remainder are SOURCE slices: splitter output
+            # does not concatenate back to its input (a chunk is rstripped, a fence
+            # is closed and reopened), so rejoining chunks would hand the user text
+            # the model never wrote. The search grades the DELIVERED form, so its
+            # answer is one this caller can take -- grading raw and re-checking after
+            # would deadlock the segment, since a deterministic search returns the
+            # same rejected answer every rotation.
+            offset = await asyncio.to_thread(
+                safe_split_offset, split_source, limit, _redact_all, _delivered_form
+            )
+            # The search grades pairs of ``split_source`` alone, but what ships is
+            # ``split_source[offset:]`` with the HELD remainder glued on -- the image
+            # reference this rotation keeps out of the splitter. So its answer is a
+            # candidate, never a verdict, and two ways it can be the rejected pair
+            # again: ``split_source`` already fits the budget (an image starting at
+            # or before it) makes the search take its ``limit >= len(text)`` early
+            # return, so ``offset`` is the whole string and the re-assignment
+            # reproduces the byte-identical pair the gate above just refused; and for
+            # a longer source the pair it graded ends at ``split_source``, not at the
+            # held tail. Re-grade what is actually delivered and withhold when it
+            # still severs, exactly as the presentation branch does.
+            candidate_sealed = [split_source[:offset]]
+            candidate_tail = split_source[offset:] + raw[len(split_source) :]
+            if offset and await asyncio.to_thread(
+                severs_a_credential,
+                [*candidate_sealed, candidate_tail],
+                _redact_all,
+                _delivered_form,
+            ):
+                offset = 0
+            if not offset:
+                # Deliver NOTHING: withheld text rides the next rotation, and the
+                # final seal redacts the whole segment as one string.
+                self._buf = [raw + protocol_suffix]
+                self._delivery_text = None
+                return
+            sealed = candidate_sealed
+            tail = candidate_tail
         for ch in sealed:
             self._buf = [ch]
             self._delivery_text = None
@@ -1216,7 +1372,15 @@ class DiscordRenderer(Renderer):
 
         chunks = [text]
         if len(text) > DISCORD_MAX_TEXT:
-            chunks = await asyncio.to_thread(split_markdown_safe, text, DISCORD_MAX_TEXT)
+            # WITH the redactor. This is the last cut before the wire and there is
+            # no rotation behind it, so a boundary chosen on length alone here is
+            # the one cut nothing grades -- which is exactly where a buffer the
+            # rotation WITHHELD as unsafe ends up: it is parked whole, arrives here
+            # over the cap, and gets sliced at the budget. Telegram's own splitter
+            # call has carried a redactor all along; Discord's had not.
+            chunks = await asyncio.to_thread(
+                split_markdown_safe, text, DISCORD_MAX_TEXT, redactor=_redact_all
+            )
         chunks = [part for chunk in chunks for part in _fit_platform_cap(chunk)]
         for index, chunk in enumerate(chunks):
             part_files = files if index == 0 else []
@@ -1241,7 +1405,10 @@ class DiscordRenderer(Renderer):
             source = _redact_transformed(source)
             recovery = [source]
             if len(source) > DISCORD_MAX_TEXT:
-                recovery = await asyncio.to_thread(split_markdown_safe, source, DISCORD_MAX_TEXT)
+                # Same cut, same reason as the seal's own split above.
+                recovery = await asyncio.to_thread(
+                    split_markdown_safe, source, DISCORD_MAX_TEXT, redactor=_redact_all
+                )
             recovery = [part for chunk in recovery for part in _fit_platform_cap(chunk)]
             landed_any = False
             for index, chunk in enumerate(recovery):

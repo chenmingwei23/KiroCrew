@@ -73,6 +73,7 @@ from kiro_crew.cloud.fargate import (
     default_log_spec,
     revision_fingerprint,
     run_task_request,
+    sole_binding,
     spec_binding,
     task_definition_document,
     task_family,
@@ -473,17 +474,18 @@ class FargateSigninHandle:
     """The sign-in step, which for Fargate has nothing to wait for.
 
     The evidence is in the image rather than in an argument: ``runtime/Dockerfile:130``
-    states the credential is "Supplied at run time, never baked in",
-    ``supervisor/__main__.py:422`` calls ``require_api_key(env)`` before serving, and a
-    search of the whole runtime subtree for device-code, SSO, OAuth or interactive-login
-    strings returns zero hits. The container is handed a key and refuses to boot without
-    one; nobody ever signs it in.
+    states the credential is "Supplied at run time, never baked in", the supervisor
+    writes the delivered identity into the crew's vault and calls
+    ``require_model_identity`` before serving, and a search of the whole runtime
+    subtree for device-code, SSO, OAuth or interactive-login strings returns zero
+    hits. The container is handed an identity and refuses to boot without one; nobody
+    ever signs it in.
 
     So this handle completes immediately rather than polling. It reports success
-    because the credential's PRESENCE was already enforced at container start --
-    and only presence. ``require_api_key``'s own docstring is explicit that a
-    present key is not a working one and that validity "can only be established by
-    a real turn", so this handle must not be read as evidence the credential works.
+    because the identity's PRESENCE was already enforced at container start --
+    and only presence. ``require_model_identity``'s own docstring is explicit that a
+    usable identity is not a working one and that validity "can only be established
+    by a real turn", so this handle must not be read as evidence the credential works.
 
     ``run_launch`` reads ``error`` first and ``already_logged_in`` next, and with an
     empty ``error`` it takes the already-signed-in branch: that branch marks the step
@@ -893,6 +895,23 @@ class FargateLaunchSpec:
     #: caller constructing a spec has to pass the confirmation to get a usable one, rather
     #: than getting a launch it never confirmed.
     confirmed_recipient: str = ""
+    #: The lane operator's internal-only trust-boundary claim, read from their
+    #: ``cloud.json`` block (``FargateConfig.internal_only``) and carried into every
+    #: task this spec launches as ``SMC_INTERNAL_ONLY``.
+    #:
+    #: With it the container starts the model subprocess UNSANDBOXED on a host with no
+    #: unprivileged user namespace, which is every Fargate host. Without it that host
+    #: refuses to start, which is the behaviour this lane had before the key existed --
+    #: so the default is the pre-existing posture and not a new one.
+    #:
+    #: It is NOT part of ``confirmed_recipient``'s confirmation, and the two answer
+    #: different questions. The confirmation exists because ``cloud.json`` chooses which
+    #: container receives the credential, so a rewritten file must not silently
+    #: substitute a recipient. This field grants no new reach: the worker could already
+    #: decrypt the crew's vault under the backend's uid on any host, sandbox or not, so
+    #: a rewrite that set this reaches nothing a rewrite of ``image`` did not already
+    #: reach, and the file's own seals are what stand behind it.
+    internal_only: bool = False
 
 
 def _tier_as_pair(size_key: str) -> Optional[str]:
@@ -1061,6 +1080,62 @@ class FargateLaunchEngine:
             store=None,
         )
 
+    def serves_mate(self) -> str:
+        """Which MATE this lane's configured image and secrets belong to, or ``""``.
+
+        One mate, not a crew: a task this lane runs holds exactly one agent spec
+        (``agent.json`` in the bundle) and serves a chat API with no dashboard, so what
+        it deploys is an individual agent and never a gateway serving a roster.
+
+        Derived from the SECRET REFERENCES through ``sole_binding``, which is the same
+        function ``FargateConfig.is_complete`` already runs over them: a registered lane
+        is one whose references name exactly one mate, so for any lane a launch can
+        reach, this answers. ``""`` only for an engine holding no spec, or a set
+        ``sole_binding`` refuses -- neither of which can launch anything.
+
+        The SECRET is the mate's identity here rather than the image, and deliberately.
+        The credential that secret delivers is the one the task decrypts that mate's
+        vault with, so a task whose secret names mate A IS mate A whatever its image is
+        labelled; reading a label instead would make the answer a claim about the image
+        rather than about what the task can reach.
+        """
+        if self._spec is None:
+            return ""
+        try:
+            return sole_binding(
+                {
+                    f"secrets[{index}].valueFrom": ref.arn
+                    for index, ref in enumerate(self._spec.secrets)
+                }
+            ).crew
+        except Exception:  # noqa: BLE001 - a set nothing can bind is a lane that cannot launch
+            return ""
+
+    def mate_name_refusal(self, mate_name: str) -> str:
+        """Why this lane cannot deploy *mate_name*, or ``""`` when it can.
+
+        The optional hook ``launch_job.engine_mate_name_refusal`` looks for, so the
+        refusal arrives at the HTTP boundary before a job file exists rather than from
+        inside the provision step. :meth:`provision` asks the same question again over
+        the spec it is about to launch, which is the check no caller can skip.
+
+        This lane runs ONE image, pinned by digest, carrying ONE mate's bundle and one
+        mate's secret. It cannot compose a fresh image for another mate -- that is a
+        build, not a launch -- so a request naming a different mate has no honest
+        outcome other than a refusal: the alternative is a task serving somebody else's
+        agent under the name the user picked.
+        """
+        if not mate_name:
+            return ""
+        serves = self.serves_mate()
+        if not serves or serves == mate_name:
+            return ""
+        return (
+            f"this lane launches the digest-pinned image configured for mate {serves!r}, so "
+            f"it cannot deploy {mate_name!r}. Deploy {serves!r} on this lane, or build and "
+            f"configure an image carrying {mate_name!r}'s bundle first"
+        )
+
     def preflight(self, profile: str, region: str) -> None:
         """Validate the region and refuse, by name, what the engine lacks.
 
@@ -1072,12 +1147,21 @@ class FargateLaunchEngine:
         validated_region(region, source="region")
         self._require_spec()
 
-    def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str:
+    def provision(
+        self, *, tag: str, size_key: str, profile: str, region: str, mate_name: str = ""
+    ) -> str:
         """Register or reuse a task definition revision and ``RunTask`` it.
 
         Refuses first of all when the operator has not confirmed the credential recipient
         this launch resolves (:attr:`FargateLaunchSpec.confirmed_recipient`), before the tag
         checks and before anything is registered or run.
+
+        *mate_name* is which MATE the REQUEST was for, empty when it named none. A name
+        this lane cannot serve is refused here as well as at the HTTP boundary
+        (:meth:`mate_name_refusal`), and for the same reason the recipient is checked
+        twice: this is the check another caller cannot skip. It CHOOSES nothing -- the
+        image, the secrets and therefore the mate all come from the spec -- so a name
+        that matches changes nothing about what is launched.
 
         Owns the two obligations the ``fargate`` module leaves to its caller. It
         refuses a ``tag`` or derived ``started_by`` outside the accepted charset
@@ -1128,6 +1212,12 @@ class FargateLaunchEngine:
                 f"{spec.confirmed_recipient}, would deliver to {resolved}. The Fargate block "
                 "in cloud.json changed since it was confirmed, so nothing was launched"
             )
+        # Asked over the SPEC, beside the recipient check and before any AWS call: the
+        # boundary already refused a mismatch, and this is the copy a second caller
+        # cannot go around. Nothing is chosen from the name -- a match is a no-op.
+        refusal = self.mate_name_refusal(mate_name)
+        if refusal:
+            raise ValueError(refusal)
         if not tag or not _TAG_VALUE_RE.match(tag):
             raise ValueError(
                 f"launch tag {tag!r} is outside the letters, digits, hyphen and underscore a "
@@ -1181,6 +1271,10 @@ class FargateLaunchEngine:
             # still holds where the sweep cannot reach: a cluster whose last launch
             # has already happened is never swept again.
             ttl_seconds=self._bounds.ttl_seconds,
+            # The lane operator's trust-boundary claim, read from the spec rather than
+            # from anything this method decides. It is what lets the container start on
+            # a Fargate host, which has no unprivileged user namespace.
+            internal_only=spec.internal_only,
         )
         result = aws.checked_json(
             ["ecs", "run-task", "--cli-input-json", _json(request)],
@@ -1447,8 +1541,22 @@ class FargateLaunchEngine:
             _sleep(min(REGISTER_TARGET_POLL_SECONDS, remaining))
             waited += REGISTER_TARGET_POLL_SECONDS
 
-    def register(self, *, instance_id: str, tag: str, profile: str, region: str) -> None:
-        """Add the launched task to the Instances registry, so the crew is switchable.
+    def register(
+        self, *, instance_id: str, tag: str, profile: str, region: str, mate_name: str = ""
+    ) -> None:
+        """Add the launched task to the Instances registry, so the mate is switchable.
+
+        *mate_name* is the name the request asked for, and the record is named
+        ``<mate> (<tag>)``. The mate has to be in it: named from the launch TAG alone the
+        agent the user picked and confirmed was renamed the moment it landed. The TAG has
+        to be in it too: two launches of one mate are two tasks and therefore two rows
+        (``register_instance`` matches an existing record by ECS target, and two tasks
+        have two), so a name carrying only the mate would leave a reader two rows they
+        cannot tell apart. The row's FACE is seeded from the mate name the job recorded,
+        not from this string, so the suffix disambiguates without giving one agent a
+        different picture per launch. Optional and defaulted for the same reason
+        ``provision``'s is: a caller written against the four-keyword ``register`` must
+        keep working.
 
         *instance_id* is the task ARN ``provision`` returned. The registry
         addresses a Fargate crew by ECS target instead, so this resolves one from
@@ -1509,7 +1617,7 @@ class FargateLaunchEngine:
             )
         registered = connect.register_instance(
             target,
-            name=f"Kiro Crew Cloud ({tag})",
+            name=f"{mate_name} ({tag})" if mate_name else f"Kiro Crew Cloud ({tag})",
             profile=profile,
             region=region,
             remote_port=FRONT_PORT,

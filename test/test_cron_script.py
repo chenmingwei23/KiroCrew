@@ -39,7 +39,7 @@ def _cron_caller_is_named(named_cron_caller):
 
 
 @pytest.fixture(autouse=True)
-def _crons_dir_tracks_patched_home(monkeypatch):
+def _crons_dir_tracks_patched_home(monkeypatch, tmp_path):
     """Keep ``cron_script.config_dir()`` pointed at ``<patched home>/.kirocrew``.
 
     The data home moved from the top-level ``~/.kirocrew`` to ``~/.kiro/crew``
@@ -53,10 +53,31 @@ def _crons_dir_tracks_patched_home(monkeypatch):
     it tracks whatever ``Path.home()`` each test patches) — preserving the
     existing ``.kirocrew/crons`` layout the tests build. Tests that patch
     ``cron_script.config_dir`` themselves still win (applied later).
+
+    The stub CREATES the directory, because the real resolver does: ``config_dir``
+    runs ``mkdir(parents=True, exist_ok=True)`` on every call, so a path it hands
+    back always exists on disk. A stub that only computes the path models a home
+    that the production code cannot be handed, and a caller that legitimately
+    creates something beside the tree it returns then fails on a missing parent
+    that no real run has.
+
+    Creating means the fallback matters: a test in this module that does NOT patch
+    ``Path.home`` would otherwise have this stub create directories in the
+    OPERATOR's real home, which outlive the run and which the conftest's
+    real-data-home guards cannot see (they inspect ``KIROCREW_HOME`` only). So an
+    unpatched home resolves to a per-test tmp dir instead, the same shape
+    ``test_cron_secret_env.py`` and ``test_cron_apps_secret_mask.py`` use.
     """
-    monkeypatch.setattr(
-        "kiro_crew.cron_script.config_dir", lambda: Path.home() / ".kirocrew"
-    )
+    real_home = Path.home()
+    fallback = tmp_path / "kirocrew-home-fallback"
+
+    def _home_dir() -> Path:
+        home = Path.home()
+        d = fallback if home == real_home else home / ".kirocrew"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    monkeypatch.setattr("kiro_crew.cron_script.config_dir", _home_dir)
 
 
 class TestResolveScriptPath:
@@ -625,6 +646,28 @@ def run(ctx):
         with patch("pathlib.Path.home", return_value=tmp_path):
             result = run_script_sandboxed(script_path + ":run", "test-job-id", "hello-world")
         assert result["status"] == "ok"
+
+    def test_dataclass_with_postponed_annotations_loads(self, tmp_path):
+        """A script that runs under plain Python must also load in the child.
+
+        ``dataclasses`` resolves a string annotation through
+        ``sys.modules[cls.__module__]``, so a script module the launcher never
+        registers there fails at import under ``from __future__ import annotations``.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            "from __future__ import annotations\n"
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Item:\n"
+            "    name: str\n"
+            "def run(ctx):\n"
+            "    if Item('x').name != 'x':\n"
+            "        raise RuntimeError('dataclass field lost')\n",
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id", "")
+        assert result["status"] == "ok", result
 
 
 class TestScriptContext:
@@ -1722,7 +1765,7 @@ class TestResolveScriptPathSensitive:
         script = crons_dir / "test.py"
         script.write_text("def run(ctx): pass")
         with patch("pathlib.Path.home", return_value=tmp_path), patch(
-            "kiro_crew.cron_script.is_sensitive_path", return_value=True
+            "kiro_crew.cron_script.sensitive_path_refusal", return_value="Blocked: x"
         ):
             with pytest.raises(PermissionError, match="security policy"):
                 resolve_script_path(str(script) + ":run")

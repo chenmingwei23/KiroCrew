@@ -11,6 +11,14 @@ from typing import Any, Protocol
 
 from aiohttp import web
 
+#: Capability a dashboard tab declares in the ``caps`` query parameter of
+#: ``/api/ws`` when its bundle applies ``slot_patch`` frames.
+SLOT_PATCH_CAPABILITY = "slot_patch"
+
+#: Socket attribute recording that declaration. Only a dashboard-user socket
+#: carries it; every other socket keeps receiving the full ``slots`` list.
+SLOT_PATCH_WS_FLAG = "_slot_patch"
+
 
 class WebSocketHubOwner(Protocol):
     """The mutable facade-owned state the hub operates on.
@@ -158,6 +166,31 @@ class WebSocketHub:
                     pending.add(slug)
                 return False
         if ws.get("_is_dashboard_user", False):
+            # Granted, and the grant is a permission decision like any other:
+            # ``AUTOSDE.yaml`` wants an SEL record for it, not only for the
+            # refusals below. Recorded HERE, at the chokepoint every dashboard
+            # frame passes (live broadcast via ``_send_ws_all``, the log
+            # fan-out's per-send recheck, and the subagent reconnect replay in
+            # ``ws.py`` all funnel through this predicate), rather than at each
+            # sender, so a send path added later is covered by construction --
+            # the same reasoning ``ws_event_allowed`` gives for app tokens.
+            # Under a reserved auditee rather than the empty app claim, so the
+            # operator can tell their own socket's grants from an unnamed
+            # app's. Never raises: a failing audit sink must not withhold a
+            # frame the owner is entitled to.
+            try:
+                from kiro_crew.dashboard.ws_event_scope import (
+                    DASHBOARD_USER_AUDITEE,
+                    _audit_allow,
+                )
+
+                _audit_allow(DASHBOARD_USER_AUDITEE, msg_type)
+            except Exception:
+                self._log.debug(
+                    "state: SEL audit for dashboard-user grant %s failed",
+                    msg_type,
+                    exc_info=True,
+                )
             return True
         ws_app: str = ws.get("_app", "")
         snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
@@ -271,6 +304,11 @@ class WebSocketHub:
         """Send one typed frame through the per-client authorization chokepoint."""
         dead: list[web.WebSocketResponse] = []
         skip_owners = msg_type == "slots"
+        # A legacy-only slots frame repeats a change every patch-capable socket
+        # already applied from its ``slot_patch`` frame.
+        skip_patch_clients = (
+            skip_owners and isinstance(data, dict) and bool(data.get("_legacy_only", False))
+        )
         owners = getattr(self._owner, "_owner_ws_clients", None) or set()
         client_allowed = self._owner_method("_ws_client_allowed", self._ws_client_allowed)
         serialize = self._owner_method("_serialize_for_client", self._serialize_for_client)
@@ -281,6 +319,8 @@ class WebSocketHub:
                 dead.append(ws)
                 continue
             if skip_owners and ws in owners:
+                continue
+            if skip_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
                 continue
             if not client_allowed(ws, msg_type, data):
                 continue
@@ -303,7 +343,7 @@ class WebSocketHub:
         for ws in dead:
             remove(ws)
 
-    def _send_ws_owners(self, msg: str) -> None:
+    def _send_ws_owners(self, msg: str, *, skip_slot_patch_clients: bool = False) -> None:
         """Send a pre-serialized message only to owner-authenticated clients."""
         dead: list[web.WebSocketResponse] = []
         spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
@@ -312,12 +352,41 @@ class WebSocketHub:
             if ws.closed:
                 dead.append(ws)
                 continue
+            if skip_slot_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
             try:
                 spawn(ws, msg)
             except Exception:
                 dead.append(ws)
         for ws in dead:
             remove(ws)
+
+    def send_ws_slot_patch(self, msg: str) -> int:
+        """Send a pre-serialized ``slot_patch`` frame to patch-capable sockets.
+
+        Returns how many sockets it was handed to. Only dashboard-user sockets
+        are ever flagged (see ``api_ws``), so no scope gate applies here: the
+        frame carries fields of the dashboard-user slot projection, which those
+        sockets already receive in full.
+        """
+        dead: list[web.WebSocketResponse] = []
+        sent = 0
+        spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
+        remove = self._owner_method("_remove_ws", self._remove_ws)
+        for ws in list(self._owner._ws_clients):
+            if ws.closed:
+                dead.append(ws)
+                continue
+            if not ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
+            try:
+                spawn(ws, msg)
+                sent += 1
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            remove(ws)
+        return sent
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
         """Send a typed message to every authorized WS client."""
@@ -444,8 +513,6 @@ class WebSocketHub:
         pending: set[str] = set()
         ws["_members_baseline_pending"] = pending
         try:
-            import asyncio
-
             from kiro_crew.eventlog.service import get_service
 
             # last_seqs() iterates and parses every uncached member log on first
@@ -488,8 +555,6 @@ class WebSocketHub:
         if not slugs:
             return
         try:
-            import asyncio
-
             from kiro_crew.eventlog import types as eventlog_types
             from kiro_crew.eventlog.service import get_service
 

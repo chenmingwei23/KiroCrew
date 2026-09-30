@@ -4,10 +4,11 @@
 per-session crew log `kiro_crew.crew_log` keeps for each ACP session id. It is a **writer
 only**: it owns which facts matter and where they are known, not storage or its layout.
 
-The emitter is gated behind `KIROCREW_CREW_LOG=1` (`constants.env_flag_enabled`,
-read per call, truthy set `{1, true, yes, on}`) and defaults **OFF**, so this module is
-inert until a later change turns it on. With the flag off no per-session crew-log unit is
-created and no emitter call reaches the storage library. The shared `crew-log` root is still
+The emitter defaults **ON** and is switched off by `KIROCREW_CREW_LOG=0`
+(`constants.crew_log_enabled`, read per call, case- and space-insensitive: unset,
+empty or a truthy value `{1, true, yes, on}` leaves it on; `{0, false, no, off}` turns it
+off, and so does any other value, which is logged once as unrecognised). With the flag
+off no per-session crew-log unit is created and no emitter call reaches the storage library. The shared `crew-log` root is still
 pre-created by `ensure_data_home()` as a security boundary, and member-kind logs are governed
 independently by [member-event-log.md](member-event-log.md).
 
@@ -20,7 +21,7 @@ body checks the flag ITSELF, before doing that work -- `on_tool_called`,
 `on_tool_completed`, `on_message_received`, `on_message_sent`,
 `on_request_configured`. Hashing is proportional to payload size and
 redaction walks the whole body, both once per frame on the event loop, so leaving the check
-to the writer would charge every user for a feature that is off by default.
+to the writer would charge a user who switched the log off for work it then discards.
 
 ## Identity
 
@@ -32,15 +33,121 @@ crew log; when it did not, the next cold start resumes the same id via `session/
 `CrewLog.exists` decides between create and open and a resumed session never truncates it.
 
 A create that a slot's PREVIOUS crew log already exists behind is the supersede case, and
-the successor records it: `session/opened.data.previous = {sid}`. The id comes from
-`SessionManager.mapped_sid`, the slot's session mapping read without pruning, latched by
-whichever allocation observes it first. One limit is recorded rather than worked around: an
-allocation whose replay is still pending does not publish its fresh id over the mapping, so for
-that window a mapping read names the crew log BEFORE the newest one, and two successive crew
-logs cite that same predecessor while the crew log between them is cited by nobody -- a chain
-walker steps over it with no signal that it did. Closing that needs a deferral that resumes
-once the predecessor's own writes settle, which is tracked with the rest of the supersede work
-in #12148. `mapped_sid` rather
+the successor records it: `session/opened.data.previous = {sid}`. Three sources answer it, in
+order, and each covers a window the next cannot.
+
+FIRST, the store the slot last handed to a `session/opened`, recorded on the slot as that
+entry's edge is spent. It is first because it is the only source that can name a crew log whose
+unit is not on disk yet: `on_session_opened` hands the create to the writer thread, so between
+an allocation and that job running there is no unit for any reader to find, and a slot's second
+allocation inside that window would otherwise name the crew log before the first one and leave
+it cited by nobody.
+
+SECOND, the slot's own newest unit IN THE STORE: the units whose header names this slot,
+ordered by the `previous` edges those units already recorded, with the crew log nothing cites
+being the one the slot is on (`session_tree.slot_chain_head`). This is the DURABLE source, and
+it is what a gateway that restarted has: the record above died with the process that held it.
+This read has THREE answers, and the third is the load-bearing one. A unit naming this slot is
+the answer when exactly one unit of the slot is uncited, or when exactly one uncited unit
+records an edge. "No crew log" covers a slot with no unit, a store that is not at the name --
+nothing is held by a directory that is not there, and that is the ordinary launch of a crew log
+switched off -- a slot whose uncited units all STATE they have no predecessor, and a slot with an
+uncited unit whose announce was read and says NOTHING about a predecessor either way, which is
+the state every store written before these keys existed is in. Anything else is
+UNDECIDED: a listing that could not be made, a unit that would not read, an uncited unit whose
+announce was never read at all, an uncited unit whose announce RECORDS an undetermined
+predecessor, more than one uncited unit recording an edge, a cycle. The
+listing is taken STRICTLY for that reason: an ordinary one silently omits
+a unit whose header will not prove while it already holds entries, and omitting the newest one
+makes the unit before it look uncited.
+
+Those five states are what the fold branches on, and they are exhaustive over what an announce
+can say: it NAMES a predecessor, STATES there is none, STATES one it could not determine, was
+not read at all, or was read and said nothing. The last two are both silences and they get
+OPPOSITE answers, which is the distinction this read turns on. An unread announce refuses,
+because it becomes readable later and the refusal costs one citation. A silence the announce
+itself carries never becomes anything else, so refusing on it would be permanent -- no edge
+would ever be written, each create would add one more unrankable unit, and the caller's next
+source would stay suppressed for the life of the slot; it hands over instead, which is also how
+such a store starts describing itself, with nothing rewriting the units already on disk.
+
+UNDECIDED writes NO edge -- but it DOES write
+`previous_undecided` on the announce, and a store the read proves is the slot's first writes
+`previous_none`. Neither is decoration, and neither meaning may rest on a key being ABSENT: the
+two silences above are byte-identical without them, so the state that must refuse would read as
+the state that may be passed over, and a later fold would elect the unit before it, writing by
+another route the citation this read declined to guess. It must not fall through to
+the mapping, which is the source this read was preferred over, and it must not be broken by
+`header.createdAt`, a wall
+clock that hands the newer crew log the earlier stamp after a backward step. One citation lost
+while a record is incomplete is recoverable by the next allocation; a wrong one in an append-only
+entry is not -- but UNDECIDED must not be answered where it would be PERMANENT either, which is
+why a store recording no succession hands over rather than refusing. Nothing latches a refusal:
+the listing re-checks a child it could not prove on
+every call, so the read answers again as soon as the bytes do. The read is BLOCKING (a listing
+cached against the root's identity, plus a line pair per unit of the slot) so the turn coroutine
+hops a thread for it, and it is keyed by the
+SLOT rather than the session key, which is what a unit's header records.
+
+THIRD, `SessionManager.mapped_sid`, the slot's session mapping read without pruning, for a slot
+the store says has NO unit at all -- its first crew log, or a launch with the crew log off. An
+UNDECIDED store read does not reach it, and neither does a decided-empty one whose edge is TAKEN
+inside that pending window: allocation holds the prior
+resumable id in the mapping deliberately, so that a restart can still resume it, and the mapping
+is then a generation behind. Latching it would make two successive crew logs cite one
+predecessor while the crew log between them is cited by nobody -- the one chain gap a walker
+steps over with no signal, since both neighbours are well formed. That combination is reachable
+on an upgraded slot whose crew logs all predate this edge: the store has no succession to order
+them by, so it answers "no succession", and the mapping is the only source left -- which is
+exactly why it must not be cited while it is knowingly holding the older generation. The log
+records a break for that one create instead, and only when the mapping names an id at all, since
+a break claims a predecessor EXISTS.
+
+The window is asked about at the TAKE and not at the read, and the placement is the whole
+correctness of it. The marker saying replay is owed is an attribute of a live session, and this
+read runs before the turn's session is allocated -- so asked from there it answers "no replay
+owed" both when none is owed and when there is no session to ask, and the second is a COLD
+START, which is the restart the durable tier exists to survive and the state in which the
+mapping is most likely to be holding the older generation. So a mapped id comes back flagged
+provisional, and the slot downgrades it to a break as the edge is handed to an entry, where a
+session exists and the answer means what it says. The flag rides with the id and not beside it:
+the slot's own record outranks a mapped id, and a latch whose record wins drops the flag with
+it, because what is latched is then this process's own statement rather than the mapping's.
+
+The DECIDED empty splits in two, and flattening them writes a false statement. Either the store
+holds no unit of this slot at all, so the absence of a predecessor is the whole truth and the
+entry may STATE it; or it holds units it could not rank -- units written before these keys
+existed, several each stating they start the chain -- where the mapping coming back empty says
+only that the mapping had nothing to give. The second is no finding about the slot, so that
+create writes NO predecessor key and reads as the legacy silence it is. Reported as a finding it
+would have a log with earlier siblings declare itself their chain start, which a later fold is
+then entitled to pass over. Only the COMPLETE absence reaches `previous_none`.
+
+The reason travelling with the id carries the same three values for the same purpose: a
+determination either way, or nothing determined. A latch that could not read the store carries no
+information about its CONTENTS, so a later latch that read it successfully supersedes that
+refusal -- left standing, the entry reports a predecessor as existing-but-unnameable for a slot
+the gateway determined has none. A later latch that determined nothing may erase a refusal, which
+loses one break and writes nothing false, and may never manufacture the statement neither latch
+made.
+
+The Discord and Telegram dispatchers open their
+OWN sessions' crew logs (`messaging.dispatch.open_turn_crew_log`) and hold no slot record to
+prefer, so they take the ALLOCATION's own capture of the mapping: `SessionAllocationService`
+reads `mapped_sid` inside the registration's critical section -- under its lock, before the
+new sid is mapped -- and stamps it on the registered session, exposed as
+`SessionManager.allocation_predecessor(key)` for the caller to consume after the claim. A
+read taken before `get_or_create` could be staled by a concurrent turn on the same key that
+allocates an intermediate session and has it recycled while the reader waits inside the
+allocation for the turn permit; the boundary's own capture cannot be. That capture is a read of
+the mapping, so it carries the same two limits as this fallback -- the replay-pending generation
+gap, and no store tier above it. It also DETERMINES nothing: it hands over whichever id the
+capture holds, and that id is empty whenever the mapping entry is gone while the slot's units
+remain. So those creates pass no determination and their units carry no predecessor key of any
+kind, which reads as the legacy silence it is. The alternative -- reading the empty id as a
+finding -- would have the entry declare a slot with units to be its own first store, in an
+append-only record, and a later fold would pass over it: the defect this section closes, written
+from the other side. `mapped_sid` rather
 than `resumable_sid`: the latter asks "can this id still be resumed", so it stats the ACP
 transcript on the calling thread (a sync store read the turn coroutine must not make) and
 PRUNES the entry when that file is gone or empty, which erases the id exactly when the two
@@ -61,7 +168,7 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 
 | Fact | Site | Data |
 |---|---|---|
-| `session/opened` | after `get_or_create`, on create or re-attach only | agent, slot key, model, `model_requested` when a tier resolved one, cwd, `resumed`; `previous {sid}` on a CREATE whose slot was mapped to a different session id, from `mapped_sid` (in-memory, non-pruning); a replay-pending allocation defers publishing its fresh id, so for that window the mapping names the crew log before the newest one and the one between is cited by nobody, which is recorded as a residual on #12148 rather than handled here; latched on the slot by whichever allocation observes it FIRST -- the eager prefetch maps its own session over the key before the first turn runs, so a turn reading the mapping for itself would answer the successor and write no edge; the latch is write-once and is spent on one entry; recorded only when the named crew log's own header names this slot, read at emit time, so a stale or recycled mapping entry yields no edge; `parent {slot, sid?}` when `session_create` made the session IN THIS GATEWAY PROCESS (`_lineage_minted`) -- the creator's key from the slot's `_created_by`, and the creator's ACP session id FROZEN at mint (`_created_by_sid`) from the live caller handle, present when the caller had a session at that moment; a slot restored from transcript metadata writes no `parent` |
+| `session/opened` | after `get_or_create`, on create or re-attach only -- the dashboard runner on every turn, and the Discord and Telegram dispatchers for their OWN sessions (`messaging.dispatch.open_turn_crew_log`, before `TurnDriver.run`; a dashboard session resumed into a chat is left to the runner that holds its lineage) | agent, slot key, model, `model_requested` when a tier resolved one, cwd, `resumed`; `previous {sid}` on a CREATE whose slot already wrote a different crew log, resolved in three tiers -- the store the slot last handed to a `session/opened` (recorded on the slot as that edge is spent, and the only source that can name a crew log whose create is still queued to the writer thread), then the slot's own newest unit IN THE STORE (the unit no other unit of that slot cites as `previous`, read off the event loop and keyed by the slot rather than the session key, which is the DURABLE answer a restart has), then `mapped_sid` (in-memory, non-pruning) for a slot with no unit at all; the mapping cannot be higher because a replay-pending allocation holds the prior resumable id there on purpose, which would name a generation behind and leave the crew log between cited by nobody, and inside that window it is not cited -- the log records `previous_undecided` instead, and a store the read proves is the slot's first records `previous_none`, because a silence the announce carries and a silence that is merely the absence of every key demand opposite treatment from a later fold. The window is asked about where a SESSION EXISTS to answer, as the edge is taken, not where the id is read: the marker is an attribute of a live session and the read runs before this turn's session is allocated, so asking there answers "no replay owed" both when none is owed and when there is nobody to ask -- and the second is a cold start, the restart this whole read exists to survive. So the mapped id is latched PROVISIONAL and downgraded to a break at the take; the slot's own record is never provisional, and a latch whose record wins over a mapped id drops the flag with it. `previous_none` is the LOOKER's statement, written only for a caller that passed a determination, and only when the store's answer is COMPLETE -- no unit of the slot at all. A store holding units it could not rank hands the question on WITHOUT a determination, so an empty mapping there is no finding about the slot and the create writes no key; the channel dispatchers hand over one captured id and determine nothing, so their units carry no predecessor key either. Both read as the legacy silence they are, rather than declaring a slot with units to be its own first store; latched on the slot by whichever allocation observes it FIRST -- the eager prefetch maps its own session over the key before the first turn runs, so a turn reading the mapping for itself would answer the successor and write no edge; the latch is write-once and is spent on one entry; the channel dispatchers, which hold no slot record, consume the ALLOCATION's own capture instead (`SessionManager.allocation_predecessor`, read by `SessionAllocationService` inside the registration's critical section from `mapped_sid` -- live id or the `discarded_sid` stash a recycle leaves -- and handed over through `messaging.dispatch.predecessor_sid` after the claim), so no read of the mapping around `get_or_create` remains to be staled by a concurrent turn's allocate-and-recycle; recorded only when the named crew log's own header names this slot, read at emit time, so a stale or recycled mapping entry yields no edge; `parent {slot, sid?}` when `session_create` made the session IN THIS GATEWAY PROCESS (`_lineage_minted`) -- the creator's key from the slot's `_created_by`, and the creator's ACP session id FROZEN at mint (`_created_by_sid`) from the live caller handle, present when the caller had a session at that moment; a slot restored from transcript metadata writes no `parent` |
 | `turn/started` | after every dispatch gate, immediately before the stream opens | turn ordinal, actor, prompt depth |
 | `turn/refused` | each gate that refuses the dispatch | turn ordinal, actor, `reason`, prompt depth |
 | `turn/completed` | the `EVENT_COMPLETE` arm, beside `_emit_turn_metric`; the turn's `finally` when no terminal event arrived | the four `TurnUsage` token counts, credits, `duration_ms`, `stop_reason`, model, provider -- or `stop_reason: "failed"` with `error` and no usage |
@@ -814,9 +921,9 @@ an absence a reader cannot tell apart from a child that never existed is the one
 refuses to allow silently. Nothing is WRITTEN for it: no declared type describes a lost pin, and
 adding one would be a shape change made to record a bug rather than a fact of the session. The
 residual is bounded and visible: it takes the cap's worth of children running at once, and it
-reports itself when it happens. Admission is NOT gated on the cap -- this is a default-off log, and
-a log that refuses a real spawn to protect its own bookkeeping has become the more expensive
-failure.
+reports itself when it happens. Admission is NOT gated on the cap -- this is a record of the
+session, and a log that refuses a real spawn to protect its own bookkeeping has become the more
+expensive failure.
 
 A cap on the NUMBER of pins bounds memory only when each pin's own fields are bounded, and the
 session id a pin carries is authored by the provider. So a pin whose session id is longer than the
@@ -913,10 +1020,9 @@ record a second time a fact another entry already carries. Removing them keeps t
 vocabulary a statement about what the log contains rather than a wish list, which is what
 makes a reader's `known=` set worth declaring.
 
-Any of them may come back when a real source exists: while the format is pre-release
-(`crew-log-core.md` section 5) that is an ordinary change, and after the freeze point it is
-an additive one, since re-adding a type is exactly the case the `ignorable` marker and the
-unknown-type refusal already handle.
+Any of them may come back when a real source exists: the format is past its freeze point
+(`crew-log-core.md` section 5), so that is an additive change, since re-adding a type is
+exactly the case the `ignorable` marker and the unknown-type refusal already handle.
 
 With the families this revision emits, nothing the vocabulary still declares is left
 waiting for a site: `approval/*`, `background/completed`, `subagent/*` and `plan/updated`
@@ -1163,9 +1269,79 @@ crew log the slot never wrote -- a persisted mapping entry can be stale or recyc
 that source against itself would prove nothing. The
 open is a read; `CrewLog.open` claims write ownership only when asked to repair, and nothing here
 asks. A candidate whose header cannot be read gets no edge, since unverifiable is not verified.
-Closing a superseded crew log's dangling turn and tool calls still needs a deferral that can resume
-once that unit's outstanding writes settle rather than being decided once, which the edge neither
-needs nor has; it is tracked with its reproductions as #12148.
+Closing that crew log's dangling turn and tool calls is a SEPARATE job rather than part of this
+entry, and the separation is the deferral: the repair is queued under the PREDECESSOR's id, and
+the writer runs a session's jobs in submission order, so it cannot run until everything that crew
+log already owes has been attempted. A real `turn/completed` still queued or retrying at supersede
+time is therefore written first; one abandoned after its attempt budget is spent is dropped and
+admitted in a `write/dropped` marker first. Either way the tail is closed exactly once and the file
+never carries two outcomes for one turn, and nothing has to decide at create time whether to wait.
+Deciding it once at create time instead stands the repair down permanently, because a
+superseded id is never resumed and nothing maps to it once the successor takes over.
+
+Waiting in that bucket is also how this job is LOST. A batch the filesystem refuses is retained
+with everything behind it, and once the attempt budget is spent the WHOLE retained batch is
+dropped -- the owed append and this job with it. So the job carries a permanent-drop hook that
+submits it once more, which is what makes the paragraph above hold in the dropped case rather than
+merely intend it. The re-submission lands behind the `write/dropped` marker, so the file states both
+that entries are missing and that the turn did not finish. It carries NO hook of its own, and that
+is what bounds this at one extra attempt: the order the first submission was waiting for is gone,
+since nothing ahead of it will be written now, and a hook that re-armed itself would follow a wedged
+disk around its retry budget for as long as the disk stayed wedged. The drop counted this job as one
+missing append before the hook ran, and it is not missing, so the count is taken back out before any
+marker is authored -- a marker is written by a LATER pass of the one writer thread, so no reader can
+have seen the count. Only the count moves: a job re-submitted this way carries no body, so the
+marker's byte total was already exact. Debt that falls to nothing is removed rather than left at
+zero, so a session whose only dropped entry is coming back appends no marker announcing that nothing
+is missing.
+
+The repair asks `_candidate_is_same_slot` again before writing, against the same immutable header
+the edge reads: this is the one place an outcome is authored into a unit that is not the session's
+own, and the same branch answers for a crew log retention collected inside the deferral window,
+which would otherwise raise `no_ledger` and be counted as a lost append. It passes no `child_gone`
+predicate, so an unmatched `subagent/spawned` stays OPEN -- the children were dispatched by a
+session that is gone, and a synthesised `unknown` ahead of a child's own real terminal would leave
+two outcomes for one `agent_id`. A turn still running in this process stands the repair down, and
+its live record is read AS IT STANDS rather than released first. `closer_owed` is set where a
+terminal is handed over, so a turn still running is indistinguishable from a leaked record by that
+field alone; releasing on it would drop the record of a turn a forced reset tore down mid-flight --
+the one case whose closer arrives later, from its own `finally` -- and the repair would then write
+`interrupted` ahead of a real `turn/completed`. `on_session_closed` preserves live records for
+exactly this reason and the repair must not undo it.
+
+Standing down is right only while that terminal is still COMING, so the stand-down records the debt
+and the TERMINAL carries the trigger that settles it. A terminal that spends its attempt budget is
+dropped, and then no outcome is coming at all; the queue cannot cover that, because it orders this
+job behind entries ALREADY queued rather than behind one handed over after it drained. So every
+terminal handover carries a permanent-drop hook, and a drop re-queues the repair that stood down for
+it. `after` cannot serve: it runs when the append RESOLVES, written or given up on alike, so it
+cannot tell the two apart, while a permanent-drop hook fires only on the giving up. The hook runs
+before the `after` that releases the live pin, so by the time the re-queued repair runs `live_turn`
+answers 0 and it closes the tail. A terminal that LANDS clears the debt instead, in `_forget_turn`:
+the tail closed truthfully, and a debt never cleared would grow the record once per supersede for
+the life of the process. In-memory state is enough, because a restart is covered by the re-attach
+recovery below.
+
+All three entry points -- the supersede, that re-attach, and a dropped terminal -- go through ONE
+submission site, so the guards, the bucket and the ceiling exemption cannot drift apart between
+them; they differ only in what brought them there.
+
+The repair JOB rides the in-memory buffer while the opening entry carrying `previous.sid` is a
+durable append, so a crash between the two loses the job and a superseded id is never resumed to
+re-queue it. A RE-ATTACH recovers it. That is the one moment a later process holds the crew log
+again, so it reads its OWN `previous.sid` back through `unit_opened_previous` -- a read-only
+accessor that proves the header folds back to its directory, takes no lease, and reads the oldest
+segment's second line, which is where `session/opened` is, so the read is O(1) whatever the file
+has grown to -- and queues the repair through the SAME submission site, so the guards, the bucket
+and the ceiling exemption cannot differ between a first pass and a recovery. The recovered value is
+latched like every other decision in that job, so a retry acts on the first attempt's reading. It is
+never the caller's `previous_sid`, which the latch refuses on a re-attach because the unit it names
+may be this same one or an unrelated one still running; the file's value was written by an earlier
+attempt of that session's own opening entry, which verified it against the slot first. Gated on the
+slot being known, which loses nothing, since an edge is only written for two crew logs KNOWN to be
+one slot's and a session with no slot therefore has no durable edge to recover. Re-queued on every
+re-attach, because the repair closes nothing when the tail is already closed, and skipping it would
+need durable state saying the repair had run -- more cross-restart state than it saves.
 
 `resumed=True` is a BELIEF about a writer this process cannot see, and two things check it,
 because they see different populations. A live turn of OUR OWN contradicts the flag directly

@@ -111,7 +111,7 @@ describe('MarkdownRenderer XSS sanitization', () => {
 
   it('strips event handler attributes', () => {
     const { container } = render(
-      <MarkdownRenderer content={'<img src="x" onerror="alert(1)">'} />
+      <MarkdownRenderer content={'<img src="/api/file-raw?path=x" onerror="alert(1)">'} />
     )
     const img = container.querySelector('img')
     expect(img?.getAttribute('onerror')).toBeNull()
@@ -128,6 +128,78 @@ describe('MarkdownRenderer XSS sanitization', () => {
     }
     // Verify no javascript: anywhere in the output
     expect(container.innerHTML).not.toContain('javascript:')
+  })
+
+  // Issue #9925: urlTransform rejects a destination by returning '' (react-
+  // markdown's defaultUrlTransform sentinel). '' is not nullish, so the plain-
+  // anchor branch rendered `<a href="">` — an ordinary-looking link whose
+  // address the browser resolves against the CURRENT PAGE, so "copy link
+  // address" yielded the dashboard's own session URL. A rejected destination
+  // must not be an anchor at all.
+  describe('rejected link destinations (#9925)', () => {
+    it('renders a non-allowlisted custom scheme as inert text, not an empty anchor', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[obsidian://open?vault=Notes](obsidian://open?vault=Notes)'} />
+      )
+      // The label survives as visible text…
+      expect(container.textContent).toContain('obsidian://open?vault=Notes')
+      // …but there is no anchor, and specifically nothing carrying href="".
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    it('renders an empty markdown destination as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'[label]()'} />)
+      expect(container.textContent).toContain('label')
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    // The ABSENT case is a distinct input value from the '' sentinel reaching
+    // the same `!href` predicate: raw-HTML `<a>bare</a>` is sanitizer-allowed
+    // and arrives with href === undefined. Pinned so a future narrowing of the
+    // guard to the sentinel alone (href === '') cannot silently restore a
+    // styled non-navigating anchor for the absent case.
+    it('renders a raw-HTML anchor with no href attribute as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'<a>bare</a>'} />)
+      expect(container.textContent).toContain('bare')
+      expect(container.querySelector('a')).toBeNull()
+    })
+
+    it('keeps inline markdown inside the inert label', () => {
+      const { container } = render(<MarkdownRenderer content={'[a `code` label](obsidian://x)'} />)
+      const code = container.querySelector('code')
+      expect(code).not.toBeNull()
+      expect(code!.textContent).toBe('code')
+      expect(container.querySelector('a')).toBeNull()
+      // With no anchor, InsideLinkCtx is deliberately not provided: the label
+      // is ordinary prose, so its code span re-enters the normal inline-code
+      // ladder and regains the click-to-copy affordance an in-link span is
+      // denied (contrast MarkdownRenderer.inlineCodeInLink.test.tsx).
+      expect(code).toHaveAttribute('role', 'button')
+    })
+
+    // Control: the guard must be scoped to the rejection sentinel — a plain
+    // https:// destination passes defaultUrlTransform unchanged and must keep
+    // rendering a real anchor with its exact href.
+    it('control: an https:// link still renders a real anchor with its exact href', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[docs](https://example.com/docs?q=1)'} />
+      )
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe('https://example.com/docs?q=1')
+    })
+
+    // Control: an allowlisted editor scheme is rescued by urlTransform, so it
+    // must also keep its anchor.
+    it('control: a vscode:// link keeps its anchor and href', () => {
+      const url = 'vscode://file/home/user/project'
+      const { container } = render(<MarkdownRenderer content={`[open](${url})`} />)
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe(url)
+    })
   })
 
   it('preserves safe HTML elements like details/summary', () => {
@@ -629,8 +701,10 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // invisible icon carries no affordance, so what this guards is unchanged —
     // a real glyph must never reach a chip the backend did not confirm.
     expect(code.querySelector('svg:not([class*="opacity-0"])')).toBeNull()
-    // Non-path chips now have cursor-pointer for click-to-copy, but no file glyph.
-    expect(code.className).toContain('cursor-pointer')
+    // A non-path chip copies, so it wears the copy cursor — not the pointer hand
+    // and glyph that mark a chip whose click opens something.
+    expect(code.className).toContain('cursor-copy')
+    expect(code.className).not.toContain('cursor-pointer')
   })
 
   it('renders a confirmed directory as a folder chip, not a broken file link', async () => {
@@ -650,8 +724,8 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    // Non-path chips now have cursor-pointer for click-to-copy.
-    expect(code.className).toContain('cursor-pointer')
+    // Not a path, so it is the copy chip: copy cursor, no path data.
+    expect(code.className).toContain('cursor-copy')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -697,7 +771,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     )
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
-      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl+click to copy`)
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl/Cmd+click to copy`)
     })
   })
 
@@ -710,7 +784,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
       expect(code.getAttribute('title')).toBe(
-        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl+click to copy',
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl/Cmd+click to copy',
       )
     })
   })
@@ -1617,7 +1691,7 @@ describe('MarkdownRenderer softBreaks', () => {
     // them adds an empty line box and blocks margin collapse, inflating the
     // gap between two attached screenshots from ~8px to ~37px.
     const { container } = render(<MarkdownRenderer
-      content={'shots\n\n![a](https://x.test/a.png)\n![b](https://x.test/b.png)'} softBreaks />)
+      content={'shots\n\n![a](/api/file-raw?path=a.png)\n![b](/api/file-raw?path=b.png)'} softBreaks />)
     expect(container.querySelectorAll('img').length).toBe(2)
     expect(container.querySelectorAll('br').length).toBe(0)
   })

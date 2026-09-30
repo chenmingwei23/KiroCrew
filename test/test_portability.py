@@ -1344,6 +1344,40 @@ class TestImportMerge:
             assert "O_NOFOLLOW" in notif[0], notif[0]
             assert not (target / "notifications.jsonl").exists()
             assert len(items) > 1, f"the whole import stopped on a platform refusal: {items}"
+            # Flagged machine-readably so the handler logs the import as
+            # partial, not a flat ok, over records that were not installed.
+            assert "notifications" in (summary.get("refused_merges") or []), summary
+        finally:
+            os.unlink(str(zip_path))
+
+    def test_import_merge_branch_platform_skip_is_recorded_as_refused(
+        self, patched_config_dir, tmp_path, monkeypatch
+    ):
+        """The MERGE branch (a live file exists) also records the platform skip.
+
+        With a live ``notifications.jsonl`` already at the target the import takes
+        the merge branch, and on a platform without ``O_NOFOLLOW`` the merge
+        raises ``NotificationCopyUnsupported``. That must degrade to a skip that
+        is flagged in ``refused_merges`` -- not a silent ``ok`` over an import
+        that merged zero records -- and must leave the live file untouched.
+        """
+        zip_path = self._make_export(patched_config_dir)
+        try:
+            target = tmp_path / "target_mc"
+            target.mkdir()
+            live = target / "notifications.jsonl"
+            live.write_text(json.dumps({"ts": "1700000000", "title": "existing"}) + "\n")
+            before = live.read_bytes()
+            monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+
+            with patch("kiro_crew.portability.config_dir", return_value=target):
+                with patch.dict(os.environ, {"KIROCREW_HOME": str(target)}):
+                    summary = apply_import_zip(zip_path, mode="merge")
+
+            notif = [i for i in summary["items"] if i.startswith("notifications")]
+            assert notif and "SKIPPED" in notif[0], summary["items"]
+            assert "notifications" in (summary.get("refused_merges") or []), summary
+            assert live.read_bytes() == before, "a refused merge changed the live file"
         finally:
             os.unlink(str(zip_path))
 
@@ -1396,6 +1430,143 @@ class TestImportReplace:
             assert data["agent"]["provider"] == "acp"
         finally:
             os.unlink(str(zip_path))
+
+
+class TestCrewTemplateWarnings:
+    """A bundle never carries ``<kiro home>/agents``: both ends name what that leaves out."""
+
+    @staticmethod
+    def _with_crews(mc: Path, crews: dict) -> None:
+        cfg = json.loads((mc / "config.json").read_text(encoding="utf-8"))
+        cfg["agents"] = crews
+        (mc / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    @staticmethod
+    def _agents_dir(tmp_path: Path) -> Path:
+        agents = tmp_path / "kiro_agents"
+        agents.mkdir()
+        (agents / "by-stem.json").write_text(json.dumps({"name": "by-stem"}))
+        (agents / "file.json").write_text(json.dumps({"name": "by-declared-name"}))
+        return agents
+
+    def test_refs_skip_rows_with_no_template_and_tolerate_a_bad_file(self, tmp_path):
+        cfg = tmp_path / "config.json"
+        cfg.write_text(
+            json.dumps({"agents": {"b": {"kiro_agent": "t2"}, "a": {"kiro_agent": "t1"},
+                                   "c": {"kiro_agent": ""}, "d": "not-a-row",
+                                   "m": {"kiro_agent": "kirocrew"},
+                                   "w": {"kiro_agent": "kirocrew-worker"},
+                                   "l": {"kiro_agent": "kirocrew-lite"}}})
+        )
+        assert portability.crew_template_refs(cfg) == [("a", "t1"), ("b", "t2")]
+        cfg.write_text(json.dumps({
+            "agent": {"default_agent": "d1"},
+            "session": {"pool_agent": "p1"},
+            "agents": {"a": {"kiro_agent": "t1"}},
+        }))
+        assert portability.crew_template_refs(cfg) == [
+            ("a", "t1"), ("agent.default_agent", "d1"), ("session.pool_agent", "p1")
+        ]
+        cfg.write_text("[not an object")
+        assert portability.crew_template_refs(cfg) == []
+        cfg.write_text("[" * 100_000 + "]" * 100_000)
+        assert portability.crew_template_refs(cfg) == []
+        assert portability.crew_template_refs(tmp_path / "absent.json") == []
+
+    def test_missing_matches_by_stem_or_declared_name(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"agents": {
+            "stem": {"kiro_agent": "by-stem"},
+            "named": {"kiro_agent": "by-declared-name"},
+            "gone": {"kiro_agent": "only-on-the-source"},
+        }}))
+        assert portability.missing_crew_templates(cfg) == (
+            [{"crew": "gone", "kiro_agent": "only-on-the-source"}],
+            0,
+        )
+
+    def test_export_names_every_template_the_crews_use(self, patched_config_dir):
+        self._with_crews(patched_config_dir, {
+            "x": {"kiro_agent": "shared"}, "y": {"kiro_agent": "shared"}, "z": {"kiro_agent": "solo"},
+        })
+        assert portability.unbundled_agent_templates() == (["shared", "solo"], 0)
+
+    def test_both_lists_are_bounded_in_count_and_length(
+        self, patched_config_dir, tmp_path, monkeypatch
+    ):
+        limit = portability.MAX_TEMPLATE_WARNINGS
+        crews = {f"c{i:03}": {"kiro_agent": f"t{i:03}"} for i in range(limit + 7)}
+        crews["long"] = {"kiro_agent": "a" + "x" * 5000}
+        self._with_crews(patched_config_dir, crews)
+        names, more = portability.unbundled_agent_templates()
+        assert len(names) == limit and more == 8
+        assert all(len(n) <= portability.MAX_TEMPLATE_NAME_CHARS for n in names)
+        assert names[0].endswith("\u2026")
+        monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
+        rows, more = portability.missing_crew_templates(patched_config_dir / "config.json")
+        assert len(rows) == limit and more == 8
+        assert all(len(r["kiro_agent"]) <= portability.MAX_TEMPLATE_NAME_CHARS for r in rows)
+
+    @pytest.mark.parametrize("mode", ["merge", "replace"])
+    def test_import_warns_about_the_missing_template_and_still_imports(
+        self, patched_config_dir, tmp_path, monkeypatch, mode
+    ):
+        self._with_crews(patched_config_dir, {
+            "ok": {"kiro_agent": "by-stem"}, "broken": {"kiro_agent": "only-on-the-source"},
+        })
+        zip_path = TestImportMerge()._make_export(patched_config_dir)
+        monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
+        target = tmp_path / "target_mc"
+        target.mkdir()
+        try:
+            with patch("kiro_crew.portability.config_dir", return_value=target):
+                with patch.dict(os.environ, {"KIROCREW_HOME": str(target)}):
+                    summary = apply_import_zip(zip_path, mode=mode)
+        finally:
+            os.unlink(str(zip_path))
+        assert summary["missing_agent_templates"] == [
+            {"crew": "broken", "kiro_agent": "only-on-the-source"}
+        ]
+        crews = json.loads((target / "config.json").read_text(encoding="utf-8"))["agents"]
+        assert set(crews) == {"ok", "broken"}
+
+    def test_an_unreadable_spec_costs_the_warning_not_the_import(
+        self, patched_config_dir, tmp_path, monkeypatch
+    ):
+        self._with_crews(patched_config_dir, {"broken": {"kiro_agent": "only-on-the-source"}})
+        zip_path = TestImportMerge()._make_export(patched_config_dir)
+
+        def deep(*_a, **_k):
+            raise RecursionError("nested spec")
+
+        monkeypatch.setattr(portability, "parsed_agent_specs", deep)
+        target = tmp_path / "target_mc"
+        target.mkdir()
+        try:
+            with patch("kiro_crew.portability.config_dir", return_value=target):
+                with patch.dict(os.environ, {"KIROCREW_HOME": str(target)}):
+                    summary = apply_import_zip(zip_path, mode="merge")
+        finally:
+            os.unlink(str(zip_path))
+        assert "missing_agent_templates" not in summary
+        assert "broken" in json.loads((target / "config.json").read_text(encoding="utf-8"))["agents"]
+
+    def test_import_with_every_template_present_adds_no_warning(
+        self, patched_config_dir, tmp_path, monkeypatch
+    ):
+        self._with_crews(patched_config_dir, {"ok": {"kiro_agent": "by-declared-name"}})
+        zip_path = TestImportMerge()._make_export(patched_config_dir)
+        monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
+        target = tmp_path / "target_mc"
+        target.mkdir()
+        try:
+            with patch("kiro_crew.portability.config_dir", return_value=target):
+                with patch.dict(os.environ, {"KIROCREW_HOME": str(target)}):
+                    summary = apply_import_zip(zip_path, mode="merge")
+        finally:
+            os.unlink(str(zip_path))
+        assert "missing_agent_templates" not in summary
 
 
 # ── Exclusion Logic Tests ──

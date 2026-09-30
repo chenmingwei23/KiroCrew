@@ -14,6 +14,14 @@ vouching that only one principal can reach the task. Renaming the prefix would
 touch the image, the task definition and every test that constructs an
 environment, so the names stay and this paragraph is the correction.
 
+`SMC_INTERNAL_ONLY` is the second declaration of that kind and the only one that
+LOOSENS anything: it is the deployment vouching that this task runs the operator's
+OWN crews and that the operator bears the risk of what those crews read, which is
+what makes an unsandboxed model subprocess acceptable on a host that cannot sandbox
+one. It does NOT claim that no untrusted input arrives -- see the field below for the
+exposure it accepts. Both default to "not claimed", because a claim is what unlocks a
+posture and silence must never.
+
 Two values are deliberately NOT configurable.
 
 `BACKEND_HOST` is fixed at 127.0.0.1. The Kiro Crew backend must never be
@@ -44,6 +52,52 @@ BACKEND_HOST = "127.0.0.1"
 # the deploy track. That track is not Python, so a constant private to the front
 # process would be a name another system copies by hand.
 CONTROL_SECRET_HEADER = "X-SMC-Control-Secret"
+
+# The namespace every installed crew spec lives in, as a filename stem AND as the
+# spec's declared ``name``. Kiro Crew derives specs of its own into the same directory
+# -- ``kirocrew.json``, ``kirocrew-lite.json`` and the ``kirocrew-worker.json`` mirror
+# it rebuilds from the default -- and a crew called ``kirocrew-worker`` is not
+# hypothetical: it is the crew this deployment ships. Without a namespace the install
+# lands ON the mirror, and the next spawn-path re-derivation replaces the shared crew's
+# prompt and tools with Kiro Crew's own, with no error.
+#
+# The prefix is on BOTH the filename and the declared name because those are two
+# different resolutions and only one of them dispatches. kiro-cli enumerates agents by
+# the spec's DECLARED name, and Kiro Crew's snapshot of dispatchable agents does the
+# same, so a file named ``crew-x.json`` whose spec still declares ``x`` is reachable
+# under neither id: ``x`` is now declared TWICE (by the crew and by the mirror) and is
+# refused as ambiguous, while ``crew-x`` is declared by nothing and falls back to the
+# default agent -- the silent-default failure the bundle install exists to prevent.
+# Measured against ``acp/kas_agents.load_agent_spec`` and
+# ``config.loader._scan_materialized_agents``, not inferred.
+#
+# ``crew-`` is free by construction: every spec Kiro Crew manages is named
+# ``kirocrew*`` (``kiro_crew/agent_files.py``), and no KAS built-in id begins with it.
+# That tree is not importable here (the container installs no ``kiro_crew``), so the
+# two definitions are pinned together by a test instead, the way the agents-dir
+# resolver already is.
+CREW_AGENT_ID_PREFIX = "crew-"
+
+# ``_AGENT_NAME_RE`` in ``kiro_crew/validation.py`` caps a dispatchable agent name at 64
+# characters. Mirrored rather than imported, for the same reason as the prefix above.
+MAX_CREW_AGENT_ID_LEN = 64
+
+
+def crew_agent_id(crew_name: str) -> str:
+    """The agent id a crew is dispatched under: its name inside the crew namespace.
+
+    Pure, and deliberately the only place the mapping is spelled: the supervisor
+    INSTALLS the crew's spec under this id and the front ADDRESSES it under this id,
+    and a deployment where those two disagree serves a default agent while reporting
+    a healthy install. The customer-facing address is unchanged -- a caller still
+    names the crew -- so this never appears in the API.
+
+    Not validated here. Whether the id can name an agent at all is decided once, at
+    install time, where a refusal stops the boot; see ``bundle.install_bundle``. A
+    per-request check would answer the same question in the place where the only
+    available answer is a 500.
+    """
+    return f"{CREW_AGENT_ID_PREFIX}{crew_name}"
 
 
 class ConfigError(ValueError):
@@ -107,6 +161,40 @@ class Settings:
     # stack. It closes the case that rule cannot see: an image run by any other path.
     single_principal: bool = False
 
+    # Whether the DEPLOYMENT vouches that this task runs the operator's OWN crews and
+    # that the operator bears the risk of what those crews read -- the internal-only
+    # trust boundary.
+    #
+    # It exists because the container is sandboxed-only and Fargate cannot be sandboxed.
+    # kiro-cli sandboxes the model subprocess in an unprivileged user namespace; Fargate's
+    # default seccomp profile denies `unshare(CLONE_NEWUSER)` and offers no
+    # `privileged`, no `dockerSecurityOptions` and no capability that changes it, so the
+    # supervisor refused to start there. Measured on a real task, not inferred.
+    #
+    # What accepting this setting accepts. On a host with no user namespace the model
+    # worker runs UNSANDBOXED, and that worker auto-approves every tool it calls. It is
+    # a child of the backend under the same uid, and the backend must be able to decrypt
+    # the crew's vault to answer the engine's token request -- so the worker can reach
+    # the model credential, and taking the credential out of its environment does not
+    # change that. Measured: a uid-1000 process reads and decrypts that vault directly.
+    #
+    # Be exact about the size of that exposure, because the setting's name invites
+    # reading it as smaller. It is NOT only about who sends the prompt. A crew consumes
+    # untrusted CONTENT in the ordinary course of its work -- tool output, a fetched web
+    # page, a connector or API payload, text someone else wrote -- any of which can carry
+    # an injection, and all of which reach the worker whoever sent the prompt. So with
+    # this set, a worker injected through any of those routes can read the model
+    # credential. What the operator accepts is that whole exposure on their own crews,
+    # where the credential at risk and the account it belongs to are theirs. A user
+    # namespace is the real containment, and a Firecracker-based runtime is the answer
+    # for multi-tenant or external callers.
+    #
+    # A security property the container cannot observe arrives as a setting, exactly as
+    # `single_principal` does. Defaults to False, which is the SAFE default: claiming the
+    # boundary is what unlocks the risky posture, so silence must mean "not claimed", and
+    # a local host or any other lane that says nothing keeps refusing.
+    internal_only: bool = False
+
     # How many seconds this task may run before the supervisor stops it, where zero
     # means unbounded.
     #
@@ -163,14 +251,30 @@ def _path(name: str, default: str) -> Path:
     return Path(os.environ.get(name) or default).expanduser()
 
 
-def _bool(name: str, default: bool) -> bool:
+#: Why an unreadable boolean is refused, when the caller names no reason of its own.
+#: Every boolean here is a security property the container cannot observe, so the
+#: general statement is the honest default rather than one setting's specifics.
+_BOOL_REFUSAL_REASON = (
+    "which is a security property this container cannot observe for itself, so a "
+    "value it cannot read is refused rather than guessed at"
+)
+
+
+def _bool(name: str, default: bool, *, why: str = _BOOL_REFUSAL_REASON) -> bool:
     """Parse a strict boolean. An unrecognised value is REFUSED, not falsy.
 
-    This gates a security-class setting (whether the deployment claims a single
-    principal), so the usual ``value.lower() in ("1", "true")`` idiom is the wrong
-    shape: it silently reads a typo such as ``ture`` or a templating artefact such
-    as ``${Claim}`` as "no", which is the safe direction here but hides that the
-    deployment did not say what it meant. Refusing makes the operator fix the value.
+    Every caller of this gates a security-class setting, so the usual
+    ``value.lower() in ("1", "true")`` idiom is the wrong shape: it silently reads a
+    typo such as ``ture`` or a templating artefact such as ``${Claim}`` as "no",
+    which is the safe direction here but hides that the deployment did not say what
+    it meant. Refusing makes the operator fix the value.
+
+    *why* is the setting's own reason, carried into the refusal. It is a parameter
+    rather than one sentence covering every caller because the settings decide
+    different things, and a message naming the wrong one sends an operator looking
+    at the wrong parameter. There is more than one such setting now
+    (``SMC_SINGLE_PRINCIPAL`` and ``SMC_INTERNAL_ONLY``), which is exactly when a
+    shared sentence starts being wrong for one of them.
     """
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -182,9 +286,7 @@ def _bool(name: str, default: bool) -> bool:
         return False
     raise ConfigError(
         f"{name} must be a boolean (true/false), got {raw!r}. It is not "
-        "interpreted loosely because it controls whether the deployment claims a "
-        "single principal, which decides whether one caller's turns may share a "
-        "conversation slot with another's."
+        f"interpreted loosely because it controls {why}."
     )
 
 
@@ -272,7 +374,25 @@ def load() -> Settings:
         # Absent or empty means "not claimed", which is the posture that refuses the
         # risky pairing rather than the one that permits it. A value that cannot be read
         # is REFUSED instead: see `_bool`.
-        single_principal=_bool("SMC_SINGLE_PRINCIPAL", False),
+        single_principal=_bool(
+            "SMC_SINGLE_PRINCIPAL",
+            False,
+            why=(
+                "whether the deployment claims a single principal, which decides "
+                "whether one caller's turns may share a conversation slot with another's"
+            ),
+        ),
+        # The internal-only trust boundary (see the field). Absent means "not claimed",
+        # so a deployment that says nothing keeps the sandboxed-only refusal.
+        internal_only=_bool(
+            "SMC_INTERNAL_ONLY",
+            False,
+            why=(
+                "whether this task serves the operator's own crews only, which decides "
+                "whether the model subprocess may run unsandboxed on a host that cannot "
+                "sandbox it"
+            ),
+        ),
         data_home=data_home,
         # Defaults to the data home itself, NOT a `config/` subdirectory.
         # Verified against a running gateway: Kiro Crew's `config_dir()` and

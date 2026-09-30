@@ -3,6 +3,7 @@ import { twMerge } from 'tailwind-merge'
 import { motion, useMotionValue, useSpring, useMotionTemplate, useReducedMotion } from 'framer-motion'
 import InfoTip from './InfoTip'
 import { i18nT } from '../i18n/t'
+import { haptic } from '../lib/haptic'
 
 /* ── Shared UI primitives ── */
 
@@ -436,8 +437,10 @@ export function Toggle({ checked, onChange, disabled, label, describedBy, tone =
       // user hears it before acting rather than discovering it by exploring.
       aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
-      onClick={() => !disabled && onChange(!checked)}
-      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
+      // A switch is the one control whose physical twin clicks under the thumb, so
+      // it gets a tap where the device can give one (phones); elsewhere no-op.
+      onClick={() => { if (!disabled) { haptic(); onChange(!checked) } }}
+      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); haptic(); onChange(!checked) } }}
       // `muted` is for a LIST of switches, where an accent fill on every row
       // shouts and duplicates a state the row's own grouping already carries.
       // The knob position still reads the state, so nothing is lost by dropping
@@ -475,6 +478,9 @@ export interface SliderProps {
   markerLabel?: string
   className?: string
   'aria-label'?: string
+  /** Id of a description the slider reads out after its name, such as why it
+   *  is disabled -- a `title` on a wrapper reaches only a hovering pointer. */
+  'aria-describedby'?: string
 }
 
 /** macOS-style range slider: accent fill, circular knob, optional step ticks.
@@ -484,6 +490,7 @@ export interface SliderProps {
 export function Slider({
   value, onChange, min = 0, max = 100, step = 1, disabled,
   label, showValue, formatValue, ticks, emphasizeMax, markerValue, markerLabel, className = '', 'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
 }: SliderProps) {
   const trackRef = React.useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = React.useState(false)
@@ -546,6 +553,27 @@ export function Slider({
     if (next !== value) onChange(next)
   }
 
+  // Armed only when setPointerCapture is missing or throws on pointer-down:
+  // window-level up/cancel listeners for that specific pointerId, so an
+  // uncaptured drag can always terminate — the same acquisition-side
+  // fallback the shared usePointerDrag hook arms.
+  const fallbackRef = React.useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = React.useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Single-fire end path shared by the element handlers, the capture-loss
+  // handler and the window fallback below.
+  const terminateDrag = React.useCallback(() => {
+    if (!pointerDown.current) return
+    pointerDown.current = false
+    disarmFallback()
+    setDragging(false)
+  }, [disarmFallback])
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  React.useEffect(() => disarmFallback, [disarmFallback])
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (disabled) return
     e.preventDefault()
@@ -553,7 +581,30 @@ export function Slider({
     // focus the track explicitly — otherwise arrow keys after a click-to-seek go
     // to whatever had focus before instead of the slider.
     trackRef.current?.focus()
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    // A new press replaces whatever gesture was in flight, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
+    // Capture is best-effort (missing or throwing): the seek below still runs.
+    // But an uncaptured drag gets no retargeting, so without a fallback a
+    // release outside the track strands `pointerDown` with the slider pressed.
+    let captured = true
+    try { (e.target as Element).setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        terminateDrag()
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
     pointerDown.current = true
     // A click (down without move) is a discrete seek — leave `dragging` false
     // so the knob springs to the new spot. Movement below flips into drag mode.
@@ -576,9 +627,8 @@ export function Slider({
   const onPointerLeave = () => { if (!pointerDown.current) setHoverVal(null) }
   const endDrag = (e: React.PointerEvent) => {
     if (!pointerDown.current) return
-    pointerDown.current = false
-    ;(e.target as Element).releasePointerCapture?.(e.pointerId)
-    setDragging(false)
+    try { (e.target as Element).releasePointerCapture(e.pointerId) } catch { /* best-effort */ }
+    terminateDrag()
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -615,6 +665,7 @@ export function Slider({
         ref={trackRef}
         role="slider"
         aria-label={ariaLabel || label}
+        aria-describedby={ariaDescribedBy}
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={current}
@@ -627,6 +678,10 @@ export function Slider({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        // A capture steal (another element capturing mid-drag) stops
+        // retargeting pointerup here with no further event: end the drag on
+        // the loss itself, as the shared usePointerDrag hook does.
+        onLostPointerCapture={endDrag}
         onPointerLeave={onPointerLeave}
         // outline-hidden is CORRECT here and must stay: the knob below already
         // carries the replacement cue (`group-focus-visible:ring-2`), which
@@ -658,17 +713,6 @@ export function Slider({
             style={{ left: center(f) }}
           />
         ))}
-        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
-          <span
-            role="img"
-            aria-label={markerLabel}
-            data-slider-marker
-            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-accent"
-            style={{ left: center(markerFrac), transform: markerTransform }}
-          >
-            {markerLabel}
-          </span>
-        )}
         {/* hover/drag tooltip — value of the step under the cursor */}
         {hoverVal !== null && (
           <div
@@ -698,6 +742,21 @@ export function Slider({
             transition={reduceMotion ? { duration: 0 } : { type: 'spring', stiffness: 500, damping: 26 }}
           />
         </motion.div>
+        {/* Rendered AFTER the knob on purpose: the focus-cue gate looks for the
+            knob's `group-focus-visible:` ring within a fixed window below the
+            track's opening tag, and this block would push it out. z-10 keeps the
+            label above the knob regardless of DOM order. */}
+        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
+          <span
+            role="img"
+            aria-label={markerLabel}
+            data-slider-marker
+            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-muted"
+            style={{ left: center(markerFrac), transform: markerTransform }}
+          >
+            {markerLabel}
+          </span>
+        )}
       </div>
 
       {/* discrete tick marks under the groove (static reference; the hover

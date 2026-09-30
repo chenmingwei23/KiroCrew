@@ -25,6 +25,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -35,7 +36,7 @@ from kiro_crew.atomic_write import fsync_dir
 from kiro_crew.crew_log.checkpoint import PrefixWitness, witness_mapping
 from kiro_crew.crew_log.schema import KIND_MEMBER
 from kiro_crew.eventlog import members_projections, types
-from kiro_crew.eventlog.log import MemberLog
+from kiro_crew.eventlog.log import APPEND_CONTENTION_SECONDS, MemberLog
 from kiro_crew.eventlog.members_projections import all_units
 from kiro_crew.eventlog.types import Event
 from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, ProjectionRegistry
@@ -52,6 +53,30 @@ Broadcast = Callable[[str, object], None]
 #: and a short-lived member would leave files behind that folding from the start
 #: already handles for free. Matches the crew log's own ``MIN_ADVANCE_ENTRIES``.
 _SAVEPOINT_MIN_ADVANCE = 256
+
+#: How many times a closer re-folds and re-asks its predicate after losing the tail
+#: to another process. Each attempt costs one fold, and a closer that keeps losing is
+#: a member under sustained foreign writes -- where declining is right anyway, since
+#: the next read decides again against a state that has settled. Small for that
+#: reason: the retry exists for the one-commit collision, not to win a write war.
+_CLOSER_TAIL_ATTEMPTS = 3
+
+
+class CloserTailContention(Exception):
+    """Every attempt to place a closer lost the tail to another process.
+
+    Distinct from a closer that does not apply, which is an ordinary ``None``: this
+    says the decision was never given a window, so nothing was learned about whether
+    it holds. A caller invoked repeatedly can ignore it, because its next run decides
+    again. A caller that runs ONCE -- the startup sweep -- must not, or the state it
+    was closing stays open until the next restart, and that is the whole reason the
+    two outcomes are told apart instead of sharing ``None``.
+    """
+
+    def __init__(self, slug: str, type: str) -> None:
+        super().__init__(f"closer {type!r} for slug {slug!r} lost the tail on every attempt")
+        self.slug = slug
+        self.type = type
 
 
 def _redact_projection_value(value: object) -> object:
@@ -138,13 +163,188 @@ def _legacy_fold_completed(slug: str) -> bool:
         return False
 
 
+def _legacy_binding_present(slug: str) -> bool:
+    """Whether a legacy DM-binding file EXISTS for *slug*.
+
+    Asked because :func:`members.read_dm_binding` is TOTAL by contract: a missing
+    file, an unreadable one and a malformed payload all read as "not bound". That
+    is the right answer for a caller that only wants to re-create the binding, and
+    the wrong one for the fold, which has to know whether it READ the source -- a
+    source it did not read is one a later pass still can. Its sibling for rules
+    raises instead, so only the binding needs this second question asked.
+
+    Fails CLOSED on an unanswerable path, meaning it reports PRESENT. The wrong
+    answer is asymmetric the same way :func:`_legacy_fold_completed`'s is: present
+    costs a re-read the counted dedupe makes safe, absent drops a binding this
+    process could have migrated.
+
+    ``stat`` carries that, where ``Path.exists`` cannot: it answers False for every
+    error it meets, so a file this process may not reach reads exactly like one that
+    is not there -- the one confusion this function exists to prevent. Only a missing
+    file is absent here, and every other error reports present.
+    """
+    from kiro_crew import members
+
+    try:
+        members.dm_binding_path(slug).stat()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("legacy binding path unanswerable for %r", slug, exc_info=True)
+        return True
+    return True
+
+
 #: How much of a legacy activity file the fold will read. The file is
-#: agent-writable and the fold runs on every ``ensure``, which the roster
+#: agent-writable and the fold runs from ``ensure``, which the roster
 #: projection calls, so an unbounded read sits on a request path.
 MAX_LEGACY_ACTIVITY_BYTES = 8 * 1024 * 1024
 
+#: The legacy source went, with this member's unit lease held over the removal.
+_CLEAN_REMOVED = "removed"
+#: Nothing was touched: the lease could not be had, or something the removal needs
+#: was unreadable. The source and whatever gates it are both still in place.
+_CLEAN_KEPT = "kept"
+#: The absence the store answered was STALE -- a peer created this member's unit,
+#: and very likely folded the legacy source into it, in the window between that
+#: ``is_dir`` and this hold. Nothing here is removed: there is now a unit to lease,
+#: so the caller re-runs the one spelling of deletion instead of removing the
+#: source beside a fold nothing would ever collect.
+_CLEAN_RACED = "raced"
+
 _singleton: "MemberEventLogService | None" = None
 _singleton_lock = threading.Lock()
+
+
+def _remove_legacy_activity(slug: str) -> bool:
+    """Remove *slug*'s pre-log activity files. Never raises; answers whether all went.
+
+    The answer is what the unit's own removal is gated on, so it is true only when
+    none of the four names is left -- including one left deliberately, because a name
+    that is a link is a name the fold can still read through. Anything short of that
+    reports false, and the caller then keeps the unit, which keeps the marker that
+    stops the fold reading what survived here.
+    The companion to removing a member's unit. These rows are the member's own
+    history from before the log existed, and they sit OUTSIDE the unit while the
+    marker recording that they were folded sits inside it -- so taking the unit
+    alone both leaves the history on disk and re-arms the fold, because the next
+    fresh ``ensure`` finds no marker and reads the source again. Every name the
+    fold reads is covered: the live file, its one rotation, and the retired names
+    the fold renames them to.
+
+    **The directory is PINNED to a descriptor and the leaves are unlinked by
+    BASENAME against it, so there is no window between deciding and deleting.**
+    ``member_dir`` resolves and then only containment-checks the result, so
+    ``members/<slug>`` swapped for a link to a PEER's directory resolves inside the
+    members root, passes that check, and hands back the peer's real directory --
+    where these four names are ordinary files, so a link test on the leaves is false
+    and the unlink destroys a live member's history. For a member whose fold has not
+    run that file is the sole copy. ``members/<slug>`` is deliberately agent-writable,
+    which is what makes the swap reachable rather than hypothetical.
+
+    A test on the name cannot close that, whatever it tests FOR: the test and the
+    unlink are separate syscalls, and whoever can plant the link chooses when to
+    plant it. ``platform_compat.pin_directory`` refuses a link AS IT OPENS -- POSIX
+    through ``O_DIRECTORY | O_NOFOLLOW``, Windows by opening a reparse point as
+    itself -- so the refusal is the open rather than a prediction about it, and it
+    answers for a junction as well as a symlink. Every unlink then names a basename
+    against that descriptor, so it resolves against the directory that was inspected
+    and a later swap of the NAME reaches nothing. Windows has no ``dir_fd``; there
+    the same handle is what closes the window, because a directory held open without
+    ``FILE_SHARE_DELETE`` can be neither renamed nor deleted, nor can any directory
+    above it, so the by-path unlink under that hold cannot be redirected either.
+
+    **``O_NOFOLLOW`` binds the FINAL component only, so the members ROOT is pinned
+    first and the slug is opened relative to it.** ``members_root()`` is an
+    unresolved path under the data home, and nothing seals the ``members`` component
+    itself -- swapped for a link, it redirects an open of ``members/<slug>`` however
+    carefully that leaf is no-followed, and the four unlinks land in a tree outside
+    the member area entirely. Two pins settle it: the root refuses a link as it
+    opens, and the slug is then opened THROUGH that descriptor, so neither name is
+    re-resolved from a string afterwards. On Windows the root's own handle is what
+    holds, since it blocks renaming ``members`` and everything above it.
+
+    The leaf test is kept as well, and it is not a second guess at the directory: it
+    covers a single file swapped for a link inside a directory that is genuinely this
+    member's, where the worst case is removing a link instead of the file it names.
+
+    Every name is attempted even after one refuses, so a single stuck file does not
+    hide the rest; the refusal is carried to the answer rather than to an exception,
+    because the caller needs a verdict it can act on and not a second failure mode.
+    """
+    from kiro_crew import members
+
+    try:
+        members.validate_slug(slug)
+        named_dir = members.members_root() / slug
+    except Exception:
+        logger.debug("legacy activity path unavailable for %r", slug, exc_info=True)
+        return False
+    live = members.ACTIVITY_FILE_NAME
+    retired = live + LEGACY_MIGRATED_SUFFIX
+    names = (live, live + ".1", retired, retired + ".1")
+    relative = os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd
+    try:
+        root = platform_compat.pin_directory(members.members_root())
+    except FileNotFoundError:
+        return True
+    except OSError:
+        logger.warning(
+            "crew log: the members root is not a real directory; "
+            "refusing to remove what its name reaches for %r",
+            slug,
+        )
+        return False
+    try:
+        try:
+            if relative:
+                pinned = os.open(slug, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            else:
+                pinned = platform_compat.pin_directory(named_dir)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            logger.warning(
+                "crew log: member directory for %r is not a real directory; "
+                "refusing to remove what its name reaches",
+                slug,
+            )
+            return False
+        all_gone = True
+        try:
+            for name in names:
+                try:
+                    if relative:
+                        if stat.S_ISLNK(os.lstat(name, dir_fd=pinned).st_mode):
+                            logger.warning(
+                                "crew log: legacy activity at %s is a link; leaving it in place",
+                                name,
+                            )
+                            all_gone = False
+                            continue
+                        os.unlink(name, dir_fd=pinned)
+                    else:
+                        leaf = named_dir / name
+                        if leaf.is_symlink():
+                            logger.warning(
+                                "crew log: legacy activity at %s is a link; leaving it in place",
+                                name,
+                            )
+                            all_gone = False
+                            continue
+                        leaf.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logger.warning(
+                        "crew log: could not remove legacy activity %s for %r", name, slug
+                    )
+                    all_gone = False
+        finally:
+            os.close(pinned)
+        return all_gone
+    finally:
+        os.close(root)
 
 
 LEGACY_PROVENANCE_KEY = "legacy_unverified"
@@ -337,8 +537,8 @@ def _read_legacy_activity_files(slug: str) -> tuple[list[dict], bool]:
     return rows, complete
 
 
-def _retire_legacy_activity(slug: str) -> None:
-    """Mark the fold complete so a later write cannot enter the ledger.
+def _retire_legacy_activity(slug: str) -> bool:
+    """Return whether the fenced fold-complete marker is durably recorded.
 
     Renames rather than deletes: the rows are the member's own history and this is a
     one-way migration, so the file is kept readable under its retired name. The
@@ -351,7 +551,7 @@ def _retire_legacy_activity(slug: str) -> None:
         base = members.member_dir(slug) / members.ACTIVITY_FILE_NAME
     except Exception:
         logger.debug("legacy activity path unavailable for %r", slug, exc_info=True)
-        return
+        return False
     # The fenced marker is written and made DURABLE BEFORE the legacy name is
     # freed. In the other order a crash between the rename and the marker leaves the
     # live name available with no marker recorded, and the next ensure folds whatever
@@ -366,7 +566,7 @@ def _retire_legacy_activity(slug: str) -> None:
     # the only ones whose legacy name stayed open for whoever wrote it next.
     fenced = _legacy_folded_marker_path(slug)
     if fenced is None:
-        return
+        return False
     try:
         fenced.parent.mkdir(parents=True, exist_ok=True)
         fenced.touch(exist_ok=True)
@@ -375,11 +575,16 @@ def _retire_legacy_activity(slug: str) -> None:
         # landed, which is the one combination the ordering above rules out.
         fsync_dir(fenced.parent)
     except OSError:
-        # Unwritten, so nothing is renamed either: the next ensure folds again rather
-        # than trusting a source it cannot prove it has finished with. Idempotent by
-        # the counted dedupe.
+        # The entry is LEFT in place. A later pass runs this again for every member
+        # whose fold completes -- a member already retired reads as a complete fold
+        # with no rows -- so ``touch`` here can meet a marker an earlier pass made
+        # durable, and removing it on a sync failure would free the live legacy name
+        # again with no marker recorded, which is the forgery this marker closes.
+        # Reporting the failure is enough: the caller withholds the memo, the retry
+        # syncs the same entry, and an entry that survives without its sync is a
+        # closed fence in every process that can see it.
         logger.debug("could not mark legacy activity folded for %r", slug, exc_info=True)
-        return
+        return False
     marker = base.with_name(base.name + LEGACY_MIGRATED_SUFFIX)
     for path in (base, base.with_name(base.name + ".1")):
         try:
@@ -391,7 +596,8 @@ def _retire_legacy_activity(slug: str) -> None:
             # loss: the fenced marker is already recorded, so the source is never
             # read again, and the rows it held were appended before this ran.
             logger.debug("could not retire legacy activity at %s", path, exc_info=True)
-            return
+            return True
+    return True
 
 
 class MemberEventLogService:
@@ -407,6 +613,9 @@ class MemberEventLogService:
         self._registry.set_on_change(self._on_change)
         # Names carried by each slug's header, overlaid onto the roster view.
         self._names: dict[str, str] = {}
+        # Slugs whose legacy fold has completed under this process. See
+        # :meth:`_migrate_legacy` for why the memo is per process and not a file.
+        self._legacy_folded: set[str] = set()
 
     # ---- wiring -----------------------------------------------------------
     def attach_broadcast(self, broadcast: Broadcast) -> None:
@@ -680,25 +889,47 @@ class MemberEventLogService:
 
     # ---- units ------------------------------------------------------------
     def ensure(self, slug: str, name: str, config=None) -> None:
+        """Make sure *slug* has a log, and fold its legacy files in once.
+
+        Reads through :meth:`_get_log`, so a slug this process has already ensured
+        costs one ``stat``: the held instance is kept, its events are parsed again
+        only when the file moved, and the fold resumes from this member's savepoints
+        instead of from the first event. That repeat is the common case -- ``ensure``
+        is called once per member on every roster read and once per message -- and
+        the creation below is the rare one.
+
+        Reusing that read is also what keeps ONE answer in this class to whether the
+        file moved. A second copy here would be a second thing to keep correct, and
+        what a wrong answer serves is the member's own drawer.
+        """
         from kiro_crew.members import validate_slug
 
         validate_slug(slug)
         lock = self._slug_lock(slug)
         with lock:
-            log = MemberLog(slug)
-            fresh = not log.exists()
-            if fresh:
-                # The header is written ONCE, so this call decides what the log says
-                # it belongs to for life. A writer with no name in hand reaches here
-                # with the slug (``emit`` passes ``name or slug``), and the slug names
-                # nobody: the roster has to treat it as unnamed, which costs this log
-                # its collision check for good. Resolve the exact name from the roster
-                # instead, and use it for the migration below too, whose rules and
-                # binding reads are name-scoped. Only on the fresh path, so a member's
-                # config is read once ever rather than on every message.
+            log = self._get_log(slug)
+            if log is None:
+                # Nothing on disk for this slug, and publishing it is what this call
+                # is for. The header is written ONCE, so this call decides what the
+                # log says it belongs to for life. A writer with no name in hand
+                # reaches here with the slug (``emit`` passes ``name or slug``), and
+                # the slug names nobody: the roster has to treat it as unnamed, which
+                # costs this log its collision check for good. Resolve the exact name
+                # from the roster instead, and use it for the migration below too,
+                # whose rules and binding reads are name-scoped. Only on this path,
+                # so a member's config is read once ever rather than on every
+                # message.
                 name = self._resolved_name(slug, name, config)
+                log = MemberLog(slug)
                 log.create(name)
-            log.load()
+                log.load()
+                with self._map_lock:
+                    self._logs[slug] = log
+                # Folded from the start: a log this call publishes carries its header
+                # and no events, so a savepoint resume has nothing to skip. ``prime``
+                # runs no change callbacks, so the name below is in place before any
+                # projection of this member is published.
+                self._registry.prime(slug, log.iter_events())
 
             # The HEADER decides who this log belongs to, not this call's argument.
             # It is written once, so on an EXISTING log the argument is only whatever
@@ -716,15 +947,11 @@ class MemberEventLogService:
                 name = header_name
 
             self._names[slug] = name
-            with self._map_lock:
-                self._logs[slug] = log
-            self._registry.prime(slug, log.iter_events())
 
-            # Run the migration on EVERY ensure, not only at create: returning
-            # early whenever the log existed meant a process that died between
-            # `create` and the end of the migration left that member's bindings,
-            # rules and activity unmigrated for good. Each item is skipped once the
-            # log carries its event, so the pass is idempotent and cheap.
+            # Each item of the migration asks whether the log already carries its
+            # event, so a pass is idempotent and an interrupted one resumes on a
+            # later call -- in this process or in the next. One completed pass per
+            # process settles it, which :meth:`_migrate_legacy` keeps track of.
             self._migrate_legacy(slug, name, log)
 
     def _resolved_name(self, slug: str, name: str, config=None) -> str:
@@ -759,10 +986,26 @@ class MemberEventLogService:
     def _migrate_legacy(self, slug: str, name: str, log: MemberLog) -> None:
         """Fold this member's legacy files into events, once per item.
 
-        Called on every ``ensure``, so each item asks whether the log already
-        carries its event and skips the legacy read when it does. That is what lets
-        an interrupted migration resume: whatever the dead run got through stays
-        done, and whatever it did not is picked up on the next call.
+        Each item asks whether the log already carries its event and skips the legacy
+        read when it does, which is what lets an interrupted migration resume:
+        whatever a dead run got through stays done, and whatever it did not is picked
+        up by a later call.
+
+        ONE completed pass per process settles the member, and every call after it
+        returns here -- without the lease, which is the point. ``ensure`` is called
+        once per member on every roster read and once per message, and by then every
+        item skips itself, so a call that cannot do any work would still be spending
+        a cross-process lease acquire and a set of legacy path reads to find that
+        out. The memo is per PROCESS and deliberately not a file: a run that dies
+        mid-fold leaves no memo behind, so the next process folds the member again.
+
+        Nothing is recorded unless the pass read every legacy source to its END. A
+        refused lease, an exception out of the fold, and a read that came back short
+        of what the file holds all leave the memo unwritten, and the member is folded
+        again on a later call. The last of those is the one worth naming: a file over
+        the byte budget, and a read an ``OSError`` interrupted, RETURN rather than
+        raise, so "the pass did not throw" is not the question -- which is why the
+        fold answers it instead.
 
         A completion marker event would answer the same question in one check, and
         is deliberately not used: it would sit in every member's log forever and
@@ -783,6 +1026,8 @@ class MemberEventLogService:
         ensure -- which the counted dedupe makes safe whether or not the other
         process finished.
         """
+        if slug in self._legacy_folded:
+            return
         lease = self._hold_unit(slug)
         if lease is None:
             logger.debug("legacy fold for %r skipped: another process holds the log", slug)
@@ -790,9 +1035,11 @@ class MemberEventLogService:
         from kiro_crew.crew_log.lease import release as release_lease
 
         try:
-            self._migrate_legacy_locked(slug, name, log)
+            settled = self._migrate_legacy_locked(slug, name, log)
         finally:
             release_lease(lease)
+        if settled:
+            self._legacy_folded.add(slug)
 
     @staticmethod
     def _hold_unit(slug: str) -> str | None:
@@ -821,9 +1068,156 @@ class MemberEventLogService:
             logger.debug("legacy fold lease refused for %r", slug, exc_info=True)
             return None
 
-    def _migrate_legacy_locked(self, slug: str, name: str, log: MemberLog) -> None:
-        """The fold itself. Runs only with this member's unit lease held."""
+    def _clean_legacy_under_unit_lease(self, slug: str) -> str:
+        """Remove *slug*'s legacy source with this member's unit lease HELD.
+
+        Answers one of :data:`_CLEAN_REMOVED`, :data:`_CLEAN_KEPT` or
+        :data:`_CLEAN_RACED`. The third is not a failure and not a removal: it says
+        the store's absence has been overtaken and there is a unit for the caller to
+        aim ``remove_unit`` at, which is a different instruction from "the source is
+        still there because nothing could be held".
+
+        The branch for a unit the store did not find. There is nothing there to hold
+        a lease in, and the race that needs holding is precisely a peer creating that
+        unit: its fresh ``ensure`` writes a header and then folds this source, so a
+        cleanup with no lease can lose to it and leave the rows in a unit nobody
+        removes. The lease is a file BESIDE the unit's segments, so the directory is
+        created to carry it, the lease is taken, and the directory goes again after.
+
+        Serializing against the fold is what the lease buys: the fold takes this same
+        lease before reading, and a non-sole acquire from another PROCESS is refused
+        rather than shared, so the peer writes nothing while this runs.
+
+        **A peer that got there FIRST is caught by re-deciding the absence inside the
+        hold, not by the store's decision.** The store answered ``absent`` from an
+        ``is_dir`` taken with no lease held, so "the store would have found a unit"
+        is only true of a unit that existed at that moment: a peer can create one,
+        fold this source into it and release entirely inside the window that ends
+        when the acquire here returns. A segment present under the hold is what proves
+        it, since the directory this method creates to carry the lease holds none.
+        Removing the source then would be the worst of the three outcomes -- the fold
+        survives in a unit for a member the roster does not have, and no sweep
+        collects it -- so that case answers :data:`_CLEAN_RACED` with the source, the
+        lease and the directory all untouched, and the caller re-runs the one spelling
+        of deletion against the unit that now exists.
+
+        The created directory is owner-only and holds no segment, so it is not a unit
+        to any reader: :func:`store.unit_ids` proves identity from a segment header
+        and skips a directory that has none, which is why this cannot make a deleted
+        member list again. It is removed anyway, so nothing is left to explain.
+
+        A lease that cannot be had answers false with the source untouched, the same
+        direction every other decision in this teardown takes -- and it leaves the
+        lease file and the directory alone as well, because a refusal means a peer
+        holds that lease and its lock names that file's inode.
+        """
+        from kiro_crew.crew_log.lease import LEASE_FILE
+        from kiro_crew.crew_log.lease import release as release_lease
+        from kiro_crew.crew_log.store import crew_log_dir, segment_paths
+        from kiro_crew.session_ledger import unlink_lock_in_hold
+
+        try:
+            directory = crew_log_dir(KIND_MEMBER, slug)
+            # Owner-only, and mkdir masks rather than widens, so this cannot grant
+            # more than 0o700 whatever the umask is. These directories hold
+            # conversation bodies once a writer uses one, and a peer's create would
+            # inherit this mode rather than set its own.
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            logger.warning(
+                "crew log: cannot hold the unit lease for %r; keeping its legacy activity",
+                slug,
+            )
+            return _CLEAN_KEPT
+        lease = self._hold_unit(slug)
+        if lease is None:
+            # Nothing is touched here, and that is the point: a refusal means a PEER
+            # holds this lease, and the lock it holds names the lease file's INODE.
+            # Unlinking that file would leave the peer's lock naming an inode no path
+            # reaches, so a later acquire would create a fresh one, lock it, and prove
+            # nothing -- two writers folding the same source at once. The directory
+            # stays for the same reason: it is the peer's working directory now,
+            # whether or not this call is what created it.
+            logger.warning(
+                "crew log: another writer owns %r; keeping its legacy activity",
+                slug,
+            )
+            return _CLEAN_KEPT
+        try:
+            # The absence is RE-DECIDED here, inside the hold, for the same reason
+            # ``remove_unit`` re-asks its guard there: the store answered ``absent``
+            # from an ``is_dir`` taken with no lease, and a peer holding neither can
+            # create the unit, fold this source into it and release inside the window
+            # that ends at the acquire above. A segment is what proves that happened
+            # -- the directory this method makes to carry the lease holds none -- and
+            # it is history, so removing the source now would leave the fold standing
+            # with no collector: the retention sweep ages session logs only. So
+            # nothing is touched, the lease and the directory are left exactly as the
+            # peer's unit needs them, and the caller re-runs ``remove_unit``, which
+            # now finds a unit to lease and removes the fold and the source inside one
+            # hold of its own.
+            if segment_paths(KIND_MEMBER, slug):
+                logger.info(
+                    "crew log: %r was recreated while its removal decided absence; "
+                    "removing that unit instead",
+                    slug,
+                )
+                return _CLEAN_RACED
+            removed = _remove_legacy_activity(slug)
+            lease_gone = unlink_lock_in_hold(directory / LEASE_FILE)
+        finally:
+            release_lease(lease)
+        self._discard_lease_carrier(directory / LEASE_FILE, directory, held=lease_gone)
+        return _CLEAN_REMOVED if removed else _CLEAN_KEPT
+
+    @staticmethod
+    def _discard_lease_carrier(lease_path: "Path", directory: "Path", *, held: bool) -> None:
+        """Drop the lease file and the directory that carried it, best-effort.
+
+        Reached ONLY by the process that held this lease, never on a refusal. A lock
+        names an inode, so unlinking a lease another process holds would leave its
+        lock naming a file no path reaches and let the next acquire lock a fresh inode
+        and prove nothing. Neither of these is data: the directory was created to give
+        the lease a place to be, and by here the work it guarded is over.
+
+        ``rmdir`` is the guard on the directory rather than a check before it: it
+        refuses a directory that is not empty, so a peer that has since created its
+        own lease or a segment keeps both.
+
+        Windows refuses an in-hold unlink of the lease, which is why the caller reports
+        whether that already happened -- and the late attempt is safe there for the
+        same reason it was refused, since it fails while any handle is open.
+        """
+        if not held:
+            try:
+                lease_path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("crew log: lease file for the absent-unit hold still held")
+        try:
+            directory.rmdir()
+        except OSError:
+            logger.debug("crew log: the absent-unit hold's directory is not empty")
+
+    def _migrate_legacy_locked(self, slug: str, name: str, log: MemberLog) -> bool:
+        """The fold itself. Runs only with this member's unit lease held.
+
+        Answers whether every legacy source was read to its END, which is what says
+        the member is settled. A read that returned less than the file holds -- an
+        unreachable path, a file over the byte budget, an ``OSError`` part-way --
+        leaves rows this pass never saw, and it does so by RETURNING rather than
+        raising. So the answer cannot be "it did not throw": the caller memoises on
+        it, and a pass recorded as settled is a pass nothing repeats.
+
+        The binding read needs one extra question for the same reason. It is total by
+        contract, so it reports an unreadable file exactly as it reports an absent
+        one; :func:`_legacy_binding_present` is what tells those apart here. The
+        rules read raises on an existing file it cannot use, so it needs nothing.
+        """
         from kiro_crew import members
+
+        # Every legacy source this pass could read, read whole. Set false by a read
+        # that came back short, never by an item that had nothing to migrate.
+        settled = True
 
         # Streamed, not the retained tail: the tail is a bounded WINDOW, so a
         # membership test against it would report an item unmigrated because its
@@ -836,7 +1230,28 @@ class MemberEventLogService:
                 binding = members.read_dm_binding(slug)
             except Exception:
                 binding = None
+                settled = False
                 logger.debug("legacy binding read failed for %r", slug, exc_info=True)
+            else:
+                if binding is None and _legacy_binding_present(slug):
+                    # "Not bound" from a total reader, with a file sitting there, does
+                    # not say there is nothing to migrate -- it says this pass did not
+                    # read what is there. EVERY such answer holds the member open, and
+                    # that is wider than "the file is unreadable": the same None comes
+                    # back for a file whose `slot_key` is not canonical and for one
+                    # naming a member that slugifies elsewhere. A total reader cannot
+                    # report which of the three happened, and the one that must not be
+                    # mistaken for "nothing to migrate" is indistinguishable from the
+                    # other two here.
+                    #
+                    # The cost of being wide falls on that member alone: it keeps
+                    # paying the lease and the legacy reads on every ensure until the
+                    # file is repaired, which is what every member pays without this
+                    # memo. Reading the file a second time here to classify it is the
+                    # alternative, and it spends that read on every pass for every
+                    # member to serve the rare one. The source is never retired, so
+                    # the next pass finds it again.
+                    settled = False
             if binding is not None and binding.get("member") == name:
                 slot_key = binding.get("slot_key")
                 if isinstance(slot_key, str) and slot_key:
@@ -848,6 +1263,7 @@ class MemberEventLogService:
                 text = members.read_member_rules(slug, name)
             except Exception:
                 text = ""
+                settled = False
                 logger.debug("legacy rules read failed for %r", slug, exc_info=True)
             if text:
                 self._append_locked(slug, log, types.MEMBER_RULES, {"text": text})
@@ -892,8 +1308,9 @@ class MemberEventLogService:
         # source is re-read on the next ensure, which the counted dedupe above makes
         # safe; an over-budget file stays unretired and is reported every pass, which
         # is the correct outcome for a file too large to migrate.
-        if legacy_complete:
-            _retire_legacy_activity(slug)
+        if legacy_complete and not _retire_legacy_activity(slug):
+            settled = False
+        return settled and legacy_complete
 
     def logged_name(self, slug: str) -> str | None:
         """The EXACT member name this slug's log was created for, or None.
@@ -986,19 +1403,78 @@ class MemberEventLogService:
         This exists rather than a predicate on :meth:`append` because the predicate
         must not re-enter the service to read state -- ``snapshot`` takes this same
         non-reentrant lock, so a caller that reached for it would deadlock.
+
+        The predicate is asked against a state no foreign commit can have moved,
+        and that guarantee comes from the store rather than from the per-slug lock
+        above. The per-slug lock orders this process's writers, and for them it is
+        enough: a concurrent in-process append queues behind this hold and lands
+        after, which is the winning order. It says nothing about another PROCESS,
+        and the member log has more than one writer -- an entry another process
+        commits between our fold and our write lands FIRST, and a last-wins
+        projection then takes ours as the newer word for a state that had already
+        moved.
+
+        What the store is given is the seq this fold reached, and what runs inside
+        its hold is ONE comparison against the tail. The fold itself parses the log,
+        and a parse under a cross-process lock is a hold nothing bounds -- a peer
+        append gives up after a bounded wait and its event is then lost for good, so
+        the expensive half stays outside, and passing a seq rather than a callback is
+        what keeps it there. A foreign commit makes the tail exceed what we folded,
+        the append declines without writing, and the loop folds that entry and asks
+        the predicate again. Seqs only increase, so the comparison cannot be fooled
+        by a tail that moved and came back.
         """
         lock = self._slug_lock(slug)
         with lock:
-            log = self._get_log(slug)
-            if log is None:
-                return None
-            values = self._registry.snapshot(slug).get("values", {})
-            if not still_applies(
-                values if isinstance(values, dict) else {},
-                observed if isinstance(observed, dict) else {},
-            ):
-                return None
-            return self._append_locked(slug, log, type, data)
+            # ONE contention budget for the whole loop, not one per attempt. Each
+            # attempt's append waits out a lease collision, and the per-slug lock is
+            # held across all of them, so a per-attempt budget would multiply the
+            # worst-case hold by the attempt count and stall every other in-process
+            # writer for this member that much longer.
+            deadline = time.monotonic() + APPEND_CONTENTION_SECONDS
+            for _ in range(_CLOSER_TAIL_ATTEMPTS):
+                log = self._get_log(slug)
+                if log is None:
+                    return None
+                self._fold_gap_locked(slug, log)
+                # The newest seq every cell has folded, which is the state the
+                # predicate is about to read. An empty log reports -1 (no cell has
+                # been driven), and the store reports 0 for a file with a header and
+                # no events, so the two agree only once the floor is clamped up.
+                folded_to = max(self._registry.observed_floor(slug), 0)
+                values = self._registry.snapshot(slug).get("values", {})
+                if not still_applies(
+                    values if isinstance(values, dict) else {},
+                    observed if isinstance(observed, dict) else {},
+                ):
+                    return None
+                event = log.append_if(type, data, max_tail_seq=folded_to, deadline=deadline)
+                if event is not None:
+                    # No gap fold here, unlike the plain append path. The write only
+                    # happened because the tail was still at or below what the fold
+                    # above reached, and this event takes the seq straight after it,
+                    # so the range a gap fold would cover is empty by construction --
+                    # and it is not free: it streams the whole file to discover that.
+                    # ``drive`` folds this event, which is the only new one.
+                    self._registry.drive(slug, event)
+                    return event
+            # Every attempt lost the same race. Declining is the safe direction --
+            # a closer not written is a normal outcome the next read re-decides,
+            # while one written against a state that moved is permanent.
+            # Warned rather than debugged, and raised rather than reported as a plain
+            # decline: the projection is left stale, which is the same silent
+            # wrongness the recheck exists to prevent, and a caller that runs ONCE
+            # cannot tell "does not apply" from "never got a clean window" without
+            # this. A floor that never reaches the tail would exhaust every closer
+            # for this member, and these two are where that becomes visible.
+            logger.warning(
+                "closer for slug=%r type=%r lost the tail race on every attempt; "
+                "the projection stays stale until a caller re-decides",
+                slug,
+                type,
+            )
+            raise CloserTailContention(slug, type)
+            return None
 
     def _fold_gap_locked(self, slug: str, log: MemberLog, *, below: int | None = None) -> None:
         """Fold events on disk that this process has not folded; caller holds the lock.
@@ -1016,8 +1492,21 @@ class MemberEventLogService:
         """
         floor = self._registry.observed_floor(slug)
         if floor < 0:
-            # No cell yet: such a cell folds from init() over whatever it is first
-            # driven with, so it must be primed rather than driven at a range.
+            # Nothing is folded yet -- either no cell, or a cell a prime over an empty
+            # stream left at the empty watermark, which is the state a log with no
+            # events is in. Such a cell folds from init() over whatever it is first
+            # driven with, so a range cannot be driven at it. Prime over the same
+            # events instead: that is the form it accepts, and it reaches the state a
+            # cold fold reaches. Returning here is the one thing that does not work --
+            # the entries another process committed would stay unfolded, and the next
+            # append drives every cell past them, after which drive drops them.
+            #
+            # ``below`` still bounds it, so the append path's own ``drive`` remains the
+            # call that fires the change callbacks ``prime`` withholds.
+            self._registry.prime(
+                slug,
+                (ev for ev in log.iter_events() if below is None or ev["seq"] < below),
+            )
             return
         for earlier in log.iter_events():
             if earlier["seq"] <= floor:
@@ -1044,6 +1533,141 @@ class MemberEventLogService:
         self._fold_gap_locked(slug, log, below=event["seq"])
         self._registry.drive(slug, event)
         return event
+
+    # ---- removal ----------------------------------------------------------
+    def remove_unit(self, slug: str, *, still_unclaimed: Callable[[], bool]) -> str:
+        """Remove *slug*'s crew log and forget it here. One of the ``REMOVE_*`` statuses.
+
+        The member half of the door ``sessions._remove_session_crew_log`` is for
+        sessions: a caller outside this package says WHICH member's history has no
+        owner left, and this owns the two steps that knowledge implies -- the
+        store's removal, and dropping what this service caches for that slug. A
+        handler reaching into the store itself would do the first and forget the
+        second, and a cached ``MemberLog`` that outlives its files answers reads
+        for a member whose history is gone.
+
+        *still_unclaimed* is the caller's reason, re-asked under the removal's own
+        lease hold: the store calls it as the ``guard`` it requires. It takes no
+        arguments because this reason is not a property of the file -- whether a
+        member is still in the roster is a property of the config -- so re-reading
+        the log here would answer a question nobody asked. Re-asking it at all is
+        what the session sweep's guard is for: the caller decided outside the
+        hold, and a same-name member committed in that window owns this very unit,
+        because the unit is keyed by the slug and a recreated namesake derives the
+        same one. The predicate answering false is an ordinary outcome, not a
+        failure: nothing is removed and nothing is written.
+
+        Called under the per-slug lock, so an append through this service is
+        serialized against it rather than racing the unlink. The lock ENTRY is
+        kept afterwards while the log and name caches are dropped: a later caller
+        that found no entry would build a second lock for the same slug, and two
+        threads holding different locks for one slug is worse than a dict entry
+        for a member that is gone. Nothing else is dropped, because nothing else
+        survives the removal as an answer -- the folded cells for this slug stay
+        in the registry, and are unreachable through every read here, each of
+        which returns empty once ``_get_log`` finds no file.
+
+        **The legacy activity source goes with the unit, INSIDE the store's own lease
+        hold and BEFORE the unit itself, and that is what makes the removal mean
+        anything.** Those rows are the member's own pre-log history, they live outside
+        the unit under ``members/<slug>/``, and the marker saying they were already
+        folded lives INSIDE it -- so a removal that took only the unit would leave the
+        history on disk AND leave the next fresh ``ensure`` free to fold it into a new
+        log, in this process or any other writer's. Taking it after the removal
+        RETURNED would leave the same fold reachable in the window between the lease's
+        release and the unlink, so it is handed to ``remove_unit`` as its ``in_hold``
+        action instead.
+
+        The order inside that hold is the source first, and it is not arbitrary: the
+        marker gating the fold is part of the unit, so a unit destroyed while the
+        source survives has ARMED the fold rather than half-finished it. So the
+        cleanup answers whether the source is really gone, and the store keeps
+        everything on a false answer -- the unit, its marker, and the source under it
+        -- and reports ``failed``. Taken, a later append can recreate at most an empty
+        header, which carries nothing.
+
+        **A unit the store does not find leaves that source behind too, so the
+        cleanup runs for an absent unit as well, and there it re-asks the roster
+        itself.** A member whose log was never written, or whose fold has not run, has
+        its history ONLY in that source, and skipping it there would leave the delete
+        having removed nothing at all. The store calls the predicate as its guard only
+        when there is a unit to hold, so for an absent one there is no answer to
+        inherit and this asks again; the question raising rather than answering keeps
+        the source, the same direction every other decision here takes. That branch
+        takes the unit's lease ITSELF rather than running bare, because the race it
+        has to win is a peer creating the very unit the store just failed to find and
+        folding this source into it. **And it re-decides the absence under that hold
+        rather than trusting the one it inherited**: the store's ``is_dir`` ran with no
+        lease, so a peer can create, fold and release entirely inside the window that
+        ends at the acquire. A unit found there means the absence is stale, nothing is
+        removed, and this method calls ``remove_unit`` a second time -- now against a
+        unit that exists, so the fold and the source go inside one hold of its own and
+        the status returned describes THAT removal rather than the absence that is no
+        longer true.
+
+        Only PROVEN absence reaches it. A unit whose own name is a link answers
+        ``linked``, not ``absent``, and that distinction is load-bearing here rather
+        than tidy: this branch re-derives the unit path, which RESOLVES, so acting on a
+        link as absence would take the lease of whatever it points at -- very likely a
+        live member's unit -- and unlink that unit's lease file inside its own hold. A
+        link is left entirely alone, for a person to remove.
+
+        **The caches go whenever the store removed anything, which includes a partial
+        removal.** A ``failed`` status can mean the contents partly went, and a reader
+        holding this slug's cached handle would then serve a projection folded from
+        history that is gone. Dropping a cache entry costs a reopen and nothing else,
+        so it is done on both ``removed`` and ``failed``; only ``owned`` -- where
+        nothing was touched, because a namesake owns the slug again -- keeps them.
+        """
+        from kiro_crew.crew_log.store import (
+            REMOVE_ABSENT,
+            REMOVE_FAILED,
+            REMOVE_REMOVED,
+            remove_unit,
+        )
+
+        with self._slug_lock(slug):
+            status = remove_unit(
+                KIND_MEMBER,
+                slug,
+                guard=lambda _directory: still_unclaimed(),
+                in_hold=lambda: _remove_legacy_activity(slug),
+            )
+            reclaim = False
+            if status == REMOVE_ABSENT:
+                try:
+                    reclaim = bool(still_unclaimed())
+                except Exception:
+                    logger.debug(
+                        "crew log: roster unreadable for %r; keeping legacy activity",
+                        slug,
+                        exc_info=True,
+                    )
+                    reclaim = False
+                if reclaim:
+                    outcome = self._clean_legacy_under_unit_lease(slug)
+                    if outcome == _CLEAN_RACED:
+                        # The absence was overtaken: a peer created this member's unit
+                        # inside the window that ended at that hold. There is a unit
+                        # to lease now, so this re-runs the SAME call rather than
+                        # spelling the removal a second way -- it re-asks the roster
+                        # under its own hold and removes the fold with the source
+                        # inside it, which is the pairing that made the source safe to
+                        # remove in the first place.
+                        status = remove_unit(
+                            KIND_MEMBER,
+                            slug,
+                            guard=lambda _directory: still_unclaimed(),
+                            in_hold=lambda: _remove_legacy_activity(slug),
+                        )
+                        reclaim = False
+                    else:
+                        reclaim = outcome == _CLEAN_REMOVED
+            if status in (REMOVE_REMOVED, REMOVE_FAILED) or reclaim:
+                with self._map_lock:
+                    self._logs.pop(slug, None)
+                    self._names.pop(slug, None)
+        return status
 
     # ---- read -------------------------------------------------------------
     def snapshot(self, slug: str) -> dict:

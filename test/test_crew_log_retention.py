@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 from crew_log_type_helpers import minimal_data
@@ -351,7 +352,7 @@ def test_remove_unit_never_follows_a_unit_directory_linked_to_another_unit():
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-attacker") == store.REMOVE_ABSENT
+    assert _remove("s-attacker") == store.REMOVE_LINKED
     assert (victim_dir / "log.jsonl").exists()
     assert CrewLog.exists(lg.KIND_SESSION, "s-victim")
 
@@ -369,7 +370,7 @@ def test_a_unit_directory_linked_outside_the_root_is_refused_by_containment(tmp_
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-outside") == store.REMOVE_ABSENT
+    assert _remove("s-outside") == store.REMOVE_LINKED
     assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "intact"
 
 
@@ -400,7 +401,7 @@ def test_a_linked_unit_directory_never_causes_the_target_to_be_removed():
 
     assert store.sweep_expired(30) == (0, 0)
     assert (stash / "log.jsonl").exists()
-    assert _remove("s-hidden") == store.REMOVE_ABSENT
+    assert _remove("s-hidden") == store.REMOVE_LINKED
     assert (stash / "log.jsonl").exists()
 
 
@@ -1456,3 +1457,78 @@ async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_aga
         assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
     finally:
         emit.reset_caches()
+
+
+def _stage_target(unit_id: str):
+    return (
+        store.crew_log_trash_root() / "batch-1" / "uid-1" / _unit_dir(lg.KIND_SESSION, unit_id).name
+    )
+
+
+def test_staging_syncs_both_parents_after_the_rename(monkeypatch):
+    """A rename is not a move until both directories are on disk."""
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-stage")
+    del log
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-stage").parent
+    target = _stage_target("s-stage")
+    synced: list = []
+    monkeypatch.setattr(atomic_write, "fsync_dir", lambda path, **_k: synced.append(Path(path)))
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-stage", target) == store.REMOVE_REMOVED
+
+    assert target.is_dir()
+    assert target.parent in synced
+    assert source_parent in synced
+
+
+def test_a_sync_that_fails_after_the_rename_puts_the_unit_back(monkeypatch):
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-unsynced")
+    del log
+    target = _stage_target("s-unsynced")
+    calls = {"n": 0}
+    real_rename = os.rename
+
+    def _rename(src, dst):
+        calls["n"] += 1
+        real_rename(src, dst)
+
+    after_rollback: list = []
+
+    def _fsync(path, **_k):
+        if calls["n"] == 1:
+            raise OSError("sync failed")
+        if calls["n"] == 2:
+            after_rollback.append(Path(path))
+
+    monkeypatch.setattr(os, "rename", _rename)
+    monkeypatch.setattr(atomic_write, "fsync_dir", _fsync)
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-unsynced").parent
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-unsynced", target) == store.REMOVE_FAILED
+
+    assert CrewLog.exists(lg.KIND_SESSION, "s-unsynced")
+    assert not target.exists()
+    assert source_parent in after_rollback, "the rollback was not made durable"
+
+
+def test_the_windows_branch_stages_an_idle_unit_and_refuses_a_held_one(monkeypatch):
+    """Windows renames only after releasing the lease; the lease still refuses a holder."""
+    monkeypatch.setattr(store, "_RENAME_UNDER_LEASE", False)
+    idle = _closed_session(unit_id="s-idle")
+    del idle
+    held = _closed_session(unit_id="s-held")
+    held.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-idle", _stage_target("s-idle")) == (
+        store.REMOVE_REMOVED
+    )
+    assert store.stage_unit(lg.KIND_SESSION, "s-held", _stage_target("s-held")) == (
+        store.REMOVE_OWNED
+    )
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-idle")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-held")
+    del held

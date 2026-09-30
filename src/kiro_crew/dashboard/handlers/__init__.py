@@ -239,6 +239,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_apply,
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
+    api_mcp_gateway_server_launch,
     api_mcp_gateway_servers,
     api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
@@ -257,14 +258,12 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
 )
-from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
-    api_mcp_apps_call,
-)
 
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
     api_member_briefing,
+    api_member_projections,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -382,6 +381,12 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_webex_config_save,
     api_wecom_config_get,
     api_wecom_config_save,
+)
+
+# ── Rendered slides for the file panel (handlers/office_slides.py) ──
+from kiro_crew.dashboard.handlers.office_slides import (  # noqa: E402, F401
+    api_file_office_slide,
+    api_file_office_slides,
 )
 from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     MAX_PROMPT_BYTES,
@@ -526,6 +531,15 @@ from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
     api_teams_list,
     api_teams_update,
 )
+
+# ── MCP Apps message/call endpoints (handlers/mcp_apps.py) ──
+# DELIBERATELY NOT IMPORTED HERE. MCP Apps are feature-gated behind
+# ``mcp_gateway.apps_enabled``, and the module imports the gateway backend at
+# module scope — an eager import here would put the entire optional gateway
+# subsystem on the dashboard boot path, which ``no-new-work-on-gateway-boot-path``
+# clause 5 forbids ("gate the import, not just the handler"). ``server._deferred``
+# binds the two routes at boot and imports this module on the first request,
+# exactly as the work_ledger and session-control routes do.
 
 
 # ── Durable task queue + capacity view (handlers/tasks.py) ──
@@ -999,6 +1013,13 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     index,
     logo,
     pwa_file,
+)
+
+# Credential-redaction switch — owner-gated, and the ONLY writer of
+# ``credential_redaction.json`` (see ``security.redaction_switch``).
+from kiro_crew.dashboard.handlers.credential_redaction import (  # noqa: E402, F401
+    api_credential_redaction_get,
+    api_credential_redaction_put,
 )
 
 # Decision seam — the operator's switch for sending conversation state to Jev

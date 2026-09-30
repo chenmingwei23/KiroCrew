@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import functools
+import hashlib
+import json
 import logging
 import os
 import re
@@ -31,6 +32,9 @@ from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.agent_discovery import (
     AgentsDirMemo,
     AmbiguousAgentSpecError,
+    SensitiveAgentSpecPathError,
+    _SpecReadRefused,
+    plain_markdown_document,
     read_agent_spec_strict,
     spec_by_declared_name,
 )
@@ -64,25 +68,29 @@ from kiro_crew.history import (
     SEARCH_MIN_CHARS,
     ConversationLog,
     HistoryLockTimeout,
+    TranscriptBusy,
+    TranscriptWithheld,
     _archive_dir,
-    is_incognito_transcript,
     transcript_lock_stems,
     transcript_stem,
     transcript_stems,
+    transcript_withholds_derivation,
 )
+from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
+from kiro_crew.label_guard import PROSE_OPENERS, is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
-from kiro_crew.pinned_fs import open_fenced_for_read
+from kiro_crew.platform import redact_log_via_context
+from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.runtime_ownership import release_session_lease
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
-    create_subprocess_limited,
     scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import (
-    is_sensitive_canonical_path,
     redact,
     redact_credentials,
     redact_exfiltration_urls,
@@ -148,6 +156,61 @@ def _empty_health_payload() -> dict[str, Any]:
     }
 
 
+async def refresh_session_health(state: Any) -> dict[str, Any]:
+    """Recompute the cached session-health verdict, and signal a change.
+
+    The one owner of both the cache and :data:`session_health.SESSION_HEALTH_EVENT`.
+    ``GET /api/sessions/health`` calls it to serve a request; the WS driver
+    (``dashboard/ws.py``) calls it on a timer so a verdict that moves with the
+    CLOCK -- a turn crossing the stall threshold, a queue draining -- is noticed
+    while nobody is polling. Both share the ``_HEALTH_REFRESH_SECS`` gate and the
+    single-flight lock, so N callers still cost at most one computation per
+    interval.
+
+    Returns the cached payload. Never raises: a failed computation logs, marks the
+    attempt so it is not retried per request, and leaves the previous value (or
+    the empty shape) in place.
+
+    Must be awaited ON the loop: the state snapshot walks live slot objects and
+    the signal touches WebSocket clients.
+    """
+    global _health_cache, _health_cache_ts
+    now = time.monotonic()
+    if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
+        async with _health_lock:
+            # Re-check after acquiring lock (another request may have refreshed)
+            if time.monotonic() - _health_cache_ts > _HEALTH_REFRESH_SECS:
+                try:
+                    from kiro_crew.dashboard import session_health
+
+                    # ``state`` is a MagicMock in much of the suite: a missing
+                    # ``state`` yields an empty snapshot, and a store that is not
+                    # a real TaskStore fails its first read inside the
+                    # computation and reads as "unavailable" -- never an error.
+                    taskq = getattr(getattr(state, "subagents", None), "_taskq", None)
+                    snapshot = session_health.snapshot_state(state)
+                    computed = await asyncio.to_thread(
+                        session_health.compute_session_health,
+                        None,
+                        taskq=taskq,
+                        monitor=None,
+                        snapshot=snapshot,
+                    )
+                    _health_cache = computed
+                    _health_cache_ts = time.monotonic()
+                    # Back on the loop: publish only when the VERDICT moved, so a
+                    # subscriber that cannot read this endpoint still learns when
+                    # to refresh what it can read. Signal only -- no session data.
+                    session_health.publish_health_change(state, computed)
+                except Exception:
+                    logger.warning("session_health computation failed", exc_info=True)
+                    _health_cache_ts = time.monotonic()
+    payload = _empty_health_payload()
+    if isinstance(_health_cache, dict):
+        payload.update(_health_cache)
+    return payload
+
+
 async def api_sessions_health(request: web.Request) -> web.Response:
     """GET /api/sessions/health — structured session health.
 
@@ -160,39 +223,11 @@ async def api_sessions_health(request: web.Request) -> web.Response:
     The slot snapshot is taken ON the loop (it walks live slot objects), the
     classification, store read and log tail run off it. Cached for
     ``_HEALTH_REFRESH_SECS`` so a busy dashboard cannot turn this into a
-    per-request SQLite + file scan.
+    per-request SQLite + file scan. The computation itself lives in
+    :func:`refresh_session_health`, shared with the WS refresh driver.
     """
-    global _health_cache, _health_cache_ts
-    now = time.monotonic()
-    if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
-        async with _health_lock:
-            # Re-check after acquiring lock (another request may have refreshed)
-            if time.monotonic() - _health_cache_ts > _HEALTH_REFRESH_SECS:
-                try:
-                    from kiro_crew.dashboard import session_health
-
-                    # ``request.app`` is a MagicMock in much of the suite: a
-                    # missing ``state`` yields an empty snapshot, and a store that
-                    # is not a real TaskStore fails its first read inside the
-                    # computation and reads as "unavailable" -- never an error.
-                    state = request.app.get("state") if hasattr(request.app, "get") else None
-                    taskq = getattr(getattr(state, "subagents", None), "_taskq", None)
-                    snapshot = session_health.snapshot_state(state)
-                    _health_cache = await asyncio.to_thread(
-                        session_health.compute_session_health,
-                        None,
-                        taskq=taskq,
-                        monitor=None,
-                        snapshot=snapshot,
-                    )
-                    _health_cache_ts = time.monotonic()
-                except Exception:
-                    logger.warning("session_health computation failed", exc_info=True)
-                    _health_cache_ts = time.monotonic()
-    payload = _empty_health_payload()
-    if isinstance(_health_cache, dict):
-        payload.update(_health_cache)
-    return web.json_response(payload)
+    state = request.app.get("state") if hasattr(request.app, "get") else None
+    return web.json_response(await refresh_session_health(state))
 
 
 _usage_cache: dict[str, object] = {}
@@ -778,8 +813,10 @@ async def _fetch_whoami_or_none(kiro_bin: str) -> dict[str, object] | None:
             subprocess_executor(), _wrap_argv_whoami, kiro_bin
         )
         argv = cgroup_scope_argv(argv)
-        proc = await create_subprocess_limited(
-            *argv,
+        # Supervised so the call ends what it leaves behind (see
+        # spawn_supervised_oneshot).
+        proc = await spawn_supervised_oneshot(
+            argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=scrub_agent_subprocess_env(),
@@ -811,8 +848,7 @@ async def _fetch_whoami_or_none(kiro_bin: str) -> dict[str, object] | None:
     finally:
         if proc is not None and proc.returncode is None:
             try:
-                proc.kill()
-                await asyncio.wait_for(proc.wait(), timeout=5)
+                await kill_and_reap(proc, timeout=5)
             except Exception:
                 pass
         if cleanup:
@@ -936,9 +972,10 @@ async def _fetch_usage_bg() -> str | None:
     async def _reap_scrape_proc() -> None:
         """Kill and reap the ``/usage`` scrape child, once, if it is still running.
 
-        kill() is non-blocking; the wait is what closes the asyncio transport
-        and pipe FDs (otherwise they leak, and this runs on a timer), bounded
-        so a wedged process cannot reintroduce the unbounded hang. Idempotent:
+        ``kill_and_reap`` kills the whole group, then reaps through a draining
+        ``communicate()``: that is what closes the asyncio transport and pipe FDs
+        (otherwise they leak, and this runs on a timer), bounded so a wedged
+        process cannot reintroduce the unbounded hang. Idempotent:
         the handle is dropped once reaped, so the ``finally`` below has nothing
         left to do after a handler already reaped it.
         """
@@ -949,8 +986,7 @@ async def _fetch_usage_bg() -> str | None:
         if child.returncode is not None:
             return
         try:
-            child.kill()
-            await asyncio.wait_for(child.wait(), timeout=5)
+            await kill_and_reap(child, timeout=5)
         except Exception:
             pass
 
@@ -1121,8 +1157,8 @@ async def _fetch_usage_bg() -> str | None:
         # returns, before anything is parsed. Only a pair that proves the same
         # account may label and publish what came back between them.
         before = (await _adjacent_identity()) or {}
-        proc = await create_subprocess_limited(
-            *argv,
+        proc = await spawn_supervised_oneshot(
+            argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=scrub_agent_subprocess_env(),
@@ -1529,6 +1565,44 @@ _SUMMARIZE_MSG_LIMIT = 12  # messages fed to the summarizer per session
 _SUMMARIZE_TIMEOUT_SECS = (
     30  # per-session deadline so one stalled prompt can't pin the shared _bg session
 )
+# Prose ceilings for the refusal guard, scaled to this prompt's 18-word contract
+# the way the title's ceilings (12 words / 24 chars) sit above its 3-6 word
+# contract: a legitimate long summary clears them, a refusal paragraph does not.
+_SUMMARIZE_PROSE_MAX_WORDS = 36
+_SUMMARIZE_PROSE_MAX_UNSPACED_CHARS = 72
+# A summary DESCRIBES the conversation, so the openers that mark a title reply
+# as narration ("the conversation covers ...", "based on the transcript ...")
+# are its legitimate shape here; the refusal openers stay. Likewise the
+# sentence-shape signals (a mid-line terminator, a Korean polite ending) tell a
+# name from a sentence and cannot tell a summary from a refusal, so the guard
+# runs without them on this path -- a false positive here is not free: the
+# summary is lost AND the model is re-asked on every later list until the
+# transcript changes, because "" is never cached.
+_SUMMARIZE_NARRATION_PREFIXES = ("the conversation", "this conversation", "based on the")
+_SUMMARIZE_PROSE_OPENERS = tuple(
+    opener for opener in PROSE_OPENERS if opener not in _SUMMARIZE_NARRATION_PREFIXES
+)
+# The exemption above is for the AFFIRMATIVE summary shape only. A refusal can
+# open the same way ("The conversation is too vague to summarize", "Based on
+# the transcript, I cannot determine a topic"), so a line that starts with one
+# of the exempted prefixes is still rejected when a refusal marker follows.
+_SUMMARIZE_REFUSAL_MARKERS = re.compile(
+    r"\b(?:cannot|can't|can not|unable|too (?:vague|short|brief|little)|not enough"
+    r"|insufficient|unclear|no clear|nothing to summari[sz]e|not possible"
+    r"|do(?:es)? not (?:contain|provide|have|include)|doesn't (?:contain|provide|have|include)"
+    r"|don't have|i need|would need)\b",
+    re.IGNORECASE,
+)
+
+
+def _summary_is_narrated_refusal(summary: str) -> bool:
+    """True for a refusal that opens with an exempted narration prefix."""
+    lowered = summary.strip().lower()
+    return lowered.startswith(_SUMMARIZE_NARRATION_PREFIXES) and bool(
+        _SUMMARIZE_REFUSAL_MARKERS.search(lowered)
+    )
+
+
 _SUMMARIZE_PROMPT = (
     "Summarize the following conversation in ONE terse line (max 18 words), "
     "describing what the user and assistant are working on. No preamble, no "
@@ -1564,14 +1638,27 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     if not log:
         return ""
     loop = asyncio.get_running_loop()
-    # get_metadata + recent do synchronous full-file reads (read_text + per-line
-    # JSON parse, up to 2MB). Offload to the executor so a batch of large session
-    # files never freezes the gateway event loop — mirrors api_sessions above.
-    meta = await loop.run_in_executor(None, log.get_metadata, key)
-    # Defense in depth: never summarize an incognito/temporary session even if a
-    # caller somehow passes its key.
-    if is_incognito_transcript(meta.get("memory_mode")):
+
+    def _read_cache_if_derivation_is_allowed() -> tuple[str | None, bool]:
+        # The sidecar is derived from the transcript. Hold the same physical
+        # lock as metadata writers while validating the line and reading the
+        # cache, so a same-key restricted recreation cannot leave a stale
+        # persistent summary readable. Unreadable fails closed.
+        with log.derivation_hold(transcript_lock_stems(key)):
+            if transcript_withholds_derivation(log, key):
+                return None, False
+            return log.get_cached_summary(key), True
+
+    try:
+        cached, derivation_allowed = await loop.run_in_executor(
+            None, _read_cache_if_derivation_is_allowed
+        )
+    except TranscriptBusy:
         return ""
+    if not derivation_allowed:
+        return ""
+    if cached:
+        return str(cached)
     # Cache: a summary persisted in a sidecar file is reusable as long as the
     # session file hasn't changed since it was generated. session_mtime advances
     # only on real message appends (preserved across metadata writes), so it is a
@@ -1584,15 +1671,23 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     # preserves the mtime while advancing this counter, and stamping the new
     # content identity onto the older summary would bless it as fresh.
     generation = await loop.run_in_executor(None, log.rotation_generation, key)
-    cached = await loop.run_in_executor(None, log.get_cached_summary, key)
-    if cached:
-        return str(cached)
-    messages = await loop.run_in_executor(
-        None,
-        functools.partial(
-            log.recent, key, max_messages=_SUMMARIZE_MSG_LIMIT, roles={"user", "assistant"}
-        ),
-    )
+    # Through the DERIVATION seam, not the plain ``recent``: the line checked
+    # above is a snapshot, and a writer can tighten it before the rows are read
+    # (a same-key hand-over landing a closed restricted tab's rows). The seam
+    # validates the line with the rows under one lock hold and raises instead of
+    # yielding rows a restricted (or unreadable) line governs.
+    try:
+        messages = await loop.run_in_executor(
+            None,
+            functools.partial(
+                log.derive_recent,
+                key,
+                max_messages=_SUMMARIZE_MSG_LIMIT,
+                roles={"user", "assistant"},
+            ),
+        )
+    except TranscriptWithheld:
+        return ""
     prompt = _build_summary_prompt(messages)
     if not prompt:
         return ""
@@ -1603,22 +1698,52 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     except Exception:
         logger.debug("Session summary generation failed for %s", key, exc_info=True)
         return ""
-    summary = text.strip().strip('"').strip("'").strip(".")
-    if not summary or summary.upper() == "SKIP":
+    # First line only: the prompt asks for ONE line, and a verdict followed by
+    # an explanation ("SKIP\n\nThe topic is unclear.") must reduce to the bare
+    # verdict rather than pass the checks below as a five-word "summary".
+    summary = text.strip().split("\n", 1)[0].strip().strip('"').strip("'").strip(".")
+    if not summary or is_verdict_reply(summary, ("SKIP",)):
         return ""
     summary, _ = redact_exfiltration_urls(summary)
     summary, _ = redact_credentials(summary)
+    if _summary_is_narrated_refusal(summary) or looks_like_prose(
+        summary,
+        max_words=_SUMMARIZE_PROSE_MAX_WORDS,
+        max_unspaced_chars=_SUMMARIZE_PROSE_MAX_UNSPACED_CHARS,
+        openers=_SUMMARIZE_PROSE_OPENERS,
+        sentence_shape=False,
+    ):
+        # The model refused or narrated instead of summarizing. Return "" so the
+        # caller falls back to the stored title, and -- crucially -- do NOT reach
+        # the sidecar write below: a cached refusal would be served on every
+        # later list until the transcript changes.
+        logger.info("Session summary reply is prose, discarding for %s", key)
+        return ""
     summary = summary[:200]
-    # Persist for reuse in a sidecar cache (best-effort; keyed by the mtime we
-    # observed above so a concurrent append invalidates it on the next call).
-    # Writing the sidecar never touches the session JSONL, so it cannot race a
-    # concurrent append or reorder list_sessions.
+    # Revalidate only after the model call has returned: model latency must never
+    # block a transcript writer. Keep the hold through the sidecar write so a
+    # same-key tightening cannot land between the privacy check and publication.
     if sig is not None:
+
+        def _publish_if_derivation_is_allowed() -> None:
+            with log.publication_hold(key):
+                log.set_cached_summary(key, summary, sig, generation)
+
         try:
-            await loop.run_in_executor(
-                None,
-                functools.partial(log.set_cached_summary, key, summary, sig, generation),
+            await loop.run_in_executor(None, _publish_if_derivation_is_allowed)
+        except TranscriptBusy:
+            logger.debug(
+                "Summary for %s withheld: the transcript lock was busy at publication",
+                key,
             )
+            return ""
+        except TranscriptWithheld:
+            logger.debug(
+                "Discarding summary for %s: the transcript became restricted "
+                "during summarisation",
+                key,
+            )
+            return ""
         except Exception:
             logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
     return summary
@@ -2590,9 +2715,25 @@ def _exclude_slot_units(
         sid = _live_slot_sid(state, slot_key)
         return "" if sid == (claim.acp_session_id or "") else sid
 
+    def listed_units() -> "tuple[str, ...]":
+        """Every unit whose header names the slot; refuses when that cannot be complete.
+
+        An established unit left out because its header would not read stays foldable
+        by the next session on the recycled slot key, so a short listing is no listing.
+        A crew-log store never created holds no units.
+        """
+        try:
+            return session_units_for_slot(slot_key, strict=True)
+        except FileNotFoundError:
+            return ()
+        except Exception as exc:
+            raise session_ledger.LedgerExclusionError(
+                f"slot {slot_key!r}'s crew logs could not all be listed"
+            ) from exc
+
     prove_generation()
     protect = live_unit()
-    units = tuple(unit for unit in session_units_for_slot(slot_key) if unit != protect)
+    units = tuple(unit for unit in listed_units() if unit != protect)
     # Re-read, in this order: the live unit first, so a successor that has recorded but
     # whose generation this thread has not observed yet is still dropped, then the
     # generation as the LAST thing before the write.
@@ -2915,70 +3056,67 @@ async def _remove_slot_for_history_key(
     # scan, so deleting those sidecars cannot be made atomic here. Preserve them:
     # stale state is reversible, while deleting a successor's state is not.
 
-    # The append-only SESSION LEDGER is not one of those sidecars, and the
-    # difference is mechanical rather than a re-reading of the rule above. What
-    # makes a work ledger unsafe to delete here is that its identity is the SLOT
-    # KEY, which is recycled -- a successor tab in the same slot legitimately
-    # inherits and resumes that record, and no check here can prove one is not
-    # about to. A session's log is keyed by the ACP SESSION ID, which never
-    # names a different conversation, so removing it cannot reach a successor's
-    # state.
+    # The append-only CREW LOG is not one of those sidecars, and the difference is
+    # mechanical rather than a re-reading of the rule above. A work ledger's identity
+    # is the SLOT KEY, which is recycled, so no check here can prove a successor is not
+    # about to inherit it. A crew-log unit is keyed by the ACP SESSION ID, and its
+    # header -- written once inside the fenced tree -- names the slot it ran on, so the
+    # units of THIS conversation can be told apart from anyone else's.
     #
-    # Gated on the teardown having SUCCEEDED, not merely on having been
-    # attempted. ``destroy_if`` refuses when the session was replaced by a
-    # successor generation, is busy, or still has a live slot owner -- and in each
-    # of those cases the session it names is preserved and may be writing right
-    # now, so removing its crew log would take a live conversation's log. The write
-    # lease is not a substitute for this check: ownership ends BETWEEN turns by
-    # design, so an idle-but-live session holds nothing for the removal to be
-    # refused by. A refused teardown therefore leaves the crew log alone and the
-    # retention sweep collects it once the session is genuinely closed.
+    # A conversation owns one unit per ACP id it ran under: a reset, an agent or model
+    # switch and a provider swap each start a new one. Which of them this delete takes
+    # depends on what the claim proved.
     #
-    # Only an id this claim PROVED is used -- captured pre-unlink, dropped on every
-    # path that disowned the slot -- so an unresolvable one removes nothing.
-    if session_destroyed and claim.acp_session_id:
-        # A key still mapping to this session id VETOES the removal. The unit is
-        # keyed by the ACP id, so a second key pointing at that id shares this very
-        # crew log, and the teardown above removed only ONE mapping -- the other holder
-        # can still resume, and its log is still needed. Two keys on one sid is a
-        # state the system itself produces: importing a transferred session twice
-        # allocates a new slot key each time and deliberately leaves the source
-        # intact (see dashboard/session_transfer.py). Reading the map to WITHHOLD a
-        # deletion is safe in the way reading it to authorize one is not -- a forged
-        # or emptied map can only make this keep more than it must.
-        try:
-            retained_key = state.sessions.find_key_by_sid(claim.acp_session_id)
-        except Exception:
-            # An unreadable map is not evidence that nothing else maps this id.
-            retained_key = "<unreadable session map>"
-        if retained_key is not None:
-            logger.info(
-                "History delete: session id for %s is still mapped; leaving its crew log "
-                "to retention",
-                key,
+    # * A delete that tore down a slot takes the units the locked transaction excluded
+    #   before the unlink (generation-proved, so never a successor's), plus the
+    #   conversation's own unit only when the teardown SUCCEEDED: ``destroy_if``
+    #   refuses for a replaced, busy or still-owned session, and that session may be
+    #   writing right now. The write lease is no substitute, because ownership ends
+    #   BETWEEN turns by design.
+    # * A row with no open slot takes none. Its claim proves no unit id, and the slot
+    #   key its headers name is recyclable: another conversation that reused it
+    #   leaves superseded units the session map does not name, which a header
+    #   match alone would hand to this delete. They are left to retention.
+    crew_log_slots = {
+        key,
+        transcript_stem(key),
+        key.removeprefix("dashboard:"),
+        *_history_delete_candidate_keys(key),
+    }
+    crew_log_units: frozenset[str] = frozenset()
+    if slot is not None:
+        crew_log_slots.update(
+            spelling
+            for spelling in (
+                getattr(claim.slot, "key", None),
+                claim.session_key,
             )
+            if isinstance(spelling, str) and spelling
+        )
+        proved = set(claim.ledger_excluded_units)
+        own = claim.acp_session_id or ""
+        if session_destroyed and own:
+            proved.add(own)
         else:
-            # Every slot spelling this delete established for itself. The removal
-            # requires the unit's own header to name one of them, because the id
-            # above came from ``session_map.json`` -- inside the agent-visible tree --
-            # while the header is written once inside the fenced crew log tree and
-            # never rewritten. A mapping that named another conversation's session
-            # would aim this removal at that conversation's crew log; its header would
-            # not name this slot. The candidate spellings are included beside the
-            # live slot key so a legacy spelling of the same slot is not read as a
-            # different one.
-            proven_slots = frozenset(
-                spelling
-                for spelling in (
-                    getattr(claim.slot, "key", None),
-                    claim.session_key,
-                    *_history_delete_candidate_keys(key),
-                )
-                if isinstance(spelling, str) and spelling
+            proved.discard(own)
+        crew_log_units = frozenset(proved)
+    if crew_log_units:
+        spellings = frozenset(crew_log_slots)
+
+        def live_units() -> "frozenset[str]":
+            return _live_session_units(state) | frozenset(
+                sid for spelling in spellings if (sid := _live_slot_sid(state, spelling))
             )
-            await asyncio.to_thread(
-                _remove_session_crew_log, claim.acp_session_id, key, proven_slots
-            )
+
+        await asyncio.to_thread(
+            _remove_session_crew_logs,
+            state.sessions,
+            key,
+            spellings,
+            crew_log_units,
+            live_units(),
+            live_units=live_units,
+        )
 
     # Cron ownership is different from the independent sidecars above: every key
     # here came from the strict store scan or from linked_session_key while the
@@ -3022,124 +3160,219 @@ async def _remove_slot_for_history_key(
 _CREW_LOG_TEARDOWN_FLUSH_SECONDS = 2.0
 
 
-def _remove_session_crew_log(
-    session_id: str, history_key: str, proven_slots: "frozenset[str]"
+def _live_session_units(state: DashboardState) -> "frozenset[str]":
+    """The crew-log unit of every session the manager is running now. Never raises."""
+    from kiro_crew.crew_log.resolve import unit_for_session_key
+
+    units: set[str] = set()
+    try:
+        keys = tuple(state.sessions.session_keys())
+    except Exception:
+        logger.debug("History delete: running sessions unreadable", exc_info=True)
+        return frozenset()
+    for session_key in keys:
+        try:
+            unit = unit_for_session_key(state.sessions, session_key)
+        except Exception:
+            continue
+        if isinstance(unit, str) and unit:
+            units.add(unit)
+    return frozenset(units)
+
+
+def _remove_session_crew_logs(
+    sessions: Any,
+    history_key: str,
+    slots: "frozenset[str]",
+    proved: "frozenset[str]",
+    protected: "frozenset[str]",
+    *,
+    live_units: "Callable[[], frozenset[str]] | None" = None,
 ) -> None:
-    """Remove the append-only crew log of *session_id*. Never raises.
+    """Remove the crew-log units of a deleted conversation. Never raises.
 
-    Imported lazily: this handler module is loaded on every startup while the
-    crew log store is only reachable behind ``KIROCREW_CREW_LOG``, so a
-    launch without the flag should not pay for the import.
+    A unit is a candidate when its HEADER names one of *slots* -- the header is written
+    once inside the fenced crew-log tree and never rewritten, so it does not move when
+    ``session_map.json`` (agent-visible) does -- and it is one of the *proved* ids. It is then kept when:
 
-    *proven_slots* is every slot spelling this delete established for itself, and
-    the unit's own HEADER has to name one of them. The id alone is not enough,
-    because it arrives from ``session_map.json`` -- a file inside the agent-visible
-    tree -- so a mapping that named another conversation's session would aim this
-    removal at that conversation's crew log. The header is the independent answer: it
-    is written once at creation inside the fenced crew log tree and never rewritten,
-    so it does not move when a mapping does, and a unit belonging to another slot
-    fails the check. Slot recycling does not weaken it, because the id is what
-    selects the unit and the slot only has to prove the unit belonged to the slot
-    being deleted.
+    * *protected* names it: a live slot or a running session serves it now;
+    * a session-map key of another conversation still maps it, or the map cannot be
+      read: that holder can resume, and its log is still needed. A key is this
+      conversation's when its transcript is the one this delete removed;
+    * a writer holds its lease;
+    * *live_units*, re-read under that lease just before the removal, names it. The
+      *protected* snapshot is taken before the selection, and a same-key resume after
+      it maps the unit back to this row's own key, which the map check accepts, while
+      the lease is free between turns. Only a fresh read of what is running now tells
+      that unit apart from a finished one. A read that fails keeps the unit.
 
-    A header that cannot be proved -- unreadable, or carrying no slot, which is the
-    case for a session that never ran on a dashboard slot -- removes NOTHING and
-    leaves the unit to the retention sweep, which collects it on age once its close
-    has landed.
+    Every unit taken is excluded from its slot's ledger fold first, so a later session
+    on the same recycled slot key cannot read the deleted conversation's state out of a
+    unit whose removal failed. That exclusion is given back only for a unit kept because
+    it is someone else's (the map, the trash hold or a live session); a unit of this
+    conversation that could not be removed keeps it and is left to the retention sweep.
 
-    Best-effort, like every other step of this teardown. The transcript row is
-    already gone by the time this runs, so raising would turn a crew log that could
-    not be collected into a failed delete the user has to retry against a row that
-    is absent -- and the retention sweep collects it on age regardless.
-    ``owned`` is the ordinary answer when a queued write still holds the lease,
-    and it is not an error: that pass simply does nothing.
+    Best-effort, like every other step of this teardown: the transcript row is already
+    gone, so raising would turn a crew log that could not be collected into a failed
+    delete the user has to retry against a row that is absent.
     """
+    from kiro_crew import session_ledger
+
     try:
         from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log import store as crew_log_store
         from kiro_crew.crew_log.schema import KIND_SESSION
-        from kiro_crew.crew_log.store import (
-            REMOVE_REMOVED,
-            remove_unit,
-            unit_header_slot,
-        )
 
-        # LET THE TEARDOWN ENTRY LAND FIRST, and not as a courtesy: until it does,
-        # this removal cannot succeed at all. ``destroy`` -- the teardown checked
-        # above -- writes ``session/closed`` through the emitter's own thread, and
-        # the emitter releases this session's cached handle, with the write lease
-        # that handle carries, only once that entry lands. A removal claiming the
-        # lease ``sole`` is refused while the handle is held, so without this
-        # barrier the funnel answers ``owned`` for every session the gateway
-        # actually emitted for. Measured directly: a crew log opened through the
-        # emitter answers ``owned``, and ``removed`` only after its close lands.
-        #
-        # A timeout is not a failure and is not treated as one. The entry stays
-        # owed, so the unit becomes collectable by the retention sweep -- which
-        # needs that same close, since a unit whose newest lifecycle entry is not
-        # a close reads as OPEN whatever its age. This pass simply does nothing.
+        # LET THE TEARDOWN ENTRY LAND FIRST: the emitter releases a session's cached
+        # handle, and the write lease that handle carries, only once its close lands.
+        # A timeout is not a failure; the unit is then ``owned`` and left to retention.
         crew_log_emit.flush(timeout=_CREW_LOG_TEARDOWN_FLUSH_SECONDS)
+        by_slot = crew_log_store.session_units_by_slot()
+    except Exception:
+        logger.warning(
+            "History delete: could not list the crew logs of %s", history_key, exc_info=True
+        )
+        return
 
-        header_slot = unit_header_slot(KIND_SESSION, session_id)
-        if header_slot is None or header_slot not in proven_slots:
-            logger.info(
-                "History delete: the session's log for %s names slot %r, which this "
-                "delete did not prove; leaving it to retention",
+    own_stems = set(transcript_stems(history_key)) | {transcript_stem(history_key)}
+
+    def own(mapped: str) -> bool:
+        return transcript_stem(mapped) in own_stems
+
+    def mapped_elsewhere(unit: str) -> bool:
+        try:
+            first = sessions.find_key_by_sid(unit)
+            if first is None:
+                return False
+            if not own(first):
+                return True
+            other = sessions.find_key_by_sid(unit, exclude=first)
+        except Exception:
+            return True
+        return other is not None and not own(other)
+
+    taken: dict[str, list[str]] = {}
+    for slot_key in sorted(slots):
+        for unit in by_slot.get(slot_key, ()):
+            if unit not in proved:
+                continue
+            if unit in protected or mapped_elsewhere(unit):
+                continue
+            taken.setdefault(slot_key, []).append(unit)
+    if not taken:
+        return
+    # What THIS transaction added, per slot: the only exclusions it may take back. A
+    # unit a concurrent delete already excluded is that delete's to keep.
+    added: dict[str, set[str]] = {}
+
+    def give_back(slot_key: str, units: "set[str]") -> None:
+        """Undo this transaction's exclusion of *units*: they stay, so they stay foldable."""
+        mine = tuple(sorted(units & added.get(slot_key, set())))
+        if not mine:
+            return
+        try:
+            session_ledger.unexclude_units(slot_key, mine)
+        except Exception:
+            logger.error(
+                "History delete: crew log(s) %s of %s were kept but stay excluded from slot "
+                "%r's ledger record; restore them by hand in the slot's control directory",
+                ", ".join(mine),
                 history_key,
-                header_slot,
+                slot_key,
+                exc_info=True,
             )
             return
+        added[slot_key] -= set(mine)
 
-        # Every OTHER unit of this slot is excluded from the ledger fold before this
-        # one is removed. A slot accumulates one unit per reset, this funnel removes
-        # only the conversation's own, and the survivors stay readable -- so a fresh
-        # session on the same recycled slot key would fold them and read a deleted
-        # conversation's goal and phase. The slot's OTHER units are excluded before the
-        # transcript is unlinked, under the delete's own lock and against its captured
-        # generation; this stage runs after the unlink, where a rescan by the recyclable
-        # slot key could pick up a successor's unit and hide a live conversation's
-        # record for good. So only THIS conversation's unit is excluded here -- the one
-        # the header check above just proved belongs to the proved slot.
-        from kiro_crew import session_ledger
-
-        session_ledger.exclude_units(header_slot, (session_id,))
-
-        # Accept-all guard, deliberately. The sweep's guard re-reads the crew log
-        # because ITS reason is a property of the file -- an age it sampled outside
-        # the lease. This caller's reason is not in the file at all: the session
-        # this crew log belongs to was destroyed by the teardown above, which is
-        # checked before this runs, and the header check above already proved the
-        # unit is this slot's. Re-reading the age here would answer a question
-        # nobody asked, and a close entry still queued behind the teardown would
-        # make the honest answer "not closed" and skip a crew log whose session is
-        # gone.
-        status = remove_unit(KIND_SESSION, session_id, guard=lambda _dir: True)
+    try:
+        for slot_key, units in taken.items():
+            recorded = session_ledger.exclude_units(slot_key, tuple(units))
+            added[slot_key] = set(getattr(recorded, "added", ()) or ())
     except session_ledger.LedgerExclusionError:
-        # The exclusion is what stops a later session on this recycled slot key from
-        # folding the units this delete leaves behind. Without it the removal is
-        # refused outright: the conversation stays visible and can be deleted again,
-        # whereas its state showing up in a stranger's session cannot be undone.
         logger.error(
-            "History delete: refusing to remove the session's log for %s -- slot %r's "
-            "surviving units could not be excluded from its ledger record",
+            "History delete: refusing to remove the crew logs of %s -- their slot's ledger "
+            "exclusion could not be recorded",
             history_key,
-            header_slot,
         )
+        for slot_key, recorded_units in list(added.items()):
+            give_back(slot_key, set(recorded_units))
         return
     except Exception:
         logger.warning(
-            "History delete: could not remove the session's log for %s",
-            history_key,
-            exc_info=True,
+            "History delete: could not exclude the crew logs of %s", history_key, exc_info=True
         )
+        for slot_key, recorded_units in list(added.items()):
+            give_back(slot_key, set(recorded_units))
         return
-    if status == REMOVE_REMOVED:
-        logger.info("History delete: removed the session's log for %s", history_key)
-    else:
-        logger.info(
-            "History delete: the session's log for %s not removed (%s); leaving it to retention",
-            history_key,
-            status,
-        )
+
+    removed = 0
+    for slot_key, units in taken.items():
+        # Units this delete leaves in place because they are SOMEONE ELSE'S: mapped to
+        # another conversation, held by the trash for a session awaiting restore, or
+        # served by a session now. Only these get their exclusion back. A unit of this
+        # conversation that could not be removed -- a writer's lease, a failed removal,
+        # an error -- stays excluded, so a later session on the recycled slot key cannot
+        # fold the deleted conversation's state out of it.
+        kept: set[str] = set()
+        for unit in units:
+            # Re-proved here, after the exclusion: a key mapped onto this unit since the
+            # selection makes it another conversation's again, and it must not be taken.
+            if mapped_elsewhere(unit):
+                kept.add(unit)
+                continue
+            refused: list[str] = []
+
+            # The guard runs under the lease and asks two things: whether the trash
+            # holds the unit -- it then belongs to a session still waiting to be
+            # restored, whose slot key this row may reuse -- and whether a session or a
+            # live slot serves it NOW, re-read here rather than taken from the snapshot
+            # the selection used. Whether the unit is closed is not asked: the sole lease
+            # refuses a unit a writer holds, and a gateway restart leaves a finished unit
+            # with no close.
+            def free(directory: Path, unit: str = unit, refused: list[str] = refused) -> bool:
+                if crew_log_store.is_trash_held(directory):
+                    refused.append("held by the trash")
+                    return False
+                if live_units is None:
+                    return True
+                try:
+                    serving = unit in live_units()
+                except Exception:
+                    serving = True
+                if serving:
+                    refused.append("served by a session now")
+                return not serving
+
+            try:
+                status = crew_log_store.remove_unit(KIND_SESSION, unit, guard=free)
+            except Exception:
+                logger.warning(
+                    "History delete: could not remove crew log %r; it stays excluded from "
+                    "slot %r's ledger record and is left to retention",
+                    unit,
+                    slot_key,
+                    exc_info=True,
+                )
+                continue
+            if status == crew_log_store.REMOVE_REMOVED:
+                removed += 1
+            elif refused:
+                kept.add(unit)
+                logger.info(
+                    "History delete: crew log %r of %s kept (%s)", unit, history_key, refused[0]
+                )
+            elif status != crew_log_store.REMOVE_ABSENT:
+                logger.info(
+                    "History delete: crew log %r of %s not removed (%s); it stays excluded "
+                    "from slot %r's ledger record and is left to retention",
+                    unit,
+                    history_key,
+                    status,
+                    slot_key,
+                )
+        give_back(slot_key, kept)
+    if removed:
+        logger.info("History delete: removed %d crew log(s) of %s", removed, history_key)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
@@ -3807,144 +4040,130 @@ class ManagedToolPolicyUnreadable(Exception):
     """
 
 
-# The fence probe's head: a UTF-8 BOM (3 bytes) plus the longest opening fence
-# line (``---\r\n``, 5 bytes) is 8, so 64 leaves the probe nothing to judge but
-# the fence -- which is the point. Never the file's length.
-_FENCE_PROBE_BYTES = 64
+def _spec_failure_kind(path: Path, exc: BaseException) -> str:
+    """WHY *path* failed the strict read, in plain words and with NO path in it.
 
+    Every answer is a PREDICATE phrase -- it reads after "``<file>`` is" and
+    after "could not be read (" alike -- because two templates splice it in.
 
-def _read_head(fd: int, limit: int) -> tuple[bytes, bool]:
-    """The first *limit* bytes of *fd*, and whether the file continues past them.
-
-    Read with ``os.read`` straight off the descriptor, ``limit + 1`` bytes in
-    all: a buffered reader would pull its own 8 KiB block to answer a 64-byte
-    question, and the one extra byte is what tells a file that ENDS inside the
-    head from one that was cut there -- the decode step treats a multibyte
-    sequence broken at the cut as incomplete, and one broken at end-of-file as
-    the parser's own decode failure.
+    The reason this feeds crosses the wire to the MCP client and lands in the
+    model-visible refusal text, so it names the failure class rather than
+    quoting ``str(exc)``: the strict reader's own messages carry the full
+    path (``f"{path}: {exc}"``, the AppleDouble and size-cap arms) and an
+    ``OSError`` carries ``filename``. The classes are the ones
+    :func:`kiro_crew.agent_discovery.read_agent_spec_strict` documents; an
+    unfamiliar one still gets a usable name from its class.
     """
-    data = b""
-    while len(data) <= limit:
-        chunk = os.read(fd, limit + 1 - len(data))
-        if not chunk:
-            break
-        data += chunk
-    return data[:limit], len(data) > limit
+    if path.name.startswith("._"):
+        return "an AppleDouble sidecar, not a spec"
+    if isinstance(exc, json.JSONDecodeError):
+        return "not valid JSON"
+    if isinstance(exc, UnicodeDecodeError):
+        return "not UTF-8 text"
+    if isinstance(exc, SensitiveAgentSpecPathError):
+        return "a path the spec reader refuses"
+    if isinstance(exc, OSError) and isinstance(exc.__cause__, _SpecReadRefused):
+        # The strict reader maps the pinned open's refusal to a generic
+        # ``EACCES``; its ``strerror`` is the reader's own placeholder, which
+        # would only restate "could not be read". The cause says why.
+        return (
+            "not a plain readable file: a link at its name, a hardlinked or "
+            "non-regular inode, or a target the spec reader fences"
+        )
+    if isinstance(exc, OSError):
+        # ``strerror`` is the C library's text ("Permission denied"); the path
+        # lives in ``filename`` and is deliberately left out.
+        return f"unreadable ({exc.strerror or exc.__class__.__name__})"
+    if isinstance(exc.__cause__, hooks.FileTooLargeError):
+        return "larger than the spec size cap"
+    if is_markdown_spec(path):
+        # No causal clause: the parser refuses a closed fence too (frontmatter
+        # that is a list, nested too deeply, a bare ``on:`` key YAML reads as a
+        # bool), so naming one cause would send the operator to check a fence
+        # that is closed. The strict reader's own messages for this family are
+        # path-free, but not every ValueError reaching here is, so the class is
+        # named rather than the text quoted.
+        return "markdown frontmatter the spec parser refuses"
+    return f"not a spec ({exc.__class__.__name__})"
 
 
-def _unc_refused(spelling: str) -> bool:
-    """The Windows UNC trusted-root gate, composed as the strict spec reader composes it.
+def _ambiguous_spec_reason(agent_name: str, exc: AmbiguousAgentSpecError) -> str:
+    """The wire ``reason`` for two specs declaring *agent_name*: names, not paths.
 
-    A UNC path names a HOST: on Windows, resolving or opening one is an outbound
-    SMB connection the path's author controls, so only the shares
-    :func:`kiro_crew.hooks.unc_probe_allowed` names are admitted -- the two
-    predicates ``hooks.validate_file_path`` and the strict spec reader both
-    apply, on the spelling before the resolve and on the resolved target after
-    it. Every other platform answers ``False``.
+    The exception's own message quotes each file's full path for the terminal
+    it was written for; this text reaches the MCP client's model-visible
+    refusal, so it carries the same files by name only (``repr``'d, as
+    untrusted input from a user-writable directory) and the remedy. Falls back
+    to the message when the raiser supplied no paths -- the one other raiser,
+    ``agent.agent_spec_path``, is never reached from here.
     """
+    if not exc.paths:
+        return str(exc)
+    names = ", ".join(repr(path.name) for path in exc.paths)
     return (
-        os.name == "nt" and hooks.is_unc_shape(spelling) and not hooks.unc_probe_allowed(spelling)
+        f"{len(exc.paths)} specs in the agents directory declare the name {agent_name!r}: "
+        f"{names}. Which one is live is undefined, so the policy for {agent_name!r} is "
+        f"unknown. Remove or rename one of them in the agents directory (~/.kiro/agents "
+        f"unless relocated); no restart needed."
     )
 
 
-def _plain_markdown_document(path: Path) -> bool:
-    """Whether *path* is a markdown document with no OPENING frontmatter fence.
+def _unreadable_spec_remedy(path: Path) -> str:
+    """The one sentence an operator can act on, appended to every refusal.
 
-    The rule this repo already applies twice (``connections/ownership.py``,
-    ``agent_discovery.agent_spec_stems``): a plain markdown file dropped into
-    the agents directory -- a README, a shared prompt fragment -- is not a
-    spec. It declares nothing and hides nothing, so it cannot hold any agent's
-    policy.
-
-    Deliberately NOT ``split_markdown_spec(text) is None``: that also folds in
-    a document whose fence OPENS and never closes, which announced itself as a
-    spec and may be a truncated real one -- the guard must keep refusing on
-    those. The probe here is the opening-fence test ``split_markdown_spec``
-    applies first: BOM aside, the document starts with a ``---`` line.
-
-    The answer is ``True`` only for a document PROVEN fence-less: its head
-    decodes as the UTF-8 the strict parser (``parse_agent_spec_bytes``) reads
-    every spec as, and the decoded text does not open with a fence. A head that
-    is not UTF-8 -- a UTF-16 or UTF-32 BOM (``0xFF``/``0xFE`` are never UTF-8
-    bytes), a Latin-1 byte, a file that ends inside a multibyte sequence -- is
-    ``False``: the parser could not decode it, so nothing here can say what
-    fence test the parser would have applied, and a UTF-16-saved spec whose
-    decoded text opens with a fence must keep the refusal rather than have its
-    exclusion list skipped as prose. A multibyte character cut by the 64-byte
-    bound is NOT that case: the head is decoded with ``final=False`` when the
-    file continues past it, so a sequence split at the cut is held back, not
-    raised. A UTF-8 BOM is stripped from the decoded text exactly as the
-    parser strips it.
-
-    The read path is the strict spec reader's own, never
-    :func:`kiro_crew.hooks.validate_file_path`: that gate re-resolves the path
-    on the two-worker ``mc-pathres`` pool and fails closed when the pool misses
-    its budget, and this probe runs on every policy request after the strict
-    reader already refused -- the exact saturation
-    :func:`kiro_crew.agent_discovery.read_agent_spec_strict` was moved off
-    that pool to survive, which would otherwise turn a stray ``.md`` back into
-    a denial of every agent whenever the pool is busy. What this path refuses,
-    and nothing else: a spelling or a resolved target that is a UNC path
-    outside the trusted roots, on Windows, checked before and after the
-    resolve as the strict reader checks it (:func:`_unc_refused`); a
-    spelling ``Path.resolve(strict=True)`` cannot canonicalise (absent, broken
-    or looping link, permission) -- a link at the name is otherwise FOLLOWED,
-    as the strict reader follows it, and its target is what is judged; a
-    resolved path :func:`kiro_crew.security.is_sensitive_canonical_path`
-    fences, the gate that submits nothing to the pool off the event loop (this
-    runs under ``asyncio.to_thread``); and, from
-    :func:`kiro_crew.pinned_fs.open_fenced_for_read`, a link at the final
-    component of the RESOLVED path (the re-point window between the resolve
-    and the open), a hardlinked or non-regular inode, an inode whose kernel
-    path cannot be read back, and an opened inode whose kernel path differs
-    from the judged one and is itself fenced. Size is not judged (below), and
-    no SEL row is written here: the strict reader already audited any
-    sensitive-target denial for this path.
-
-    The read is BOUNDED at ``_FENCE_PROBE_BYTES`` through :func:`_read_head`:
-    the strict reader refuses an oversize file AT the cap precisely so it is
-    never slurped into memory, and an unbounded re-read here would hand the
-    loop an attacker-sized allocation whose ``MemoryError`` escapes every
-    fail-closed arm. The fence test needs only the first bytes (a BOM plus one
-    ``---`` line), so 64 is generous, and an over-cap plain document is still
-    skipped: the probe judges its opening, not its length.
-
-    Every failure -- unresolvable, a refused open, an unreadable descriptor, an
-    undecodable or NUL-bearing head -- is ``False``, because the caller is
-    deciding whether to SKIP a file its strict reader already refused, and a
-    file that cannot even be probed is unknown, not ignorable: fail closed,
-    the guard keeps raising.
+    The filename is ``repr``'d: it is untrusted input from a user-writable,
+    tool-shared directory and this text reaches a terminal and the model. The
+    directory is named by role, not by path -- the reason is client-visible.
     """
-    if _unc_refused(str(path)):
-        return False
+    return (
+        f"Move or fix {path.name!r} in the agents directory (~/.kiro/agents unless "
+        f"relocated); no restart needed."
+    )
+
+
+# ``(path digest, mtime_ns)`` pairs already warned about. The client re-asks
+# for its policy on every ``tools/call`` and a refusal is never memoized, so
+# without this the gateway log would carry one WARNING per refused tool call
+# for as long as the file stays broken. A fix or a re-break changes the mtime
+# and is logged again. Bounded in BOTH dimensions: the entry count is capped
+# (clearing costs one repeated line, nothing else), and each entry retains a
+# fixed-size SHA-256 digest of the path rather than the path itself, so the
+# cap bounds the bytes held and not only the number of items -- the path is
+# needed once, for the log line, and never read back out of here.
+_UNREADABLE_SPEC_WARNED: set[tuple[bytes, int]] = set()
+_UNREADABLE_SPEC_WARNED_MAX = 1024
+
+
+def _warn_unreadable_spec_once(path: Path, kind: str) -> None:
+    """Name *path* in the gateway log, once per on-disk revision of it.
+
+    The FULL path goes here, ``%r``'d: the gateway log is local to the
+    operator, and it is the one place the reason on the wire (name only) can be
+    joined back to a location. The SEL row the caller writes per request
+    carries the wire reason, so the audit trail is complete without this line;
+    this is for the operator tailing the log.
+    """
     try:
-        real = path.resolve(strict=True)
-    except (OSError, RuntimeError):
-        # OSError: absent, broken link, permission; RuntimeError: pathlib's
-        # signal for a symlink loop on the Pythons that raise it as such.
-        return False
-    real_str = str(real)
-    if _unc_refused(real_str) or is_sensitive_canonical_path(real_str):
-        return False
-    try:
-        fd = open_fenced_for_read(real, fence=is_sensitive_canonical_path)
+        revision = path.stat().st_mtime_ns
     except OSError:
-        return False
-    try:
-        head, truncated = _read_head(fd, _FENCE_PROBE_BYTES)
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-    try:
-        text = codecs.getincrementaldecoder("utf-8")().decode(head, final=not truncated)
-    except UnicodeDecodeError:
-        return False
-    if "\x00" in text:
-        return False
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    return not text.startswith(("---\n", "---\r\n"))
+        revision = -1
+    key = (hashlib.sha256(str(path).encode("utf-8", "surrogateescape")).digest(), revision)
+    if key in _UNREADABLE_SPEC_WARNED:
+        return
+    if len(_UNREADABLE_SPEC_WARNED) >= _UNREADABLE_SPEC_WARNED_MAX:
+        _UNREADABLE_SPEC_WARNED.clear()
+    _UNREADABLE_SPEC_WARNED.add(key)
+    # The filename is untrusted input from a user-writable directory and this
+    # line persists in gateway.log: the same log-egress redaction every other
+    # operational line carrying foreign text applies (``redact_log_via_context``,
+    # the non-raising spelling for a log site), so a credential-shaped name is
+    # scrubbed before it is written. ``%r`` still escapes control bytes.
+    logger.warning(
+        "agent spec %r could not be read (%s); every session whose agent has no "
+        "spec of its own is refused its managed tools until it is moved or fixed",
+        redact_log_via_context(str(path)),
+        kind,
+    )
 
 
 def _refuse_if_any_spec_is_unreadable(agents_dir: Path, agent_name: str) -> None:
@@ -3964,26 +4183,34 @@ def _refuse_if_any_spec_is_unreadable(agents_dir: Path, agent_name: str) -> None
 
     One exception, taken only after the strict read already refused: a markdown
     file with no opening frontmatter fence is not a spec at all (see
-    :func:`_plain_markdown_document`), so it is skipped rather than allowed to
-    deny every agent that has no spec of its own. A FENCED document that fails
+    :func:`kiro_crew.agent_discovery.plain_markdown_document`), so it is
+    skipped rather than allowed to deny every agent that has no spec of its
+    own. A FENCED document that fails
     to parse still raises: its declared name is unrecoverable, so the policy
     stays unknown.
 
     Uses :func:`read_agent_spec_strict`, the reader that keeps the failure class,
-    for exactly the reason its docstring gives: this caller needs to know WHY.
+    for exactly the reason its docstring gives: this caller needs to know WHY --
+    and the refusal says WHICH: the message names the file (name only, the
+    directory is the caller's) and the failure kind in words, then what to do.
+    The verdict is unchanged by that; only its text is. Without the name, the
+    operator told to "fix or remove the unreadable spec" had to validate every
+    file in the directory by hand to find it.
     """
     for path in iter_agent_spec_files(agents_dir):
         try:
             read_agent_spec_strict(path, operation="session_tool_policy", source="dashboard")
         except (OSError, ValueError) as exc:
-            if is_markdown_spec(path) and _plain_markdown_document(path):
+            if is_markdown_spec(path) and plain_markdown_document(path):
                 # Not a spec (no opening fence): it cannot declare a policy,
                 # so it must not turn into a denial of every other agent.
                 continue
+            kind = _spec_failure_kind(path, exc)
+            _warn_unreadable_spec_once(path, kind)
             raise ManagedToolPolicyUnreadable(
-                f"a spec in the agents directory could not be read "
-                f"({exc.__class__.__name__}), so the policy for {agent_name!r} is "
-                f"unknown: it may be the file that declares it"
+                f"agent spec {path.name!r} in the agents directory could not be read "
+                f"({kind}), so the policy for {agent_name!r} is unknown: it may be "
+                f"the file that declares it. {_unreadable_spec_remedy(path)}"
             ) from exc
 
 
@@ -4039,7 +4266,8 @@ def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dic
 
     ``None`` means "this agent has no policy to report" -- no spec file, a spec
     that declares none, or a fence-less ``<agent_name>.md`` in the filename slot,
-    which is a prose document and not a spec (:func:`_plain_markdown_document`).
+    which is a prose document and not a spec
+    (:func:`kiro_crew.agent_discovery.plain_markdown_document`).
     The caller answers ``{}`` for it, without a SEL ``ok`` record when nothing
     was parsed.
 
@@ -4053,6 +4281,12 @@ def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dic
     two specs declare *agent_name*: that is not "no policy" either, and the
     caller records it as a denial rather than answering it silently.
     """
+    # The file the policy was read from, when it was a direct-filename read.
+    # The declared-name scan returns a parse and not a path (see
+    # ``spec_by_declared_name``: a path to reopen would put a second read
+    # outside the guards), so a shape refusal on ITS result names the agent
+    # only -- which identifies the spec, since exactly one declares that name.
+    spec_path: Path | None = None
     try:
         config: Any = spec_by_declared_name(
             agents_dir, agent_name, operation="session_tool_policy", source="dashboard"
@@ -4074,22 +4308,23 @@ def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dic
                 # its policy -- and a file this cannot read may be exactly it.
                 _refuse_if_any_spec_is_unreadable(agents_dir, agent_name)
                 return None
+            spec_path = present[0]
             # The hardened reader: the agents directory is user-writable, so
             # a symlink here is not followed to a sensitive target.
             try:
                 config = read_agent_spec_strict(
-                    present[0], operation="session_tool_policy", source="dashboard"
+                    spec_path, operation="session_tool_policy", source="dashboard"
                 )
             except (OSError, ValueError):
-                if not (is_markdown_spec(present[0]) and _plain_markdown_document(present[0])):
+                if not (is_markdown_spec(spec_path) and plain_markdown_document(spec_path)):
                     raise
                 # ``<agent_name>.md`` with no opening fence and no JSON twin is
                 # not this agent's spec: it is a prose document sharing the
-                # name (see ``_plain_markdown_document``), so it cannot hold a
-                # policy any more than a stray ``README.md`` can. The same
-                # not-a-spec rule the enumeration guard applies, at the one
-                # other place a fence-less file is parsed as a spec -- and the
-                # same disposition as no candidate at all. A fenced document
+                # name (see ``agent_discovery.plain_markdown_document``), so it
+                # cannot hold a policy any more than a stray ``README.md`` can.
+                # The same not-a-spec rule the enumeration guard and the KAS
+                # projection's direct-filename read apply -- and the same
+                # disposition as no candidate at all. A fenced document
                 # that fails to parse re-raised above: it announced itself as
                 # a spec, so its policy stays unknown.
                 _refuse_if_any_spec_is_unreadable(agents_dir, agent_name)
@@ -4100,24 +4335,50 @@ def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dic
         raise
     except (OSError, ValueError) as exc:
         # The file is there and could not be read or parsed. Whatever exclusions
-        # it declares are unknown, so this is reported as unknown.
+        # it declares are unknown, so this is reported as unknown. The prefix is
+        # the one an earlier reader of this arm matches on; the name and kind
+        # follow it. ``spec_path`` is unset only when the directory WALK itself
+        # raised (``spec_by_declared_name`` and ``iter_agent_spec_files`` both
+        # propagate the glob's ``OSError``): there is no file to name, so that
+        # arm keeps its class-name-only text.
+        if spec_path is None:
+            raise ManagedToolPolicyUnreadable(
+                f"agent spec for {agent_name!r} could not be read: {exc.__class__.__name__}"
+            ) from exc
+        kind = _spec_failure_kind(spec_path, exc)
+        _warn_unreadable_spec_once(spec_path, kind)
         raise ManagedToolPolicyUnreadable(
-            f"agent spec for {agent_name!r} could not be read: {exc.__class__.__name__}"
+            f"agent spec for {agent_name!r} could not be read: {spec_path.name!r} is "
+            f"{kind}. {_unreadable_spec_remedy(spec_path)}"
         ) from exc
     if not isinstance(config, dict):
         # Valid JSON that is not an object (a list, a scalar, null) parses
         # fine, but `.get` on it would raise. It is a malformed spec, so it
-        # takes the same disposition as the unparseable case above.
+        # takes the same disposition as the unparseable case above. Only the
+        # direct read lands here -- the scan matches ``dict`` specs only -- so
+        # ``spec_path`` is set; the bare form is kept for the type checker.
+        if spec_path is None:
+            raise ManagedToolPolicyUnreadable(
+                f"agent spec for {agent_name!r} is valid JSON but not an object"
+            )
         raise ManagedToolPolicyUnreadable(
-            f"agent spec for {agent_name!r} is valid JSON but not an object"
+            f"agent spec for {agent_name!r} could not be read: {spec_path.name!r} is "
+            f"valid JSON but not an object. {_unreadable_spec_remedy(spec_path)}"
         )
     policy = config.get("managedToolPolicy", {})
     if isinstance(policy, dict):
         return policy
     # A policy of the wrong shape is a policy this cannot read, not an absent
     # one: the operator wrote something here and its meaning is unknown.
+    if spec_path is None:
+        raise ManagedToolPolicyUnreadable(
+            f"managedToolPolicy for {agent_name!r} is {type(policy).__name__}, not an "
+            f"object. Fix the spec declaring name {agent_name!r} in the agents "
+            f"directory (~/.kiro/agents unless relocated); no restart needed."
+        )
     raise ManagedToolPolicyUnreadable(
-        f"managedToolPolicy for {agent_name!r} is {type(policy).__name__}, not an object"
+        f"managedToolPolicy for {agent_name!r} in {spec_path.name!r} is "
+        f"{type(policy).__name__}, not an object. {_unreadable_spec_remedy(spec_path)}"
     )
 
 
@@ -4204,7 +4465,12 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
     except AmbiguousAgentSpecError as exc:
         # Two specs declare this agent's name. The policy is undefined, not
         # empty, so it is answered with a status the caller cannot mistake for
-        # a policy-free agent, and recorded as a denial naming both files.
+        # a policy-free agent, and recorded as a denial naming both files. The
+        # SEL row keeps the exception's own message, full paths included --
+        # the audit trail is local. The wire ``reason`` names the files
+        # WITHOUT their directory, in the shape every other refusal here takes:
+        # it reaches the MCP client's model-visible error text, and a full
+        # path there discloses the account name and on-disk layout.
         _sel().log_api_access(
             caller=session_key,
             operation="session_tool_policy",
@@ -4217,7 +4483,7 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
             {
                 "error": f"The policy for agent {agent_name!r} could not be determined.",
                 "code": "policy_unreadable",
-                "reason": str(exc),
+                "reason": _ambiguous_spec_reason(agent_name, exc),
             },
             status=409,
         )
@@ -4303,6 +4569,12 @@ async def _reset_all_sessions(request: web.Request) -> int:
                         "Session shutdown hung past %.1fs; forcing kill",
                         _timeout,
                     )
+                    # The timeout cancelled ``shutdown`` mid-flight, so it may not
+                    # have reached its own release. Release here before the kill --
+                    # idempotent, so a shutdown that did get that far costs
+                    # nothing, and without it the gate refuses the very kill this
+                    # arm exists to perform and the hung tree leaks.
+                    await release_session_lease(p)
                     try:
                         # The kill signals the provider's whole process group and
                         # then waits out a bounded SIGTERM grace, so it blocks for

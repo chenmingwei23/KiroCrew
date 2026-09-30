@@ -64,16 +64,44 @@ value and the notice with it.
 ## Sandbox
 
 `agent.sandbox` controls whether Kiro Crew wraps the agent process in its own
-OS-level sandbox (a user namespace on Linux, `sandbox-exec` on macOS).
+OS-level sandbox (a user namespace on Linux, `sandbox-exec` on macOS), and how
+much of your home directory that sandbox hides from the agent's subprocesses.
 
 | Value | Behavior |
 |-------|----------|
-| `auto` (default) | Add the Kiro Crew OS-level sandbox; on macOS it defers to the kiro-cli internal sandbox when that is enabled |
+| `auto` (default) | Add the Kiro Crew OS-level sandbox at the **standard** tier; on macOS it defers to the kiro-cli internal sandbox when that is enabled |
+| `strict` | Add the Kiro Crew OS-level sandbox at the **strict** tier: everything `standard` hides, plus `~/.aws` (including `~/.aws/sso/cache`, kiro-cli's grant store for OAuth-connected remote MCP servers), `~/.ssh` (only `known_hosts` stays readable), `~/.kube`, `~/.config/gh`, and the credential files `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials` |
 | `off` | Skip the Kiro Crew OS-level sandbox |
+
+**What the default leaves visible, and why.** The standard tier hides
+`~/.gnupg`, `~/.docker`, `~/.azure`, `~/.config/gcloud`, the crew secret vault
+and the governance cache. It deliberately does **not** hide `~/.aws`, `~/.ssh`
+or `~/.kube`: the `aws` CLI, boto3 and `credential_process`, git-over-SSH and
+`kubectl` all read those directories, and an agent that cannot reach them
+cannot debug or deploy the way you would. Kiro Crew's file tools still refuse to
+open paths under them, and the AWS/SSH environment-variable, SDK and
+exfiltration command shapes are denied at the tool gate, but a plain shell read
+(`cat ~/.aws/credentials`) is not fenced at this tier — the OS sandbox is the
+enforcement point, and standard does not seal that directory.
+
+**When to use `strict`.** Set it when the host holds credentials the agent must
+never read, and you accept that inside the agent the `aws` CLI, boto3,
+git-over-SSH, `gh`, `kubectl`, npm/pip registry auth (`~/.npmrc`, `~/.pypirc`),
+`.netrc` HTTPS auth, the git credential store (`~/.git-credentials`) and
+OAuth-connected remote MCP servers (their grants live in `~/.aws/sso/cache`)
+stop working — they cannot see their config, keys or tokens, even though the
+gateway-side Connections page, which reads your real home, still shows the grant.
+It is opt-in and per host; nothing changes for you until you set it.
+Like every value of this key, a change applies to sessions started after it: a
+session already running keeps the tier it was spawned with until it ends, so
+restart the sessions (or the gateway) you want confined at the new tier.
+`strict` only tightens where Kiro Crew's own sandbox is what confines the
+spawn: on Windows there is no OS backend, and a macOS spawn delegated to
+kiro-cli's internal sandbox is confined by that profile instead.
 
 The two layers are mutually exclusive on macOS because a nested seatbelt sandbox fails with `EPERM`. The default is `auto`: it uses the Kiro Crew sandbox where available and defers to the kiro-cli internal sandbox on macOS when that sandbox is enabled.
 
-Set via `kirocrew config set agent.sandbox auto`.
+Set via `kirocrew config set agent.sandbox auto` (or `strict`, or `off`).
 
 ## ACP Backend
 
@@ -171,7 +199,8 @@ Set a registered value with, for example,
     "history_max_days": 365,
     "persistence_enabled": true,
     "inject_memory": true,
-    "inject_lessons": true
+    "inject_lessons": true,
+    "inject_activity": true
   },
   "skills": {
     "max_triggered": 0
@@ -198,7 +227,7 @@ Set a registered value with, for example,
 | `agent.approval_mode` | `"auto"` or `"interactive"` | `"auto"` |
 | `agent.model` | Default LLM model for new sessions. `"auto"` defers to the agent config, then to Kiro's own default. Editable from Settings → Chat → Model; a per-session model picker overrides it for that session only | `"auto"` |
 | `agent.reasoning_effort` | Default reasoning effort on models that support it. One of `""`, `low`, `medium`, `high`, `xhigh`, `max`; `""` defers to the provider/model default. A per-session override wins | `""` |
-| `agent.sandbox` | `"auto"` (use Kiro Crew OS-level sandbox, or defer to the kiro-cli internal sandbox on macOS) or `"off"` (skip the Kiro Crew sandbox) | `"auto"` |
+| `agent.sandbox` | `"auto"` (Kiro Crew OS-level sandbox at the standard tier, which leaves `~/.aws`/`~/.ssh`/`~/.kube` visible for credential tooling; defers to the kiro-cli internal sandbox on macOS), `"strict"` (also hides `~/.aws` incl. `sso/cache`, `~/.ssh` bar `known_hosts`, `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials`), or `"off"` (skip the Kiro Crew sandbox). Applies to sessions started after the change. See [Sandbox](#sandbox) | `"auto"` |
 | `agent.streaming` | Stream response text as it is generated | `true` |
 | `agent.bot_name` | Custom name the bot identifies as | `""` |
 | `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
@@ -245,6 +274,7 @@ Set a registered value with, for example,
 | `dashboard.qr_session_until_restart` | Keep a phone signed in for as long as the gateway process runs. Ordinary idling no longer signs it out; a gateway restart does, and so does going 30 days untouched (the refresh credential's lifetime, renewed on each visit). Turn off for a timed session that expires on a clock whether or not the gateway is still running. | `true` |
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
+| `dashboard.title_refresh_every_turns` | Re-examine an auto-generated session title every N user turns (N, 2N, 3N, ...) and rename the session when the topic moved. `0` keeps the built-in schedule (turns 8 and 24 only); either way, a title that began as a bare link or ticket key also gets one refresh after the first turn. 1-3 is raised to 4; ceiling 1000. Each refresh is one background LLM call. Turns are counted over the messages held for the session. A session reloaded by a gateway restart or reopened from History holds its latest 500 plus the new ones, and the cadence continues from the restored count; if the reload keeps fewer user turns than the latest built-in turn the session had already reached (the first turn, 8 or 24), the cadence resumes after that turn instead. Once 10,000 are held, the oldest drop off as new ones arrive, so refreshes slow down or stop until the next reload. A title renamed by hand is never refreshed | `0` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
 | `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
 | `dashboard.link_patterns` | Rewrite matching plain text in transcripts into links at display time, through the same autolink rule engine editions register vocabulary on. Each rule pairs a JavaScript regex with an absolute http(s) URL template in which `{match}` inserts the matched text percent-encoded (no userinfo, placeholder outside the host), e.g. `{"pattern": "\\bPROJ-\\d+\\b", "url": "https://tracker.example.com/browse/{match}"}`. Code blocks and existing links are never rewritten; an inline code span whose whole text matches becomes a link chip. At most 50 rules with distinct patterns, each carrying at most one wide quantifier (`*`, `+`, `{n,}` or a wide `{n,m}`; narrow ranges may accompany it), scanning at most 2000 characters per text block | `[]` |
@@ -413,6 +443,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.persistence_enabled` | Global switch for persistent memory. Off: no automatic memory writes anywhere — `learn_add` and `kirocrew learn add` refuse, history consolidation pauses entirely (no LLM turn spent), task-runner lesson extraction skips — and stored memory/lessons are not injected into new sessions. Within-conversation context is unaffected, and explicit dashboard edits/deletions (the right to forget) stay available. One documented exception: an installed app's own ingestion sweep (Ops Mission Control's ledger import) still writes app-scoped episodic rows, because it is reached only through that app's trigger | `true` |
 | `memory.inject_memory` | Inject the stored memory block (preferences, the memory activity index, recent-session snippets) into new-session context, including the re-injection after a compaction. On-demand `memory_recall` and writes are unaffected | `true` |
 | `memory.inject_lessons` | Inject the learned-corrections and user-profile blocks into new-session context. Writes are unaffected | `true` |
+| `memory.inject_activity` | Inject the recent activity block (active projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts and relevant past episodes) into new-session context as a budgeted background block the context budget may drop whole. Off: only preferences and the activity index ship at session start, and older material is read through `memory_recall`. Requires `inject_memory` | `true` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.
 V2 keeps memory until explicit correction, replacement, forgetting or restoration.

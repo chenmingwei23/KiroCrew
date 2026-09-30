@@ -221,6 +221,41 @@ def test_mirror_unchanged_identity_still_drains(tmp_path):
     assert [q["content"] for q in slot._queue] == ["same audience"]
 
 
+def test_mirror_unlinked_while_queued_is_a_narrowing_and_drains(tmp_path, _inline_audit):
+    """A mirror that goes AWAY while the entry waits is a narrowing, not a
+    retarget: every room the delivery can now reach was admitted. The composed
+    identity (mirror row + Slack thread) must not turn the thread's unlink into a
+    ``mirror_retarget`` drop of a delivery whose audience only shrank -- while a
+    rebind to a DIFFERENT thread is a room the admission never saw and drops."""
+    state = _make_state(tmp_path)
+    slot = _busy(state.get_or_create_slot("chat-1"))
+    key = slot_history_key(slot)
+    state.sessions.set_mirror_link(key, "C0AUDIENCE_A", "1700000000.000400")
+    state.sessions.set_slack_link(key, "1700000000.000700", "C0OPSROOM")
+    slot.enqueue_or_run_prompt("meant for both rooms", _never_runs, state)
+    assert _snapshot_of(slot._queue[0])["mirror_identity"] == (
+        "slack:C0AUDIENCE_A:1700000000.000400|slack:C0OPSROOM:1700000000.000700"
+    )
+
+    assert state.sessions.clear_slack_link(key) is True
+    cr._drop_stale_admissions(state, slot)
+
+    assert [q["content"] for q in slot._queue] == ["meant for both rooms"]
+    assert [m for m in slot.messages if m.get("role") == "notice"] == []
+    assert _inline_audit.log_tool_invocation.call_count == 0
+
+    state.sessions.set_slack_link(key, "1700000000.000800", "C0OPSROOM")
+    cr._drop_stale_admissions(state, slot)
+
+    assert slot._queue == []
+    notices = [m for m in slot.messages if m.get("role") == "notice"]
+    assert notices and "retargeted" in notices[-1]["content"]
+    assert (
+        "mirror_retarget"
+        in _inline_audit.log_tool_invocation.call_args.kwargs["metadata"]["newly_held"]
+    )
+
+
 def test_unchanged_containment_drains(tmp_path):
     """No containment change, no drop — including a constraint that already
     held at admission (a channel-born session keeps its queue)."""
@@ -771,27 +806,38 @@ _SNAPSHOT_NON_CONSTRAINT_KEYS = {"mirror_identity", "mirror_unverified"}
 
 
 def _authorize_target_refusal_codes() -> set[str]:
-    """Every literal ``deny(..., code)`` in :func:`authorize_target`, from source.
+    """Every literal ``deny(..., code)`` in the target-authorization GATE, from source.
 
     Parsed rather than hand-listed on purpose. A hand-listed copy would be a
     THIRD spelling of the constraint set, free to drift from the other two --
     which is the failure this test exists to catch, not to reproduce.
 
+    The gate is THREE functions, not one. ``authorize_target`` keeps the
+    target-side refusals and delegates the caller-side ones to
+    ``refuse_caller_identity`` (before it resolves a target) and
+    ``refuse_caller_surface`` (after), so the targetless verbs can share one copy
+    of those checks instead of growing a second sequence that drifts. All three
+    are parsed together because the tables below describe the gate a queued
+    prompt met, and it does not matter to a drain which of the three functions
+    raised. Parsing only ``authorize_target`` silently loses eight caller-side
+    refusals and reports every one of them as removed.
+
     One ``deny`` call re-raises a resolution failure with ``exc.code`` rather
     than a literal; it carries no new constraint, so a non-literal code is
     skipped instead of failing the parse.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(sc.authorize_target)))
     codes: set[str] = set()
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "deny"):
-            continue
-        positional = node.args[1] if len(node.args) >= 2 else None
-        keyword = next((kw.value for kw in node.keywords if kw.arg == "code"), None)
-        for candidate in (keyword, positional):
-            if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
-                codes.add(candidate.value)
-                break
+    for fn in (sc.authorize_target, sc.refuse_caller_identity, sc.refuse_caller_surface):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "deny"):
+                continue
+            positional = node.args[1] if len(node.args) >= 2 else None
+            keyword = next((kw.value for kw in node.keywords if kw.arg == "code"), None)
+            for candidate in (keyword, positional):
+                if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+                    codes.add(candidate.value)
+                    break
     return codes
 
 
@@ -806,13 +852,25 @@ def _base_snapshot(tmp_path) -> dict:
 def test_the_parse_finds_the_refusals_it_is_asked_to_pin():
     """Guard the guard: an empty or tiny parse would make the tests below vacuous.
 
-    If ``authorize_target``'s refusals ever stop being spelled as ``deny(...,
-    "code")`` the extraction silently returns less, and a parity test that
-    compares against nothing passes while pinning nothing.
+    If the gate's refusals ever stop being spelled as ``deny(..., "code")`` the
+    extraction silently returns less, and a parity test that compares against
+    nothing passes while pinning nothing.
+
+    One refusal from EACH of the gate's three functions is named, so the parse
+    losing a whole function is caught here rather than surfacing as eight
+    refusals that look deleted: ``workspace_mismatch`` is raised by
+    ``authorize_target`` itself, ``unattended_caller`` by
+    ``refuse_caller_identity`` before a target is resolved, and
+    ``ephemeral_caller`` by ``refuse_caller_surface`` after.
     """
     codes = _authorize_target_refusal_codes()
     assert len(codes) >= len(_TARGET_CONTAINMENT_REFUSALS) + len(_NON_CONTAINMENT_REFUSALS)
-    assert "workspace_mismatch" in codes, "the sixth refusal must be visible to the parse"
+    for code, fn in (
+        ("workspace_mismatch", "authorize_target"),
+        ("unattended_caller", "refuse_caller_identity"),
+        ("ephemeral_caller", "refuse_caller_surface"),
+    ):
+        assert code in codes, f"{fn}'s refusals are not visible to the parse ({code} missing)"
 
 
 def test_every_refusal_is_classified():

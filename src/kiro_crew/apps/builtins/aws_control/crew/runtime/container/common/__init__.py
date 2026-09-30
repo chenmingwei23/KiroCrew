@@ -8,8 +8,11 @@ becomes the next disagreement.
 from .config import (
     BACKEND_HOST,
     CONTROL_SECRET_HEADER,
+    CREW_AGENT_ID_PREFIX,
+    MAX_CREW_AGENT_ID_LEN,
     ConfigError,
     Settings,
+    crew_agent_id,
     load,
     parse_route_prefix,
 )
@@ -24,8 +27,11 @@ from .secret import (
 __all__ = [
     "BACKEND_HOST",
     "CONTROL_SECRET_HEADER",
+    "CREW_AGENT_ID_PREFIX",
+    "MAX_CREW_AGENT_ID_LEN",
     "ConfigError",
     "Settings",
+    "crew_agent_id",
     "load",
     "parse_route_prefix",
     "HEADER",

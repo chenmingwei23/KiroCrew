@@ -1606,6 +1606,12 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    The stroke is in the shared asset, so it applies on both palettes — on the
    dark surface a black edge against a near-black background is imperceptible,
    which is why no dark-theme override is needed. */
+/* The file-drop chomper (ChatDropOverlay, `.chat-drop-art`) has no baked stroke,
+   so light modes give it a 1px dark edge here. useTheme writes data-mode on
+   <html>, so installed palettes are covered and dark modes render unchanged.
+   Only an edition theme's own CSS can override it: chat-drop-art is not an
+   overrides.css hook, so the pack scoper drops rules that target it. */
+[data-mode="light"] .chat-drop-art{filter:drop-shadow(0 0 1px #000)}
 @property --glow-strength{syntax:'<number>';inherits:false;initial-value:0}
 @keyframes approval-glow{0%,100%{--glow-strength:0}50%{--glow-strength:1}}
 .approval-glow{--glow-strength:0;animation:approval-glow 2.5s ease-in-out infinite;box-shadow:0 0 0 1.5px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 55%), transparent),0 0 14px 1px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 40%), transparent)}
@@ -1617,6 +1623,29 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   100%{transform:rotate(360deg)}
 }
 
+/* ── Custom font ligatures ──
+   The "Custom" Font Family option sets --font-body to the user's installed
+   family app-wide (useZoom), so chat prose, the composer, and sidebar session
+   and folder names pick it up by inheritance — no per-surface font-family rule
+   is needed, and a Nerd Font's glyphs render from the family alone. This turns
+   on ligatures app-wide ONLY while Custom is active AND the "Enable ligatures"
+   toggle is on (html[data-font-family="custom"][data-custom-ligatures="on"], both
+   set by useZoom), so a programming font (Fira Code, Cascadia Code, …) shows its
+   ligatures on demand without changing how the built-in Sans/Mono presets render.
+   Code and diffs inside messages keep --mono via the more-specific rules below
+   AND reset ligatures to normal, so a custom font never turns on calt ligatures
+   in code that did not have them. */
+html[data-font-family="custom"][data-custom-ligatures="on"] body{font-variant-ligatures:common-ligatures contextual}
+/* OFF must be explicit `none`, not the absence of the rule above: contextual
+   (calt) and common (liga) ligatures are ON by default in CSS, so a font like
+   JetBrains Mono keeps rendering =>/!=/-> under the initial `normal` value —
+   only `none` actually turns them off. */
+html[data-font-family="custom"][data-custom-ligatures="off"] body{font-variant-ligatures:none}
+/* Also cover Pierre's .code-block / .diff-block hosts: their lines are not
+   always <pre>, so without these selectors the OFF rule's `none` would leak
+   into rendered code and diffs by inheritance. */
+.msg-content code,.msg-content pre,.msg-content .code-block,.msg-content .diff-block{font-variant-ligatures:normal}
+
 /* ── Code in messages ── */
 .msg-content code{font-family:var(--mono);font-size:.9em}
 .msg-content :not(pre)>code{background:rgba(0,0,0,.15);padding:.15em .4em;border-radius:4px;overflow-wrap:break-word;word-break:break-all}
@@ -1624,6 +1653,25 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* Kiro theme: inline code = neutral elevated surface (Prey/750) + light-purple text (Figma 3906:185658) */
 [data-theme="kiro-dark"] .msg-content :not(pre)>code{background:#28242e;color:#c19aff}
 [data-theme="kiro-light"] .msg-content :not(pre)>code{background:var(--bg-hover);color:#723acc}
+/* Inline-code CHIPS (MarkdownRenderer): a chip's colour says what its click does. A chip whose
+   click navigates (`navigate`: a confirmed path, a session, an autolinked work item or a span
+   inside a link) wears the accent, the colour links wear; a chip that only copies (`copy`)
+   wears the NEUTRAL text colour, plus its dotted underline and copy cursor (set by the
+   component). Two values, because these two rules are the attribute's only consumer and two
+   kinds are all they tell apart. Neutral, not the Kiro inline-code purple above: on these
+   themes that purple and the accent are two near-identical purples, and a reader takes both
+   for the same kind of chip — "link-coloured = navigates, neutral = copies" has to hold on
+   every theme, and on the others inline code already inherits the text colour. The two Kiro
+   rules above set `color` at specificity (0,2,2), and the utilities are emitted unlayered, so
+   the `text-accent` utility (0,1,0) the actionable chips carry lost to them: every chip
+   painted in the code colour. Both chip states therefore get their own rule here, at (0,3,2),
+   keyed on the `data-chip-action` the renderer sets (raw HTML cannot: InlineCode drops any
+   inbound one). Kiro dark uses Purple/300, the same step-up message links take below. A span
+   that is no chip at all (an image-only raw span) keeps the theme's purple. */
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:#b07fff}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:var(--accent)}
 /* Kiro dark: brighten message links — #8e48ff (=accent, same as the button fill) reads dull as thin
    text on the dark bg, so step up to Purple/300 for equal perceived vibrancy. Scoped to Kiro. */
 [data-theme="kiro-dark"] .msg-content a{color:#b07fff;text-decoration-color:rgba(176,127,255,.45)}
@@ -1788,6 +1836,45 @@ file-tree-container{
 .edit-grow>textarea,.edit-grow::after{grid-area:1/1;font:inherit;line-height:inherit;letter-spacing:inherit;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .edit-grow>textarea{width:100%;min-width:0}
 
+/* Pinned-prompt stand-in. While a user prompt is pinned, its transcript row is
+   `visibility: hidden` (ChatPage's row wrapper, VirtualTranscript, ChatMessageList)
+   and the PinnedPrompt card is drawn in its place — but the card copies only the
+   BUBBLE, and the row also carries the message's action strip (copy, copy link,
+   pin, edit, timestamp). Visibility is inherited, so a `visible` descendant of the
+   hidden row is drawn and clickable: this re-shows the strip in its own place,
+   directly under the card, which folds down the bubble's remaining height and so
+   never covers it. Shown outright rather than behind the strip's hover reveal
+   (`opacity-0` + `group-hover/msg:opacity-100`): the card lives in an overlay
+   that is a sibling of the scroller, so hovering it can never be a hover of this
+   row, and a hover-only strip under a card is one the reader has to find by
+   pointing at a blank gap. Before this rule a prompt taller than the viewport had
+   no action strip at all — its bottom is only on screen once its top is above the
+   fold, i.e. once the whole row is hidden. Pinned by
+   src/test/UserMessage.pinnedStandinActions.test.tsx, which reads this rule.
+   Keyed on the `folding` VALUE, not the bare marker. The hosts write that value
+   while the strip is still UNCOVERED — some of it below the card's resting
+   bottom, on screen (usePinnedPrompt measures the strip's own rect). That is the
+   whole fold and the strip's own height of scroll after it: the card reaches its
+   clamp while the strip, hanging under the bubble, is still sliding under it, so
+   a value keyed on the fold alone dropped the strip out from under the pointer
+   for those last pixels and left the band blank. Once the strip is under the
+   card or behind the header, a strip left `visible` would be invisible yet
+   focusable — Tab through the transcript stopping on controls nobody can see,
+   each stop scrolling the transcript away from the position the pin exists to
+   hold. With the marker empty the strip inherits the row's `hidden` again and is
+   neither drawn nor in the tab order.
+   Edit is the one control left out (`data-message-edit`), for any marker value:
+   it swaps the bubble for a textarea + Cancel/Send tree that is not part of the
+   strip, so it would open inside the hidden row where nothing can see, focus or
+   dismiss it. `display:none` rather than `visibility:hidden` so the strip closes
+   the gap; it returns as soon as the row is no longer the stand-in.
+   The re-show matches the strip only as a direct child of UserMessage's
+   `data-role="user"` root, the one place it is rendered: structural scoping, so
+   the sanitizer's `data-message-*` reservation (MarkdownRenderer) is not the only
+   guard keeping a marker minted inside a message body off this paint path. */
+[data-pinned-standin="folding"] [data-role="user"] > [data-message-actions]{visibility:visible;opacity:1}
+[data-pinned-standin] [data-message-edit]{display:none}
+
 /* ── Auto-hiding scrollbar for code/diff blocks ── */
 .scroll-fade::-webkit-scrollbar{height:6px}
 .scroll-fade::-webkit-scrollbar-thumb{background:transparent;border-radius:3px;transition:background .2s}
@@ -1921,6 +2008,27 @@ file-tree-container{
    the centre track by auto-placement. */
 @media (max-width:767px){
   .topbar{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
+}
+/* Phone chat page (`topbar-single`, App.tsx): the header is the ONE bar for
+   shell and conversation, so its centre cell is the chat page's title slot and
+   has to take every pixel the side cells leave -- the opposite of the
+   window-centred search above, where the sides split the remainder. Hence
+   `auto minmax(0,1fr) auto`, and no gap: the leading cell is empty in the
+   single-crew case, and a gap after an empty cell would push the sessions
+   toggle off the 16px page gutter the rest of the app lines up on.
+
+   The side cells here are a plain flex div / `.tb-trail`, deliberately NOT the
+   `.tb-left` / `.tb-right` groups: those are inline-size containers, and a size
+   container in an `auto` track has no content size to give, so it collapses to
+   its padding and clips its contents (the measurement is recorded in
+   test/topbarMenuButtonNarrow.test.ts). The single bar has no collapse ladder
+   -- the readout capsule is not rendered on it -- so it needs no containers.
+   `.tb-trail` keeps `.tb-right`'s padding/negative-margin pair for the same
+   reason `.tb-right` has it: the bell badge overhangs its button by 4px, and
+   the header's own overflow would otherwise square it off. */
+@media (max-width:767px){
+  .topbar.topbar-single{grid-template-columns:auto minmax(0,1fr) auto;gap:0}
+  .topbar.topbar-single .tb-trail{padding:6px 6px 0 0;margin:-6px -6px 0 0}
 }
 
 /* Each side group is a size-query container. Inline-size containment also stops
@@ -2433,6 +2541,33 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
 .session-row.session-reveal-flash,.folder-row.session-reveal-flash,.folder-col.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
 .session-row.session-reveal-flash-fade,.folder-row.session-reveal-flash-fade,.folder-col.session-reveal-flash-fade{outline-color:transparent}
+/* Pinned folder headers in the Sessions lane (ChatSidebar renderFolderHeader).
+   A sticky row needs an opaque surface or the session rows scroll visibly
+   through it; it takes the card's own surface so it reads as part of the
+   panel. `:where()` keeps this at one class of specificity so the row's
+   `hover:bg-bg-hover` still wins on hover. kiro-light steps the card back to
+   --panel (.sidebar-inner above), so the pinned row follows it. A host that
+   repaints the card sets --folder-row-sticky-bg to the same surface (the
+   /embed/sessions wrapper in ChatPage paints it --bg).
+   --folder-row-sticky-h is the header's height, which is what a nested header
+   is offset by per depth, so the row is held to it: a default-agent badge or
+   the rename input would otherwise grow the row 4-6px and the pinned header
+   below would overlap it. Both fit inside the row's padding at this height.
+   The Playwright spec sidebar-sticky-folder-header.spec.ts measures the row
+   against it.
+   --folder-row-sticky-inset is the lane's top padding (LIST_BODY_CLS `p-2`):
+   sticky offsets count from the scroll container's padding edge, so without
+   it the pinned row sits 8px low and sessions scroll through the gap above. */
+.sidebar,.folder-row-sticky{--folder-row-sticky-h:32px;--folder-row-sticky-inset:0.5rem}
+.folder-row-sticky{height:var(--folder-row-sticky-h)}
+/* Rows scrolled into view (arrow-key roving, focus, reveal) stop below the
+   pinned header stack of their folder block (ChatSidebar renderFolderBlock
+   sets --folder-pin-stack); unfiled rows have no stack and keep 0. Chromium's
+   `block: 'nearest'` ignores this margin for a row already in view, so the
+   arrow-key rove re-aligns such a row itself (chat/sessionRowNav.ts). */
+:where(.sidebar) .session-row{scroll-margin-top:var(--folder-pin-stack,0px)}
+:where(.sidebar) .folder-row-sticky{background-color:var(--folder-row-sticky-bg,var(--bg-elevated))}
+:where([data-theme="kiro-light"] .sidebar-inner) .folder-row-sticky{background-color:var(--folder-row-sticky-bg,var(--panel))}
 /* Stalled goal loop (ChatSidebar `goalLoopStalled`): the loop is armed but its
    last turn died and nothing is executing — the whole card flashes danger-red
    until the user resumes. Two-class specificity outranks the Tailwind
@@ -2756,6 +2891,101 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   z-index: 1;
 }
 
+/* Settings icon tiles (SidePanelLayout `tile`): the coloured rounded square
+ * behind each Settings section icon, as macOS / iOS System Settings draw them.
+ * Fixed hues by design -- a tile is an identity mark for its section, and the
+ * same section must look the same in every theme -- with a light polarity that
+ * is a shade deeper so a white glyph keeps contrast on a white list. */
+:root {
+  --tile-fg: #fff;
+  --tile-gray: #8e8e93; --tile-blue: #0a84ff; --tile-green: #30d158; --tile-indigo: #5e5ce6;
+  --tile-orange: #ff9f0a; --tile-pink: #ff375f; --tile-purple: #bf5af2; --tile-red: #ff453a;
+  --tile-teal: #40c8e0;
+}
+[data-mode="light"] {
+  --tile-gray: #8e8e93; --tile-blue: #007aff; --tile-green: #34c759; --tile-indigo: #5856d6;
+  --tile-orange: #ff9500; --tile-pink: #ff2d55; --tile-purple: #af52de; --tile-red: #ff3b30;
+  --tile-teal: #32ade6;
+}
+
+/* Liquid Glass tint (components/ui/liquid-glass.tsx): the fill laid over the
+ * blurred backdrop of the composer and the mobile settings search capsule. Read
+ * from data-mode polarity like the composer halo: light themes get a milky
+ * white so the glass reads as a lit pane, dark themes a translucent near-black
+ * so it reads as smoked glass — both keep --text legible on top. The light tint
+ * is a cool light GREY, not white: on a white page a white fill leaves the top /
+ * bottom light bands nothing to stand out from, and the grey is what makes the
+ * pane read as glass rather than a lighter card. --glass-band is the color of
+ * those two bands: near-white on the light grey, a faint white on smoked glass.
+ * The pane draws NO ring: its top and bottom are the light bands, its left and
+ * right are a 1px --glass-edge line (dark on a light page, light on smoked
+ * glass), and nothing runs around the corners — as in the reference material,
+ * two lit edges set against thin dark sides. Each lit band is backed by
+ * --glass-hairline, a half-pixel dark sliver just OUTSIDE the top and bottom
+ * edges (the reference's bands sit on a very thin dark line). --glass-edge is
+ * also the hairline for a DIVIDER inside a pane (the approval bar meeting the
+ * composer, the split chip's seam). --glass-tint-focus is the tint a focused
+ * `.glass-shadow` pane swaps in: the same hue a step more opaque and brighter,
+ * and --glass-edge-focus the side line it swaps in at the same moment (the same
+ * ink at roughly twice the alpha, so the two side lines read as the focus ring
+ * the material otherwise has none of),
+ * so the pane visibly lights up (neutral, never the theme color) when a control
+ * inside it takes focus — the shadow deepening alone measured as no delta. */
+:root { --glass-tint: rgba(30, 30, 34, 0.40); --glass-tint-focus: rgba(84, 84, 92, 0.72); --glass-band: rgba(255, 255, 255, 0.22); --glass-edge: rgba(255, 255, 255, 0.14); --glass-edge-focus: rgba(255, 255, 255, 0.55); --glass-hairline: rgba(0, 0, 0, 0.50); }
+[data-mode="light"] { --glass-tint: rgba(238, 238, 243, 0.45); --glass-tint-focus: rgba(255, 255, 255, 0.92); --glass-band: rgba(255, 255, 255, 0.92); --glass-edge: rgba(0, 0, 0, 0.24); --glass-edge-focus: rgba(0, 0, 0, 0.60); --glass-hairline: rgba(0, 0, 0, 0.20); }
+
+/* Tint steps for a Liquid Glass pane (components/Glass.tsx). Every surface in
+ * the composer dock — the composer, the follow-up chips, the tip / suggestion /
+ * question cards, the memory chip, the jump-to-bottom button — is the SAME
+ * primitive rendered as its own element, so there is no CSS copy of the
+ * material. What a call site says is only WHICH tint step its pane is on:
+ * `glass-accent` (a picked chip, an attached card) and `glass-warn` (the
+ * incognito chip) mix a hue INTO the glass tint so the pane stays a glass, and
+ * `glass-hover` brightens an interactive pane a step on hover, as the old chip
+ * border-color change did. Each step is a `--glass-tint` swap on the host: the
+ * primitive's frost box reads the token, so the pane repaints without a rule
+ * of its own. The mixed values are computed once on :root (from the polarity's
+ * own `--glass-tint`), so a swap on the host cannot reference itself. */
+:root { --glass-tint-accent: color-mix(in srgb, var(--accent) 14%, var(--glass-tint)); --glass-tint-warn: color-mix(in srgb, var(--warn) 12%, var(--glass-tint)); --glass-tint-hover: color-mix(in srgb, var(--text) 8%, var(--glass-tint)); }
+.glass-accent { --glass-tint: var(--glass-tint-accent); }
+.glass-warn { --glass-tint: var(--glass-tint-warn); }
+.glass-hover:hover { --glass-tint: var(--glass-tint-hover); }
+
+/* Neutral rest shadow for a glass pane that is NOT the session composer: the
+ * mobile Settings capsule, the tip / suggestion / question cards. Same offset-
+ * free spread as `.composer-halo` below, minus the accent focus glow — the
+ * theme-colored highlight belongs to the composer alone, never to the material.
+ * Focus-within deepens the shadow one step AND, on a neutral pane, swaps the
+ * tint for `--glass-tint-focus` (a brighter, more opaque step of the same hue)
+ * and the side line for `--glass-edge-focus` (the same ink, about twice the
+ * alpha): the shadow step alone read as zero delta on the capsule screenshots,
+ * and the tint step alone measured +23 in the dark theme yet still went unseen
+ * beside the unchanged edges, so the edges now step with it. Neutral on
+ * purpose — no theme color: the accent glow is the session composer's alone.
+ * Where the material is solidified (the three fallback blocks at the end of
+ * this file) none of these layers paint, so those blocks give a focused
+ * `.glass-shadow` pane the app's standard accent outline instead. */
+.glass-shadow { box-shadow: 0 0 18px rgba(0, 0, 0, 0.06); transition: box-shadow 0.18s ease; }
+[data-mode="dark"] .glass-shadow { box-shadow: 0 0 18px rgba(0, 0, 0, 0.30); }
+.glass-shadow:focus-within { box-shadow: 0 0 18px rgba(0, 0, 0, 0.14); }
+/* Neutral panes only: an accent / warn pane already carries its hue, and the
+   focus step must not wash it out while a control inside it has focus. */
+.glass-shadow:focus-within:not(.glass-accent, .glass-warn) { --glass-tint: var(--glass-tint-focus); --glass-edge: var(--glass-edge-focus); }
+[data-mode="dark"] .glass-shadow:focus-within { box-shadow: 0 0 18px rgba(0, 0, 0, 0.55); }
+
+/* The composer dock's two wrapper boxes (ChatPage.tsx) span the pane but hold
+   nothing of their own: every child is its own content column. The wrappers
+   pass input through and each child catches it, so the empty width beside the
+   column, and the scrollbar gutter, reach the transcript underneath. One rule
+   rather than a class per child, so a bar added to the dock later is covered.
+   The status stack is itself a scroll box (`max-h-[50svh] overflow-y-auto`):
+   while it overflows, its own scrollbar has to be a hit target, and a
+   scrollbar belongs to the box, not to a child, so the dock's measure marks
+   the overflowing stack (`data-overflowing`, ChatPage.tsx) and it catches input
+   as a whole for exactly that stretch. */
+.dock-inert{pointer-events:none}.dock-inert>*{pointer-events:auto}
+.dock-inert[data-overflowing="true"]{pointer-events:auto}
+
 /* Composer halo (ChatInput.tsx): an offset-free shadow spreading evenly on all
  * four sides, so the box reads as set INTO the page rather than dropped onto it.
  * At rest it is neutral and faint; while the composer holds focus it takes the
@@ -2778,6 +3008,14 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 }
 .composer-halo:focus-within {
   box-shadow: 0 0 18px var(--accent-glow);
+}
+/* Dark themes add a 1px accent ring under the glow: on smoked glass the glow
+   alone did not separate a focused capsule from a resting one (a reader could
+   not tell the two apart), while on a light page the hairline turning accent
+   already reads. Same specificity as the dark rest rule, later in source, so
+   focus still wins; the memory-mode forms below come later again. */
+[data-mode="dark"] .composer-halo:focus-within {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 0 18px var(--accent-glow);
 }
 /* Memory-mode variants follow the wrapper's always-on border color (warn for
  * incognito, aim for temporary) so focus reads as one color per control. No
@@ -2836,6 +3074,19 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
  * never match this query and keep the glass look. */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .topbar-glass,.glass-surface{ background:var(--bg) !important }
+  /* The Liquid Glass pane (components/ui/liquid-glass.tsx) solidifies to the
+     elevated surface and drops its effect layers, so the composer and the
+     Settings capsule keep an opaque, delimited box. */
+  .liquid-glass{ background:var(--bg-elevated) !important }
+  /* The solid fill above is the host's own background (the tint layer is
+     hidden with the rest), so the picked chip and the incognito chip re-assert
+     their hue on the solid surface. */
+  .liquid-glass.glass-accent{ background:color-mix(in srgb, var(--accent) 14%, var(--bg-elevated)) !important }
+  .liquid-glass.glass-warn{ background:color-mix(in srgb, var(--warn) 12%, var(--bg-elevated)) !important }
+  .liquid-glass>[data-liquid-glass-layer]{ display:none !important }
+  /* The focus cue of a neutral pane (tint + side-line step) lives in the hidden
+     layers, so a solidified pane holding focus gets the standard ring. */
+  .glass-shadow:focus-within{ outline:2px solid var(--accent) !important; outline-offset:2px }
   /* Floating notification cards (NotificationFeed mac variant) sit OVER page
      content, so they solidify to the card color, not the page background. */
   .notif-material{ background:var(--card) !important }
@@ -2874,10 +3125,32 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   *,*::before,*::after{ transition-duration:0s !important; scroll-behavior:auto !important }
 }
 @media (prefers-reduced-transparency: reduce){
-  .topbar-glass,.glass-surface{ backdrop-filter:none !important; -webkit-backdrop-filter:none !important; background:var(--bg) !important }
+  .topbar-glass,.glass-surface{ backdrop-filter:none !important; -webkit-backdrop-filter:none !important }
+  .topbar-glass,.glass-surface{ background:var(--bg) !important }
+  .liquid-glass{ background:var(--bg-elevated) !important }
+  .liquid-glass.glass-accent{ background:color-mix(in srgb, var(--accent) 14%, var(--bg-elevated)) !important }
+  .liquid-glass.glass-warn{ background:color-mix(in srgb, var(--warn) 12%, var(--bg-elevated)) !important }
+  .liquid-glass>[data-liquid-glass-layer]{ display:none !important }
+  .glass-shadow:focus-within{ outline:2px solid var(--accent) !important; outline-offset:2px }
 }
 @media (prefers-contrast: more){
   .glass-surface,.topbar-glass{ background:var(--bg) !important; border:1px solid var(--text) !important }
+  .liquid-glass{ background:var(--bg-elevated) !important }
+  /* The material draws no edge, so contrast mode gives every pane one (an
+     outline: no layout shift). The picked chip and the incognito chip keep their
+     own color, or the pane edge erases the only property that tells them apart. */
+  .liquid-glass{ outline:1px solid var(--text) !important; outline-offset:-1px }
+  .liquid-glass.glass-accent{ outline-color:var(--accent) !important }
+  .liquid-glass.glass-warn{ outline-color:var(--warn) !important }
+  /* The pane outline above is !important, so it would beat the base-layer
+     :focus-visible ring on the chips / memory chip / jump button, which are
+     glass buttons; keyboard focus re-asserts the ring inside the same block. */
+  .liquid-glass:focus-visible{ outline:2px solid var(--accent) !important; outline-offset:2px !important }
+  :root{ --glass-edge:var(--text) }
+  .liquid-glass>[data-liquid-glass-layer]{ display:none !important }
+  /* Outranks the 1px pane outline above (same importance, higher specificity),
+     so a focused capsule reads as focused, not merely delimited. */
+  .glass-shadow:focus-within{ outline:2px solid var(--accent) !important; outline-offset:2px !important }
 }
 
 /* ── Mono-family compensation ─────────────────────────────────────────────
