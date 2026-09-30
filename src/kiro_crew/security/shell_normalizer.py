@@ -410,6 +410,37 @@ _NESTED_SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "
 _NESTED_SHELL_VERBS = frozenset({"eval", "source", "."})
 
 
+#: Language interpreters that EXECUTE code read from stdin when they carry no
+#: script-file operand (``echo '<code>' | python`` / ``| python -`` runs the
+#: piped text). Used only by :func:`_pipes_into_evaluator`: a producer piped into
+#: a bare interpreter is executing what it emits, exactly like ``| sh`` — so the
+#: data-consumer exemption is withdrawn. A downstream interpreter WITH a script
+#: file (``| python process.py``) reads stdin as DATA to that script, not as code,
+#: so it is NOT an evaluator here.
+_STDIN_CODE_INTERPRETERS = frozenset(
+    {"python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php"}
+)
+#: A versioned interpreter spelling (``python3.12``, ``perl5.36``, ``ruby2.7``) is
+#: the SAME evaluator as its unversioned name but misses an exact-membership test
+#: (GPT security-class: ``grep 'rm -rf ~' p.py | python3.12`` kept the
+#: data-consumer exemption and ran the home wipe). Strip the ``.NN`` minor/patch
+#: tail first (keeping the major digit so ``python3`` / ``python2`` stay distinct,
+#: both set members); if that still is not a member, strip the whole trailing
+#: digit/dot run (``perl5`` -> ``perl``). Mirrors ``rm_floor._rm_is_interpreter``.
+_STDIN_INTERPRETER_VERSION_RE = re.compile(r"(\.\d+)+$")
+_STDIN_INTERPRETER_VERSION_FULL_RE = re.compile(r"[0-9.]+$")
+
+
+def _is_stdin_code_interpreter(token: str) -> bool:
+    """True if *token*'s basename is a stdin code interpreter, version and all."""
+    base = _program_basename(token)
+    if base in _STDIN_CODE_INTERPRETERS:
+        return True
+    if _STDIN_INTERPRETER_VERSION_RE.sub("", base) in _STDIN_CODE_INTERPRETERS:
+        return True
+    return _STDIN_INTERPRETER_VERSION_FULL_RE.sub("", base) in _STDIN_CODE_INTERPRETERS
+
+
 _ENV_SPLIT_PROGRAMS = frozenset({"env"})
 
 
@@ -682,18 +713,59 @@ def _pipes_into_evaluator(tokens: "list[str]") -> bool:
     ``echo <name> <verb> | sh`` produces the dangerous command as TEXT and then
     hands it to something that runs it, so the "arguments are just data" reasoning
     does not hold: the data IS the command.
+
+    A pipe into a bare stdin-reading code INTERPRETER (``echo '<code>' | python``
+    / ``| python -``) is the same shape: the interpreter runs the piped text as a
+    program, so the exemption is withdrawn. An interpreter given a SCRIPT FILE
+    (``| python process.py``) reads stdin as DATA to that script, not as code, so
+    it is NOT an evaluator here — matched by requiring the interpreter to carry no
+    script-file operand before the next pipeline boundary.
     """
     seen_pipe = False
-    for token in tokens:
+    n = len(tokens)
+    for idx, token in enumerate(tokens):
         if "|" in token:
             seen_pipe = True
-        if seen_pipe and (
+        if not seen_pipe:
+            continue
+        if (
             _program_basename(token) in _NESTED_SHELL_PROGRAMS
             or _program_basename(token) in _NESTED_SHELL_VERBS
             or _program_basename(token) == "xargs"
             or _is_shell_variable_reference(token)
         ):
             return True
+        # A downstream command's PROGRAM word that is a code interpreter reading
+        # stdin (no script-file operand) executes the piped text. A pipe glued to
+        # THIS token (``…'|python3``) keeps the operator inside one shlex word, so
+        # the previous token carries no ``|``; derive the program position from
+        # the token itself too, as the ``_program_basename`` split already does
+        # for the nested-shell branch above (GPT/Opus security-class: deleting one
+        # space before ``|`` hid the interpreter and reached a root/home wipe).
+        is_program_word = idx == 0 or ("|" in tokens[idx - 1]) or ("|" in token)
+        if is_program_word and _is_stdin_code_interpreter(token):
+            has_script_file = False
+            k = idx + 1
+            while k < n and "|" not in tokens[k]:
+                operand = tokens[k]
+                # A flag, a ``-c``/``-e`` code payload's flag, or a bare ``-``
+                # (explicit stdin) does not make it a script-file read; any other
+                # bare operand is the script file the interpreter runs instead.
+                if operand.startswith("-"):
+                    # A code-string flag means it runs that argument, not stdin —
+                    # its own frame is classified elsewhere; here stdin is free, so
+                    # a piped producer is not feeding an executed program. Treat it
+                    # as NOT a stdin evaluator (leave it to the interpreter-code
+                    # path) rather than over-claim.
+                    if operand in {"-c", "-e", "-E"}:
+                        has_script_file = True
+                        break
+                elif operand:
+                    has_script_file = True
+                    break
+                k += 1
+            if not has_script_file:
+                return True
     return False
 
 
@@ -3574,8 +3646,13 @@ _SHELL_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)$", re.DOTALL
 # vanish (e.g. g""it -> git, ca''t -> cat).
 _EMPTY_QUOTE_RE = re.compile(r'""|\'\'')
 
-# Regex for $HOME or ${HOME} variable expansion.
-_HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME", re.IGNORECASE)
+# Regex for $HOME or ${HOME} variable expansion. The bare ``$HOME`` form
+# requires a variable-name boundary after ``HOME`` (a following ``[A-Za-z0-9_]``
+# would make it a DIFFERENT variable), so ``$HOME_BACKUP`` is not mis-expanded to
+# the home path plus ``_BACKUP`` — which otherwise makes an unrelated variable
+# look like a home-directory target (issue review finding). ``${HOME}`` is
+# already delimited by its braces.
+_HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])", re.IGNORECASE)
 
 # ANSI-C (``$'…'``) and locale (``$"…"``) quoting.  Both are QUOTING forms whose
 # value the shell computes before the program sees it, so they are resolved as part
