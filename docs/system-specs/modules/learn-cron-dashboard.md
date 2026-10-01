@@ -1264,7 +1264,11 @@ specified compatibility change.
   fails closed in all three.
   **These callers authorize on a FRESH probe, not the latch**
   (`kiro_verified_ready` → `KiroPrerequisiteService.verified_ready`, re-probing
-  when the latch is older than `_VERIFY_MAX_AGE_SECS` = 30s). The latch is
+  when the latch is older than the caller's bound). The destructive reruns,
+  `/v1/chat/completions`, and the degraded-only `/api/models` poll read the tight
+  `_VERIFY_MAX_AGE_SECS` = 30s; the `/api/sessions/usage` poll reads the wider
+  `_POLL_GATE_MAX_AGE_SECS` = 300s, safe because its spawn is already throttled to
+  one fetch per `_USAGE_REFRESH_SECS` (600s). The latch is
   written at boot and narrowed only when a chat turn observes an auth failure, so
   an external logout with no chat turn in between would leave it `ready=True`
   indefinitely — and a stale `ready=True` here authorizes exactly the irreversible

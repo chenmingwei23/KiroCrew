@@ -1850,8 +1850,17 @@ Subprocess lifecycle:
   reports its own `AcpAuthRequired` (see the governance of latched readiness in
   `modules/learn-cron-dashboard.md`), whereas a timer-driven spawn has no turn to
   carry that error. These sites authorize on a **freshly verified** probe
-  (`verified_ready`, 30s ceiling), never the bare latch — a stale `ready=True`
-  would green-light exactly the signed-out spawn the gate exists to prevent.
+  (`verified_ready`), never the bare latch — a stale `ready=True` would
+  green-light exactly the signed-out spawn the gate exists to prevent. The
+  freshness bound differs by site: `/api/models` keeps the tight 30s ceiling
+  (`_VERIFY_MAX_AGE_SECS`) because it is polled only while degraded and has no
+  server-side cooldown on its spawn, so a wide window would re-open the
+  browser-login storm; `/api/sessions/usage` reads on a 5-minute
+  `_POLL_GATE_MAX_AGE_SECS` because its spawn is already throttled to one fetch
+  per `_USAGE_REFRESH_SECS` (600s), so the wide window cannot storm it and only
+  spares the credit pill the inline probe. The widened worst case is one
+  stale-`ready=True` usage spawn up to five minutes after an external logout,
+  still caught sooner by the identity-change re-probe and by Refresh.
 - **`AcpAuthRequired` is the authoritative logout signal.** Readiness is probed
   at gateway start and on explicit user action only, so a mid-session sign-out is
   discovered when the ACP attempt fails, not by a poll. `AcpRuntime`/`AcpClient`

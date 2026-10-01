@@ -2324,6 +2324,13 @@ async def api_models(request: web.Request) -> web.Response:
     # opened a browser window every 8s indefinitely. The 503 is the same
     # degraded response the timeout/unresolved branches already return, so the
     # client contract is unchanged; only the subprocess is skipped.
+    #
+    # Keep the tight destructive bound here: this endpoint polls only while the
+    # model list is a degraded fallback and stops the instant a live fetch wins
+    # (website/src/providers/modelListHealth.ts), so it is not polled at all when
+    # healthy and gains no latency from a wider window. It has no server-side
+    # cooldown on its kiro-cli spawn, so a wide stale-authorize window would let a
+    # stale ready=True latch spawn a browser-opening login on most degraded ticks.
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked

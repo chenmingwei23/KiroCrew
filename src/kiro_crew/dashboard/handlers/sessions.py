@@ -60,7 +60,10 @@ from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
     internal_memory_scope,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.kiro_readiness import (
+    _POLL_GATE_MAX_AGE_SECS,
+    reject_if_kiro_unverified,
+)
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
 from kiro_crew.executors import subprocess_executor
@@ -1304,7 +1307,14 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     # `kiro-cli chat --no-interactive ... /usage`, which auto-opens a browser
     # login while signed out. This endpoint is polled every 30s by the top-bar
     # credit pill, so an unauthenticated gateway spawned a browser every 30s.
-    blocked = await reject_if_kiro_unverified(request)
+    #
+    # Read on the poll-gate max-age, not the tight destructive bound: a 30s bound
+    # matches this endpoint's own 30s poll, so the latch expires at nearly every
+    # tick and the request runs a whoami probe inline — the documented-cached
+    # read then waits seconds on the probe. The wider window authorizes many
+    # polls between probes while still containing the only risk (a browser login
+    # spawned on a stale ready=True).
+    blocked = await reject_if_kiro_unverified(request, max_age_secs=_POLL_GATE_MAX_AGE_SECS)
     if blocked is not None:
         return blocked
     now = time.time()
