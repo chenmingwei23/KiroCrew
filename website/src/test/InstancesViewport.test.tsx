@@ -818,6 +818,135 @@ describe('InstancesViewport', () => {
       await send(watch('w-1'), 7778, w1)
       expect(post1).not.toHaveBeenCalled()
     })
+
+  describe('pane clipboard-write relay (mc-pane-clipboard-write)', () => {
+    // A pane cannot run navigator.clipboard itself — the dashboard's `(self)`
+    // clipboard Permissions-Policy does not reach the pane's cross-origin frame.
+    // The host holds the grant, so it writes on the pane's behalf and answers
+    // once, to the pane's exact origin, so the pane can stop waiting.
+    const frameFor = (port: number) =>
+      [...document.querySelectorAll('iframe')].find(f => f.src.includes(`:${port}`)) as HTMLIFrameElement
+    const send = (data: unknown, port: number, source: Window | null) =>
+      act(async () => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data, origin: `http://127.0.0.1:${port}`, source,
+        }))
+      })
+    async function renderTwoPanes() {
+      mockConnectedCd1()
+      const store = createTestStore({
+        instances: {
+          warm: { 'cd-1': { port: 7778, token: 'tok' }, 'cd-2': { port: 7779, token: 'tok2' } },
+          activeId: 'cd-1', mru: ['cd-1', 'cd-2'], unread: {}, ready: { 'cd-1': true, 'cd-2': true },
+        },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(frameFor(7778)).toBeDefined())
+      await waitFor(() => expect(frameFor(7779)).toBeDefined())
+      const fakeWindow = (el: HTMLIFrameElement) => {
+        const w = { postMessage: vi.fn() } as unknown as Window
+        Object.defineProperty(el, 'contentWindow', { configurable: true, get: () => w })
+        return w
+      }
+      const w1 = fakeWindow(frameFor(7778))
+      const w2 = fakeWindow(frameFor(7779))
+      return { store, w1, w2, post1: vi.mocked(w1.postMessage), post2: vi.mocked(w2.postMessage) }
+    }
+
+    let writeText: ReturnType<typeof vi.fn>
+    let write: ReturnType<typeof vi.fn>
+    beforeEach(() => {
+      writeText = vi.fn().mockResolvedValue(undefined)
+      write = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText, write } })
+      vi.stubGlobal('ClipboardItem', class { constructor(public items: unknown) {} })
+    })
+    afterEach(() => { vi.unstubAllGlobals() })
+
+    const req = (id: string, extra: Record<string, unknown>) =>
+      ({ type: 'mc-pane-clipboard-write', v: 1, id, ...extra })
+
+    it('writes a text payload in the host document and answers ok to the exact origin', async () => {
+      const { w1, post1 } = await renderTwoPanes()
+      await send(req('c-1', { text: 'copied link' }), 7778, w1)
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('copied link'))
+      await waitFor(() =>
+        expect(post1).toHaveBeenLastCalledWith(
+          { type: 'mc-pane-clipboard-result', v: 1, id: 'c-1', ok: true },
+          'http://127.0.0.1:7778',
+        ),
+      )
+      for (const call of post1.mock.calls) expect(call[1]).not.toBe('*')
+    })
+
+    it('writes an image+text item and answers ok', async () => {
+      const { w1, post1 } = await renderTwoPanes()
+      const png = new Blob(['x'], { type: 'image/png' })
+      await send(req('c-img', { image: { png, text: 'cap' } }), 7778, w1)
+      await waitFor(() => expect(write).toHaveBeenCalledTimes(1))
+      await waitFor(() =>
+        expect(post1).toHaveBeenLastCalledWith(
+          { type: 'mc-pane-clipboard-result', v: 1, id: 'c-img', ok: true },
+          'http://127.0.0.1:7778',
+        ),
+      )
+    })
+
+    it('answers ok=false when the host write rejects', async () => {
+      writeText.mockRejectedValue(new Error('nope'))
+      const { w1, post1 } = await renderTwoPanes()
+      await send(req('c-2', { text: 'x' }), 7778, w1)
+      await waitFor(() =>
+        expect(post1).toHaveBeenLastCalledWith(
+          { type: 'mc-pane-clipboard-result', v: 1, id: 'c-2', ok: false },
+          'http://127.0.0.1:7778',
+        ),
+      )
+    })
+
+    it('ignores a request from the wrong frame, a malformed payload, and an unknown version', async () => {
+      const { w1, w2, post1 } = await renderTwoPanes()
+      // cd-1's origin, but the message came from another frame's window.
+      await send(req('c-spoof', { text: 'x' }), 7778, w2)
+      // Right frame, but neither text nor image.
+      await send(req('c-empty', {}), 7778, w1)
+      // Right frame, but both shapes at once.
+      await send(req('c-both', { text: 'x', image: { png: new Blob(['y']), text: 't' } }), 7778, w1)
+      // Right frame, unknown protocol version.
+      await send({ ...req('c-v2', { text: 'x' }), v: 2 }, 7778, w1)
+      await act(async () => {})
+      expect(writeText).not.toHaveBeenCalled()
+      expect(post1).not.toHaveBeenCalled()
+    })
+
+    it('drops a request from a loopback origin that maps to no warm pane', async () => {
+      const { post1, post2 } = await renderTwoPanes()
+      // Port 9999 is not a warm tunnel: resolveTunnelOrigin returns no id.
+      await act(async () => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data: req('c-x', { text: 'x' }), origin: 'http://127.0.0.1:9999',
+        }))
+      })
+      expect(writeText).not.toHaveBeenCalled()
+      expect(post1).not.toHaveBeenCalled()
+      expect(post2).not.toHaveBeenCalled()
+    })
+
+    it('drops a request from a non-active (hidden) pane so a background pane cannot overwrite the clipboard', async () => {
+      const { store, w2, post2 } = await renderTwoPanes()
+      // cd-1 is active; cd-2 is a background pane (display:none). Its request,
+      // from its own frame and warm origin, is still dropped with no write and
+      // no answer — only the pane on screen may touch the OS clipboard.
+      await send(req('c-bg', { text: 'x' }), 7779, w2)
+      await act(async () => {})
+      expect(writeText).not.toHaveBeenCalled()
+      expect(post2).not.toHaveBeenCalled()
+      // Once cd-2 is the active pane, its request is honored.
+      await act(async () => { store.dispatch(setActiveId('cd-2')) })
+      await send(req('c-fg', { text: 'now active' }), 7779, w2)
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('now active'))
+    })
+  })
   })
 
   it('applies the incoming pane\'s chrome state on switch instead of the outgoing one\'s', async () => {

@@ -1,3 +1,5 @@
+import { writeClipboardViaHost } from '../lib/paneClipboard'
+
 /** Copy code, trimming leading + trailing whitespace so a pasted command lands
  *  clean at the prompt — no leading indent, no trailing space. */
 export function copyCode(text: string): Promise<boolean> {
@@ -35,6 +37,20 @@ export async function copyWithOutcome(text: string): Promise<CopyOutcome> {
     await navigator.clipboard.writeText(text)
     return { ok: true, hadAsyncApi: true }
   } catch (asyncError) {
+    // The async API is refused. Inside an embedded instance pane that refusal
+    // is the dashboard's `(self)` clipboard Permissions-Policy, which cannot be
+    // delegated to the pane's cross-origin frame. Ask the host frame to write
+    // in its own top-level document, where the grant applies, before the
+    // textarea fallback: `execCommandCopy` silently fails for a copy run from a
+    // menu whose focus moves off the staging textarea, and the host write does
+    // not depend on this frame's focus. A host without the bridge answers
+    // `false` (or not at all, via the relay timeout), so the fallback still
+    // runs. `writeClipboardViaHost` resolves `false` immediately when this frame
+    // is not an embedded pane, so a top-level caller skips straight to the
+    // fallback at no cost.
+    if (await writeClipboardViaHost({ text })) {
+      return { ok: true, hadAsyncApi: true, asyncError }
+    }
     return { ok: execCommandCopy(text), hadAsyncApi: true, asyncError }
   }
 }

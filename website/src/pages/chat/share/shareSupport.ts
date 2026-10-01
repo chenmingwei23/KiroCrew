@@ -4,6 +4,7 @@
  * clipboard/download fallbacks. Kept free of React so every piece is unit
  * testable without a DOM.
  */
+import { writeClipboardViaHost } from '../../../lib/paneClipboard'
 
 /** Public repo link baked into the default caption and the card footer. */
 export const SHARE_REPO_URL = 'https://github.com/kirodotdev/KiroCrew'
@@ -109,7 +110,15 @@ export function prevUserTextFor(
  * to a download, never a dead button.
  */
 export async function copyImageWithText(blob: Blob, text: string): Promise<boolean> {
-  if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) return false
+  if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
+    // No async image-write path here at all. Inside an embedded instance pane
+    // that is the dashboard's `(self)` clipboard Permissions-Policy refusing
+    // the pane's cross-origin frame; the host frame holds the grant, so relay
+    // the image there. Resolves `false` immediately at top level, so a genuine
+    // "no ClipboardItem" browser falls straight through to the caller's
+    // download fallback.
+    return writeClipboardViaHost({ image: { png: blob, text } })
+  }
   try {
     await navigator.clipboard.write([
       new ClipboardItem({ 'image/png': blob, 'text/plain': new Blob([text], { type: 'text/plain' }) }),
@@ -120,7 +129,12 @@ export async function copyImageWithText(blob: Blob, text: string): Promise<boole
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
       return true
     } catch {
-      return false
+      // Both local writes refused. In a pane this is the Permissions-Policy
+      // block (image copy has no `execCommand` equivalent, so without this it
+      // degrades to a download); ask the host to write in its top document
+      // before giving up. `false` at top level or without a bridge, so the
+      // caller's download fallback still runs.
+      return writeClipboardViaHost({ image: { png: blob, text } })
     }
   }
 }

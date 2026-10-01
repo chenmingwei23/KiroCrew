@@ -57,6 +57,12 @@ import {
   watchCursorAwayNative,
 } from '../lib/cursorAway'
 import { NATIVE_NOTIFY_TYPE, parseNativeNotifyEnvelope, postRelayedNativeNotification } from '../lib/nativeNotify'
+import {
+  PANE_CLIPBOARD_RESULT_TYPE,
+  PANE_CLIPBOARD_VERSION,
+  parsePaneClipboardRequest,
+  performRelayedClipboardWrite,
+} from '../lib/paneClipboard'
 import { frameDocumentState, paneLog, safePaneUrl } from '../lib/paneLog'
 import { clearPaneHttpCache, paneOriginFor } from '../lib/paneCache'
 import { connectInstanceInto } from '../lib/connectInstance'
@@ -514,6 +520,45 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         postRelayedNativeNotification(name, id, note, () => {
           window.focus()
           dispatch(setActiveId(id))
+        })
+      } else if (data.type === 'mc-pane-clipboard-write') {
+        // A pane wants a clipboard write it cannot perform itself: the
+        // dashboard's `(self)` clipboard Permissions-Policy grants
+        // `clipboard-write` to this top-level origin only, and it cannot be
+        // delegated to the pane's cross-origin frame, so `navigator.clipboard`
+        // rejects there. This frame holds the grant, so it writes on the pane's
+        // behalf — exactly the delegation the Permissions-Policy allows without
+        // widening the header. The SENDER is already trusted (its origin
+        // resolved to a currently-warm tunnel port above); the PAYLOAD is not,
+        // so parsePaneClipboardRequest shape-checks it (text XOR image, a Blob
+        // for the PNG) before any write. Only `write`/`writeText` is used —
+        // `clipboard-read` is never performed on a pane's behalf. The one result
+        // is answered to the exact sender frame and origin so the pane can stop
+        // waiting; a write that throws answers `false` and the pane falls back.
+        //
+        // Only the pane the user is actually looking at may replace the OS
+        // clipboard — the same rule as the sibling window-level relays
+        // (mc-focus-chrome, the cursor-away watch). A background pane renders
+        // `display: none`, so the user cannot have clicked a Copy control in
+        // one; honoring its write would let a background pane silently overwrite
+        // the clipboard with no gesture and no visible trace. A background
+        // pane's request is dropped without an answer, so its own copy falls
+        // back in-pane.
+        const parsed = parsePaneClipboardRequest(data)
+        if (!parsed) return
+        if (id !== activeIdRef.current) return
+        const frame = iframeRefs.current.get(id)?.contentWindow
+        if (!frame || e.source !== frame) return
+        const origin = e.origin
+        void performRelayedClipboardWrite(parsed.request).then(ok => {
+          try {
+            frame.postMessage(
+              { type: PANE_CLIPBOARD_RESULT_TYPE, v: PANE_CLIPBOARD_VERSION, id: parsed.id, ok },
+              origin,
+            )
+          } catch {
+            /* frame mid-navigation — nothing left to answer */
+          }
         })
       } else if (data.type === 'mc-auth-expired') {
         // Reactive recovery: the embedded dashboard reported an expired session.
