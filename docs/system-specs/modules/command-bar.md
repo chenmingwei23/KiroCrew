@@ -219,8 +219,18 @@ that.
   empty. `view` is named separately from its group because it opens a surface instead of acting
   and closing.
 - `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page;
-  settings use the tighter `SETTINGS_IDLE_LIMIT = 2` while the query is empty, and `recent` is
-  capped ahead of ranking by the overlay at `RECENT_SESSION_ROWS = 3` rather than by this limit.
+  settings carry a second, tighter `SETTINGS_WEAK_LIMIT = 2` on WEAK matches whether or not a
+  query is present, and `recent` is capped ahead of ranking by the overlay at
+  `RECENT_SESSION_ROWS = 3` rather than by this limit. A weak settings match is one that does not
+  name the setting — an empty query (every row is weak), or a typed query that is not a substring
+  of the title and only survived as a scattered subsequence. The cap on weak matches holds under
+  a query for the same reason it holds on the idle page: a word that merely scatters across six
+  long setting titles would otherwise spend six rows and push the overlay's recovery rows (Ask
+  the agent, Search sessions / artifacts / folders / crewmates) below the fold — and those rows
+  are the whole answer to "the root does not search content" for a reader who typed a name. A
+  DIRECT settings hit (the query is a substring of the title) is the user naming the setting, so
+  it ranks up to `PER_GROUP_LIMIT` like any row and searching settings on their own name surfaces
+  every one of them. The full settings corpus stays one `view` row away regardless.
   **Known gap:** rows past a root cap are dropped silently. The artifacts view does not share
   that gap — it renders a `+N more` line under its list, outside the listbox so it cannot become
   an option that Enter does nothing with — and that line is the shape to copy when this one is
