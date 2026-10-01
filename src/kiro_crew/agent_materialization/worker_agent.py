@@ -14,15 +14,22 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew import agent as agent_mod
 from kiro_crew import agent_state
-from kiro_crew.agent_files import AGENT_FILENAME
+from kiro_crew.agent_files import (
+    AGENT_FILENAME,
+)
+from kiro_crew.agent_files import (
+    DASHBOARD_AUTHOR_AGENT_FILENAME as _DASHBOARD_AUTHOR_AGENT_FILENAME,
+)
 from kiro_crew.agent_files import WORKER_AGENT_FILENAME as _WORKER_AGENT_FILENAME
 from kiro_crew.agent_materialization import auto_approve, managed_mcp
+from kiro_crew.agent_spec_format import parse_markdown_spec
 
 #: The keys the worker spec MIRRORS from the resolved default agent spec, so its
 #: superset claim holds against the agent the user actually runs rather than
@@ -1203,3 +1210,277 @@ def rederive_worker_agent(reason: str) -> bool:
         return False
     agent_mod.logger.info("Re-derived worker agent config after %s", reason)
     return True
+
+
+#: The shipped ``dashboard-template`` skill spec -- the ONE authoritative copy of the
+#: dashboard author's charter. The installer reads its ``prompt`` and ``description`` from
+#: here through :func:`parse_markdown_spec` rather than from a Python constant held equal
+#: to it by nothing. ``parent.parent`` is the ``kiro_crew`` package root (this module is
+#: ``kiro_crew/agent_materialization/worker_agent.py``).
+_DASHBOARD_AUTHOR_SPEC_PATH: Path = (
+    Path(__file__).resolve().parent.parent
+    / "builtin_skills"
+    / "kirocrew-dev"
+    / "dashboard-template"
+    / "agent-spec.md"
+)
+
+#: The agent NAME the dashboard-author spec declares. The install writes it as
+#: ``config["name"]``; ownership is confirmed by the installer-recorded digest keyed on
+#: this name (:func:`kiro_crew.agent_state.get_managed_digest`), not by the name itself.
+_MANAGED_OWNED_NAME = "kirocrew-dashboard-author"
+
+
+def _foreign_dashboard_author_spec_reason(spec: dict[str, Any] | None) -> str | None:
+    """Why *spec*, read from the owned dashboard-author path, is not this installer's own
+    managed write, or ``None`` when it REPRODUCES the installer-recorded ownership digest
+    (so the installer may rewrite it).
+
+    PROVENANCE by an installer-recorded digest in the ``agent_state`` sidecar, NOT by
+    content marks. The dashboard-author stem was a user-creatable template name before it
+    became owned, so a user could hand-place a ``kirocrew-dashboard-author.json`` -- and,
+    as review found, so could a copy of ANOTHER owned agent (``kirocrew``, a conductor)
+    renamed onto the stem, which would forge any mark chosen from the managed spec's own
+    shape (its name, its ``kirocrew-core`` reference, even a narrowed server map). Content
+    marks cannot tell such a duplicate apart from the managed spec. The digest can: it is
+    recorded by the installer AFTER it lands a write (:func:`_install_dashboard_author_agent`
+    calls :func:`kiro_crew.agent_state.set_managed_digest`), so only a file whose exact
+    bytes reproduce that recorded value is confirmed as this installer's own last write.
+
+    ``None`` -- "ours to rewrite" -- means exactly: *spec* is a dict whose canonical bytes
+    (:func:`kiro_crew.agent_state.spec_digest`) equal the digest the installer recorded for
+    this owned name. Everything else is foreign and left untouched:
+
+    * NO digest is recorded (``get_managed_digest`` is ``None``) -- the installer never
+      wrote here, so there is nothing to confirm and the present file is a user artefact;
+    * *spec* is absent / unreadable / not a dict (the caller passes ``None``) -- a file
+      whose provenance cannot even be parsed is never read as ours;
+    * *spec*'s bytes do not reproduce the recorded digest -- it has been hand-edited, or it
+      is a different agent's spec renamed onto the stem; either way not our last write.
+
+    A crash between the write and the digest record leaves no digest, which fails CLOSED:
+    the next rebuild sees "no ownership recorded" and declines rather than overwriting a
+    file it cannot attribute. The install gate (:func:`_present_spec_blocks_install`)
+    still refuses up front on an unreadable or symlinked file, so a broken file is covered
+    there too.
+    """
+    if not isinstance(spec, dict):
+        return None
+    recorded = agent_state.get_managed_digest(_MANAGED_OWNED_NAME, strict=True)
+    if not recorded:
+        return "no managed-ownership digest is recorded for this name"
+    if agent_state.spec_digest(spec) != recorded:
+        return "its bytes do not reproduce the installer-recorded ownership digest"
+    return None
+
+
+def _managed_dashboard_author_install_lands(path: Path) -> bool:
+    """Would the managed install actually WRITE at *path* -- i.e. is the stem owned by a
+    live installer that re-filters its grants every rebuild?
+
+    True only when :func:`_write_dashboard_author_spec` would land: NO candidate (the
+    ``.json`` or a ``.md`` sibling) blocks the install -- the ``.json`` is absent or
+    reproduces the installer-recorded ownership digest, AND no user ``.md`` sits beside it.
+    This is the F4 gate the fork governance loop needs: a private copy that reproduces the
+    digest but has a ``.md`` sibling makes the installer REFUSE, so no owned writer ever
+    re-filters that ``.json`` -- treating it as "owned" there would leave its approvals live
+    against a tightened ceiling. The answer matches the install gate exactly by reusing the
+    same per-candidate check.
+    """
+    agents_dir = path.parent
+    stem = path.stem
+    for candidate in (path, agents_dir / (stem + ".md")):
+        if _present_spec_blocks_install(candidate) is not None:
+            return False
+    return True
+
+
+def _is_confirmed_managed_dashboard_author(spec: dict[str, Any] | None) -> bool:
+    """Does *spec* POSITIVELY confirm as this installer's own managed dashboard-author?
+
+    The fail-closed companion to :func:`_foreign_dashboard_author_spec_reason`, for the
+    callers that must never strip a user's guards or skip filtering a user's approvals: the
+    fork refresh, the capability-parent check and the governance filter. Those ask "is this
+    confirmed OURS?", so an ABSENT, unreadable or non-dict spec (``None``) is confirmed as
+    NOTHING -- it is treated as a user file (never refreshed, never guard-stripped, still
+    filtered), NOT as "ours to rewrite". The install gate keeps using the reason helper,
+    where a broken file IS replaceable so one truncated write cannot wedge the install
+    forever; here the opposite default is the safe one.
+
+    Confirmation is the installer-recorded ownership digest: *spec*'s canonical bytes
+    reproduce the value :func:`kiro_crew.agent_state.get_managed_digest` holds for this
+    owned name. No digest recorded, or bytes that do not reproduce it, is NOT confirmed.
+    """
+    if not isinstance(spec, dict):
+        return False
+    return _foreign_dashboard_author_spec_reason(spec) is None
+
+
+def _install_dashboard_author_agent() -> None:
+    """Generate and install the kirocrew-dashboard-author agent config.
+
+    A dispatched, worker-shaped agent, but NOT the default-mirroring worker: it carries
+    its own charter and its own tool surface, so it is built from scratch the way each
+    conductor is rather than mirrored from the default spec. It authors ONE dashboard
+    template and lands it as a pull request, so it mounts the two capabilities that work
+    needs -- ``fs_write`` and ``execute_bash`` -- and nothing that would make it a
+    conductor or a reporting worker: no ``session`` verb, no ``@kirocrew-work`` mount, no
+    ``@kirocrew-dashboard`` publication surface, no ``code`` (governance classes it under
+    ``filesystem.write``, a second path to two capabilities already mounted).
+
+    ``fs_write`` and ``execute_bash`` are MOUNTED but never auto-approved, the line
+    ``kirocrew-conductor`` draws and for the same reason: ``allowedTools`` has no argument
+    matching, so a blanket write or shell grant cannot be told apart from "write anywhere"
+    / "run anything", and the author's whole safety story is that a human reads its diff
+    before it lands. Every auto-approved entry only READS or recalls -- the frontmatter
+    ``allowedTools`` of the shipped ``agent-spec.md`` (``fs_read``, ``tool_search`` and the
+    four read-only ``@kirocrew-core`` verbs) minus ``fs_read`` -- which is what makes
+    granting it on the one path that never reaches the PreToolUse gate safe.
+
+    Derived from the kirocrew agent so it inherits the resolved ``@kirocrew-core``
+    invocation and the security hooks, then narrowed: the ``mcpServers`` map keeps only
+    ``kirocrew-core`` (the one server any grant below names), and the KAS policy is
+    derived from the FILTERED grant list rather than restated, so a ceiling that strips a
+    grant strips its KAS rule with it. The shared writer version-gates it.
+
+    The ``prompt``, ``description``, ``tools`` and ``allowedTools`` are ALL read from the
+    shipped ``dashboard-template`` skill's ``agent-spec.md`` -- the one authoritative copy
+    of the charter, which :func:`parse_markdown_spec` already parses from the package --
+    rather than restated in Python literals that nothing holds equal to it. The
+    frontmatter ``allowedTools`` is the SOURCE's authored auto-approve intent; the install
+    drops ``fs_read`` from it (the one omission with a named reason below) and re-filters
+    the rest through the governance ceiling, so what lands is the governed surface rather
+    than a copy.
+    """
+    spec_source = parse_markdown_spec(_DASHBOARD_AUTHOR_SPEC_PATH.read_text(encoding="utf-8"))
+    config = agent_mod.build_agent_config()
+    config["name"] = _MANAGED_OWNED_NAME
+    config["description"] = spec_source["description"]
+    config["prompt"] = spec_source["prompt"]
+    config["tools"] = list(spec_source["tools"])
+    # ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so every
+    # grant is filtered through the governance ceiling first -- a governed ref stays
+    # MOUNTED (it is still in ``tools``) and simply prompts. The source frontmatter's
+    # ``allowedTools`` is the authored auto-approve intent; we drop ``fs_read`` from it
+    # because the ceiling withholds it from every derived spec's auto-approve list, so it
+    # reaches the gate like ``fs_write`` and ``execute_bash`` do, and offering it only to
+    # have it stripped would emit a withheld-audit event on every rebuild for a grant that
+    # was never going to land. The rest is derived from the parsed spec rather than
+    # restated, so the one authored list stays the single source of truth.
+    config["allowedTools"] = auto_approve._filter_auto_approve(
+        tuple(g for g in spec_source["allowedTools"] if g != "fs_read"),
+        source="_install_dashboard_author_agent",
+    )
+    # Narrowed to the one server any grant above names. ``build_agent_config`` mounts the
+    # whole managed set; a template is not published at run time, so the publication and
+    # session-control servers are surface this charter cannot account for.
+    mcp = config.get("mcpServers", {}) or {}
+    core_entry = mcp.get("kirocrew-core")
+    config["mcpServers"] = {"kirocrew-core": core_entry} if core_entry else {}
+    # Derived from the FILTERED grant list rather than restated, so a ceiling that strips
+    # a grant strips its KAS rule with it; the shared writer version-gates it.
+    auto_approve._write_derived_permissions(
+        config, config["allowedTools"], _DASHBOARD_AUTHOR_AGENT_FILENAME
+    )
+    agents_dir = agent_mod.kiro_agents_dir_path()
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    path = agents_dir / _DASHBOARD_AUTHOR_AGENT_FILENAME
+    # The whole read -> attribute -> write runs under ``agents_spec_lock``, the template-spec
+    # writer lock every other read-modify-writer of this directory holds (the worker
+    # installer, the reset path, the fork refresh, the dashboard PATCH). Without it two
+    # overlapping rebuilds could interleave their reads and writes. Holding the lock makes
+    # the content-mark attribution and the write one atomic step, as the sibling worker
+    # installer does.
+    with agent_mod.agents_spec_lock(agents_dir):
+        _write_dashboard_author_spec(path, config)
+
+
+def _write_dashboard_author_spec(path: Path, config: dict) -> None:
+    """Write the managed spec, attributing any file already at *path* by the INSTALLER-RECORDED
+    OWNERSHIP DIGEST. Caller holds ``agents_spec_lock``.
+
+    POSITIVE-CONFIRMATION by the digest recorded in the ``agent_state`` sidecar
+    (:func:`_foreign_dashboard_author_spec_reason`): the spec is written only when the path
+    is FREE, or the file there reproduces the digest the installer recorded for its last
+    managed write, i.e. our own prior landed write. A user who hand-placed a spec at this
+    once-user-creatable stem -- or a copy of another owned agent renamed onto it -- is left
+    untouched, because its bytes do not reproduce the recorded digest. The digest is recorded
+    AFTER this write (below), under this same lock, so the record and the file move together.
+
+    Three branches, exactly:
+
+    * path ABSENT -> install (nothing to lose).
+    * path PRESENT and the file reproduces the recorded ownership digest -> refresh is
+      allowed (that digest IS the record that this is our own prior write).
+    * path PRESENT not reproducing the digest (no digest recorded, hand-edited, or a
+      different agent's spec renamed on), OR the file cannot be read -> leave it untouched
+      and log once. We never overwrite a file we cannot positively confirm is our own write.
+
+    BOTH candidate forms are checked before the name is claimed: kiro-cli reads
+    ``<stem>.json`` and the v3 engine also reads ``<stem>.md``, and a ``.json`` written
+    beside a user's ``.md`` would SHADOW that markdown spec. So a user ``.md`` at the stem
+    blocks the install exactly as an unconfirmed ``.json`` does -- the installer never
+    shadows a spec it did not write.
+    """
+    agents_dir = path.parent
+    stem = path.stem
+    md_candidate = agents_dir / (stem + ".md")
+    for candidate in (path, md_candidate):
+        blocked = _present_spec_blocks_install(candidate)
+        if blocked is not None:
+            agent_mod.logger.warning(
+                "Not installing the managed %s: %s. Leaving it untouched; remove or rename "
+                "that file to let the managed agent install.",
+                _DASHBOARD_AUTHOR_AGENT_FILENAME,
+                blocked,
+            )
+            return
+    # Every candidate is free, or the ``.json`` reproduces the installer-recorded ownership
+    # digest (so a refresh is allowed): write it through ``_atomic_json_write`` (a tmp-file +
+    # atomic replace), the same writer every sibling installer uses, so a kiro-cli reader
+    # never sees partial JSON at an owned filename.
+    agent_mod._atomic_json_write(path, config)
+    # Record the ownership digest of exactly what we just wrote, under the same spec lock
+    # that guards the write, so the recorded value and the bytes on disk move together. This
+    # is what a later rebuild (and the fork / capability gates) confirm the file against. A
+    # crash before this line leaves no digest, which fails CLOSED -- the next rebuild sees
+    # "no ownership recorded" and declines to overwrite rather than attributing a file it
+    # cannot confirm.
+    agent_state.set_managed_digest(_MANAGED_OWNED_NAME, agent_state.spec_digest(config))
+    agent_mod.logger.info("Installed dashboard-author agent config: %s", path)
+
+
+def _present_spec_blocks_install(candidate: Path) -> str | None:
+    """Why a file already at *candidate* (a ``.json`` or ``.md`` at the dashboard-author
+    stem) must block the managed install, or ``None`` when it does not.
+
+    ``None`` means: the candidate is ABSENT, or it is a ``.json`` that reproduces the
+    installer-recorded ownership digest (our own prior write, which the refresh may
+    overwrite). A reason string means leave everything untouched:
+
+    * a symlink / non-regular file -> never follow or clobber;
+    * a read failure (oversized, non-UTF-8, unparseable) -> provenance unconfirmable;
+    * a file that does not reproduce the recorded digest -> a user artefact or another
+      agent's spec (its ``.json`` is not our write; ANY ``.md`` is a user spec, since the
+      installer only ever writes ``.json``, so even a ``.md`` that reproduced the digest
+      would still be the user's and is left untouched).
+
+    The digest-reproducing ``.json`` refresh case is the ONE overwrite the installer makes;
+    everything else is protected.
+    """
+    if not os.path.lexists(candidate):
+        return None
+    if candidate.is_symlink() or not candidate.is_file():
+        return f"{candidate} is not a regular file"
+    current = agent_mod._read_spec_capped(candidate)
+    if current is None:
+        return f"the file at {candidate} could not be read, so its provenance cannot be confirmed"
+    # The installer only ever writes the ``.json`` form, so a ``.md`` is never its own write:
+    # a ``.md`` is always a user spec and must be left untouched. Only a ``.json`` may be
+    # confirmed as ours and refreshed.
+    if candidate.suffix.lower() != ".json":
+        return f"a user markdown spec exists at {candidate}"
+    reason = _foreign_dashboard_author_spec_reason(current)
+    if reason is not None:
+        return f"a file at {candidate} is not this installer's own ({reason})"
+    return None

@@ -213,3 +213,58 @@ def test_strict_get_fork_info_surfaces_corruption_while_lenient_degrades(monkeyp
     assert agent_state.get_fork_info("any") is None  # lenient default
     with pytest.raises(ValueError):
         agent_state.get_fork_info("any", strict=True)
+
+
+# --------------------------------------------------------------------------- #
+# managed_digest -- the installer-recorded ownership record (GPT 6.1 F1).
+# --------------------------------------------------------------------------- #
+
+
+def test_spec_digest_matches_the_bytes_the_installer_writes():
+    """``spec_digest`` hashes the CANONICAL bytes the atomic writer lands --
+    ``json.dumps(indent=2)`` + a trailing newline -- so a spec read back and re-serialized
+    the same way reproduces the recorded value. No ``sort_keys`` (the writer does not sort)."""
+    import hashlib
+    import json
+
+    config = {"name": "kirocrew-dashboard-author", "mcpServers": {"kirocrew-core": {}}}
+    expected = hashlib.sha256((json.dumps(config, indent=2) + "\n").encode("utf-8")).hexdigest()
+    assert agent_state.spec_digest(config) == expected
+
+
+def test_managed_digest_roundtrips_and_clears():
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+    agent_state.set_managed_digest("kirocrew-dashboard-author", "deadbeef")
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") == "deadbeef"
+    agent_state.set_managed_digest("kirocrew-dashboard-author", None)
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+
+
+def test_managed_digest_survives_alongside_model_bookkeeping():
+    agent_state.set_model_managed("kirocrew-dashboard-author", True)
+    agent_state.set_managed_digest("kirocrew-dashboard-author", "cafe1234")
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") == "cafe1234"
+    assert agent_state.get_model_managed("kirocrew-dashboard-author") is True
+
+
+def test_prune_drops_the_managed_digest():
+    agent_state.set_managed_digest("x", "feed0000")
+    agent_state.prune("x")
+    assert agent_state.get_managed_digest("x") is None
+
+
+def test_strict_get_managed_digest_surfaces_corruption_while_lenient_degrades(
+    monkeypatch, tmp_path
+):
+    """A caller whose answer decides an OVERWRITE reads strict: an unreadable sidecar must
+    raise (fail closed), not degrade to 'no ownership' and let the file be rewritten. Display
+    callers keep the lenient default."""
+    import pytest
+
+    sidecar = tmp_path / "agent_model_state.json"
+    sidecar.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(agent_state, "_state_path", lambda: sidecar)
+
+    assert agent_state.get_managed_digest("any") is None  # lenient default
+    with pytest.raises((ValueError, OSError)):
+        agent_state.get_managed_digest("any", strict=True)

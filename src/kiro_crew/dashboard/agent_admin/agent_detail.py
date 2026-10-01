@@ -408,6 +408,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             # so ENOSPC mid-write would destroy the existing
                             # template. Same tmp+rename helper as the fork
                             # refresh and install paths.
+                            # An authorized model/skills edit of the OWNED dashboard-author
+                            # spec rewrites its bytes. Provenance is a CONTENT MARK (declared
+                            # name + kirocrew-core reference) carried by the spec itself, which
+                            # this merge preserves, so the installer's content-mark gate still
+                            # recognises the rewritten file as its own on the next rebuild --
+                            # there is nothing to re-stamp.
                             _atomic_json_write(f, fresh)
                         if snapshot is None:
                             # No skills in this patch: the mapping is the pre-lock read's.

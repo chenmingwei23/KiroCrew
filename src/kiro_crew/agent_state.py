@@ -18,6 +18,14 @@ rather than the kiro spec:
 - ``forked_from`` / ``private_to`` (str): recorded on a template that is one
   crew's private copy of another template (blueprint semantics — editing a
   crew's definition forks a copy instead of mutating the shared file).
+- ``managed_digest`` (str): the SHA-256 of the exact spec bytes the installer
+  last wrote at an OWNED filename whose stem was a user-creatable name before it
+  became owned (today only ``kirocrew-dashboard-author``). It is the installer's
+  record that THIS file is its own managed write: a rebuild overwrites the spec
+  only when the file on disk reproduces this digest, so a user artefact that
+  happens to sit at the stem -- or a copy of another agent renamed onto it -- is
+  never read as managed and overwritten. Smallest possible ownership record: one
+  string per owned name, in this one file, no second store.
 
 State file (``~/.kiro/crew/agent_model_state.json``, honoring ``KIROCREW_HOME``)::
 
@@ -34,6 +42,7 @@ This is a near-leaf module: it imports only the stdlib plus the leaf
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -57,6 +66,12 @@ _MIRRORED_FROM = "mirrored_from"
 _MIRRORED_STAT = "mirrored_stat"
 _FORKED_FROM = "forked_from"
 _PRIVATE_TO = "private_to"
+# Installer-recorded ownership for a spec at an owned filename that was a
+# user-creatable name before it became owned (today: kirocrew-dashboard-author).
+# Holds the SHA-256 of the exact spec bytes the installer last wrote there, so
+# "is this file our own managed write?" is answered by a digest the installer
+# recorded, not by marks a user artefact could carry by coincidence.
+_MANAGED_DIGEST = "managed_digest"
 
 # Guards in-process read-modify-write races (e.g. dashboard PATCH vs gateway
 # refresh). ``atomic_write`` makes each WRITE atomic, but two processes can
@@ -462,6 +477,65 @@ def set_mirrored_stat(name: str, value: str | None) -> None:
             entry[_MIRRORED_STAT] = str(value)
         else:
             entry.pop(_MIRRORED_STAT, None)
+        if entry:
+            data[name] = entry
+        else:
+            data.pop(name, None)
+        _write(data)
+
+
+def spec_digest(config: MutableMapping[str, object] | dict) -> str:
+    """SHA-256 of a spec's CANONICAL bytes, as the installer writes them.
+
+    The ownership record is a digest of the exact bytes
+    :func:`kiro_crew.agent._atomic_json_write` lands on disk --
+    ``json.dump(data, indent=2)`` then a trailing newline -- so a spec read back
+    from the file and re-serialized the same way hashes to the value the installer
+    recorded when it wrote it. Any field reorder, retype or edit changes the digest,
+    which is the point: a file whose bytes do not reproduce the recorded digest is
+    not this installer's last managed write and must not be overwritten.
+
+    ``sort_keys`` is deliberately NOT set: the installer does not sort, so the digest
+    is taken over the bytes actually written, not a normalized form that would differ
+    from the file on disk.
+    """
+    payload = json.dumps(config, indent=2) + "\n"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_managed_digest(name: str, *, strict: bool = False) -> str | None:
+    """Return the installer-recorded digest of *name*'s last managed write, or ``None``.
+
+    ``None`` means NO ownership was recorded for this name -- there is no managed write to
+    confirm the on-disk file against, so the file is treated as a user artefact. ``strict``
+    propagates an unreadable sidecar instead of degrading it to ``None``, for the reason
+    :func:`get_fork_info` gives: a caller whose answer decides an OVERWRITE must not read
+    "the sidecar will not parse" as "no ownership recorded" -- an unverifiable file is a
+    user file. Display/read callers stay lenient.
+    """
+    with _lock:
+        value = _entry(_read(strict=strict), name).get(_MANAGED_DIGEST)
+    return value if isinstance(value, str) and value else None
+
+
+def set_managed_digest(name: str, value: str | None) -> None:
+    """Record (or clear, when *value* is falsy) the digest of *name*'s last managed write.
+
+    Called by the installer immediately AFTER it lands the spec, under the same spec lock
+    that guards the write, so the recorded digest and the bytes on disk move together. A
+    crash between the write and this call leaves the digest absent, which fails CLOSED: the
+    next rebuild sees "no ownership recorded" and declines to overwrite rather than
+    overwriting a file it cannot attribute.
+    """
+    with _locked():
+        data = _read(strict=True)
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            entry = {}
+        if value:
+            entry[_MANAGED_DIGEST] = str(value)
+        else:
+            entry.pop(_MANAGED_DIGEST, None)
         if entry:
             data[name] = entry
         else:
