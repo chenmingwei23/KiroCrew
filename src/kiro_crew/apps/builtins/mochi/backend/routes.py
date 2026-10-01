@@ -434,6 +434,7 @@ _CHAT_EVENTS = frozenset(
         "approval_granted",
         "approval_rejected",
         "error",
+        "delivery_uncertain",
     }
 )
 
