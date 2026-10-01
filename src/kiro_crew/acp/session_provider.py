@@ -563,7 +563,13 @@ class AcpSessionProvider(LLMProvider):
     def native_steering(self) -> bool:
         from kiro_crew.acp.types import ACP_BACKEND_KAS
 
-        return self.backend == ACP_BACKEND_KAS
+        # KAS carries the three default steering roots in its projected view, so
+        # it owns steering delivery -- UNLESS this session fell back to the
+        # authored spec, which declares only ``.kiro/steering`` and inherits the
+        # others from nobody once the projection's workspace overlay is in place.
+        # The runtime records that on the handle; without it folder steering
+        # would skip the two missing roots as already delivered.
+        return self.backend == ACP_BACKEND_KAS and bool(self._handle.native_default_roots_delivered)
 
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""

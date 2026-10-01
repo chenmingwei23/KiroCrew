@@ -5913,6 +5913,32 @@ class AcpRuntime:
             await self.terminate_session(session_id)
             raise AcpRuntimeError(str(exc)) from exc
 
+    async def _record_native_default_roots(self, handle: Any, session_work_dir: Any) -> None:
+        """Mark whether *handle*'s session receives kiro-cli's three default roots.
+
+        The projected view carries global steering, workspace steering and
+        ``AGENTS.md``; the authored spec declares only ``.kiro/steering``. A KAS
+        projection also writes the workspace
+        ``chat.disableInheritingDefaultResources`` overlay, which turns off
+        kiro-cli's native inheritance for EVERY session sharing that
+        ``cli.json``. So a session that ran the authored spec -- no projection
+        active here -- carries that overlay from another live session and gets
+        the two extra roots from nobody. Flagging it lets folder steering
+        backfill them instead of skipping them as natively delivered.
+
+        Only KAS reports ``native_steering``, so only KAS can over-report
+        delivery; a projection active for this process means the projected view
+        (which carries the roots) is what the session runs. The settings read is
+        off-loop.
+        """
+        if self.acp_backend == ACP_BACKEND_KAS and (
+            getattr(self, "_native_skill_projection", None) is None
+        ):
+            from kiro_crew.acp.skill_projection import authored_agent_misses_default_roots
+
+            if await asyncio.to_thread(authored_agent_misses_default_roots, session_work_dir):
+                handle.native_default_roots_delivered = False
+
     async def _handshake_client_capabilities(self) -> dict[str, Any]:
         """The ``clientCapabilities`` this spawn sends, with the settings channel filled.
 
@@ -7168,6 +7194,7 @@ class AcpRuntime:
                 wire_registered=kas_agents is not None,
             )
             handle.active_agent = mode_agent
+            await self._record_native_default_roots(handle, session_work_dir)
             # Whether set_mode actually SWITCHED modes: the servers that
             # initialized during session/new belong to the mode kiro-cli
             # started the session on. If the requested agent differs, those
@@ -7725,6 +7752,7 @@ class AcpRuntime:
                 wire_registered=kas_agents is not None,
             )
             handle.active_agent = mode_agent
+            await self._record_native_default_roots(handle, session_work_dir)
             # See create_session: after a real mode switch, registration frames
             # staged during session/load describe the pre-switch roster.
             _ids, _current, _adv = parse_session_modes(resp)

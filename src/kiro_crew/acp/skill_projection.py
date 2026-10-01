@@ -1201,6 +1201,41 @@ def inherits_default_resources(work_dir: str | os.PathLike[str] | None) -> bool:
     return _inheritance_preference(local, global_settings)[0]
 
 
+def authored_agent_misses_default_roots(work_dir: str | os.PathLike[str] | None) -> bool:
+    """Whether an authored-spec session in *work_dir* loses the three default roots.
+
+    A session that runs the AUTHORED agent (no projected view active) relies on
+    kiro-cli to load the global steering tree, the workspace steering tree and
+    ``AGENTS.md`` natively. kiro-cli reads the literal
+    ``chat.disableInheritingDefaultResources`` key for that, and a projection
+    writes that key ``true`` whenever it runs -- for EVERY session in the
+    workspace, since one shared ``cli.json`` serves them all. So an authored
+    session carries the overlay another session's projection left behind and
+    inherits none of the three, while its spec declares only ``.kiro/steering``.
+
+    This answers True only when the overlay is Crew's own AND the preference it
+    recorded was to inherit: a workspace the operator themselves opted out of
+    never wanted those roots, so a missing root there is their choice, not a
+    gap to backfill. Settings that cannot be read answer False -- the roots are
+    assumed reachable, the pre-overlay behaviour.
+    """
+    try:
+        global_settings = _settings(kiro_home() / "settings" / "cli.json")
+        local = (
+            _settings(Path(work_dir) / ".kiro" / "settings" / "cli.json")
+            if work_dir is not None
+            else {}
+        )
+    except (OSError, ValueError, RuntimeError, RecursionError, FileTooLargeError):
+        logger.warning(
+            "skill projection: Kiro settings unreadable; assuming default roots reachable",
+            exc_info=True,
+        )
+        return False
+    inherited, _source, overlaid = _inheritance_preference(local, global_settings)
+    return overlaid and inherited
+
+
 def _restore_inheritance(path: Path, local: dict[str, Any]) -> None:
     """Undo only our overlay; a changed or removed native setting wins."""
     inherited = local.get(_MANAGED_SETTING)

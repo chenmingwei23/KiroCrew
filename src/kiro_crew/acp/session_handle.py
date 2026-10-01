@@ -1025,6 +1025,16 @@ class AcpSessionHandle:
         # the prompt about to go out, so no steer is sent until it is set.
         self._prompt_written: bool = False
         self.native_context_documents: dict[str, str] = {}
+        # Whether this session's active agent actually receives kiro-cli's three
+        # default resource roots (global steering, workspace steering, AGENTS.md).
+        # A KAS projection carries them in the projected view and then writes the
+        # workspace ``chat.disableInheritingDefaultResources`` overlay, so a
+        # session that runs the AUTHORED spec instead -- that overlay still in the
+        # shared cli.json from another live session's projection -- inherits none
+        # of them from kiro-cli and declares only ``.kiro/steering`` itself. The
+        # runtime sets this False for that session so folder steering backfills
+        # the missing roots rather than skipping them as already delivered.
+        self.native_default_roots_delivered: bool = True
         self._queue = queue
         self._runtime = runtime
         # When True, destroy() skips the transcript unlink (subagent
