@@ -1593,12 +1593,32 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _timeline_start() -> dict[str, Any]:
-    return {"moments": [], "dropped": 0}
+    # ``last_seq`` is the seq of the newest moment folded so far, or 0 before the
+    # first. A crew log's seq is strictly increasing within one succession unit and
+    # restarts at 1 in the next, so a moment at or below it is the mark that a SECOND
+    # unit has begun -- which this fold refuses below rather than render as one
+    # scrambled timeline.
+    return {"moments": [], "dropped": 0, "last_seq": 0}
 
 
 def _timeline_step(state: dict[str, Any], entry: Entry) -> None:
     if entry.type not in TIMELINE_TYPES:
         return
+    if entry.seq <= state["last_seq"]:
+        # A slot-wide read folds the units a slot ran under back to back, and each
+        # unit's seq restarts at 1. One session holds exactly one unit, so the only
+        # reader today never gets here; the day a slot-keyed reader folds this over a
+        # slot, two units interleaved by wall clock carry a clock-rollback inversion.
+        # Fail loudly at that boundary so the timeline is ordered by succession before
+        # anyone orders it by bare timestamp.
+        raise CrewLogError(
+            f"timeline moment at seq {entry.seq} is at or below the fold's seq "
+            f"{state['last_seq']}; the timeline fold spans one succession unit, not a "
+            f"slot of them -- order the units by succession before folding",
+            code=CODE_BAD_DATA,
+            field="seq",
+        )
+    state["last_seq"] = entry.seq
     moment: dict[str, Any] = {"seq": entry.seq, "time": entry.time, "type": entry.type}
     data = entry.data
     for key in (
@@ -4792,6 +4812,10 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _timeline_render,
         affects=TIMELINE_TYPES,
         copy_state=_timeline_copy,
+        # The state carries ``last_seq`` now, so a savepoint from a build that stored
+        # only ``moments`` describes an older shape and resumes onto this logic blind
+        # to the unit boundary -- retire it.
+        state_version=_FOLD_STATE_VERSION_BASE + 1,
     ),
     "tools": _Fold(
         "tools",
