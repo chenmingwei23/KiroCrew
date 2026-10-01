@@ -224,7 +224,14 @@ transcript message, and
 calls `stop_turn(..., force=False, preserve_queue=True, on_soft=, on_hard=)`. The
 queue is deliberately preserved here: a stop should cancel the running turn and
 leave queued messages for the user to process or dismiss individually. If the
-provider reports `"idle"`, the orphaned card is resolved immediately.
+provider reports `"idle"`, the orphaned card is resolved immediately. When that
+`"idle"` lands on a slot that still reads `running` — the turn reached its done
+boundary at the provider but the slot has not seen the terminal event settle it —
+the reply carries `info: "no active turn"` so it does not read as "stopped a
+running turn". A genuine in-flight turn whose cooperative cancel does not confirm
+answers `stop_turn` with a non-acked outcome instead, which escalates to the hard
+kill on its own (step 2 above); `"idle"` is the signal that there is no provider
+turn to kill, so the handler names the state rather than forcing a reset.
 
 **Second press escalates on ANY second press**, not only when the client computed
 `force=true`. The client derives `force` from the WS-echoed `stop_state`, which can

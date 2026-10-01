@@ -6079,7 +6079,17 @@ async def stop_slot_turn(
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
-    # Resolve orphaned card when provider reports no active turn
+    # A genuine in-flight turn whose cooperative cancel does not confirm within
+    # the budget answers ``stop_turn`` with a non-acked outcome, which that
+    # method escalates to a hard reset on its own -- a dispatched, mid-execution
+    # tool call that never acks is reaped there. ``"idle"`` is the opposite
+    # signal: the provider holds no active turn to cancel (its model stream
+    # reached the done boundary, or no session is registered for the key). When
+    # the slot still reads running at that point its turn ended at the provider
+    # but the slot has not seen the terminal event settle it. The orphaned card
+    # is resolved and the reply names the honest state -- there is no running
+    # provider turn here to report as "stopped", and no provider turn to kill.
+    _idle_running = outcome == "idle" and slot.running
     if outcome == "idle" and slot._stop_event_id:
         _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
@@ -6107,6 +6117,11 @@ async def stop_slot_turn(
     )
     if outcome == "compacting":
         return {"ok": True, "info": "compacting", "compacting": True}
+    if _idle_running:
+        # The provider held no active turn to cancel while the slot still read
+        # running: the turn ended at the provider but the slot had not settled.
+        # Naming it keeps the reply from reading as "stopped a running turn".
+        return {"ok": True, "info": "no active turn"}
     return {"ok": True}
 
 
