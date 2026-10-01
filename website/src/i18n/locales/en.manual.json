@@ -2357,7 +2357,9 @@
       "connecting": "Connecting…",
       "connection_error": "Connection error",
       "disconnected": "Disconnected",
-      "pane_failed_to_load": "Pane failed to load"
+      "pane_failed_to_load": "Pane failed to load",
+      "pane_needs_loopback_origin": "This pane needs a local dashboard address",
+      "pane_needs_loopback_origin_how": "Remote crew panes embed only when the dashboard is open on localhost. Open the dashboard there to use this pane."
     },
     "instanceTabBar": {
       "connected": "connected",

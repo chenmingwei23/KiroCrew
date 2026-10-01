@@ -6960,6 +6960,8 @@
       "disconnected": "Desconectado",
       "loading_pane": "Carregando painel…",
       "pane_failed_to_load": "Falha ao carregar o painel",
+      "pane_needs_loopback_origin": "Este painel precisa de um endereço de painel de controle local",
+      "pane_needs_loopback_origin_how": "Os painéis de crew remota só são incorporados quando o painel de controle está aberto em localhost. Abra-o ali para usar este painel.",
       "retry": "Tentar novamente",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "O túnel parece conectado, mas o painel remoto nunca carregou. Ele pode estar\n                  reiniciando — tente novamente ou troque de aba acima.",
       "this_tab_stays_until_you_disconnect_the_instance": "Esta aba permanece até você desconectar a crew em <0>Configurações → Crew remota</0>."

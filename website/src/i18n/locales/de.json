@@ -6850,6 +6850,8 @@
       "disconnected": "Getrennt",
       "loading_pane": "Bereich wird geladen…",
       "pane_failed_to_load": "Bereich konnte nicht geladen werden",
+      "pane_needs_loopback_origin": "Dieser Bereich benötigt eine lokale Dashboard-Adresse",
+      "pane_needs_loopback_origin_how": "Bereiche für entfernte Crews werden nur eingebettet, wenn das Dashboard über localhost geöffnet ist. Öffne das Dashboard dort, um diesen Bereich zu nutzen.",
       "retry": "Wiederholen",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "Der Tunnel scheint verbunden zu sein, aber das Remote-Dashboard wurde nie geladen. Es startet möglicherweise\n                  neu — versuche es erneut oder wechsle oben die Tabs.",
       "this_tab_stays_until_you_disconnect_the_instance": "Dieser Tab bleibt, bis du die Crew unter <0>Einstellungen → Remote-Crew</0> trennst."

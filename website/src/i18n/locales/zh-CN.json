@@ -6740,6 +6740,8 @@
       "disconnected": "已断开连接",
       "loading_pane": "正在加载窗格…",
       "pane_failed_to_load": "窗格加载失败",
+      "pane_needs_loopback_origin": "此窗格需要本地仪表板地址",
+      "pane_needs_loopback_origin_how": "远程 crew 窗格仅在仪表板于 localhost 打开时才能嵌入。请在该地址打开仪表板以使用此窗格。",
       "retry": "重试",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "隧道看起来已连接，但远程仪表板始终未加载。它可能正在\n                  重启 — 请重试，或切换上方的标签页。",
       "this_tab_stays_until_you_disconnect_the_instance": "此标签页会一直保留，直到你在“<0>设置 → 远程 Crew</0>”中断开此 Crew。"

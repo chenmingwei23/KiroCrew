@@ -1249,11 +1249,18 @@ _BASE_CSP = (
 # for a bracketed IPv6 host, so IPv6 loopback preview cannot be expressed here
 # without pinning a specific port — which the arbitrary-port preview use case
 # rules out.
+# The client mirrors this set in `isEmbeddableLoopbackOrigin`
+# (website/src/lib/tunnelOrigin.ts) to decide, before mounting a remote-crew
+# pane, whether the dashboard's own origin can embed it. Edit the two in step:
+# admitting a new frame-src origin here (e.g. [::1] or https *.localhost) while
+# the client stays unchanged leaves the pane silently refused on an origin the
+# server now allows.
 _LOOPBACK_FRAME_SRC = (
     " http://127.0.0.1:* http://localhost:* http://0.0.0.0:*"
     " https://127.0.0.1:* https://localhost:* https://0.0.0.0:*"
 )
 # Additional tunnel wildcard, only when the instances feature is enabled.
+# Mirrored client-side in isEmbeddableLoopbackOrigin (see above).
 _INSTANCES_FRAME_SRC_EXTRA = " http://*.localhost:*"
 
 # Permissions-Policy header. Chrome 143+ changed the default policy so
