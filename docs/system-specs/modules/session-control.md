@@ -857,12 +857,31 @@ other answer, including an unreadable config or a degraded `memory_stores`
 section, is `False`, which withdraws admission and the bypass and can never open
 the surface wider than it is.
 
-`_created_by` is the marker, and it needs no lineage walk: `create_session` is its
-ONLY writer, so a non-empty value means "an agent made this session" at any depth.
-A grandchild carries its parent's key there and is fenced by the same test, and a
-chain whose middle slot has been closed cannot fail open because no chain is
-walked. A person's own tab and a fork reach `get_or_create_slot` directly and stay
-unattributed, so ordinary human use is unaffected.
+`_created_by` is the attribution marker, and it needs no lineage walk:
+`create_session` is its ONLY writer, so a non-empty value means "an agent made
+this session" at any depth. `_caller_is_ownership_fenced` reads this marker alone
+for the ownership boundary `authorize_target` evaluates on every verb: ANY
+agent-created session is fenced there, so a created session reaches only slots it
+created itself and nothing an unfenced creator could reach. A person's own tab and
+a fork reach `get_or_create_slot` directly and stay unattributed, so ordinary human
+use is unaffected.
+
+The one place an owner-rooted agent chain must be LET THROUGH is the
+private-member delegation gate in `create_session`: a conductor the owner started
+in their own tab has to be able to mint private-member workers, while a conductor
+rooted in a cron, channel link or crew member must not. That decision is made at
+the gate alone by `_delegation_lineage_fenced`, read once per create and never by
+`authorize_target`, so permitting the owner-rooted dispatch never widens the
+per-verb ownership boundary. The gate walk climbs the `_created_by` chain LIVE at
+each hop: a creator that is now a crew member, carries a channel link, or is a cron
+tab fences the whole chain the moment it does -- there is no frozen verdict to go
+stale, so a mid-chain takeover cannot leave an "unfenced" answer behind. The walk
+ends unfenced only at an unattributed root (the owner's own tab or a fork); it
+fails CLOSED on any gap -- a hop whose creator slot is gone, or a chain past the
+depth bound -- so a chain whose middle slot has been closed loses dispatch rather
+than widening reach. No verdict is stored on the slot and none is persisted: the
+owner-rooted answer is recomputed live from the chain at each delegation, so a
+restart changes nothing about the boundary.
 
 The same attribution is the one lineage fact the child's append-only crew log
 records: its `session/opened` carries `parent {slot, sid?}` -- `_created_by` as the

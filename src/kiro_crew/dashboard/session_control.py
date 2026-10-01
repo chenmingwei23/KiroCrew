@@ -376,9 +376,14 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
     ``_created_by`` is the marker for that last population and needs no lineage
     walk: :func:`create_session` is its ONLY writer (a person's own tab and a fork
     reach ``get_or_create_slot`` directly and stay unattributed), so a non-empty
-    value means "an agent made this session" at any depth. A grandchild carries
-    its parent's key there and is fenced by the same test, and a chain whose
-    middle slot has been closed cannot fail open because no chain is walked.
+    value means "an agent made this session" at any depth. An agent-created
+    session is fenced regardless of which population its creator belonged to: the
+    predicate is read for every verb through :func:`authorize_target`, so it
+    answers "whose authority is this session" from the slot's own stamp alone and
+    never widens on a creator that happened to be unfenced. The owner-rooted
+    private-member dispatch that :func:`create_session` must still permit is
+    decided at that gate (see :func:`_delegation_lineage_fenced`), not here, so
+    this predicate's containment of every agent-created session stays intact.
 
     There is deliberately NO attendance exemption. ``_ChatSlot._human_seen`` looks
     like the right hatch and is not: it records that a human has EVER driven the
@@ -398,6 +403,55 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
     if _channel_link_of(slot):
         return True
     return bool(getattr(slot, "_created_by", ""))
+
+
+def _delegation_lineage_fenced(state: "DashboardState", caller_key: str) -> bool:
+    """Whether *caller_key* may NOT dispatch a private-member worker.
+
+    The private-member delegation gate in :func:`create_session` needs the one
+    thing :func:`_caller_is_ownership_fenced` deliberately does not give it: a
+    conductor the owner started in their own tab must be allowed to mint private
+    workers, while a conductor rooted in a cron, channel link or crew member must
+    not. The shared predicate answers "every agent-created session is fenced" for
+    the ownership boundary read on every verb, and that answer must stay intact;
+    this walk is read ONLY here, at the once-per-create delegation gate, so it
+    never widens :func:`authorize_target`.
+
+    It climbs the ``_created_by`` chain LIVE at each hop -- a creator that has
+    since become a crew member, acquired a channel link, or is a cron tab fences
+    the whole chain the moment it does, so a mid-chain takeover cannot leave a
+    stale "unfenced" behind (there is no frozen verdict to go stale). The root of
+    an owner-rooted chain is a person's own unattributed tab, which reaches
+    ``get_or_create_slot`` directly and carries no ``_created_by`` and no fence
+    source, so the walk ends unfenced. It fails CLOSED on any gap: a hop whose
+    creator slot is gone, or a chain longer than the depth bound, is fenced, so a
+    chain whose middle slot was closed loses dispatch rather than widening.
+    """
+    seen: set[str] = set()
+    key = caller_key
+    # The chain is at most as deep as live slots, but a bound keeps a corrupted
+    # ``_created_by`` cycle from spinning; any chain this long is treated as a
+    # gap and fails closed.
+    for _ in range(64):
+        if key in seen:
+            return True
+        seen.add(key)
+        if _member_caller(state, key) or _cron_caller(key):
+            return True
+        slot = state.get_slot(key)
+        if slot is None:
+            # Mid-chain creator gone: cannot prove the root is the owner's, so
+            # fail closed rather than treat an unreadable ancestor as unfenced.
+            return key != caller_key
+        if _channel_link_of(slot):
+            return True
+        parent = getattr(slot, "_created_by", "")
+        if not parent:
+            # Unattributed root -- a person's own tab or a fork. Owner-rooted:
+            # the one chain the delegation gate exists to permit.
+            return False
+        key = parent
+    return True
 
 
 def _channel_link_of(slot: Any) -> str:
@@ -2369,13 +2423,15 @@ async def create_session(
             # that case, and a link landing mid-resolution must surface as the
             # identity change it is, not as a delegation refusal.
             _refuse_moved_caller_identity(state, caller_key, caller_slot, caller_memory_identity)
-            # Off-loop: the inline predicate reads the config record. Only reached
-            # when the carried verdict is absent, and only for a private selection,
-            # so an ordinary create pays nothing.
+            # Off-loop: the walk reads live slot state up the creation chain. Only
+            # reached when the carried verdict is absent, and only for a private
+            # selection, so an ordinary create pays nothing. Confined to this gate
+            # on purpose: the owner-rooted allowance never widens the per-verb
+            # ownership boundary in `authorize_target`.
             fenced = (
                 caller_fenced
                 if caller_fenced is not None
-                else await asyncio.to_thread(_caller_is_ownership_fenced, state, caller_key)
+                else await asyncio.to_thread(_delegation_lineage_fenced, state, caller_key)
             )
             if fenced:
                 # Server-side ONLY, and it says the one thing the caller's refusal
@@ -2386,7 +2442,29 @@ async def create_session(
                 # forgery shape the agreement exists to refuse. Names neither the
                 # store nor the member, so the log is not a second disclosure
                 # channel for what the refusal withholds.
-                if caller_vouched is None:
+                #
+                # Lineage is named FIRST and on its own, because it is the operative
+                # condition for the caller class the vouched-identity causes below
+                # cannot describe: a Global-store session an agent created is never
+                # vouched (`bind_session_execution` vouches only a truthy
+                # `member_id`), so without this every such refusal would log "no
+                # vouched identity" and point an operator at restart/cap churn that
+                # no re-bind will clear -- the fence here is `_created_by`, which is
+                # immutable. The member and cron caller classes are fenced too but
+                # are not reached as a private-member CREATE caller the way an
+                # agent-created Global conductor is, so this names the condition
+                # that actually reaches this line.
+                caller_slot_now = state.get_slot(caller_key)
+                if (
+                    caller_fenced is None
+                    and caller_slot_now is not None
+                    and caller_slot_now._created_by
+                    and not _member_caller(state, caller_key)
+                    and not _cron_caller(caller_key)
+                    and not _channel_link_of(caller_slot_now)
+                ):
+                    cause = "the caller is fenced by its creation lineage (_created_by)"
+                elif caller_vouched is None:
                     cause = "this process holds no vouched identity for the caller"
                 elif (
                     caller_execution is not None and caller_vouched.store != caller_execution.store
