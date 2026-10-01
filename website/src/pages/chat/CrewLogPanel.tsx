@@ -137,6 +137,18 @@ const count = (v: unknown): string => {
 const measured = (v: unknown, reported: unknown): string =>
   int(reported) === 0 ? '—' : count(v)
 
+/** How many reporters stand behind the session's credit total, across sources.
+ *
+ *  `usage.credits` sums three spenders -- a turn closer, a subagent call, a
+ *  background call -- and `credits_by_source[*].reported` counts them one per
+ *  source. The credits stat gates on this sum, not on `turns.credits_reported`:
+ *  a session billed only by a child or background call has a turn count of zero
+ *  beside a real total, and gating on the turn count dashes a number the fold
+ *  holds. `turns.credits_reported` stays turn-scoped for the per-turn question
+ *  it answers; this answers the session-wide one the credits stat asks. */
+const creditsReportedBySource = (bySource: unknown): number =>
+  Object.values(obj(bySource)).reduce<number>((sum, row) => sum + int(obj(row).reported), 0)
+
 /** Whether a fold reported this field at all -- a number or a non-empty string.
  *
  *  A stamp arrives as epoch MILLISECONDS, so a string-only test (`str(v)`) reads
@@ -337,7 +349,7 @@ function UsageBody({ value }: { value: Record<string, unknown> }) {
   return (
     <>
       <div className="grid grid-cols-2 gap-1.5">
-        <Stat value={measured(value.credits, turns.credits_reported)} label={i18nT('pages.chat.crewLog.stat_credits', { turns: fmtNumber(int(turns.credits_reported)) })} />
+        <Stat value={measured(value.credits, creditsReportedBySource(value.credits_by_source))} label={i18nT('pages.chat.crewLog.stat_credits')} />
         <Stat value={measured(tokens.total, turns.tokens_reported)} label={i18nT('pages.chat.crewLog.stat_tokens')} />
         <Stat value={int(turns.duration_reported) === 0 ? '—' : fmtElapsed(int(value.duration_ms))} label={i18nT('pages.chat.crewLog.stat_duration')} />
         <Stat
@@ -808,10 +820,12 @@ function summaryFor(fold: CrewLogFold, value: Record<string, unknown>): string {
   if (fold === 'usage') {
     // The same rule the tiles follow: a total nobody measured is a dash, not a
     // zero. A collapsed header is the ONE line a reader sees without opening the
-    // fold, so "credits: 0" there is the most-read version of the claim.
+    // fold, so "credits: 0" there is the most-read version of the claim. Credits
+    // gate on the session-wide reporter count, since the total spans three
+    // sources; tokens stay turn-scoped, the question that stat answers.
     const turns = obj(value.turns)
     return i18nT('pages.chat.crewLog.summary_usage', {
-      credits: int(turns.credits_reported) === 0
+      credits: creditsReportedBySource(value.credits_by_source) === 0
         ? '—'
         : fmtNumber(num(value.credits) ?? 0, { maximumFractionDigits: 2 }),
       tokens: int(turns.tokens_reported) === 0

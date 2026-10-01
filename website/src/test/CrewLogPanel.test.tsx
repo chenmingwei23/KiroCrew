@@ -66,6 +66,11 @@ function populatedBundle(overrides: Record<string, unknown> = {}) {
       value: {
         turns: { completed: 12, credits_reported: 12, tokens_reported: 12, duration_reported: 12 },
         credits: 8.41,
+        credits_by_source: {
+          turn: { credits: 8.41, reported: 12 },
+          subagent: { credits: 0.0, reported: 0 },
+          background: { credits: 0.0, reported: 0 },
+        },
         tokens: { input: 918220, output: 96431, cache_read: 182004, cache_write: 8258, total: 1204913 },
         duration_ms: 1624000,
         by_model: { 'a-model': { turns: 12, credits: 8.41, credits_reported: 12, tokens: 1204913 } },
@@ -511,6 +516,11 @@ describe('CrewLogTab', () => {
     Object.assign((bundle.usage.value as Record<string, unknown>), {
       turns: { completed: 1, credits_reported: 0, tokens_reported: 0, duration_reported: 0 },
       credits: 0,
+      credits_by_source: {
+        turn: { credits: 0.0, reported: 0 },
+        subagent: { credits: 0.0, reported: 0 },
+        background: { credits: 0.0, reported: 0 },
+      },
       tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 },
       duration_ms: 0,
       by_model: {},
@@ -524,6 +534,34 @@ describe('CrewLogTab', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(7)
     // A compaction count really was measured, so it is not dashed.
     expect(screen.getByText('3')).toBeInTheDocument()
+  })
+
+  it('shows credits a subagent spent even when no turn reported a cost', async () => {
+    // `credits` covers three spenders, but the gate counts TURN reporters only.
+    // A session billed by a child call -- a synthesized turn closer, or spend
+    // from a background call -- carries `turn.reported: 0` beside a non-zero
+    // total, so a turn-scoped gate dashes a number the fold holds. The gate is
+    // the session-wide reporter count, the sum across sources.
+    const bundle = populatedBundle()
+    Object.assign(bundle.usage.value as Record<string, unknown>, {
+      turns: { completed: 1, credits_reported: 0, tokens_reported: 1, duration_reported: 1 },
+      credits: 0.75,
+      credits_by_source: {
+        turn: { credits: 0.0, reported: 0 },
+        subagent: { credits: 0.75, reported: 1 },
+        background: { credits: 0.0, reported: 0 },
+      },
+    })
+    vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(read(bundle))
+    renderWithProviders(<CrewLogTab slot={SLOT} />)
+    await waitFor(() => expect(screen.getByText('Lifecycle')).toBeInTheDocument())
+    // The collapsed header is the most-read copy of the claim: it carries the
+    // real total, not a dash.
+    expect(screen.getByText('credits: 0.75 · tokens: 1.2M')).toBeInTheDocument()
+    // The expanded tile reads the same number.
+    const creditsLabel = screen.getByText(/^credits ·/)
+    expect(creditsLabel.parentElement?.textContent).toContain('0.75')
+    expect(creditsLabel.parentElement?.textContent).not.toContain('—')
   })
 
   it('shows a closed session its close time and reason', async () => {

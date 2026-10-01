@@ -11020,7 +11020,7 @@
         "turn_running": "चरण {{turn}}",
         "dropped_value": "प्रविष्टियाँ: {{count}}",
         "context_value": "टोकन: {{tokens}} · खंड: {{blocks}}",
-        "stat_credits": "क्रेडिट · {{turns}} टर्न में",
+        "stat_credits": "क्रेडिट · पूरा सत्र",
         "stat_tokens": "सभी चरणों के टोकन",
         "stat_duration": "चरणों में लगा समय",
         "stat_compactions": "कॉन्टेक्स्ट संकुचन · विंडो का {{freed}} पुनःप्राप्त",

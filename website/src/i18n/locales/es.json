@@ -11175,7 +11175,7 @@
         "turn_running": "turno {{turn}}",
         "dropped_value": "entradas: {{count}}",
         "context_value": "tokens: {{tokens}} · bloques: {{blocks}}",
-        "stat_credits": "créditos · en {{turns}} turnos",
+        "stat_credits": "créditos · toda la sesión",
         "stat_tokens": "tokens de todos los turnos",
         "stat_duration": "tiempo dentro de los turnos",
         "stat_compactions": "compactaciones de contexto · {{freed}} de la ventana recuperada",

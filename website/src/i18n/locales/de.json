@@ -11020,7 +11020,7 @@
         "turn_running": "Runde {{turn}}",
         "dropped_value": "Einträge: {{count}}",
         "context_value": "Token: {{tokens}} · Blöcke: {{blocks}}",
-        "stat_credits": "Credits · über {{turns}} Züge",
+        "stat_credits": "Credits · gesamte Sitzung",
         "stat_tokens": "Token über alle Runden",
         "stat_duration": "Zeit in Runden",
         "stat_compactions": "Kontext-Verdichtungen · {{freed}} des Fensters zurückgewonnen",

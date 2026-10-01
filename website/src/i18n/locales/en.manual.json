@@ -4684,7 +4684,7 @@
         "turn_running": "turn {{turn}}",
         "dropped_value": "entries: {{count}}",
         "context_value": "tokens: {{tokens}} · blocks: {{blocks}}",
-        "stat_credits": "credits · across {{turns}} turns",
+        "stat_credits": "credits · whole session",
         "stat_tokens": "tokens, all turns",
         "stat_duration": "time inside turns",
         "stat_compactions": "context compactions · {{freed}} of the window reclaimed",

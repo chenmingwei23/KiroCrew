@@ -10865,7 +10865,7 @@
         "turn_running": "第 {{turn}} 轮",
         "dropped_value": "条目：{{count}}",
         "context_value": "token：{{tokens}} · 区块：{{blocks}}",
-        "stat_credits": "积分 · 覆盖 {{turns}} 个轮次",
+        "stat_credits": "积分 · 整个会话",
         "stat_tokens": "全部轮次的 token",
         "stat_duration": "轮次内耗时",
         "stat_compactions": "次上下文压缩 · 回收了窗口的 {{freed}}",

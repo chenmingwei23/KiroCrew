@@ -11330,7 +11330,7 @@
         "turn_running": "ход {{turn}}",
         "dropped_value": "записи: {{count}}",
         "context_value": "токены: {{tokens}} · блоки: {{blocks}}",
-        "stat_credits": "кредитов · за {{turns}} ходов",
+        "stat_credits": "кредиты · вся сессия",
         "stat_tokens": "токены за все ходы",
         "stat_duration": "время внутри ходов",
         "stat_compactions": "сжатий контекста · освобождено {{freed}} окна",

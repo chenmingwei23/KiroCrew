@@ -11020,7 +11020,7 @@
         "turn_running": "পর্ব {{turn}}",
         "dropped_value": "এন্ট্রি: {{count}}",
         "context_value": "টোকেন: {{tokens}} · ব্লক: {{blocks}}",
-        "stat_credits": "ক্রেডিট · {{turns}}টি টার্ন জুড়ে",
+        "stat_credits": "ক্রেডিট · সম্পূর্ণ সেশন",
         "stat_tokens": "সব পর্বের টোকেন",
         "stat_duration": "পর্বে কাটানো সময়",
         "stat_compactions": "কনটেক্সট সংকোচন · উইন্ডোর {{freed}} পুনরুদ্ধার",

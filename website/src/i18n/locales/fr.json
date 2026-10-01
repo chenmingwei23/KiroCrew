@@ -11175,7 +11175,7 @@
         "turn_running": "tour {{turn}}",
         "dropped_value": "entrées : {{count}}",
         "context_value": "jetons : {{tokens}} · blocs : {{blocks}}",
-        "stat_credits": "crédits · sur {{turns}} tours",
+        "stat_credits": "crédits · session entière",
         "stat_tokens": "jetons, tous les tours",
         "stat_duration": "temps passé dans les tours",
         "stat_compactions": "compactages du contexte · {{freed}} de la fenêtre récupérée",

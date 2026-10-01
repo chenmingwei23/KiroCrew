@@ -10865,7 +10865,7 @@
         "turn_running": "{{turn}}번째 턴",
         "dropped_value": "항목: {{count}}",
         "context_value": "토큰: {{tokens}} · 블록: {{blocks}}",
-        "stat_credits": "크레딧 · {{turns}} 턴 기준",
+        "stat_credits": "크레딧 · 전체 세션",
         "stat_tokens": "모든 턴의 토큰",
         "stat_duration": "턴 내 소요 시간",
         "stat_compactions": "컨텍스트 압축 · 창의 {{freed}} 회수",
