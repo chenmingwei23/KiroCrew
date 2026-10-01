@@ -70,6 +70,10 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   saveChatConfig: (next: Record<string, unknown>) => {
     cfg.value = next
     window.dispatchEvent(new Event('mc-config-changed'))
+    // Match the real contract: true on a persisted save. The sidebar's board
+    // toggle gates seeding and width-restore on this (GPT 6.1 F1), so a bare
+    // undefined would read as a failed save and skip both.
+    return true
   },
 }))
 

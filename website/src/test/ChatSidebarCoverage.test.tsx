@@ -48,7 +48,12 @@ vi.mock('framer-motion', async () => {
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 
 const cfg = vi.hoisted(() => ({
-  saveChatConfig: vi.fn(),
+  // Real saveChatConfig returns true on a persisted save, false only when the
+  // write rolled back (GPT 6.1, errors-use-error-notice). The sidebar's board
+  // toggle now gates seeding on that result, so the mock must default to the
+  // success contract — a bare vi.fn() returns undefined, which the toggle would
+  // read as a failed save and skip seeding. A failure case overrides it locally.
+  saveChatConfig: vi.fn(() => true),
   value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
@@ -461,6 +466,27 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // separate control beside it, not text inside the banner.
     expect(within(banner).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+  })
+
+  it('surfaces a failed chat-config save and does NOT seed lanes (GPT 6.1 F1)', async () => {
+    // The board toggle persists tagColumnsEnabled through saveChatConfig, which
+    // returns false and rolls back when storage cannot hold the write. A board
+    // that was never saved must not then seed lanes as if it had — the user sees
+    // the save-failure notice, and no seed mutation runs.
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
+    cfg.saveChatConfig.mockReturnValueOnce(false)
+    mocks.tagColumns.mockResolvedValue([])
+    renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
+    openHeaderMenu()
+    fireEvent.click(await screen.findByText('Switch to board view'))
+    const banner = await screen.findByTestId('lane-seed-error')
+    expect(banner.textContent).toContain("Couldn't switch board view")
+    // No seed happened: the preference did not persist, so the board is not
+    // populated behind the failure.
+    expect(mocks.createTagColumn).not.toHaveBeenCalled()
+    // The seed-retry button must NOT show: its "Try again" would seed lanes,
+    // not retry the save (UX Review blocker).
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
   })
 
   it('gives back the pre-board width when switching to list view', async () => {

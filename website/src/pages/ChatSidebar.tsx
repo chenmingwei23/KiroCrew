@@ -2447,6 +2447,11 @@ function ChatSidebar({
 
   // Sidebar-only state
   const [seedError, setSeedError] = useState('')
+  // The board/list toggle also persists a chat-config field (`tagColumnsEnabled`)
+  // via `saveChatConfig`, which returns false and rolls back when storage cannot
+  // hold the write (GPT 6.1, errors-use-error-notice). That reuses the seedError
+  // notice slot below, but with a save-specific title — this flag picks it.
+  const [toggleSaveFailed, setToggleSaveFailed] = useState(false)
   // Shared failure line for the board's column mutations (delete / reorder /
   // add-after / card drop) — one state, because they all edit the same strip and
   // a second banner per verb would stack. Server-side inputs only, so a failed
@@ -4479,7 +4484,18 @@ function ChatSidebar({
                 const isActive = tagColumnsEnabled && rawColumns.length > 0
                 const next = !isActive
                 const cfg = loadChatConfig()
-                saveChatConfig({ ...cfg, tagColumnsEnabled: next })
+                // The toggle persists `tagColumnsEnabled` through saveChatConfig,
+                // which returns false and rolls back when the write (or its dirty
+                // marker) cannot be stored. Surface that failure and STOP before
+                // clearing the error, seeding lanes or restoring widths — none of
+                // which should happen for a preference that was not saved (GPT 6.1
+                // F1, errors-use-error-notice).
+                if (!saveChatConfig({ ...cfg, tagColumnsEnabled: next })) {
+                  setToggleSaveFailed(true)
+                  setSeedError(i18nT('pages.chatSidebar.failed_to_save_board_toggle'))
+                  return
+                }
+                setToggleSaveFailed(false)
                 setSeedError('')
                 if (!next) {
                   // Leaving board view: give back the width the user chose before
@@ -5564,21 +5580,28 @@ function ChatSidebar({
          * Retry is a separate button, not the notice itself. */
         <div className="mx-2 mt-2 flex flex-col gap-1 shrink-0">
           <ErrorNotice
-            title={i18nT('pages.chatSidebar.lane_seed_failed')}
+            title={toggleSaveFailed ? undefined : i18nT('pages.chatSidebar.lane_seed_failed')}
             message={seedError}
             askAgent
-            onDismiss={() => setSeedError('')}
+            onDismiss={() => { setSeedError(''); setToggleSaveFailed(false) }}
             testId="lane-seed-error"
           />
-          <div>
-            <Btn
-              type="button"
-              className="text-[12px] px-2 py-0.5"
-              onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
-            >
-              {i18nT('pages.chatSidebar.lane_seed_retry')}
-            </Btn>
-          </div>
+          {/* The Retry button seeds state lanes — the recovery for a SEED
+           * failure. It must not show under a toggle-SAVE failure: there its
+           * "Try again" label would promise to retry the save but instead seed
+           * lanes into a board the user never switched to (UX Review). The
+           * save-failure copy already carries its own next step. */}
+          {!toggleSaveFailed && (
+            <div>
+              <Btn
+                type="button"
+                className="text-[12px] px-2 py-0.5"
+                onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
+              >
+                {i18nT('pages.chatSidebar.lane_seed_retry')}
+              </Btn>
+            </div>
+          )}
         </div>
       )}
       {/* Read failures for the two lists this pane is built from. Same placement

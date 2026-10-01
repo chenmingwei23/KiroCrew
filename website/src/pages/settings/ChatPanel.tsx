@@ -468,6 +468,23 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   // user believing that setting persisted. The ref records which config path
   // produced the current banner; null = not a picker failure.
   const saveErrorPathRef = useRef<string | null>(null)
+  // The save-error banner sits at the top of the panel, above the scroll. A
+  // chat-setting toggle lower down that fails to save snaps back AND raises the
+  // banner, but the user may see only the snap-back and read it as a broken
+  // control (UX Review). So each chat-save failure bumps this tick, and the
+  // effect below scrolls the banner into view and moves focus to it — the
+  // notice is `role="alert"`, so focusing it also re-announces it. A monotonic
+  // counter (not a boolean) re-fires on a SECOND identical failure, which the
+  // unchanged `saveError` string alone would not.
+  const saveErrorBannerRef = useRef<HTMLDivElement | null>(null)
+  const [chatSaveFailTick, setChatSaveFailTick] = useState(0)
+  useEffect(() => {
+    if (chatSaveFailTick === 0) return
+    const el = saveErrorBannerRef.current
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.focus()
+  }, [chatSaveFailTick])
   // Outlives the Transcript page, which the rail unmounts on a switch.
   const linkPatternsDraft = useRef<LinkPatternsDraft | null>(null)
   const setSaveError = (msg: string) => {
@@ -1102,7 +1119,21 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
     setChatCfg(prev => {
       const next = { ...prev, [k]: v }
-      saveChatConfig(next)
+      // `saveChatConfig` returns false when the write (or its dirty marker) could
+      // not be persisted and it rolled back, so nothing was stored (GPT 6.1 F1,
+      // errors-use-error-notice). Surface that through the shared ErrorNotice
+      // banner and keep the PRIOR value on screen, rather than displaying the
+      // un-persisted value as if it saved — a reload would discard it. On
+      // success, clear any stale save banner this panel raised.
+      if (!saveChatConfig(next)) {
+        rawSetSaveError(i18nT('pages.settings.chatPanel.failed_to_save_chat_setting'))
+        saveErrorPathRef.current = null
+        // Bump the tick so the effect scrolls the banner into view and focuses
+        // it: a toggle below the fold otherwise just snaps back silently.
+        setChatSaveFailTick(t => t + 1)
+        return prev
+      }
+      if (saveErrorPathRef.current === null) rawSetSaveError('')
       return next
     })
   }, [])
@@ -1142,7 +1173,14 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
           this panel's live drafts. A hand-off click blurs the field, which STARTS
           a save — and if that save fails after the navigation has unmounted the
           panel, the typed value is gone with nothing left on screen to say so. */}
-      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
+      {/* Wrapped so a chat-setting save failure can scroll the banner into
+          view and move focus to it (UX Review): a toggle below the fold
+          otherwise just snaps back with the notice stranded off-screen.
+          tabIndex=-1 makes the wrapper programmatically focusable without
+          adding a Tab stop. */}
+      <div ref={saveErrorBannerRef} tabIndex={-1} className="outline-none">
+        <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
+      </div>
       {dashQ.isError && (
         <div className="mb-4 flex flex-wrap items-center gap-3">
           {/* No hand-off: the rest of the panel — and its `localRoleOther` /
