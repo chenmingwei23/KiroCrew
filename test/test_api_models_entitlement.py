@@ -50,6 +50,39 @@ CATALOG = [
 ]
 
 
+def _drain_catalog_task():
+    # A degraded fetch that timed out at the request bound leaves its background
+    # task running; cancel and await it before clearing the slot so it cannot
+    # resume after this test's patches exit and run real sandbox / kiro-cli
+    # resolution against a later test (no-test-side-effects).
+    task = agents._catalog_cache.task
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        asyncio.get_event_loop().run_until_complete(asyncio.gather(task, return_exceptions=True))
+    except RuntimeError:
+        # No usable loop (closed/none): the task is detached from any live loop,
+        # so clearing the slot is enough — it has no loop to resume on.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_cache():
+    # api_models caches the catalog in a module-level singleton. Reset it around
+    # each test so one test's fetched catalog does not short-circuit the next
+    # test's spawn (which pins what the narrowing does on a FRESH fetch).
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
+    yield
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
+
+
 def _stub_wrap_argv(argv: list[str], **kwargs: Any) -> tuple[list[str], None]:
     """Pass-through stand-in for ``sandbox.wrap_argv`` (twin of the one in
     ``test_api_models_retry.py``): absorbs the real signature's keyword arguments

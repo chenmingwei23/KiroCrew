@@ -161,6 +161,36 @@ def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
     return _impl(model_id, advertised)  # type: ignore[arg-type]
 
 
+async def resolve_kiro_bin_for_spawn() -> str | None:
+    """The Kiro CLI path to spawn, resolved off the event loop, or ``None``.
+
+    Thin delegation to :func:`kiro_crew.acp.client._resolve_kiro_bin_for_spawn`
+    so the model-list endpoint reaches the spawn path through the SDK surface
+    instead of importing the ACP layer (the agent-sdk-boundary gate refuses a new
+    edge). No argument, a path string or ``None`` back — no ACP type crosses the
+    boundary. Function-local import for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn as _impl
+
+    return await _impl()
+
+
+def resolve_ssh_auth_sock(env: dict[str, str]) -> None:
+    """Point ``SSH_AUTH_SOCK`` in *env* at a live agent socket, in place.
+
+    Thin delegation to :func:`kiro_crew.acp.client._resolve_ssh_auth_sock` so the
+    model-list endpoint reaches it through the SDK surface instead of importing
+    the ACP layer (the agent-sdk-boundary gate refuses a new edge). A plain env
+    mapping in, mutated in place, nothing back — no ACP type crosses the
+    boundary. The caller runs it off the event loop (it globs ``/tmp``); keeping
+    it a plain sync function preserves that contract. Function-local import for
+    the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import _resolve_ssh_auth_sock as _impl
+
+    _impl(env)
+
+
 def derived_agent_permissions(allowed_tools: object, agent_filename: str) -> dict:
     """The KAS policy a generated agent spec should carry, from its grant list.
 

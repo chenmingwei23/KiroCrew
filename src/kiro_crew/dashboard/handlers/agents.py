@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -60,7 +61,9 @@ from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import (
     EntitlementRevalidating,
     catalog_row_would_drop,
+    resolve_kiro_bin_for_spawn,
     resolve_pin_spelling,
+    resolve_ssh_auth_sock,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (
@@ -166,8 +169,35 @@ from kiro_crew.user_json import loads_user_json
 from kiro_crew.validation import TEMPLATE_NAME_RE
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
-# Upper bound on the `kiro-cli chat --list-models` subprocess behind the model list.
+# How long one GET /api/models waits for a catalog before answering the degraded
+# 503. Unchanged: a remote hub still budgets its whole cold path against this
+# bound (see api_models), so raising it would move
+# DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS with it.
 _LIST_MODELS_SUBPROCESS_TIMEOUT_SECS: float = 10.0
+# How long the SHARED background catalog fetch may run, decoupled from any one
+# request. On a host where a cold `kiro-cli --list-models` spawn always exceeds
+# the request bound, killing it at that bound meant no call ever finished, so
+# every 8s poll started another doomed cold spawn and the picker never left
+# `auto`. The fetch now outlives the request that started it: the request still
+# answers 503 after _LIST_MODELS_SUBPROCESS_TIMEOUT_SECS, but the spawn keeps
+# running under this ceiling and the next poll is served from its result.
+_LIST_MODELS_BACKGROUND_TIMEOUT_SECS: float = 90.0
+# A cached catalog younger than this is served straight away; an older one is
+# served straight away too and refreshed behind the reply (stale-while-
+# revalidate). The catalog changes rarely, so a few minutes stale costs nothing
+# the per-request entitlement narrowing does not already correct.
+_LIST_MODELS_CATALOG_TTL_SECS: float = 300.0
+# The cache is the one place ``--list-models`` output is held past the request,
+# so retention is bounded before it is stored. Row count and identifying-field
+# length reuse the repo's ONE shared admission bound
+# (``model_registry.ADVERTISED_MODELS_MAX_IDS`` /
+# ``ADVERTISED_MODEL_ID_MAX_CHARS``) so the picker cannot serve an id the window
+# / advertised stores refused — an over-long id is REFUSED (the whole row
+# skipped), never truncated, matching ``admit_catalog_rows``. This cap bounds
+# only the non-identifying extra fields a row may carry (the shared admission
+# does not speak to those): each is clamped to the id-length bound and a row
+# keeps at most this many.
+_CATALOG_CACHE_MAX_FIELDS_PER_ROW = 64
 
 logger = logging.getLogger(__name__)
 
@@ -2560,6 +2590,346 @@ def _scoped_default(cfg: Any, backend: str) -> str:
     )
 
 
+class _CatalogUnavailable(Exception):
+    """A degraded catalog fetch outcome that maps to one 503 body.
+
+    The fetch runs in a shared background task that cannot return an HTTP
+    response, so each degraded outcome (binary unresolved, timeout, non-zero
+    exit, empty / invalid output) raises this carrying its error message, and
+    the request path renders a dict-literal 503 body from it — one 503 per
+    outcome. The message is carried, not a response dict, so the single render
+    site stays a dict literal the error-code ratchet can scan.
+    """
+
+    def __init__(self, error: str):
+        super().__init__(error)
+        self.error = error
+
+
+def _bounded_catalog(models: list[dict]) -> list[dict]:
+    """Clamp a parsed catalog to what the cache may safely retain.
+
+    The retention point (:data:`_catalog_cache`) holds the list past the request,
+    so it is bounded here before it is stored, through the SAME admission the
+    window / advertised stores use — ``model_registry.ADVERTISED_MODELS_MAX_IDS``
+    rows, each identifying field (``model_name`` / ``model_id``) at most
+    ``ADVERTISED_MODEL_ID_MAX_CHARS`` — so the cache cannot serve an id those
+    stores refused. An over-long id is REFUSED (its whole row skipped), never
+    truncated, matching :func:`model_registry.admit_catalog_rows`'s own
+    invariant; the picker reads the name, so a sliced name would name a different
+    model or none.
+
+    Each remaining scalar field (str / int / float / bool / None) is kept, with
+    strings clamped to the id-length bound and a row holding at most
+    :data:`_CATALOG_CACHE_MAX_FIELDS_PER_ROW`; a non-scalar field (nested object
+    or array) is dropped — no reader of the cached list consumes one, and it is
+    the unbounded edge the retention bound exists to close. Row ORDER is
+    preserved (readers treat catalog order as meaningful). Rows and fields
+    discarded for any reason are counted and logged once per snapshot.
+    """
+    max_rows = model_registry.ADVERTISED_MODELS_MAX_IDS
+    max_chars = model_registry.ADVERTISED_MODEL_ID_MAX_CHARS
+    bounded: list[dict] = []
+    dropped_rows = 0
+    dropped_fields = 0
+    for row in models:
+        if len(bounded) >= max_rows:
+            dropped_rows += 1
+            continue
+        if not isinstance(row, dict):
+            dropped_rows += 1
+            continue
+        # Refuse (skip) a row whose identifying field is over-long, rather than
+        # slicing it into an id no store retained.
+        ident = row.get("model_name") or row.get("model_id")
+        if isinstance(ident, str) and len(ident) > max_chars:
+            dropped_rows += 1
+            continue
+        kept: dict = {}
+        for key, value in row.items():
+            if len(kept) >= _CATALOG_CACHE_MAX_FIELDS_PER_ROW:
+                dropped_fields += 1
+                continue
+            # The KEY is a retained string too: refuse (skip) an over-long one
+            # rather than cache it, so no retained string is unbounded.
+            if isinstance(key, str) and len(key) > max_chars:
+                dropped_fields += 1
+                continue
+            if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+                kept[key] = value
+            elif isinstance(value, str):
+                kept[key] = value[:max_chars]
+            else:
+                # Non-scalar (nested dict/list): dropped — unbounded and unread.
+                dropped_fields += 1
+        bounded.append(kept)
+    if dropped_rows or dropped_fields:
+        logger.warning(
+            "api_models: catalog cache dropped %d row(s) and %d field(s) over the "
+            "retention bound (max_rows=%d, max_id_chars=%d)",
+            dropped_rows,
+            dropped_fields,
+            max_rows,
+            max_chars,
+        )
+    return bounded
+
+
+@dataclasses.dataclass
+class _CatalogCache:
+    """The last good ``--list-models`` catalog, kept in memory only.
+
+    One slow success is enough: once ``models`` is set, every request is served
+    from it (after per-request entitlement narrowing) while a stale entry is
+    refreshed behind the reply. A gateway restart drops it, so the first request
+    after a restart pays the cold start again — the catalog is not persisted,
+    which keeps a downgraded account's stale rows from surviving a restart.
+
+    ``task`` single-flights the fetch: concurrent polls (and the 8s self-heal
+    loop) share one spawn rather than each starting its own cold start.
+    """
+
+    models: list[dict] | None = None
+    fetched_at: float = 0.0
+    task: "asyncio.Task[list[dict]] | None" = None
+
+
+_catalog_cache = _CatalogCache()
+
+
+async def _fetch_kiro_catalog() -> list[dict]:
+    """Spawn ``kiro-cli --list-models`` once and return the catalog rows.
+
+    Calls the module-level ``resolve_kiro_bin_for_spawn`` /
+    ``resolve_ssh_auth_sock`` wrappers directly. They are imported from
+    ``kiro_crew.agent_sdk.drivers.acp`` — the agent-SDK surface, not a forbidden
+    root — so this background worker reaches the spawn helpers without adding an
+    ACP-layer edge (see ``scripts/check_agent_sdk_boundary.py``).
+
+    Returns the deprecated-stripped list and seeds the window/advertised caches —
+    the UNFILTERED-then-deprecated-stripped list, i.e. the response body before
+    per-request entitlement narrowing. Raises :class:`_CatalogUnavailable` for a
+    degraded outcome (binary unresolved, timeout, non-zero exit, empty / invalid
+    output) and lets :class:`SandboxUnavailableError` propagate; the request path
+    renders each as its own 503.
+
+    Bounded by :data:`_LIST_MODELS_BACKGROUND_TIMEOUT_SECS`, NOT the request wait,
+    so a cold start that outlasts one poll still finishes and warms the cache for
+    the next one.
+    """
+    from kiro_crew.env import augmented_path  # noqa: F811
+
+    kiro_bin = await resolve_kiro_bin_for_spawn()
+    if not kiro_bin:
+        # Degraded (binary not resolved yet), NOT a genuine "zero models" result.
+        # 503 so the client retries instead of caching an empty list — a cached
+        # [] renders an empty picker that only a manual page refresh recovers from.
+        raise _CatalogUnavailable("kiro binary not resolved")
+    argv = [kiro_bin, "chat", "--list-models", "--format", "json", "--no-interactive"]
+    # Mirror AcpClient._spawn() sandbox: wrap_argv + env + process isolation.
+    # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
+    # pipes); this is a one-shot read-only command, so we replicate the
+    # sandbox setup directly.  See the security-controls rule.
+    #
+    # The configured tier is passed EXPLICITLY rather than left to
+    # wrap_argv's "auto" parameter default, so this endpoint can never ask
+    # for stricter isolation than the chat spawn of the same binary. It
+    # matters wherever the operator set agent.sandbox="off" (deferring
+    # isolation to kiro-cli's own internal sandbox): the one-shot and chat
+    # path must have one posture. The explicit Kiro classification also
+    # makes the shipped "auto" tier work on Windows via Kiro's built-in
+    # sandbox instead of answering 503 on every 8s poll.
+    #
+    # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
+    # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
+    # can cold-probe the backend with a synchronous
+    # `subprocess.run(..., timeout=5)`. This runs behind the request, but a
+    # blocking call on the event loop still stalls chat, cron and the liveness
+    # heartbeat on exactly the host where the probe is slowest. Both reads run
+    # in the worker, so the mode is resolved there too rather than passed in.
+    #
+    # A remote hub proxying this endpoint budgets its WHOLE cold path (the
+    # sandbox detection, the list-models subprocess, and the up to
+    # _READ_PATH_PROBE_DEADLINE_SECS the read-path entitlement revalidation
+    # waits in _entitled_kiro_models) via
+    # DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+    # kiro_crew/instances/constants.py — 5 + 10 + 3 < 20. The per-request wait
+    # (_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS) is what that budget sizes against,
+    # NOT the longer background ceiling; growing the request wait means moving
+    # that constant with it.
+    argv, cleanup = await asyncio.get_running_loop().run_in_executor(
+        subprocess_executor(), _wrap_list_models_argv, argv
+    )
+    argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
+    try:
+        env = {**os.environ}
+        env["PATH"] = augmented_path(env.get("PATH", ""))
+        # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
+        # every hit, so its latency scales with the /tmp entry count. Its
+        # sibling wrapper's contract states it must never run on the event loop.
+        await asyncio.to_thread(resolve_ssh_auth_sock, env)
+        # The Docker entrypoint removes credentials from the long-lived
+        # gateway environment.  This fixed-argv child is the official
+        # kiro-cli and KIRO_API_KEY is its own model credential, so settle
+        # the same single key the interactive ACP spawn receives.  Keep
+        # the protected .env read off the gateway loop.
+        await asyncio.to_thread(inject_kiro_cli_api_key, env)
+        env = scrub_agent_subprocess_env(env)
+        # Supervised so the call ends whatever it leaves behind. A kiro-cli
+        # launcher wrapper can start a ~140-thread credential helper for each
+        # call and leave it running; the self-heal loop re-polls every 8s while
+        # degraded, so on a gateway on that path every poll leaked one until
+        # the agent cgroup ran out of pids.
+        proc = await spawn_supervised_oneshot(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_LIST_MODELS_BACKGROUND_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            # The whole group, while the supervisor still leads it: killing
+            # only the leader would leave the command and its helpers running.
+            await kill_and_reap(proc)
+            # A cold CLI spawn exceeded even the background ceiling. 503 so the
+            # client keeps its last-good list and polls again rather than caching
+            # a successful empty result.
+            logger.warning("api_models: --list-models timed out; returning 503")
+            raise _CatalogUnavailable("model list timed out")
+    finally:
+        if cleanup and callable(cleanup):
+            cleanup()
+
+    if proc.returncode != 0:
+        from kiro_crew.platform import redact_via_context  # noqa: F811
+
+        stderr_tail = stderr.decode(errors="replace").strip()
+        stderr_tail = redact_via_context(stderr_tail)[-_MODEL_LIST_STDERR_TAIL_CHARS:]
+        logger.warning(
+            "api_models: --list-models exited %s: %s; returning 503",
+            proc.returncode,
+            stderr_tail or "<no stderr>",
+        )
+        raise _CatalogUnavailable("model list command failed")
+
+    if not stdout.strip():
+        logger.warning("api_models: --list-models returned empty output; returning 503")
+        raise _CatalogUnavailable("model list returned empty output")
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "api_models: --list-models returned invalid JSON (%s); returning 503",
+            exc,
+        )
+        raise _CatalogUnavailable("model list returned invalid JSON")
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        logger.warning("api_models: --list-models returned an invalid payload; returning 503")
+        raise _CatalogUnavailable("model list returned an invalid payload")
+    models = data["models"]
+    # Seed the central window authority from kiro's authoritative structured
+    # 'context_window_tokens' field (keyed by model_id/model_name). This is
+    # the ONE place these rows enter the system; every other consumer (the
+    # ACP backfill, the context-budget scaler, the live meter) then resolves
+    # through model_registry.model_window() rather than re-reading kiro. The
+    # in-memory update is synchronous (cheap dict mutation); only the disk
+    # persist is offloaded to an executor so the event loop never blocks on
+    # filesystem I/O (no blocking call on the event loop).
+    #
+    # This fork keeps kiro's bare-dotted ids as the picker WIRE FORMAT
+    # (guarded by _model_rejected_reason / api_chat_slot_model, which rejects
+    # canonical registry keys the ACP CLI can't accept). The upstream
+    # registry-key canonicalization is deliberately NOT ported — it is
+    # incompatible with this fork's _model_rejected_reason guard. The window
+    # seeding above uses kiro's authoritative context_window_tokens to give
+    # the backfill real GPT/DeepSeek/Qwen windows, independent of the
+    # wire-format choice.
+    #
+    # The same rows also warm the ``acp`` advertised-model cache, kiro's
+    # VOCABULARY: which ids are kiro's own, so model_scope can tell a pin
+    # chosen for another harness from one chosen here before any session
+    # exists (the chip and the provider factory judge from the cache; the
+    # wire holds the live list). ONE admission feeds both caches
+    # (refresh_kiro_catalog), so an id the bound refuses gets no row in
+    # either. Fed from the UNFILTERED catalog on purpose: a deprecated or
+    # unentitled row is still a kiro id, and dropping it here would make
+    # model_scope call a native pin foreign. Entitlement stays with the
+    # live ``session/new`` list downstream (_entitled_kiro_models,
+    # model_is_unusable) -- ``--list-models`` is a catalog and no reader
+    # of this cache treats it as more. Sourced here rather than from any
+    # ``session/new`` payload because the registry attributes that payload
+    # to claude-agent-acp and a kiro session's list is scoped to the agent
+    # that session started. In-memory updates on the loop, disk persists
+    # off it.
+    windows_changed, advertised_changed = model_registry.refresh_kiro_catalog(
+        models, model_registry_namespace(ACP_BACKEND_KIRO)
+    )
+    if windows_changed:
+        await asyncio.get_running_loop().run_in_executor(
+            maintenance_executor(), model_registry.persist_kiro_windows
+        )
+    if advertised_changed:
+        await asyncio.get_running_loop().run_in_executor(
+            maintenance_executor(), model_registry.persist_advertised_models
+        )
+    return [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
+
+
+def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
+    """Return the in-flight catalog fetch, starting one if none is running.
+
+    Single-flight: concurrent polls share one spawn. The task caches its result
+    (and clears itself) when it finishes, so the next poll after a slow success
+    is served straight from the cache rather than starting another cold start.
+    """
+    existing = _catalog_cache.task
+    if existing is not None and not existing.done():
+        return existing
+
+    async def _run() -> list[dict]:
+        try:
+            models = await _fetch_kiro_catalog()
+        finally:
+            # Release the single-flight slot the moment this attempt ends,
+            # win or lose, so a failed fetch does not wedge every later poll.
+            _catalog_cache.task = None
+        # Bound the retained list before it enters the one store that outlives
+        # the request (see _bounded_catalog).
+        bounded = _bounded_catalog(models)
+        _catalog_cache.models = bounded
+        _catalog_cache.fetched_at = time.monotonic()
+        return bounded
+
+    task = asyncio.ensure_future(_run())
+    _catalog_cache.task = task
+    # A stale-while-revalidate refresh is fire-and-forget: the request path
+    # returns the cached list without awaiting this task, so a degraded refresh
+    # (expired auth, background-ceiling timeout, SandboxUnavailableError) would
+    # leave an unretrieved exception that crash_guard's asyncio handler logs as a
+    # full crash record at the 8s poll cadence. Consume it here: a failed refresh
+    # keeps the last-good cache and is a debug line, not a crash.
+    task.add_done_callback(_consume_refresh_exception)
+    return task
+
+
+def _consume_refresh_exception(task: "asyncio.Task[list[dict]]") -> None:
+    """Retrieve a finished refresh task's exception so it is never 'unhandled'.
+
+    A cached catalog means a degraded background refresh is non-fatal — the
+    request path already served the last-good list — so its exception is logged
+    at debug and swallowed rather than left for ``Task.__del__`` to escalate.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("api_models: background catalog refresh failed (serving cached)", exc_info=exc)
+
+
 async def api_models(request: web.Request) -> web.Response:
     """GET /api/models — the model list for the configured backend.
 
@@ -2597,180 +2967,41 @@ async def api_models(request: web.Request) -> web.Response:
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked
-    kiro_bin: str | None = None
     try:
-        from kiro_crew.acp.client import (  # noqa: F811
-            _resolve_kiro_bin_for_spawn,
-            _resolve_ssh_auth_sock,
-        )
-        from kiro_crew.env import augmented_path  # noqa: F811
+        cached = _catalog_cache.models
+        if cached is not None:
+            # Serve the last good catalog straight away; a stale one is refreshed
+            # behind the reply (stale-while-revalidate). Entitlement narrowing
+            # still runs on every request, so a plan change is reflected now even
+            # when the catalog rows themselves are a few minutes old.
+            if time.monotonic() - _catalog_cache.fetched_at >= _LIST_MODELS_CATALOG_TTL_SECS:
+                _shared_catalog_fetch()
+            models = await _entitled_kiro_models(request, list(cached))
+            return web.json_response(models)
 
-        kiro_bin = await _resolve_kiro_bin_for_spawn()
-        if not kiro_bin:
-            # Degraded (binary not resolved yet), NOT a genuine "zero models"
-            # result. Return 503 so the client retries instead of caching an
-            # empty list — a cached [] renders an empty picker that only a
-            # manual page refresh recovers from.
-            return web.json_response({"error": "kiro binary not resolved"}, status=503)
-        argv = [kiro_bin, "chat", "--list-models", "--format", "json", "--no-interactive"]
-        # Mirror AcpClient._spawn() sandbox: wrap_argv + env + process isolation.
-        # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
-        # pipes); this is a one-shot read-only command, so we replicate the
-        # sandbox setup directly.  See the security-controls rule.
-        #
-        # The configured tier is passed EXPLICITLY rather than left to
-        # wrap_argv's "auto" parameter default, so this endpoint can never ask
-        # for stricter isolation than the chat spawn of the same binary. It
-        # matters wherever the operator set agent.sandbox="off" (deferring
-        # isolation to kiro-cli's own internal sandbox): the one-shot and chat
-        # path must have one posture. The explicit Kiro classification above also
-        # makes the shipped "auto" tier work on Windows via Kiro's built-in
-        # sandbox instead of answering 503 on every 8s poll.
-        #
-        # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
-        # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
-        # can cold-probe the backend with a synchronous
-        # `subprocess.run(..., timeout=5)`. This endpoint is polled every 8s while
-        # the model list is degraded, so leaving either on the loop stalls chat,
-        # cron and the liveness heartbeat on exactly the host where the probe is
-        # slowest. Both reads run in the worker, so the mode is resolved there
-        # too rather than passed in.
-        #
-        # A remote hub proxying this endpoint budgets its WHOLE cold path (the
-        # sandbox detection above, the list-models subprocess below, and the up
-        # to _READ_PATH_PROBE_DEADLINE_SECS the read-path entitlement
-        # revalidation waits in _entitled_kiro_models) via
-        # DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
-        # kiro_crew/instances/constants.py — 5 + 10 + 3 < 20. Growing any bound
-        # here means moving that constant with it.
-        argv, cleanup = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _wrap_list_models_argv, argv
-        )
-        argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
+        # No catalog yet. Join (or start) the one shared background fetch and wait
+        # at most the per-request bound for it — the SAME 10s a request waited
+        # before. On timeout we answer the same degraded 503, but the fetch is NOT
+        # cancelled: it runs on under its own longer ceiling and warms the cache,
+        # so the next 8s poll is served from its result instead of starting
+        # another doomed cold start.
+        task = _shared_catalog_fetch()
         try:
-            env = {**os.environ}
-            env["PATH"] = augmented_path(env.get("PATH", ""))
-            # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
-            # every hit, so its latency scales with the /tmp entry count. Its
-            # sibling wrapper's contract states it must never run on the event
-            # loop, and this endpoint is polled every 8s while degraded.
-            await asyncio.to_thread(_resolve_ssh_auth_sock, env)
-            # The Docker entrypoint removes credentials from the long-lived
-            # gateway environment.  This fixed-argv child is the official
-            # kiro-cli and KIRO_API_KEY is its own model credential, so settle
-            # the same single key the interactive ACP spawn receives.  Keep
-            # the protected .env read off the gateway loop.
-            await asyncio.to_thread(inject_kiro_cli_api_key, env)
-            env = scrub_agent_subprocess_env(env)
-            # Supervised so the call ends whatever it leaves behind. A kiro-cli
-            # launcher wrapper can start a ~140-thread credential helper for each
-            # call and leave it running; this endpoint re-polls every 8s while
-            # degraded, so on a gateway on that path every poll leaked one until
-            # the agent cgroup ran out of pids.
-            proc = await spawn_supervised_oneshot(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
+            models = await asyncio.wait_for(
+                asyncio.shield(task), timeout=_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS
-                )
-            except asyncio.TimeoutError:
-                # The whole group, while the supervisor still leads it: killing
-                # only the leader would leave the command and its helpers running.
-                await kill_and_reap(proc)
-                # A cold CLI spawn exceeded the timeout. This is the common
-                # cause of the "picker is empty until I refresh" symptom: a
-                # slow first `--list-models` spawn returning [] (HTTP 200) would
-                # be cached by the client as a successful empty result. Return
-                # 503 instead so React Query retries with backoff and the
-                # picker self-heals without a manual refresh.
-                logger.warning("api_models: --list-models timed out; returning 503")
-                return web.json_response({"error": "model list timed out"}, status=503)
-        finally:
-            if cleanup and callable(cleanup):
-                cleanup()
-
-        if proc.returncode != 0:
-            from kiro_crew.platform import redact_via_context  # noqa: F811
-
-            stderr_tail = stderr.decode(errors="replace").strip()
-            stderr_tail = redact_via_context(stderr_tail)[-_MODEL_LIST_STDERR_TAIL_CHARS:]
-            logger.warning(
-                "api_models: --list-models exited %s: %s; returning 503",
-                proc.returncode,
-                stderr_tail or "<no stderr>",
-            )
-            return web.json_response({"error": "model list command failed"}, status=503)
-
-        if not stdout.strip():
-            logger.warning("api_models: --list-models returned empty output; returning 503")
-            return web.json_response({"error": "model list returned empty output"}, status=503)
-
-        try:
-            data = json.loads(stdout.decode(errors="replace"))
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "api_models: --list-models returned invalid JSON (%s); returning 503",
-                exc,
-            )
-            return web.json_response({"error": "model list returned invalid JSON"}, status=503)
-        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
-            logger.warning("api_models: --list-models returned an invalid payload; returning 503")
-            return web.json_response(
-                {"error": "model list returned an invalid payload"}, status=503
-            )
-        models = data["models"]
-        # Seed the central window authority from kiro's authoritative structured
-        # 'context_window_tokens' field (keyed by model_id/model_name). This is
-        # the ONE place these rows enter the system; every other consumer (the
-        # ACP backfill, the context-budget scaler, the live meter) then resolves
-        # through model_registry.model_window() rather than re-reading kiro. The
-        # in-memory update is synchronous (cheap dict mutation); only the disk
-        # persist is offloaded to an executor so the event loop never blocks on
-        # filesystem I/O (no blocking call on the event loop).
-        #
-        # This fork keeps kiro's bare-dotted ids as the picker WIRE FORMAT
-        # (guarded by _model_rejected_reason / api_chat_slot_model, which rejects
-        # canonical registry keys the ACP CLI can't accept). The upstream
-        # registry-key canonicalization is deliberately NOT ported — it is
-        # incompatible with this fork's _model_rejected_reason guard. The window
-        # seeding above uses kiro's authoritative context_window_tokens to give
-        # the backfill real GPT/DeepSeek/Qwen windows, independent of the
-        # wire-format choice.
-        #
-        # The same rows also warm the ``acp`` advertised-model cache, kiro's
-        # VOCABULARY: which ids are kiro's own, so model_scope can tell a pin
-        # chosen for another harness from one chosen here before any session
-        # exists (the chip and the provider factory judge from the cache; the
-        # wire holds the live list). ONE admission feeds both caches
-        # (refresh_kiro_catalog), so an id the bound refuses gets no row in
-        # either. Fed from the UNFILTERED catalog on purpose: a deprecated or
-        # unentitled row is still a kiro id, and dropping it here would make
-        # model_scope call a native pin foreign. Entitlement stays with the
-        # live ``session/new`` list downstream (_entitled_kiro_models,
-        # model_is_unusable) -- ``--list-models`` is a catalog and no reader
-        # of this cache treats it as more. Sourced here rather than from any
-        # ``session/new`` payload because the registry attributes that payload
-        # to claude-agent-acp and a kiro session's list is scoped to the agent
-        # that session started. In-memory updates on the loop, disk persists
-        # off it.
-        windows_changed, advertised_changed = model_registry.refresh_kiro_catalog(
-            models, model_registry_namespace(ACP_BACKEND_KIRO)
-        )
-        if windows_changed:
-            await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), model_registry.persist_kiro_windows
-            )
-        if advertised_changed:
-            await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), model_registry.persist_advertised_models
-            )
-        models = [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
-        models = await _entitled_kiro_models(request, models)
+        except asyncio.TimeoutError:
+            # The cold spawn outran one request. Keep the shared fetch running
+            # (shield already detached it from this await) so the next poll lands
+            # on the warmed cache rather than re-spawning.
+            logger.warning("api_models: --list-models slower than the request bound; returning 503")
+            return web.json_response({"error": "model list timed out"}, status=503)
+        models = await _entitled_kiro_models(request, list(models))
         return web.json_response(models)
+    except _CatalogUnavailable as exc:
+        # A degraded fetch outcome (binary unresolved, timeout, non-zero exit,
+        # empty / invalid output). The carried body is the 503 for that outcome.
+        return web.json_response({"error": exc.error}, status=503)
     except EntitlementRevalidating:
         # An entitlement revalidation is in flight past the read deadline. The
         # picker snapshot might narrow the catalog on an un-revalidated answer,
