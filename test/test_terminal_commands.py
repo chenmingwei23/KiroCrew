@@ -1169,7 +1169,8 @@ class TestRunProbe:
         # launcher source by
         # test_sandbox_gradle_daemon.py::test_sets_the_flag_when_gradle_opts_is_absent.
         sandbox_injected = {"KIROCREW_HOST_PID", "KIROCREW_SANDBOX_ACTIVE",
-                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SPAWNED",
+                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SANDBOX_TOOL",
+                            "KIROCREW_SPAWNED",
                             "GIT_SSH_COMMAND", "GRADLE_OPTS"}
         shell_added = {"PWD", "SHLVL", "_"}
         # macOS injects __CF_USER_TEXT_ENCODING into every spawned process

@@ -61,6 +61,30 @@ _LINUX_LINK_PIN = pytest.mark.skipif(
     reason="pinning a link no-follow needs O_PATH; the namespace launcher is Linux-only",
 )
 
+
+class _OsWithOPath:
+    """``os`` for the launcher region, with ``O_PATH`` guaranteed to exist.
+
+    The region opens its pin descriptors with ``os.O_PATH``, a flag only Linux
+    defines. The shipped launcher runs on Linux alone, so production never meets
+    its absence; a non-Linux test runner driving the extracted region does, and
+    would raise ``AttributeError`` before any assertion. This proxy delegates
+    every attribute to the real ``os`` and supplies ``O_PATH`` as 0 when the host
+    lacks it -- the same no-op fallback the launcher's own ``_O_PATH`` constant
+    uses, since the flag only asks for a descriptor that reads nor writes, which
+    a plain open already gives. On Linux it is the real flag and the region is
+    byte-for-byte what executes in the child.
+    """
+
+    O_PATH = getattr(os, "O_PATH", 0)
+
+    def __getattr__(self, name):  # noqa: ANN001, ANN204
+        return getattr(os, name)
+
+
+#: Injected as the region's ``os`` so a host without ``O_PATH`` runs it too.
+_OS_FOR_REGION = _OsWithOPath()
+
 #: Module-level helpers: from the first one's ``def`` to the first substitution.
 _HELPER_START = "def _mount_or_die("
 _HELPER_END = "REAL_UID = "
@@ -305,7 +329,7 @@ def _run(
         "_MS_NOEXEC": 8,
         "_MNT_DETACH": 2,
         "ctypes": ctypes,
-        "os": os,
+        "os": _OS_FOR_REGION,
         "stat": stat,
         "sys": sys,
         "tempfile": tempfile_shim or tempfile,
@@ -457,7 +481,7 @@ def _run_with_libc(tmp_path: Path, bed: _Bed, libc: _FakeLibc) -> str | None:
         "_MS_NODEV": 4,
         "_MS_NOEXEC": 8,
         "ctypes": ctypes,
-        "os": os,
+        "os": _OS_FOR_REGION,
         "stat": stat,
         "sys": sys,
         "tempfile": tempfile,
@@ -787,7 +811,9 @@ def _pin_namespace_from_builder(
     module.write_text(
         textwrap.dedent(helpers) + "\nREQUIRED_MASK_TARGETS = frozenset()\n" + emitted[0] + "\n"
     )
-    return runpy.run_path(str(module), init_globals={"os": os, "stat": stat, "sys": sys})
+    return runpy.run_path(
+        str(module), init_globals={"os": _OS_FOR_REGION, "stat": stat, "sys": sys}
+    )
 
 
 def test_the_builder_forwards_the_referent_kind(tmp_path: Path) -> None:
@@ -1437,7 +1463,7 @@ def _verifier(tmp_path: Path):  # noqa: ANN202
     b = script.rindex("\n", 0, script.index("REAL_UID = ", a)) + 1
     region_file = tmp_path / "verify_region.py"
     region_file.write_text(script[a:b])
-    namespace = runpy.run_path(str(region_file), init_globals={"os": os, "sys": sys})
+    namespace = runpy.run_path(str(region_file), init_globals={"os": _OS_FOR_REGION, "sys": sys})
     return namespace["_verify_masked_name"], namespace["_PINNED_OCCUPANTS"]
 
 
