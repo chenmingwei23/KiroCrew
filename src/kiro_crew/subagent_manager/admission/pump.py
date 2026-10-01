@@ -208,6 +208,12 @@ class _PumpMixin(ManagerComponent):
         )
         if result is not None and not result.done and result.id in self._manager._agents:
             await self.taskq_child_registered_async(result)
+        # The retry settled the row -- it registered, was refused, or stopped --
+        # unless it re-retained on a still-failing store. Drop its queryability
+        # window only when it did NOT re-retain; a still-retained row stays
+        # pending work the done-probe must keep the serial guard for.
+        if agent_id not in self._manager._retained_claims:
+            self._manager._dispatching_params.pop(agent_id, None)
         self._after_dispatch_impl(stop_params, result, refill=lambda **_kw: 0)
         if retained:
             self._schedule_retained_claim_retry()
@@ -273,8 +279,14 @@ class _PumpMixin(ManagerComponent):
                     # ``spawn`` answered -- started, re-queued, parked, refused,
                     # or raised -- the row is either registered (live-excluded)
                     # or back in the store as waiting, and either way the
-                    # count and the refill must see it as the store does.
-                    self._unmark_dispatching(params)
+                    # count and the refill must see it as the store does. A
+                    # retained claim is the exception: it holds a reserved slot
+                    # and is still pending with no ``_agents`` row, so its
+                    # queryability window survives until the retry settles it.
+                    retained = str(params.get("_preassigned_id") or "") in (
+                        self._manager._retained_claims
+                    )
+                    self._unmark_dispatching(params, retained=retained)
                 self._after_dispatch_impl(params, drained, refill=lambda **_kw: 0)
         except Exception:
             logger.error("drain pump failed", exc_info=retain_error_detail)
@@ -283,13 +295,34 @@ class _PumpMixin(ManagerComponent):
             # granting loop, or a cancelled pass) would otherwise keep its mark
             # for the process lifetime and be skipped by every refill: the
             # durable row would never run again. The store is the truth for
-            # every row this pass did not dispatch.
+            # every row this pass did not dispatch. A row the inner loop
+            # retained is the exception: its claim is held for the retry and it
+            # is still pending with no ``_agents`` row, so its queryability
+            # window must survive this sweep exactly as it survived the inner
+            # one -- erasing it here would let the done-probe read the id as
+            # finished before the retry runs.
             for params in picked:
-                self._unmark_dispatching(params)
+                retained = str(params.get("_preassigned_id") or "") in (
+                    self._manager._retained_claims
+                )
+                self._unmark_dispatching(params, retained=retained)
 
-    def _unmark_dispatching(self, params: "Mapping[str, Any]") -> None:
-        """Drop the popped row's dispatching mark, if it carries an id."""
-        self._manager._dispatching_ids.discard(str(params.get("_preassigned_id") or ""))
+    def _unmark_dispatching(self, params: "Mapping[str, Any]", *, retained: bool = False) -> None:
+        """Drop the popped row's dispatching mark, if it carries an id.
+
+        ``_dispatching_ids`` is the depth-count exclusion and is always dropped
+        once the attempt ends -- a retained claim holds a reserved slot, so it
+        is already out of the waiting count. ``_dispatching_params`` is the
+        queryability window the done-probe reads: a retained claim is still
+        pending work with no ``_agents`` row, so its params are KEPT until the
+        retained claim registers or is refused (``retry_retained_claims``);
+        dropping them here would let the probe read the id as finished and
+        release the caller's serial guard.
+        """
+        agent_id = str(params.get("_preassigned_id") or "")
+        self._manager._dispatching_ids.discard(agent_id)
+        if not retained:
+            self._manager._dispatching_params.pop(agent_id, None)
 
     async def _dispatch_async_impl(self, params: dict[str, Any]) -> "SubagentInfo | None":
         """Start a picked window row with its claim (``store.claim``) on the
@@ -446,6 +479,7 @@ class _PumpMixin(ManagerComponent):
                 # own task; one in flight reads again), so dropping the mark
                 # here, before re-entry asks, is always seen by that read.
                 self._manager._dispatching_ids.discard(point.agent_id)
+                self._manager._dispatching_params.pop(point.agent_id, None)
             result = reenter(claimed)
         finally:
             # Queued-stop reporting temporarily installs a synthetic terminal
@@ -629,6 +663,7 @@ class _PumpMixin(ManagerComponent):
         # ``claim_and_start``, and the gate's failed-claim emit.
         if queued_id:
             self._manager._dispatching_ids.add(queued_id)
+            self._manager._dispatching_params[queued_id] = params
         # The popped item's parent just lost one waiting agent — ask for its
         # queued depth (0 when this was its last) so the chip's "waiting" count
         # tracks the drain. The read runs later, as its own task, and the mark

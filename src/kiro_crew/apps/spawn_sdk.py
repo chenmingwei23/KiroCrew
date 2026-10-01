@@ -228,13 +228,22 @@ def build_done_probe(subagents: object) -> DoneProbe:
     """Adapt a live ``SubagentManager`` to :data:`DoneProbe`.
 
     An id the manager does not track reads as done: the reaper prunes
-    records, and "gone" must never hold a caller's serial lock open.
+    records, and "gone" must never hold a caller's serial lock open. The one
+    exception is a spawn accepted behind the concurrency / adaptive cap: it has
+    no ``_agents`` entry yet (``get`` misses) but is real pending work, so
+    reading it as done would clear the guard and let the caller queue a
+    duplicate of work that has not run. ``is_queued`` names that window.
     """
 
     def _probe(spawn_id: str) -> bool:
         if subagents is None or not spawn_id:
             return True
         info = subagents.get(spawn_id)  # type: ignore[attr-defined]
-        return info is None or bool(getattr(info, "done", False))
+        if info is not None:
+            return bool(getattr(info, "done", False))
+        is_queued = getattr(subagents, "is_queued", None)
+        if callable(is_queued) and is_queued(spawn_id):
+            return False  # accepted, not started: pending work holds the guard
+        return True
 
     return _probe

@@ -154,6 +154,18 @@ if TYPE_CHECKING:
     from ...subagent import SubagentInfo, asyncio
 
 
+def _drop_accepted_unstarted(manager: Any, agent_id: str) -> None:
+    """Best-effort removal from the overflow-accepted id set.
+
+    The set lives on the manager; a bridge mounted without one (a test
+    double that drives only the store seam) has nothing to drop, so this
+    tolerates a missing manager or set rather than raising on a cleanup path.
+    """
+    ids = getattr(manager, "_accepted_unstarted_ids", None)
+    if ids is not None:
+        ids.discard(agent_id)
+
+
 class _TaskqBridgeMixin(ManagerComponent):
     __slots__ = ()
 
@@ -824,6 +836,9 @@ class _TaskqBridgeMixin(ManagerComponent):
         store = self.taskq_store()
         if store is None:
             return
+        # Terminal: it cannot be pending, so it leaves the set (registration
+        # usually dropped it already; this covers a row that terminated by another path).
+        _drop_accepted_unstarted(getattr(self, "_manager", None), info.id)
         if info.user_stopped:
             state = _taskq.CANCELLED
         elif info.error:
@@ -1740,6 +1755,9 @@ class _TaskqBridgeMixin(ManagerComponent):
                 continue
             if rec.id not in present:
                 self._manager._queue.append(entry)
+            # Now windowed (in _queue) or already present there: is_queued
+            # covers it via _queue, so the overflow-accepted set drops it.
+            _drop_accepted_unstarted(getattr(self, "_manager", None), rec.id)
 
     def _refill_idle_wake_read(
         self, store: "_taskq.TaskStore", children_only: bool
@@ -1997,6 +2015,9 @@ class _TaskqBridgeMixin(ManagerComponent):
             return None
         if previous is None:
             return None
+        # Terminal now: drop it from the overflow-accepted set so is_queued does
+        # not hold the serial guard for a cancelled row that never ran.
+        _drop_accepted_unstarted(getattr(self, "_manager", None), agent_id)
         params = dict(rec.params)
         params["_preassigned_id"] = agent_id
         return params

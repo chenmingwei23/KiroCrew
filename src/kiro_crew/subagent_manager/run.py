@@ -424,6 +424,40 @@ class RunEventCoordinator(ManagerComponent):
         """Get agent info by ID."""
         return self._manager._agents.get(agent_id)
 
+    def is_queued_impl(self, agent_id: str) -> bool:
+        """Whether *agent_id* names a spawn accepted but not yet started.
+
+        A spawn admitted behind the concurrency / adaptive cap returns its real
+        id to the caller but has no ``_agents`` entry until it drains. It can
+        wait in three places, and a serial-lock done-probe that read such an id
+        as finished (``_agents`` miss) would release the caller's guard and let
+        a duplicate of not-yet-run work be queued:
+
+        * the in-memory ``_queue`` (a params dict), while it is windowed;
+        * ``_dispatching_params``, across the pump's pop-to-claim /
+          retained-claim window when it is in neither map;
+        * the durable task store ONLY, when the gate accepted it as overflow
+          past the in-memory window (``taskq_should_window`` kept it on disk) --
+          the design's ordinary backlog path, so this id is reachable under
+          plain load and must count as pending too. These ids are held in the
+          in-memory ``_accepted_unstarted_ids`` set, NEVER read from the store
+          here: a done-probe runs on the gateway loop and a synchronous SQLite
+          read under lock contention would freeze it.
+
+        A ``_resume_id`` entry reuses an existing ``_agents`` row, so it is not a
+        fresh queued spawn; an id-less entry has no handle.
+        """
+        if not agent_id:
+            return False
+        for params in self._manager._queue:
+            if params.get("_resume_id"):
+                continue
+            if params.get("_preassigned_id", "") == agent_id:
+                return True
+        if agent_id in self._manager._dispatching_params:
+            return True
+        return agent_id in self._manager._accepted_unstarted_ids
+
     async def _teardown_run_session_impl(self, info: SubagentInfo, session_key: str) -> None:
         """Release and reset the run's own session (skipped when reaped).
 

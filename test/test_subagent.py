@@ -279,6 +279,70 @@ class TestSpawnWithoutApprovalCallback:
         assert manager.has_pending_work_for("cron:j1") is True
         assert manager.queued_count_for("cron:other") == 0
 
+    @pytest.mark.asyncio
+    async def test_is_queued_names_pending_spawns_and_the_dispatch_window(self) -> None:
+        """``is_queued`` is the serial-guard done-probe's queue check: it names
+        a fresh ``_queue`` entry and the pop-to-claim window the pump tracks in
+        ``_dispatching_params``, skips a ``_resume_id`` re-entry (its real row is
+        in ``_agents``) and an id-less row, and does not claim a started run."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            on_spawn_approval=AsyncMock(return_value=True),
+        )
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            manager.spawn("task one", parent_session_key="dashboard:tab")
+            queued = manager.spawn("task two", parent_session_key="dashboard:tab")
+
+        assert queued is not None and queued.queued is True
+        assert manager.is_queued(queued.id) is True  # waiting in _queue
+        assert manager.is_queued("ffffffffffffffff") is False  # unknown id
+        # A started run (one with an _agents row) is not "queued".
+        for started_id in list(manager._agents):
+            assert manager.is_queued(started_id) is False
+
+        # A resume re-entry and an id-less row are not fresh queued spawns.
+        manager._queue.append({"_resume_id": "abc", "_preassigned_id": "abc"})
+        manager._queue.append({"_preassigned_id": "", "parent_session_key": "dashboard:tab"})
+        assert manager.is_queued("abc") is False
+        assert manager.is_queued("") is False
+
+        # The pump's pop-to-claim window: the row left _queue but is held in
+        # _dispatching_params; is_queued still names it so the guard holds.
+        params = next(p for p in list(manager._queue) if p.get("_preassigned_id") == queued.id)
+        manager._queue.remove(params)
+        manager._dispatching_params[queued.id] = params
+        assert manager.is_queued(queued.id) is True
+
+    def test_unmark_dispatching_keeps_params_for_a_retained_claim(self) -> None:
+        """``_unmark_dispatching`` drops the depth-count id mark unconditionally
+        but keeps the queryability window (``_dispatching_params``) for a
+        retained claim -- the contract BOTH the inner per-row finally and the
+        outer drain-pass sweep rely on, so a claim retained across a pass is not
+        erased by that same pass's cleanup (GPT F1)."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+        )
+        pump = manager._admission
+        params = {"_preassigned_id": "held", "parent_session_key": "dashboard:tab"}
+        manager._dispatching_ids.add("held")
+        manager._dispatching_params["held"] = params
+
+        # retained=True: the slot leaves the depth count but the row stays
+        # queryable, so the done-probe keeps the serial guard.
+        pump._unmark_dispatching(params, retained=True)
+        assert "held" not in manager._dispatching_ids
+        assert manager._dispatching_params.get("held") is params
+        assert manager.is_queued("held") is True
+
+        # retained=False (the settled path): both marks go.
+        pump._unmark_dispatching(params, retained=False)
+        assert "held" not in manager._dispatching_params
+        assert manager.is_queued("held") is False
+
 
 class TestSpawnWithApprovalCallback:
     """When on_spawn_approval is set, spawns are gated behind approval."""

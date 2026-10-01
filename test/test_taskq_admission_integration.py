@@ -780,6 +780,11 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
             _stage_boundary_owner=owner,
         )
     params = mgr._queue.pop(0)
+    # The pump marks a row dispatching at pop time (SubagentManager._queue ->
+    # _dispatching_ids/_dispatching_params); replicate it so the retained-claim
+    # guard operates on the same state the real drain pass sees.
+    mgr._dispatching_ids.add(waiting.id)
+    mgr._dispatching_params[waiting.id] = params
     mgr._running_count = 0
     real_run = store.run
     taskq_revalidate = mgr._admission.taskq_claim_still_current
@@ -805,6 +810,13 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
         assert mgr._running_count == 1
         assert mgr._retained_claims[waiting.id][1] == admitted.generation
         assert waiting.id not in mgr._agents
+        # While the claim is retained the row is in neither _queue nor _agents,
+        # but it is still pending work: is_queued must report it so the serial
+        # done-probe keeps the caller's guard rather than reading it as done
+        # (the gap GPT F1 named -- the outer drain-pass cleanup must not erase
+        # _dispatching_params for a still-retained claim).
+        assert waiting.id in mgr._dispatching_params
+        assert mgr.is_queued(waiting.id) is True
 
         await mgr._drain_queue_pass()
 
@@ -812,8 +824,55 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
     assert waiting.id not in mgr._retained_claims
     assert mgr._retained_claim_retry_handle is None
     assert waiting.id in mgr._agents
+    # Once the retry registers the run, the retention window closes: the row is
+    # an _agents entry now, so is_queued stops naming it.
+    assert waiting.id not in mgr._dispatching_params
+    assert mgr.is_queued(waiting.id) is False
     assert await store.run(store.state_of, waiting.id) == model.STARTING
     assert mgr._running_count == 1
+
+
+@pytest.mark.asyncio
+async def test_is_queued_names_a_store_only_overflow_row(quiet) -> None:
+    """The gate accepts a spawn as durable overflow past the in-memory window,
+    so the row lives ONLY in the task store -- not in _queue,
+    _dispatching_params or _agents. is_queued must still name it (GPT F1) via
+    the in-memory _accepted_unstarted_ids set -- NEVER a synchronous store read
+    on the gateway loop -- so the serial-lock done-probe keeps the caller's
+    guard instead of reading an _agents miss as finished. The set clears when
+    the overflow row is cancelled, so a never-run row cannot hold the guard
+    forever."""
+    mgr = await _manager(max_concurrent=1)
+    store: TaskStore = mgr._taskq
+    overflow_id = "sa-overflow"
+    record = mgr._admission.taskq_build_record(
+        overflow_id,
+        {"task": "t", "parent_session_key": "dash:ovf"},
+        parent_session_key="dash:ovf",
+        memory_store="",
+        app="",
+        model="",
+        allowed_tools=None,
+        approval_mode="",
+    )
+    store.accept([record])  # QUEUED on disk
+    # The accept path records a store-only (non-windowed) row here; replicate
+    # that bookkeeping, the state is_queued reads.
+    mgr._accepted_unstarted_ids.add(overflow_id)
+
+    assert overflow_id not in mgr._agents
+    assert not any(p.get("_preassigned_id") == overflow_id for p in mgr._queue)
+    assert overflow_id not in mgr._dispatching_params
+    # is_queued answers from the in-memory set WITHOUT touching the store: a
+    # store read would raise here and fail the test (it must never run on loop).
+    with patch.object(store, "state_of", side_effect=AssertionError("store read on loop")):
+        assert mgr.is_queued(overflow_id) is True
+
+    # Cancelling the unstarted overflow row drops it from the set, so the guard
+    # is not held for work that will never run.
+    await store.run(mgr._admission.taskq_cancel_queued, overflow_id)
+    assert mgr.is_queued(overflow_id) is False
+    assert overflow_id not in mgr._accepted_unstarted_ids
 
 
 @pytest.mark.asyncio

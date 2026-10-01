@@ -3643,6 +3643,22 @@ class SubagentManager:
         # durable state is still QUEUED, so without this set every store-backed
         # depth read between pop and claim counts them as waiting.
         self._dispatching_ids: set[str] = set()
+        # The popped params for each dispatching id, retained for the same
+        # pop-to-claim window so a queued-view read (``_queued_info_for``) can
+        # still project the row while it is in neither ``_queue`` nor
+        # ``_agents``: without it the done-probe reads such a row as finished
+        # and the serial guard releases, starting overlapping work. Kept in
+        # lockstep with ``_dispatching_ids`` -- marked and unmarked together.
+        self._dispatching_params: dict[str, dict[str, Any]] = {}
+        # Ids of spawns the gate accepted into the durable store as overflow
+        # PAST the in-memory window -- so they live only on disk, in neither
+        # _queue nor _agents. is_queued reads this set (an in-memory membership
+        # check, never a store read on the gateway loop) so the serial-lock
+        # done-probe keeps the guard for such a row. Added when the store
+        # accepts the row; removed when it registers, drains into _queue, or the
+        # drain pass finds its store row is not pending (bounded cleanup, so
+        # a cancelled-before-drain row cannot leak indefinitely).
+        self._accepted_unstarted_ids: set[str] = set()
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -5489,6 +5505,13 @@ class SubagentManager:
         # claim run on the writer thread; the sync re-entry only registers.
         await self._admission.ensure_coordinator_async()
         window_hint = await self._admission.taskq_should_window_async(prepared.agent_id)
+        # A row the window does not take is accepted but lives only on disk --
+        # in neither _queue nor _agents. Track it so is_queued (the serial-lock
+        # done-probe) keeps the guard for it without a loop-blocking store read.
+        # Cleared when it registers, drains into _queue, or the drain pass finds
+        # it is not pending.
+        if not window_hint:
+            self._accepted_unstarted_ids.add(prepared.agent_id)
         common: dict[str, Any] = dict(
             _preassigned_id=prepared.agent_id,
             _store_accepted=True,
@@ -5927,6 +5950,9 @@ class SubagentManager:
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)
+
+    def is_queued(self, agent_id: str) -> bool:
+        return self._run_events.is_queued_impl(agent_id)
 
     @property
     def count(self) -> int:
