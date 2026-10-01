@@ -1524,6 +1524,40 @@ def test_lock_failure_never_overwrites_a_newer_settings_generation(native_tree, 
     assert newer and settings.read_bytes() == newer[0]
 
 
+def test_alias_lock_fallback_logs_one_line_without_a_traceback(native_tree, monkeypatch, caplog):
+    """A busy alias lock is routine contention, not a defect. The fallback logs
+    a single WARNING that carries the lock helper's own wait detail, and no
+    traceback -- a full stack repeated dozens of times a day only buries the
+    log in contextlib frames that name the helper, not a cause.
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    assert projection.prepare_native_skill_projection(project) is not None
+
+    detail = (
+        "could not acquire exclusive file lock: still held after waiting 2.00s "
+        "(limit 2s); refusing to proceed unserialized"
+    )
+
+    def busy(_directory):
+        raise OSError(detail)
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", busy)
+
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert projection.prepare_native_skill_projection(project) is None
+
+    fallbacks = [r for r in caplog.records if "alias lock unavailable" in r.getMessage()]
+    assert len(fallbacks) == 1
+    (record,) = fallbacks
+    assert record.levelname == "WARNING"
+    # The helper's real wait detail reaches the operator inline...
+    assert detail in record.getMessage()
+    assert "using authored agents" in record.getMessage()
+    # ...and no stack is attached: the one line is the whole report.
+    assert record.exc_info is None
+
+
 def test_prune_keeps_alias_while_an_external_projection_lease_is_locked(native_tree, monkeypatch):
     _home, agents, project = native_tree
     source = agents / "custom.json"

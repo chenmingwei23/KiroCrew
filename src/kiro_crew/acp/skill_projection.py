@@ -2641,11 +2641,17 @@ def prepare_native_skill_projection(
     _warn_on_display_text(display_sizes)
     try:
         alias_lock = _projection_alias_lock(directory)
-    except OSError:
+    except OSError as exc:
+        # Lock contention is a routine, expected outcome on a busy host, not a
+        # defect: the raised OSError already names what is known (how long the
+        # acquire waited and that the lock was still held), so one warning line
+        # carries the whole story. A full traceback adds only contextlib frames
+        # that point at the lock helper, not at a cause, and repeats dozens of
+        # times a day on a contended host.
         logger.warning(
-            "skill projection: alias lock unavailable; retaining aliases, settings, and using "
-            "authored agents",
-            exc_info=True,
+            "skill projection: alias lock unavailable (%s); retaining aliases, settings, and "
+            "using authored agents",
+            exc,
         )
         # `local` was read before agent enumeration and lock acquisition. A
         # concurrent projection can write a newer overlay or unrelated setting
@@ -2765,11 +2771,14 @@ def prepare_native_skill_projection(
                 except BaseException:
                     lease_stack.close()
                     raise
-        except OSError:
+        except OSError as exc:
+            # Same routine contention as the alias-lock fallback above: the
+            # OSError names the real wait, so one warning line suffices and a
+            # traceback would only repeat the lock-helper frames.
             logger.warning(
-                "skill projection: workspace settings or lease lock unavailable; retaining "
+                "skill projection: workspace settings or lease lock unavailable (%s); retaining "
                 "aliases and using authored agents",
-                exc_info=True,
+                exc,
             )
             return None
         _register_active_projection(prepared)
