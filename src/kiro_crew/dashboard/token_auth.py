@@ -3112,16 +3112,27 @@ def token_auth_middleware(
             _scope_deny = _enforce_app_scope(request, _app, path)
             if _scope_deny is not None:
                 return _scope_deny
-            _sel = _sel_fn()
-            _sel.log_api_access(
-                caller=_caller,
-                operation="internal_auth",
-                outcome="granted",
-                source="token_auth",
-                resources=path,
-                error="cookie auth (no secret header)",
-            )
-            _log_auth(request, "internal", "granted", f"cookie auth for {_uid}")
+            # A dashboard-user cookie poll on a mixed-internal path is the same
+            # request the ``_log_auth`` row below already audits (operation
+            # ``dashboard.token_auth``), so emitting an ``internal_auth`` row
+            # here too double-logs one request — the signal the high-frequency
+            # ``/api/workflows/runs`` poll dominates. The ``_log_auth`` row
+            # carries the daemon-verified caller (``_audit_uid`` — the peer
+            # login when a peer resolved, else the token subject), so the single
+            # surviving row names the identity the suppressed row would have.
+            # An app token is a distinct security decision (its scoped reach onto
+            # a mixed route), so it keeps the per-layer ``source=token_auth`` row.
+            if _app:
+                _sel = _sel_fn()
+                _sel.log_api_access(
+                    caller=_caller,
+                    operation="internal_auth",
+                    outcome="granted",
+                    source="token_auth",
+                    resources=path,
+                    error="cookie auth (no secret header)",
+                )
+            _log_auth(request, _audit_uid(_uid), "granted", f"cookie auth for {_uid}")
             return await handler(request)  # type: ignore[operator]
         elif _matches_internal:
             if _matches_mixed:
@@ -3194,17 +3205,25 @@ def token_auth_middleware(
                 _scope_deny = _enforce_app_scope(request, _app, path)
                 if _scope_deny is not None:
                     return _scope_deny
-                _sel = _sel_fn()
-                _sel.log_api_access(
-                    caller=_caller,
-                    operation="internal_auth",
-                    outcome="granted",
-                    source="token_auth",
-                    resources=path,
-                    error="mixed non-loopback cookie auth",
-                )
+                # Same dedup as the loopback mixed branch above: the dashboard
+                # user's grant is already audited by ``_log_auth``, whose row
+                # carries the daemon-verified caller (``_audit_uid``); only an
+                # app token's scoped grant keeps the ``source=token_auth`` row.
+                if _app:
+                    _sel = _sel_fn()
+                    _sel.log_api_access(
+                        caller=_caller,
+                        operation="internal_auth",
+                        outcome="granted",
+                        source="token_auth",
+                        resources=path,
+                        error="mixed non-loopback cookie auth",
+                    )
                 _log_auth(
-                    request, "internal", "granted", f"mixed non-loopback cookie auth for {_uid}"
+                    request,
+                    _audit_uid(_uid),
+                    "granted",
+                    f"mixed non-loopback cookie auth for {_uid}",
                 )
                 return await handler(request)  # type: ignore[operator]
             else:
