@@ -1236,13 +1236,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
         # names), no agent influence, 5s-capped, read-only query.
         "cli_doctor.py::_detect_userspace_oom_killer",
-        # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`,
-        # a fixed argv whose only variable is the invoking account name taken
-        # from $USER/$LOGNAME (never agent-supplied). Same class as
-        # service/linux.py::_current_group — an identity/state query the doctor
-        # makes to tell the user whether pods survive logout. No shell, no
-        # agent-influenced argument, nothing written.
-        "cli_doctor.py::_linger_enabled",
         "cli_server.py::_logs_cmd",
         "cli_server.py::_spawn_detached_gateway",
         "cli_server.py::_update",
@@ -1628,6 +1621,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "service/apparmor.py::parser_version",
         "service/apparmor.py::validate",
         "service/linux.py::_current_group",
+        # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`, a
+        # fixed argv whose only variable is the service account name taken from
+        # $USER/$LOGNAME (never agent-supplied). Same class as
+        # service/linux.py::_current_group — an identity/state query the install
+        # makes to warn the operator when runtimes would die at logout. No shell,
+        # no agent-influenced argument, nothing written.
+        "service/linux.py::_linger_enabled",
         "service/linux.py::_sudo_run",
         "service/linux.py::_systemctl",
         "service/linux.py::_write_unit_via_sudo",

@@ -1529,8 +1529,17 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     lacks a credential; a fall-back login store, or a stopped unit beside a
     foreground `kirocrew gateway`, both leave the host healthy while the check
     fires.
-  - Boot survival via `WantedBy=multi-user.target` (no linger needed —
-    that's a user-service concept; this is system-level).
+  - Boot survival of the GATEWAY via `WantedBy=multi-user.target` needs no
+    linger — the gateway is a system-level unit, and linger is a user-service
+    concept. The AGENT RUNTIMES are a separate matter: the unit bakes
+    `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` for the service account, so each
+    runtime scope is created under that account's `user@<uid>.service`, which
+    logind stops when the account's last login session ends unless linger is on
+    — killing in-flight scoped runtimes and dropping later spawns to the
+    unscoped path (no cgroup ceilings). `install_service()` therefore prints a
+    non-fatal warning naming `loginctl enable-linger <user>` when it detects
+    linger off for the service account, beside the headless-auth warning above;
+    it is advisory and never changes the install outcome.
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.
   - **A home another gateway already serves is not retried.** `kirocrew
     gateway` takes `<home>/gateway.lock` before it binds anything. One

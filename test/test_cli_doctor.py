@@ -409,14 +409,16 @@ class TestPodSessionBus:
 
 
 class TestLingerProbe:
-    """`loginctl show-user <u> -p Linger --value` → tri-state."""
+    """`loginctl show-user <u> -p Linger` → tri-state, via the canonical probe."""
 
     def _run(self, monkeypatch, *, stdout: str, returncode: int = 0):
         import subprocess
 
-        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _n: "/usr/bin/loginctl")
+        from kiro_crew.service import linux as service_linux
+
+        monkeypatch.setattr(service_linux, "trusted_system_bin", lambda _n: "/usr/bin/loginctl")
         monkeypatch.setattr(
-            cli_doctor.subprocess,
+            service_linux.subprocess,
             "run",
             lambda *a, **k: subprocess.CompletedProcess(
                 args=[], returncode=returncode, stdout=stdout, stderr=""
@@ -425,19 +427,21 @@ class TestLingerProbe:
         return cli_doctor._linger_enabled("tester")
 
     def test_yes_is_true(self, monkeypatch) -> None:
-        assert self._run(monkeypatch, stdout="yes\n") is True
+        assert self._run(monkeypatch, stdout="Linger=yes\n") is True
 
     def test_no_is_false(self, monkeypatch) -> None:
-        assert self._run(monkeypatch, stdout="no\n") is False
+        assert self._run(monkeypatch, stdout="Linger=no\n") is False
 
     def test_unparseable_is_unknown(self, monkeypatch) -> None:
-        assert self._run(monkeypatch, stdout="wat\n") is None
+        assert self._run(monkeypatch, stdout="Linger=wat\n") is None
 
     def test_nonzero_exit_is_unknown(self, monkeypatch) -> None:
         assert self._run(monkeypatch, stdout="", returncode=1) is None
 
     def test_absent_loginctl_is_unknown(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _n: None)
+        from kiro_crew.service import linux as service_linux
+
+        monkeypatch.setattr(service_linux, "trusted_system_bin", lambda _n: None)
         assert cli_doctor._linger_enabled("tester") is None
 
 

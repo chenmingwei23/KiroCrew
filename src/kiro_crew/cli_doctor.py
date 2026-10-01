@@ -1147,29 +1147,12 @@ def _linger_enabled(user: str) -> bool | None:
     """Whether ``user``'s systemd instance lingers past logout.
 
     ``None`` when it cannot be determined (no ``loginctl``, unknown user, or an
-    unrecognised value) so the caller can stay quiet rather than guess.
+    unrecognised value) so the caller can stay quiet rather than guess. Thin
+    delegate to the package's one linger probe,
+    :func:`kiro_crew.service.linux._linger_enabled`, so the ``loginctl`` argv and
+    its parsing live in a single place.
     """
-    if shutil.which("loginctl") is None:
-        return None
-    try:
-        res = subprocess.run(
-            ["loginctl", "show-user", user, "-p", "Linger", "--value"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if res.returncode != 0:
-        return None
-    val = res.stdout.strip().lower()
-    if val in ("yes", "true", "1"):
-        return True
-    if val in ("no", "false", "0"):
-        return False
-    return None
+    return service_linux._linger_enabled(user)
 
 
 def _git_line(repo: Path, *args: str) -> str | None:
