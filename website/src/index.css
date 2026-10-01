@@ -3477,3 +3477,24 @@ html[data-font-family="opendyslexic"] .nav-item {
   width: max(100%, calc(var(--chat-pane-width, 100%) - 80px));
   margin-inline: min(0px, calc((100% - (var(--chat-pane-width, 100%) - 80px)) / 2));
 }
+
+/* Overflow cue for a horizontally-clipped markdown table. The scroller carries
+   data-overflow=left|right|both (MarkdownTable.tsx, from useScrollEdges) and a
+   mask-image fades its CONTENT to transparent at whichever edge still hides
+   content — surface-independent (reads over the bg-bg-elevated header, the bg
+   body, or a card host alike), unlike a painted from-bg overlay. 24px feather,
+   matching the app's other scroll-edge fades (ThinkingBlock/ChatInput). A clear
+   edge stays opaque. The gradients live here, in the stylesheet, rather than as
+   inline-style strings in the .tsx. */
+.markdown-table .overflow-x-auto[data-overflow="left"] {
+  mask-image: linear-gradient(to right, transparent, black 24px);
+  -webkit-mask-image: linear-gradient(to right, transparent, black 24px);
+}
+.markdown-table .overflow-x-auto[data-overflow="right"] {
+  mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+  -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+}
+.markdown-table .overflow-x-auto[data-overflow="both"] {
+  mask-image: linear-gradient(to right, transparent, black 24px, black calc(100% - 24px), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, black 24px, black calc(100% - 24px), transparent);
+}
