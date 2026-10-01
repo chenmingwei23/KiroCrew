@@ -3312,6 +3312,31 @@ describe('New crewmate dialog', () => {
     })
   })
 
+  it('a successful create marks the shared sessionless agents-catalog cache stale, so a later reader (the command bar\'s crewmates view) lists the new crewmate without a reload and without a fetch per keystroke', async () => {
+    const membersMock = api.members as ReturnType<typeof vi.fn>
+    const { queryClient } = await renderPage([row()])
+    expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-oncall')
+    // A reader of the shared key holds its answer across a stale window (the
+    // command bar serves from it at MATES_STALE_MS; nothing else invalidates
+    // it). Seed it fresh, so only an explicit invalidation on create can turn
+    // it stale.
+    queryClient.setQueryData(['agents-catalog', 'global'], { agents: [], default_agent: 'kirocrew' })
+    expect(queryClient.getQueryState(['agents-catalog', 'global'])?.isInvalidated).toBe(false)
+    await openDialog()
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'radar' } })
+    membersMock.mockResolvedValue({ members: [row(), row({ name: 'radar', slug: 'radar' })], default_agent: 'kirocrew' })
+    fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+    await waitFor(() => expect(screen.queryByTestId('crewmate-create-form')).toBeNull())
+    // Stale now: the next reader's first fetch refetches, so the crewmate is
+    // listed. The command-bar view pays that once-per-entry fetch and then
+    // filters a cached roster per keystroke (CommandBarOverlay.mates.test.tsx:
+    // "pays for exactly one fetch"), so freshness does not buy a request per
+    // keystroke.
+    await waitFor(() =>
+      expect(queryClient.getQueryState(['agents-catalog', 'global'])?.isInvalidated).toBe(true),
+    )
+  })
+
   it('a cache warm-up that never answers does not hold the dialog on Creating…: the create hands over within its bound', async () => {
     const membersMock = api.members as ReturnType<typeof vi.fn>
     const { queryClient } = await renderPage([row()])
