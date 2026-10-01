@@ -1792,6 +1792,18 @@ class SessionConfig:
             "Context usage percentage at which auto-compaction triggers (5-90).",
         ),
     )
+    compact_wait_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Compaction Wait Budget",
+            "Seconds the automatic-compaction coordinator waits for a "
+            "compaction to finish before giving up and restarting the "
+            "session. 0 (the default) uses the built-in budget. A positive "
+            "value below 60 is raised to 60 and a value above 3600 is capped. "
+            "Raise it on a host where automatic compaction on a large context "
+            "window regularly needs longer than the built-in budget.",
+        ),
+    )
     pool_size: int = field(
         default=DEFAULT_POOL_SIZE,
         metadata=_meta(
@@ -3517,6 +3529,16 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 # read instead.
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
+
+# ``session.compact_wait_secs``: 0 is the sentinel for "use the built-in
+# budget"; any positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN``
+# and capped at ``COMPACT_WAIT_SECS_MAX`` so a hand-edited typo cannot arm a
+# near-zero budget (which would restart every compaction) or an unbounded
+# wait. The load path applies the sentinel-preserving floor
+# (``value if value == 0 else max(value, MIN)``); the resolver treats <= 0 as
+# unset and falls back to the built-in default.
+COMPACT_WAIT_SECS_MIN = 60.0
+COMPACT_WAIT_SECS_MAX = 3600.0
 
 # ── Load/write bound parity ────────────────────────────────────────────────────
 # Ranges for bounded numeric fields the LOAD path clamps, while `_EDITABLE_CONFIG`

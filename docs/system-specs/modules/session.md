@@ -884,7 +884,9 @@ against sweep completeness, and are torn down at `close_all`.
   rather than from the queue — but only when the turn reached its own end
   boundary uncancelled, since a cancelled turn compacted nothing and a false
   `completed` resets the meter AND arms the cooldown. Awaiting the queue for an
-  inline member instead spends the full `COMPACT_WAIT_TIMEOUT_SECS` and then
+  inline member instead spends the full compaction wait budget
+  (`COMPACT_WAIT_TIMEOUT_SECS`, raised per host by `session.compact_wait_secs`)
+  and then
   recycles a session that had just compacted correctly. That answer lives on the
   WAIT, because both routes to a compaction reach it — the manual entry points
   through `provider.compact()`, the autocompact through

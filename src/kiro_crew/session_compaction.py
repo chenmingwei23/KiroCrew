@@ -127,7 +127,7 @@ class CompactionDeps:
     context_pct_is_unknown: Callable[[LLMProvider], bool]
     unlink_session_queue: Callable[[Any], None]
     compact_wait_timeout_secs: Callable[[], float]
-    compact_result_wait_secs: Callable[[float], float]
+    compact_result_wait_secs: Callable[[float, float], float]
     context_warn_margin_pct: float
     compact_result_wait_margin_secs: float
     compact_failure_cooldown_secs: float
@@ -1028,6 +1028,10 @@ class CompactionCoordinator:
         that is still compacting, consume the late completion event, and hang
         without an end-turn boundary.
         """
+        # One effective budget per compaction: this single snapshot feeds the
+        # permit wait below, the outer ``_run`` backstop, and the inner status
+        # wait, so a live ``session.compact_wait_secs`` change mid-compaction
+        # cannot split one compaction across two deadlines.
         timeout = self._deps.compact_wait_timeout_secs()
         try:
             await asyncio.wait_for(session.semaphore.acquire(), timeout=timeout)
@@ -1069,7 +1073,7 @@ class CompactionCoordinator:
                     # site instead would have left the same strand at every
                     # other site that awaits a compaction.
                     result_wait_used = self._deps.compact_result_wait_secs(
-                        time.monotonic() - started
+                        time.monotonic() - started, timeout
                     )
                     result = await session.provider.wait_for_compaction(timeout=result_wait_used)
                     status = result.get("type") if isinstance(result, dict) else None

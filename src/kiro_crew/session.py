@@ -666,20 +666,36 @@ _COMPACT_RESULT_WAIT_MARGIN_SECS = 5.0
 _COMPACT_RESULT_WAIT_FLOOR_SECS = 5.0
 
 
-def _compact_result_wait_secs(elapsed: float) -> float:
+def _compact_result_wait_secs(elapsed: float, budget: float = COMPACT_WAIT_TIMEOUT_SECS) -> float:
     """Inner deadline for the async compaction-status wait.
 
-    The FULL remainder of the shared ``COMPACT_WAIT_TIMEOUT_SECS`` budget
-    after ``elapsed`` seconds — never less, so a compaction completing in the
-    final seconds of the budget is not abandoned early. The outer
-    ``asyncio.wait_for`` carries ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of
-    headroom on top, keeping this wait's graceful "no result" diagnostic
-    reachable. Clamped to a floor so the wait can never be zero or negative.
+    The FULL remainder of the shared compaction ``budget`` after ``elapsed``
+    seconds — never less, so a compaction completing in the final seconds of
+    the budget is not abandoned early. The outer ``asyncio.wait_for`` carries
+    ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of headroom on top, keeping this
+    wait's graceful "no result" diagnostic reachable. Clamped to a floor so
+    the wait can never be zero or negative.
+
+    ``budget`` defaults to ``COMPACT_WAIT_TIMEOUT_SECS``; the automatic path
+    passes the effective budget (``_resolve_compact_wait_secs``), so a config
+    key raising the budget raises this inner wait with it rather than leaving
+    it clamped at the built-in default minus elapsed.
     """
     return max(
         _COMPACT_RESULT_WAIT_FLOOR_SECS,
-        COMPACT_WAIT_TIMEOUT_SECS - elapsed,
+        budget - elapsed,
     )
+
+
+def _resolve_compact_wait_secs(configured: float) -> float:
+    """The effective compaction wait budget.
+
+    ``configured`` is ``cfg.session.compact_wait_secs``: a positive value is
+    the operator's chosen budget, and 0 (the default) or any non-positive
+    value falls back to the built-in ``COMPACT_WAIT_TIMEOUT_SECS``. Resolved
+    per compaction so a live config change takes effect on the next one.
+    """
+    return configured if configured > 0 else COMPACT_WAIT_TIMEOUT_SECS
 
 
 # After a failed compact, suppress auto-compaction for this many seconds so a
@@ -1937,8 +1953,12 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: COMPACT_WAIT_TIMEOUT_SECS,
-                compact_result_wait_secs=lambda elapsed: _compact_result_wait_secs(elapsed),
+                compact_wait_timeout_secs=lambda: _resolve_compact_wait_secs(
+                    self._cfg.session.compact_wait_secs
+                ),
+                compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
+                    elapsed, budget
+                ),
                 context_warn_margin_pct=CONTEXT_WARN_MARGIN_PCT,
                 compact_result_wait_margin_secs=_COMPACT_RESULT_WAIT_MARGIN_SECS,
                 compact_failure_cooldown_secs=_COMPACT_FAILURE_COOLDOWN_SECS,

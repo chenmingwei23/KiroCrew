@@ -106,7 +106,7 @@ async def _setup():
     mgr._compaction._deps = dataclasses.replace(
         mgr._compaction._deps,
         compact_wait_timeout_secs=lambda: 5.0,
-        compact_result_wait_secs=lambda _elapsed: 0.05,
+        compact_result_wait_secs=lambda _elapsed, _budget: 0.05,
         compact_failure_cooldown_secs=123.0,
     )
     notices: list[tuple[bool, str]] = []

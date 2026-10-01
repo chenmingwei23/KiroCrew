@@ -1452,6 +1452,7 @@
         "empty_response_auto_continue": true,
         "empty_response_max_continues": 1,
         "autocompact_pct": 70.0,
+        "compact_wait_secs": 0.0,
         "pool_size": 0,
         "pool_agent": "",
         "pool_ttl_secs": 1800,
@@ -1516,6 +1517,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 70.0
+    },
+    {
+      "path": "session.compact_wait_secs",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Compaction Wait Budget",
+      "help": "Seconds the automatic-compaction coordinator waits for a compaction to finish before giving up and restarting the session. 0 (the default) uses the built-in budget. A positive value below 60 is raised to 60 and a value above 3600 is capped. Raise it on a host where automatic compaction on a large context window regularly needs longer than the built-in budget.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
     },
     {
       "path": "session.pool_size",
