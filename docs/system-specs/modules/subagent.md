@@ -2085,6 +2085,44 @@ The dispatcher's order is not global FIFO. The store side is in
   queued row the refill refetches in FIFO order. Pinned end to end by
   `test_fairness_lanes.py::test_reserve_pulls_a_child_into_a_window_holding_one_entry_per_lane`
   and directly by `::test_eviction_frees_one_lane_head_per_call_and_never_a_resume`.
+- **An id stays pending wherever the row waits (`is_queued`).** A spawn the
+  cap queued, or the memory / posture guard deferred, already returned its id
+  but has no `_agents` row, and the eviction above moves a windowed row back to
+  store-only. The app SDK's serial-lock done-probe (`spawn_sdk.build_done_probe`)
+  reads an untracked id as done UNLESS `SubagentManager.is_queued` names it, so
+  every such place must answer: a missed one releases the caller's guard and lets
+  a duplicate of not-yet-run work be queued (#15668). `is_queued` is False for
+  an id with a live `_agents` row, then True when any of three holds:
+  - **`_queue`** names it (a fresh entry; a `_resume_id` entry is a resident
+    run and never counts). The window add / pop and the eviction move it in and
+    out.
+  - **`_dispatch_window_ids`** names it. The pump adds the id when it pops a row
+    (beside `_dispatching_ids`, the depth exclusion). It drops it when that one
+    attempt ends: a refused or re-queued `spawn`, a claim that did not proceed,
+    or the inner or outer `_unmark_dispatching`. A RETAINED claim is the
+    exception and keeps it until `retry_retained_claims` settles the row.
+    `_dispatching_ids` is dropped at every attempt end, retained or not. For a
+    non-durable row (`incognito` / `temporary`, or no store at all) this set is
+    the only record between pop and registration.
+  - **`TaskStore.is_unstarted`** names it, for every durable row. The store
+    keeps an in-memory index of the ids in a claimable or `admitted` state (the
+    `_SQL_UNSTARTED` set `count_pending(include_admitted=True)` reads). It loads
+    the index at `open` and updates it after the commit of every state write
+    that can cross that set: `accept`, `insert_if_absent`, `transition` (and so
+    `finish` / `advance` / `enter_wait`), `cancel`, `wake_wait`. A `claim` stays
+    inside it (claimable to `admitted`). So the cap's store-only
+    branch, a pressure deferral at accept (sync `spawn` or `spawn_async`) or at
+    drain time (`park_defer`), the eviction and a retained claim all stay named
+    without a manager-side add. Every terminal write unnames the row: settle,
+    queued cancel, boundary cancel, `cancel_tree`, wait expiry. The manager
+    keeps no set of its own for this, so a new path that moves a row on disk
+    needs no extra bookkeeping. The read is a set lookup under a lock that no
+    I/O is ever done under, never SQLite, because the probe runs on the gateway
+    loop. A write by another connection on the same file is not seen until the
+    next `open`.
+
+  Pinned by `test_taskq_admission_integration.py::test_is_queued_*` and
+  `test_taskq_store.py::test_unstarted_index_*`.
 - **`CapacityView` (`capacity_view()`).** One reading per decision:
   `cap_total` = `_max_concurrent`, lifted to `min(user_max_concurrent,
   adaptive_floor + child_reserve)` ONLY while a parent is in

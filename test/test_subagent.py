@@ -283,7 +283,7 @@ class TestSpawnWithoutApprovalCallback:
     async def test_is_queued_names_pending_spawns_and_the_dispatch_window(self) -> None:
         """``is_queued`` is the serial-guard done-probe's queue check: it names
         a fresh ``_queue`` entry and the pop-to-claim window the pump tracks in
-        ``_dispatching_params``, skips a ``_resume_id`` re-entry (its real row is
+        ``_dispatch_window_ids``, skips a ``_resume_id`` re-entry (its real row is
         in ``_agents``) and an id-less row, and does not claim a started run."""
         manager = SubagentManager(
             sessions=_mock_sessions(),
@@ -309,15 +309,15 @@ class TestSpawnWithoutApprovalCallback:
         assert manager.is_queued("") is False
 
         # The pump's pop-to-claim window: the row left _queue but is held in
-        # _dispatching_params; is_queued still names it so the guard holds.
+        # _dispatch_window_ids; is_queued still names it so the guard holds.
         params = next(p for p in list(manager._queue) if p.get("_preassigned_id") == queued.id)
         manager._queue.remove(params)
-        manager._dispatching_params[queued.id] = params
+        manager._dispatch_window_ids.add(queued.id)
         assert manager.is_queued(queued.id) is True
 
-    def test_unmark_dispatching_keeps_params_for_a_retained_claim(self) -> None:
+    def test_unmark_dispatching_keeps_the_window_for_a_retained_claim(self) -> None:
         """``_unmark_dispatching`` drops the depth-count id mark unconditionally
-        but keeps the queryability window (``_dispatching_params``) for a
+        but keeps the queryability window (``_dispatch_window_ids``) for a
         retained claim -- the contract BOTH the inner per-row finally and the
         outer drain-pass sweep rely on, so a claim retained across a pass is not
         erased by that same pass's cleanup (GPT F1)."""
@@ -329,18 +329,18 @@ class TestSpawnWithoutApprovalCallback:
         pump = manager._admission
         params = {"_preassigned_id": "held", "parent_session_key": "dashboard:tab"}
         manager._dispatching_ids.add("held")
-        manager._dispatching_params["held"] = params
+        manager._dispatch_window_ids.add("held")
 
         # retained=True: the slot leaves the depth count but the row stays
         # queryable, so the done-probe keeps the serial guard.
         pump._unmark_dispatching(params, retained=True)
         assert "held" not in manager._dispatching_ids
-        assert manager._dispatching_params.get("held") is params
+        assert "held" in manager._dispatch_window_ids
         assert manager.is_queued("held") is True
 
         # retained=False (the settled path): both marks go.
         pump._unmark_dispatching(params, retained=False)
-        assert "held" not in manager._dispatching_params
+        assert "held" not in manager._dispatch_window_ids
         assert manager.is_queued("held") is False
 
 

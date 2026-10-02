@@ -788,7 +788,12 @@ loop is deliberately not added (the reaper sweep is `LEASE_SECS`).
 
 ## Bounded dispatch window
 
-The store keeps no dispatch state in memory. The adapter's in-memory queue
+The store keeps no dispatch state in memory. Its one in-memory fact is an
+index, not a decision: the ids of rows in a claimable or `admitted` state
+(`TaskStore.is_unstarted`). It is loaded at `open`, written through after the
+commit of every state write, and readable on the event loop without SQLite. The
+subagent done-probe's `is_queued` reads it ([subagent](subagent.md) § Fairness
+lanes). The adapter's in-memory queue
 (`SubagentManager._queue`) is a FIFO window of at most `TaskStore.window`
 (`agent.task_dispatch_window`, default 64) entries:
 

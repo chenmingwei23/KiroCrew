@@ -2,7 +2,7 @@
 
 A spawn admitted behind the concurrency / adaptive cap returns its real id to
 the caller but has no ``_agents`` entry until it drains, and the pump briefly
-holds it in ``_dispatching_params`` across the pop-to-claim / retained-claim
+holds it in ``_dispatch_window_ids`` across the pop-to-claim / retained-claim
 window when it is in neither map. The serial lane's done-probe reads such an id
 as untracked and would report it done, releasing the guard and letting the
 caller queue a duplicate of work that has not run. ``is_queued`` names that
@@ -46,7 +46,7 @@ def test_a_queued_run_holds_the_guard_despite_no_agents_row() -> None:
 
 def test_a_dispatching_window_id_holds_the_guard() -> None:
     """``is_queued`` also covers the pop-to-claim / retained-claim window the
-    pump tracks in ``_dispatching_params`` -- so a probe sampling that window
+    pump tracks in ``_dispatch_window_ids`` -- so a probe sampling that window
     does not release the guard."""
     assert build_done_probe(_subagents(queued_ids=("dispatching",)))("dispatching") is False
 

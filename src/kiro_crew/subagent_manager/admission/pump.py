@@ -213,7 +213,7 @@ class _PumpMixin(ManagerComponent):
         # window only when it did NOT re-retain; a still-retained row stays
         # pending work the done-probe must keep the serial guard for.
         if agent_id not in self._manager._retained_claims:
-            self._manager._dispatching_params.pop(agent_id, None)
+            self._manager._dispatch_window_ids.discard(agent_id)
         self._after_dispatch_impl(stop_params, result, refill=lambda **_kw: 0)
         if retained:
             self._schedule_retained_claim_retry()
@@ -312,9 +312,9 @@ class _PumpMixin(ManagerComponent):
 
         ``_dispatching_ids`` is the depth-count exclusion and is always dropped
         once the attempt ends -- a retained claim holds a reserved slot, so it
-        is already out of the waiting count. ``_dispatching_params`` is the
+        is already out of the waiting count. ``_dispatch_window_ids`` is the
         queryability window the done-probe reads: a retained claim is still
-        pending work with no ``_agents`` row, so its params are KEPT until the
+        pending work with no ``_agents`` row, so its id is KEPT until the
         retained claim registers or is refused (``retry_retained_claims``);
         dropping them here would let the probe read the id as finished and
         release the caller's serial guard.
@@ -322,7 +322,7 @@ class _PumpMixin(ManagerComponent):
         agent_id = str(params.get("_preassigned_id") or "")
         self._manager._dispatching_ids.discard(agent_id)
         if not retained:
-            self._manager._dispatching_params.pop(agent_id, None)
+            self._manager._dispatch_window_ids.discard(agent_id)
 
     async def _dispatch_async_impl(self, params: dict[str, Any]) -> "SubagentInfo | None":
         """Start a picked window row with its claim (``store.claim``) on the
@@ -479,7 +479,7 @@ class _PumpMixin(ManagerComponent):
                 # own task; one in flight reads again), so dropping the mark
                 # here, before re-entry asks, is always seen by that read.
                 self._manager._dispatching_ids.discard(point.agent_id)
-                self._manager._dispatching_params.pop(point.agent_id, None)
+                self._manager._dispatch_window_ids.discard(point.agent_id)
             result = reenter(claimed)
         finally:
             # Queued-stop reporting temporarily installs a synthetic terminal
@@ -663,7 +663,7 @@ class _PumpMixin(ManagerComponent):
         # ``claim_and_start``, and the gate's failed-claim emit.
         if queued_id:
             self._manager._dispatching_ids.add(queued_id)
-            self._manager._dispatching_params[queued_id] = params
+            self._manager._dispatch_window_ids.add(queued_id)
         # The popped item's parent just lost one waiting agent — ask for its
         # queued depth (0 when this was its last) so the chip's "waiting" count
         # tracks the drain. The read runs later, as its own task, and the mark

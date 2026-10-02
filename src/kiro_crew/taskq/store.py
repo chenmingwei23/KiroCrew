@@ -11,7 +11,13 @@ outcome. Every state write goes through the transition table in ``model``.
 
 The store keeps no dispatch state in memory: the bounded dispatch window is the
 CALLER's list (``TaskStore.window`` is the size it should be bounded to), and
-:meth:`fetch_dispatchable` refills it from the rows on disk in FIFO order.
+:meth:`fetch_dispatchable` refills it from the rows on disk in FIFO order. The
+one in-memory fact it does keep is an index, not a decision: the ids of the
+rows that are accepted and not yet started (:meth:`is_unstarted`), written
+through after every committed write that moves a row into or out of that set
+and loaded at :meth:`open`, so an
+event-loop caller can ask "is this id still pending?" without the SQLite read
+the loop must never take.
 
 WAL is the default journal. A data home on a network filesystem gets
 ``journal_mode=DELETE`` instead -- WAL relies on shared memory the NFS/SMB
@@ -159,7 +165,8 @@ _SQL_WAITING = "(" + ",".join(f"'{s}'" for s in sorted(WAITING)) + ")"
 #: Claimable rows plus ``admitted`` ones: every row accepted and not yet started.
 #: A caller that subtracts the rows this process has registered as runs is left
 #: with exactly the accepted work no run exists for yet (``include_admitted``).
-_SQL_UNSTARTED = "(" + ",".join(f"'{s}'" for s in sorted(CLAIMABLE | {ADMITTED})) + ")"
+_UNSTARTED: frozenset[str] = CLAIMABLE | {ADMITTED}
+_SQL_UNSTARTED = "(" + ",".join(f"'{s}'" for s in sorted(_UNSTARTED)) + ")"
 #: The ``children_only`` filter the dispatch reads and their wake share: nested rows.
 _SQL_CHILD_ONLY = " AND parent_id IS NOT NULL AND parent_id <> ''"
 
@@ -440,6 +447,15 @@ class TaskStore:
         #: no counter and a test asserting "this path took NO on-loop call"
         #: needs a number, not the absence of a log line.
         self.loop_thread_calls = 0
+        #: Ids of the rows in an :data:`_UNSTARTED` state as of the last commit
+        #: on this connection: :meth:`is_unstarted`'s answer. Written through by
+        #: :meth:`_note_state` after every committed write that can move a row
+        #: into or out of that set (all of them run in this class) and reloaded
+        #: by :meth:`open`. Guarded by its own
+        #: lock, never ``_lock``, for the reason ``_executor_lock`` gives: the
+        #: reader is the event loop, and ``_lock`` is held across the busy wait.
+        self._unstarted_ids: set[str] = set()
+        self._unstarted_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -517,7 +533,51 @@ class TaskStore:
                     raise TaskStoreUnavailable(
                         f"task store {self._path} is corrupt after quarantine: {again}"
                     ) from again
+            self._load_unstarted_ids(self._conn)
             return self
+
+    def _load_unstarted_ids(self, conn: sqlite3.Connection) -> None:
+        """Seed :meth:`is_unstarted` from the rows already on disk.
+
+        A row accepted by an earlier incarnation, or imported at boot, is
+        pending work too; the write-through in :meth:`_note_state` only sees
+        this connection's own writes from here on. A read that fails leaves the
+        index empty rather than refusing the open: the index is an answer for a
+        probe, and an open that refused over it would refuse every spawn.
+        """
+        try:
+            rows = conn.execute(f"SELECT id FROM tasks WHERE state IN {_SQL_UNSTARTED}").fetchall()
+        except sqlite3.Error:
+            logger.warning("taskq: could not load the unstarted-row index", exc_info=True)
+            rows = []
+        with self._unstarted_lock:
+            self._unstarted_ids = {str(row["id"]) for row in rows}
+
+    def _note_state(self, task_id: str, state: str) -> None:
+        """Record *task_id*'s committed *state* in the unstarted-row index.
+
+        Called after the ``COMMIT`` of every write that can move a row into or
+        out of :data:`_UNSTARTED`, and only then, so a rolled-back write never
+        reaches the index. :meth:`claim` is the one state write that skips it:
+        claimable to ``admitted`` stays inside the set.
+        """
+        with self._unstarted_lock:
+            if state in _UNSTARTED:
+                self._unstarted_ids.add(task_id)
+            else:
+                self._unstarted_ids.discard(task_id)
+
+    def is_unstarted(self, task_id: str) -> bool:
+        """Whether *task_id* is accepted and not yet started (claimable or admitted).
+
+        Safe ON the event loop: an in-memory set read under a lock no I/O is
+        ever done under -- it never takes ``_lock`` or reaches :meth:`_c`, so
+        it neither waits out ``busy_timeout`` nor trips the on-loop guard. The
+        answer is this process's committed view: a write by another connection
+        on the same file is not seen until the next :meth:`open`.
+        """
+        with self._unstarted_lock:
+            return task_id in self._unstarted_ids
 
     def _open_connection(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = None
@@ -898,6 +958,8 @@ class TaskStore:
             except (sqlite3.Error, OSError, ValueError) as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task store write failed: {exc}") from exc
+        for rec in batch:
+            self._note_state(rec.id, rec.state)
         return [rec.id for rec in batch]
 
     def accept_one(self, record: TaskRecord) -> str:
@@ -929,6 +991,8 @@ class TaskStore:
             except (sqlite3.Error, OSError) as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task store write failed: {exc}") from exc
+        if inserted:
+            self._note_state(record.id, record.state)
         return inserted
 
     # -- claim / lease -------------------------------------------------------
@@ -972,6 +1036,8 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task claim failed: {exc}") from exc
+        # No index write: a claim moves a claimable row to ``admitted``, and
+        # both are unstarted.
         return ClaimResult(record=rec)
 
     def claim_next(
@@ -1124,6 +1190,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task transition failed: {exc}") from exc
+        self._note_state(task_id, new_state)
         if new_state in TERMINAL:
             # The completion-rate series: the one funnel every terminal write
             # crosses (finish/cancel route here). ``outcome`` is a state name
@@ -1255,6 +1322,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task cancel failed: {exc}") from exc
+        self._note_state(task_id, CANCELLED)
         emit_counter(TASKQ_COMPLETIONS, {"outcome": CANCELLED})
         return old
 
@@ -1446,6 +1514,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task wake failed: {exc}") from exc
+        self._note_state(task_id, to)
         return gen + 1
 
     @_typed_read

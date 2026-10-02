@@ -1280,9 +1280,6 @@ class _GateMixin(ManagerComponent):
         info._memory_mode_ready = not bool(conversation_key)
         info._taskq_generation = taskq_generation
         self._manager._agents[agent_id] = info
-        # Registered now: it is an _agents row, so the overflow-accepted set no
-        # longer needs to name it for is_queued.
-        self._manager._accepted_unstarted_ids.discard(agent_id)
         self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)
         if not _dispatch_now:  # a ClaimPoint re-entry already holds its reservation
             self._manager._running_count += 1

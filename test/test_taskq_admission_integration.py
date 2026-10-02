@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from overload_fakes import memory_critical, settle_store_writes
 
+import kiro_crew.resource_status as resource_status
 import kiro_crew.subagent as subagent_mod
 from kiro_crew.dashboard import chat_utils
 from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -781,10 +782,10 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
         )
     params = mgr._queue.pop(0)
     # The pump marks a row dispatching at pop time (SubagentManager._queue ->
-    # _dispatching_ids/_dispatching_params); replicate it so the retained-claim
+    # _dispatching_ids/_dispatch_window_ids); replicate it so the retained-claim
     # guard operates on the same state the real drain pass sees.
     mgr._dispatching_ids.add(waiting.id)
-    mgr._dispatching_params[waiting.id] = params
+    mgr._dispatch_window_ids.add(waiting.id)
     mgr._running_count = 0
     real_run = store.run
     taskq_revalidate = mgr._admission.taskq_claim_still_current
@@ -814,8 +815,8 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
         # but it is still pending work: is_queued must report it so the serial
         # done-probe keeps the caller's guard rather than reading it as done
         # (the gap GPT F1 named -- the outer drain-pass cleanup must not erase
-        # _dispatching_params for a still-retained claim).
-        assert waiting.id in mgr._dispatching_params
+        # _dispatch_window_ids for a still-retained claim).
+        assert waiting.id in mgr._dispatch_window_ids
         assert mgr.is_queued(waiting.id) is True
 
         await mgr._drain_queue_pass()
@@ -826,22 +827,46 @@ async def test_claim_revalidation_outage_retains_generation_and_slot_until_retry
     assert waiting.id in mgr._agents
     # Once the retry registers the run, the retention window closes: the row is
     # an _agents entry now, so is_queued stops naming it.
-    assert waiting.id not in mgr._dispatching_params
+    assert waiting.id not in mgr._dispatch_window_ids
     assert mgr.is_queued(waiting.id) is False
     assert await store.run(store.state_of, waiting.id) == model.STARTING
     assert mgr._running_count == 1
 
 
+def _no_store_read(store: TaskStore):
+    """Fail the test if anything takes the store's connection.
+
+    ``is_queued`` runs on the gateway loop (the serial-lock done-probe), so it
+    must answer from memory. ``_c`` is the one accessor every SQLite read goes
+    through, so patching it catches any read, not only ``state_of``.
+    """
+    return patch.object(store, "_c", side_effect=AssertionError("store read on the loop"))
+
+
+def _probe_says_done(mgr: SubagentManager, agent_id: str) -> bool:
+    from kiro_crew.apps.spawn_sdk import build_done_probe
+
+    return build_done_probe(mgr)(agent_id)
+
+
+def _assert_pending_off_every_manager_list(mgr: SubagentManager, agent_id: str) -> None:
+    """The row is on disk only: neither windowed, popped nor registered. Only
+    the store can still name it."""
+    assert agent_id not in mgr._agents
+    assert not any(p.get("_preassigned_id") == agent_id for p in mgr._queue)
+    assert agent_id not in mgr._dispatch_window_ids
+    assert mgr._taskq.state_of(agent_id) == model.QUEUED
+    with _no_store_read(mgr._taskq):
+        assert mgr.is_queued(agent_id) is True
+        assert _probe_says_done(mgr, agent_id) is False
+
+
 @pytest.mark.asyncio
 async def test_is_queued_names_a_store_only_overflow_row(quiet) -> None:
-    """The gate accepts a spawn as durable overflow past the in-memory window,
-    so the row lives ONLY in the task store -- not in _queue,
-    _dispatching_params or _agents. is_queued must still name it (GPT F1) via
-    the in-memory _accepted_unstarted_ids set -- NEVER a synchronous store read
-    on the gateway loop -- so the serial-lock done-probe keeps the caller's
-    guard instead of reading an _agents miss as finished. The set clears when
-    the overflow row is cancelled, so a never-run row cannot hold the guard
-    forever."""
+    """A row accepted on disk past the in-memory window lives ONLY in the task
+    store, so only the store's unstarted index can name it. The answer comes
+    from memory (no SQLite read on the loop). A cancel unnames it, so a row
+    that never ran cannot hold the guard forever."""
     mgr = await _manager(max_concurrent=1)
     store: TaskStore = mgr._taskq
     overflow_id = "sa-overflow"
@@ -855,24 +880,147 @@ async def test_is_queued_names_a_store_only_overflow_row(quiet) -> None:
         allowed_tools=None,
         approval_mode="",
     )
-    store.accept([record])  # QUEUED on disk
-    # The accept path records a store-only (non-windowed) row here; replicate
-    # that bookkeeping, the state is_queued reads.
-    mgr._accepted_unstarted_ids.add(overflow_id)
+    store.accept([record])  # QUEUED on disk, in no manager list
+    _assert_pending_off_every_manager_list(mgr, overflow_id)
 
-    assert overflow_id not in mgr._agents
-    assert not any(p.get("_preassigned_id") == overflow_id for p in mgr._queue)
-    assert overflow_id not in mgr._dispatching_params
-    # is_queued answers from the in-memory set WITHOUT touching the store: a
-    # store read would raise here and fail the test (it must never run on loop).
-    with patch.object(store, "state_of", side_effect=AssertionError("store read on loop")):
-        assert mgr.is_queued(overflow_id) is True
-
-    # Cancelling the unstarted overflow row drops it from the set, so the guard
-    # is not held for work that will never run.
     await store.run(mgr._admission.taskq_cancel_queued, overflow_id)
     assert mgr.is_queued(overflow_id) is False
-    assert overflow_id not in mgr._accepted_unstarted_ids
+    assert _probe_says_done(mgr, overflow_id) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_async", [False, True])
+async def test_is_queued_follows_a_row_across_every_store_only_transition(quiet, via_async) -> None:
+    """Both ways a cap-queued row becomes store-only keep it pending: the gate
+    queueing it past a full window (from ``spawn`` and from ``spawn_async``,
+    the app SpawnSDK's entry), and the refill EVICTING a windowed row back to
+    disk to make room. The refill that brings it into the window again hands
+    it to ``_queue``. Driven through the real gate and eviction, so a path
+    that moves a row on disk without naming it fails."""
+    mgr = await _manager(max_concurrent=1)
+    store: TaskStore = mgr._taskq
+    store._window = 1
+    with patch.object(SubagentManager, "_run", new=AsyncMock()):
+        mgr.spawn("occupy", parent_session_key="dash:busy")
+        windowed = mgr.spawn("windowed", parent_session_key="dash:w")
+        if via_async:
+            on_disk = await mgr.spawn_async("on disk", parent_session_key="dash:d")
+        else:
+            on_disk = mgr.spawn("on disk", parent_session_key="dash:d")
+    assert on_disk is not None and on_disk.queued and not on_disk.done, on_disk
+    assert [p["_preassigned_id"] for p in mgr._queue] == [windowed.id]
+    _assert_pending_off_every_manager_list(mgr, on_disk.id)  # the cap's store-only branch
+
+    assert mgr._admission._evict_for_lanes(1) == 1
+    assert not mgr._queue
+    _assert_pending_off_every_manager_list(mgr, windowed.id)  # evicted back to disk
+
+    rows = store.fetch_dispatchable_fair(
+        model.KIND_SUBAGENT,
+        limit=1,
+        scheduler=mgr._admission.lane_refill_scheduler(),
+        exclude_ids=[on_disk.id],
+    )
+    mgr._admission._refill_apply(rows)
+    assert [p["_preassigned_id"] for p in mgr._queue] == [windowed.id]
+    assert mgr.is_queued(windowed.id) is True  # now named by _queue
+
+
+def _press_memory(pressure: pytest.MonkeyPatch, guard: str) -> None:
+    """Make the next admission defer: the posture guard or the low-memory floor."""
+    if guard == "posture":
+        pressure.setattr(
+            subagent_mod,
+            "cached_admission_check",
+            lambda: resource_status.AdmissionDecision(
+                admitted=False,
+                posture=resource_status.POSTURE_CRITICAL,
+                available_gb=0.5,
+                reason="host memory critically low",
+            ),
+        )
+    else:
+        pressure.setattr(
+            subagent_mod, "check_memory_available", lambda min_gb=None, path=None: (False, 0.2)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["posture", "low_memory"])
+@pytest.mark.parametrize("via_async", [False, True])
+async def test_is_queued_holds_for_a_spawn_deferred_at_accept(
+    quiet, monkeypatch: pytest.MonkeyPatch, guard: str, via_async: bool
+) -> None:
+    """A pressure deferral at accept (the gate's ``_deferred``) leaves the row
+    QUEUED on disk with no window entry and no ``_agents`` row. That holds for
+    the sync ``spawn`` and for ``spawn_async``, the app SpawnSDK's entry. The
+    done-probe must keep the caller's serial guard for it."""
+    mgr = await _manager()
+    with monkeypatch.context() as pressure:
+        _press_memory(pressure, guard)
+        with patch.object(SubagentManager, "_run", new=AsyncMock()):
+            if via_async:
+                info = await mgr.spawn_async("later", parent_session_key="dash:1")
+            else:
+                info = mgr.spawn("later", parent_session_key="dash:1")
+    assert info is not None and info.queued and not info.done, info
+    _assert_pending_off_every_manager_list(mgr, info.id)
+
+
+@pytest.mark.asyncio
+async def test_is_queued_holds_for_a_row_deferred_at_drain_time(
+    quiet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pump pops a windowed row and the gate parks it on memory pressure
+    (``park_defer``). The attempt's dispatch mark is dropped and the row is back
+    on disk, deferred. The done-probe must still keep the guard for it."""
+    mgr = await _manager(max_concurrent=1)
+    with patch.object(SubagentManager, "_run", new=AsyncMock()):
+        mgr.spawn("occupy", parent_session_key="dash:busy")
+        waiting = mgr.spawn("waiting", parent_session_key="dash:1")
+    assert [p["_preassigned_id"] for p in mgr._queue] == [waiting.id]
+    mgr._running_count = 0  # the slot frees; the next pass picks the row
+    with monkeypatch.context() as pressure:
+        _press_memory(pressure, "posture")
+        with patch.object(SubagentManager, "_run", new=AsyncMock()):
+            await mgr._drain_queue_pass()
+            await _settle(mgr._taskq)
+    row = mgr._taskq.get(waiting.id)
+    assert row.next_run_at is not None and row.next_run_at > mgr._taskq.now()
+    assert "deferred" in [e.kind for e in mgr._taskq.events(waiting.id)]
+    _assert_pending_off_every_manager_list(mgr, waiting.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_by", ["boundary_cancel", "cancel_tree"])
+async def test_is_queued_releases_a_store_only_row_ended_without_running(
+    quiet, ended_by: str
+) -> None:
+    """A store-only row the store ends before it ever ran -- an exact boundary
+    cancel, or a parent's cancel-tree -- must stop holding the guard. If it
+    stayed named, the probe would hold the caller's serial lock until its
+    timeout for work that will never run."""
+    mgr = await _manager(max_concurrent=1)
+    store: TaskStore = mgr._taskq
+    store._window = 1
+    parent, owner = "dash:ended", "owner-a"
+    with patch.object(SubagentManager, "_run", new=AsyncMock()):
+        mgr.spawn("occupy", parent_session_key="dash:busy")
+        mgr.spawn("windowed", parent_session_key="dash:w")
+        on_disk = mgr.spawn("on disk", parent_session_key=parent, _stage_boundary_owner=owner)
+    _assert_pending_off_every_manager_list(mgr, on_disk.id)
+
+    if ended_by == "boundary_cancel":
+        mgr._report_queued_stop = MagicMock()  # type: ignore[method-assign]
+        await mgr.cancel_for_boundary(parent, owner)
+    else:
+        mgr._admission._cancel_live_or_row(on_disk.id, reason="parent cancelled")
+    await _settle(store)
+
+    assert store.state_of(on_disk.id) == model.CANCELLED
+    with _no_store_read(store):
+        assert mgr.is_queued(on_disk.id) is False
+        assert _probe_says_done(mgr, on_disk.id) is True
 
 
 @pytest.mark.asyncio
