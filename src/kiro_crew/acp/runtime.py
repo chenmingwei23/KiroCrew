@@ -4371,6 +4371,35 @@ class AcpRuntime:
                     # unmarked and keeps reading the frame as its own.
                     if len(_queues) > 1:
                         msg.fanout_no_owner = True
+                        # EXPERIMENTAL (exp/kas-no-turn-lock): announce every
+                        # sessionless control frame fanned out to several
+                        # tenants, so the soak can count them by (backend,
+                        # method). Backend is the host that emitted the frame
+                        # (kiro / kas / codex); method is the raw JSON-RPC
+                        # method; sessionUpdate_kind is the inner "sessionUpdate"
+                        # tag when this is a session_update, else "". Kept
+                        # inside the fanout branch, so a lone-owner frame
+                        # (which is unambiguous) stays silent.
+                        _m = msg.method if isinstance(msg.method, str) else ""
+                        _kind = ""
+                        try:
+                            _p = msg.params
+                            if isinstance(_p, dict):
+                                _upd = _p.get("update")
+                                if isinstance(_upd, dict):
+                                    _k = _upd.get("sessionUpdate")
+                                    if isinstance(_k, str):
+                                        _kind = _k
+                        except Exception:
+                            _kind = ""
+                        logger.warning(
+                            "fanout_no_owner backend=%s method=%s "
+                            "sessionUpdate_kind=%s tenants=%d",
+                            self._acp_backend,
+                            _m,
+                            _kind,
+                            len(_queues),
+                        )
                     for queue in _queues:
                         await queue.put(msg)
                 else:
@@ -5645,7 +5674,37 @@ class AcpRuntime:
         subagent turn is deliberately kept out of it, because it runs while its
         parent's turn is still open and would otherwise deadlock on the lock the
         parent holds. See ``_chat_turn_lock``.
+
+        EXPERIMENTAL (exp/kas-no-turn-lock): on kas the gate is a NO-OP, so
+        parallel kas prompts on a shared runtime run concurrently. The soak
+        driving this branch measures whether kas needs the lock at all; the
+        serial path above remains in force for every other backend. See
+        kas-nolock-report.md.
         """
+        if self._acp_backend == ACP_BACKEND_KAS:
+            # Record the start/end wall-clock + monotonic so the soak can
+            # compute overlap after the fact. The frame is tiny; the whole
+            # turn runs between enter and exit here, so a sibling turn's log
+            # between them is proof of overlap.
+            _enter_mono = time.monotonic()
+            _enter_wall = time.time()
+            logger.info(
+                "chat_turn_gate kas no-lock start pid=%s mono=%.6f wall=%.6f",
+                self._pid,
+                _enter_mono,
+                _enter_wall,
+            )
+            try:
+                yield
+            finally:
+                _exit_mono = time.monotonic()
+                logger.info(
+                    "chat_turn_gate kas no-lock end pid=%s mono=%.6f dur_s=%.6f",
+                    self._pid,
+                    _exit_mono,
+                    _exit_mono - _enter_mono,
+                )
+            return
         async with self._chat_turn_lock:
             yield
 

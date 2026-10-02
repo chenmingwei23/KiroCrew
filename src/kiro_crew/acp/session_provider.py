@@ -775,6 +775,17 @@ class AcpSessionProvider(LLMProvider):
         # sessions only — see _chat_turn_gate). Held around _claim_shared_turn so
         # the tenancy claim and every event yield fall inside the one-turn-at-a-
         # time window that makes an ownerless control frame unambiguously ours.
+        # EXPERIMENTAL turn trace (exp/kas-no-turn-lock): log start / end per
+        # session with monotonic timestamps so the soak can compute whether two
+        # sessions' turns overlapped in wall time (proof of parallelism) or ran
+        # back-to-back (proof of serialization).
+        _turn_sid = self._handle.session_id
+        _turn_start_mono = time.monotonic()
+        logger.info(
+            "chat_turn_trace prompt start sid=%s mono=%.6f",
+            _turn_sid,
+            _turn_start_mono,
+        )
         async with self._chat_turn_gate():
             claim = self._claim_shared_turn()
             send = self._handle.prompt
@@ -803,6 +814,13 @@ class AcpSessionProvider(LLMProvider):
                 raise AcpError(str(exc)) from exc
             finally:
                 await self._end_shared_turn(claim)
+        _turn_end_mono = time.monotonic()
+        logger.info(
+            "chat_turn_trace prompt end sid=%s mono=%.6f dur_s=%.6f",
+            _turn_sid,
+            _turn_end_mono,
+            _turn_end_mono - _turn_start_mono,
+        )
 
     async def steer(self, message: str) -> bool:
         """Forward a mid-turn steer to the session handle (kiro _session/steer).
@@ -855,6 +873,14 @@ class AcpSessionProvider(LLMProvider):
         # ownerless-control-frame producers the gate exists to disambiguate, so a
         # shared chat session holds the per-process turn gate around the whole
         # command turn (see _chat_turn_gate).
+        _turn_sid = self._handle.session_id
+        _turn_start_mono = time.monotonic()
+        logger.info(
+            "chat_turn_trace command start sid=%s cmd=%s mono=%.6f",
+            _turn_sid,
+            command,
+            _turn_start_mono,
+        )
         async with self._chat_turn_gate():
             claim = self._claim_shared_turn()
             try:
@@ -871,6 +897,14 @@ class AcpSessionProvider(LLMProvider):
                 raise AcpError(str(exc)) from exc
             finally:
                 await self._end_shared_turn(claim)
+        _turn_end_mono = time.monotonic()
+        logger.info(
+            "chat_turn_trace command end sid=%s cmd=%s mono=%.6f dur_s=%.6f",
+            _turn_sid,
+            command,
+            _turn_end_mono,
+            _turn_end_mono - _turn_start_mono,
+        )
 
     def _translate_dead(
         self, exc: AcpRuntimeDead, *, own_write_only: bool = False

@@ -139,15 +139,15 @@ class TestChatSharingEligibility:
         )
 
     def test_a_backend_without_multiplexed_sessions_is_not_eligible(self):
-        """A chat slot is necessary but not sufficient: the host must multiplex.
-
-        Such a host is still served by AcpRuntime, but its destroy() is an
-        irreversible server-side session delete, and the shared teardown must
-        destroy the handle to leave a process it may not kill -- so sharing there
-        would discard the session's own resume record on every ordinary close.
+        """EXPERIMENTAL (exp/kas-no-turn-lock): kas is now in the chat-sharing
+        set so the overnight soak can place two or more kas sessions on one
+        shared runtime. The original assertions kept kas OUT because its
+        teardown deletes the record; the soak measures whether a shared kas
+        runtime is correctness-safe anyway. If the soak reports kas is safe,
+        this test is rewritten; if not, the frozenset change reverts.
         """
-        assert ACP_BACKEND_KAS not in ACP_BACKENDS_CHAT_RUNTIME_SHARING
-        assert not eligible_for_chat_sharing(
+        assert ACP_BACKEND_KAS in ACP_BACKENDS_CHAT_RUNTIME_SHARING
+        assert eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
             sharing_enabled=True,
@@ -176,7 +176,8 @@ class TestChatSharingEligibility:
         assert ACP_BACKEND_CODEX in ACP_BACKENDS_SESSION_SHARING
         assert ACP_BACKEND_CODEX not in ACP_BACKENDS_CHAT_RUNTIME_SHARING
         # The chat set is a SUBSET of the subagent set -- a chat-shareable host
-        # must first be subagent-shareable, but not the reverse.
+        # must first be subagent-shareable, but not the reverse. EXPERIMENTAL
+        # (exp/kas-no-turn-lock): kas is in both for the soak.
         assert ACP_BACKENDS_CHAT_RUNTIME_SHARING <= ACP_BACKENDS_SESSION_SHARING
         assert not eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",

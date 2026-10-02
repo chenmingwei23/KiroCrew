@@ -830,7 +830,15 @@ def resolve_selected_backend(value: object) -> str:
 # demux Crew has -- see ``ACP_BACKENDS_ACP_RUNTIME`` -- so Crew opens one process per
 # session and there is no shared session to persist. A harness capability Crew cannot
 # reach is recorded here rather than claimed.
-ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
+# EXPERIMENTAL (exp/kas-no-turn-lock): kas added so the chat-sharing subset
+# invariant (CHAT ⊆ SUBAGENT) holds while CHAT contains kas for this soak.
+# The subagent spawn_continue property named above is NOT measured here, so
+# this is not a release decision — only the overnight-soak premise. If the
+# soak keeps kas in CHAT, keeping kas here will still need separate evidence
+# that spawn_continue tolerates a kas delete-on-teardown.
+ACP_BACKENDS_SESSION_SHARING = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_CODEX, ACP_BACKEND_KAS}
+)
 
 # Backends a top-level DASHBOARD CHAT slot may share a runtime on. Deliberately
 # SEPARATE from ``ACP_BACKENDS_SESSION_SHARING`` above, not an alias of it, for
@@ -871,7 +879,15 @@ ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 # or because it is not served by ``AcpRuntime`` at all (no second chat session to
 # share): KAS deletes the record on teardown, opencode/pi/deepseek open one
 # process per session.
-ACP_BACKENDS_CHAT_RUNTIME_SHARING = frozenset({ACP_BACKEND_KIRO})
+# EXPERIMENTAL (exp/kas-no-turn-lock): kas added so the overnight soak can
+# place two or more kas sessions on one shared runtime. Required to measure
+# whether kas carries sessionId on compaction / clear / agent-switch, and
+# whether kas serves two session/prompt in parallel. If the measurement
+# shows kas IS safe, this and the kas-side turn-gate relaxation stay. If
+# the measurement shows kas is NOT safe (sessionless control frame or
+# conflicting shared state), this is reverted and kas never joins a shared
+# runtime regardless of what the lock does.
+ACP_BACKENDS_CHAT_RUNTIME_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends that can load an enrolled member's full saved agent spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
