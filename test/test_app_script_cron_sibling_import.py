@@ -140,8 +140,27 @@ class TestAScriptCronNamingTheBundle:
         assert result["status"] == "ok", result
 
 
+#: Command crons resolve a POSIX ``sh`` through ``_resolve_command_shell`` (never
+#: ``$PATH``), which returns ``None`` on Windows (cmd.exe is not POSIX, Git-for-Windows's
+#: ``sh.exe`` is bash) -- so ``run_command_sandboxed`` refuses before it ever reaches
+#: ``wrap_argv`` and the call-site mask invariant below would go unchecked on Windows.
+#: Rather than skip the test there (which would loosen the cross-platform ratchet), make
+#: the call site reachable on Windows: force the resolver to hand back the interpreter and
+#: build a direct ``[sys.executable, run.py]`` argv (no ``sh -c``, which Windows cannot
+#: run). POSIX is untouched -- the real shell resolves and the real ``sh -c`` argv is used.
+def _force_command_shell_on_windows(monkeypatch) -> None:
+    if sys.platform != "win32":
+        return
+    monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: sys.executable)
+    monkeypatch.setattr(
+        "kiro_crew.cron_script._command_argv",
+        lambda shell, command: shlex.split(command),
+    )
+
+
 class TestACommandCronRunningBundleCode:
     def test_the_call_site_leaves_the_bundle_readable(self, bundle, monkeypatch):
+        _force_command_shell_on_windows(monkeypatch)
         seen = _record_spawns(monkeypatch)
 
         result = run_command_sandboxed(_command(bundle), timeout=60, job_id="job-sibling")
@@ -155,7 +174,8 @@ class TestACommandCronRunningBundleCode:
         _assert_bundle_readable(spawns[0], bundle)
 
     @_NO_BACKEND
-    def test_the_real_sandbox_runs_it(self, bundle):
+    def test_the_real_sandbox_runs_it(self, bundle, monkeypatch):
+        _force_command_shell_on_windows(monkeypatch)
         result = run_command_sandboxed(_command(bundle), timeout=120, job_id="job-sibling")
 
         assert result["status"] == "ok", result
