@@ -1957,7 +1957,17 @@ tool's read and its PUT is not silently dropped by a wholesale replace — the c
 fails 409 `stale_base` and re-reads. The session is resolved through the same
 scoped `_visible_chat_slots` as `chat_folder_move_session`, and the PUT route
 applies the same App Kit ownership check `api_chat_slot_folder` does, so an app
-agent cannot reach a foreign session's tags from either side.
+agent cannot reach a foreign session's tags from either side. The route also
+applies the agent tag-grants policy for every non-person caller — the same
+protected-store authority the `chat_tag` `set_state` directive enforces, so
+`chat_tag_assign` cannot be a bypass of it: a tag the person reserved (a
+protected grant row) is refused `tag_policy_denied`, a workflow-status tag with
+no protected row is refused `status_identity_unprotected` on add as well as
+strip, a replace that would leave two status tags is refused
+`status_tag_requires_set_state`, and
+a degraded store fails closed with `tag_grants_unavailable`. A rowless ordinary
+label is not a reservation and is left assignable. The person (browser) is never
+gated — the whole store constrains agents, not the owner.
 
 **Pins follow the same shape.** `chat_session_pin` sets one live session's
 `pinned` flag (`PATCH /api/chat/slots/<slot>/pin`). It resolves the session
