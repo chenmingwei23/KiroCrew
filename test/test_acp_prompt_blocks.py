@@ -317,6 +317,12 @@ class TestPlatformPathGrammar:
             r"C:/Users/alice/AppData/Local/Temp/tmpabc.png",
             r"\\fileserver\team\diagram.jpg",
             "//fileserver/team/diagram.jpg",
+            # A GitHub Actions Windows runner's %TEMP% resolves to the 8.3 SHORT
+            # name of its profile ("RUNNER~1"); a long-named local user can be
+            # "Admini~1" the same way. The tilde must be a path character or the
+            # non-greedy body cannot cross it and the whole path fails to match.
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\kcabc\John Smith\tmpab12cd_4.png",
+            r"C:\Users\Admini~1\AppData\Local\Temp\shot.png",
         ],
     )
     def test_windows_pattern_matches_native_absolute_paths(self, text):
@@ -324,7 +330,9 @@ class TestPlatformPathGrammar:
 
         The forward-slash UNC form is what the dashboard composer serializes
         into message text (a markdown destination cannot carry raw
-        backslashes), and Windows file APIs accept it verbatim.
+        backslashes), and Windows file APIs accept it verbatim. The ``~`` cases
+        are the 8.3 short-name temp directory a CI runner (and a long-named
+        local user) actually gets.
         """
         assert prompt_blocks._WINDOWS_PATH_RE.search(text) is not None
 

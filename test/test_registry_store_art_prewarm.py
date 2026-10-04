@@ -42,6 +42,7 @@ from kiro_crew.apps.registry import (
     _effective_registries,
     _entry_git_url,
     _manifest_cache_path,
+    _manifest_source_coordinates,
     _merge_manifest,
     _open_pinned_asset,
     _prewarm_owner_tier_store_assets,
@@ -3684,3 +3685,59 @@ class TestTheRowCapCountsExaminedRows:
         ]
         await _prewarm_owner_tier_store_assets(reg, rows)
         assert len(looked) == 6
+
+
+# ---------------------------------------------------------------------------
+# The manifest-cache source coordinates degrade a hostile row to safe defaults
+# ---------------------------------------------------------------------------
+
+
+class TestManifestSourceCoordinatesDegradeHostileValues:
+    """``_manifest_source_coordinates`` feeds a cache KEY, so every value an
+    external index controls must degrade to a safe, distinct-but-harmless default
+    when it is not the expected type -- never crash the derivation. A row whose
+    ``name``, ``branch`` and ``subdirectory`` are all non-strings (and an empty
+    branch) exercises each defensive branch at once."""
+
+    def test_non_string_name_branch_and_subdirectory_fall_back(self):
+        coords = _manifest_source_coordinates(
+            {
+                "name": 123,
+                "gitUrl": SIBLING,
+                "repo": SIBLING,
+                "branch": 456,
+                "subdirectory": 789,
+            }
+        )
+        origin, ref, subdirectory, name = coords
+        # The origin is still the normalized credential-free clone URL.
+        assert origin == SIBLING.removesuffix(".git")
+        # Each non-string coordinate collapsed to its safe default.
+        assert name == ""
+        assert ref == "branch:main"  # a non-string branch defaults to main
+        assert subdirectory == ""
+
+    def test_an_empty_branch_also_defaults_to_main(self):
+        """An empty-string branch is as unusable as a non-string one and takes the
+        same ``main`` default, so the two share one identity component."""
+        _origin, ref, _subdir, name = _manifest_source_coordinates(
+            {"name": "app", "gitUrl": SIBLING, "repo": SIBLING, "branch": "", "subdirectory": ""}
+        )
+        assert ref == "branch:main"
+        assert name == "app"
+
+    def test_a_well_formed_row_is_unchanged_negative_control(self):
+        """Negative control: a row with ordinary string coordinates keeps them, so
+        the fallbacks above observe the bad types and not an unconditional rewrite."""
+        _origin, ref, subdirectory, name = _manifest_source_coordinates(
+            {
+                "name": "app",
+                "gitUrl": SIBLING,
+                "repo": SIBLING,
+                "branch": "dev",
+                "subdirectory": "apps/app",
+            }
+        )
+        assert name == "app"
+        assert ref == "branch:dev"
+        assert subdirectory == "apps/app"

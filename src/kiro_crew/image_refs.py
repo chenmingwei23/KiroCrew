@@ -102,7 +102,15 @@ _POSIX_PATH_RE = re.compile(
 # and Windows file APIs accept the forward-slash form verbatim. The leading
 # pair likewise accepts ``//``; ``(?<![\w:/])`` guards it from matching inside
 # a URL's ``://``.
-_WINDOWS_PATH_CHARS = r"[\w\\/.@ \t()\-]"
+# ``~`` is load-bearing on Windows and was the bug this class was missing: a
+# runner's ``%TEMP%`` resolves to the 8.3 SHORT name of its profile
+# (``C:\Users\RUNNER~1\AppData\Local\Temp\...`` on GitHub Actions), and a user
+# can equally be ``Admini~1``. Without the tilde the non-greedy ``+?`` could not
+# cross it, so the whole path failed to match and every Windows attachment under
+# such a temp dir stayed prose -- then its temp file was swept at end of turn,
+# leaving a dead reference. The POSIX class has always held ``~``; this keeps the
+# two grammars symmetric on the one character a real Windows temp path needs.
+_WINDOWS_PATH_CHARS = r"[\w\\/.@~ \t()\-]"
 _WINDOWS_PATH_RE = re.compile(
     rf"(?<![\w:])(?:(?<![\w:/]))((?:[A-Za-z]:[\\/]|[\\/]{{2}}[^\\/:*?\"<>|\r\n]+[\\/])"
     rf"{_WINDOWS_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
