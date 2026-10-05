@@ -1161,16 +1161,56 @@ async def acquire_session_lease(provider: object) -> None:
         await holder.acquire_runtime_lease()  # type: ignore[attr-defined]
 
 
+def _shares_its_runtime(holder: object) -> bool:
+    """Whether *holder* is one tenant of a process it may not kill.
+
+    Read off the holder's own flag rather than from the lease table, because the
+    two answer different questions: the table says how many leases a pid carries
+    right now, which is 1 for a founder whose co-tenants have not arrived yet and
+    for a sole owner alike. What decides the teardown is whether this session's
+    process is allowed to outlive it.
+
+    Duck-typed for the reason :func:`_lease_holder` is: this module sits below the
+    ACP layer. A stand-in that answers every ``hasattr`` is excluded by requiring
+    the flag to be a real bool and the shutdown to be callable, so a mocked
+    provider on these paths keeps the plain lease release it had.
+    """
+    if getattr(holder, "_shared_runtime", None) is not True:
+        return False
+    return callable(getattr(holder, "shutdown", None))
+
+
 async def release_session_lease(provider: object) -> None:
     """Give up a session's claim on its runtime. Idempotent; no-op for other shapes.
 
     For the paths that end a session WITHOUT a graceful ``shutdown`` -- a failure
     after registration, the dashboard's force-kill fallback. A path that shuts the
     provider down normally has already released inside ``shutdown``.
+
+    A SHARED tenant is shut down rather than merely released, and that difference
+    is the whole of this function's care. Every caller here follows the release
+    with a hard kill of the pid, which for a sole owner ends the session along
+    with the process -- so dropping the lease is all the caller owes. On a shared
+    runtime that kill is REFUSED while any co-tenant holds a lease, and refusing
+    it is correct: the other sessions are mid-turn. The consequence is that the
+    release is the only thing that runs on a discarded tenant, and a release that
+    does not end the session leaves it resident on a process nothing may kill,
+    holding its whole MCP set for that process's life.
+
+    ``shutdown`` is the existing shared teardown and already does each part this
+    needs: it cancels an in-flight turn, releases the lease for its return value,
+    destroys the handle -- which is what evicts the session from the host -- and
+    kills the runtime only when the table says this was its last holder. So the
+    founder whose own setup failed still ends its process, and a loser beside a
+    live sibling does not.
     """
     holder = _lease_holder(provider)
-    if holder is not None:
-        await holder.release_runtime_lease()  # type: ignore[attr-defined]
+    if holder is None:
+        return
+    if _shares_its_runtime(holder):
+        await holder.shutdown()  # type: ignore[attr-defined]
+        return
+    await holder.release_runtime_lease()  # type: ignore[attr-defined]
 
 
 def _reset_for_tests() -> None:
