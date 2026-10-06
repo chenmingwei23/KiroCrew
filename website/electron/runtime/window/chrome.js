@@ -153,10 +153,24 @@ function createWindowChrome({
     );
   }
 
+  // Re-centre the native caption controls in the 42px header after a zoom
+  // change. Both insets derive from the zoom factor — the macOS traffic-light
+  // position (trafficLightPositionForZoom) and the Windows overlay HEIGHT
+  // (titleBarOverlayOptions scales it by zoom) — so a zoom step that updates
+  // only one of them leaves the native buttons mis-centred on the other
+  // platform. The two zoom entry points (the View-menu items in
+  // window-lifecycle.js and the Settings "Zoom Level" stepper via applyZoom)
+  // both reconcile through here so they can never drift apart again.
+  function reconcileZoomChrome(win) {
+    if (!win || !win._mcView) return;
+    if (IS_MAC) positionTrafficLights(win);
+    if (IS_WINDOWS) updateWindowsTitleBarOverlay(win);
+  }
+
   function applyZoom(sender, factor) {
     sender.setZoomFactor(factor);
     for (const win of BaseWindow.getAllWindows()) {
-      if (win._mcView) positionTrafficLights(win);
+      reconcileZoomChrome(win);
     }
     return factor;
   }
@@ -179,6 +193,7 @@ function createWindowChrome({
   return {
     syncNativeTheme,
     positionTrafficLights,
+    reconcileZoomChrome,
     trackZoomChrome,
     setThemeAccent,
     handleFocusMode,

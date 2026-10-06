@@ -19,6 +19,7 @@ const PROMPTS_SOURCE = fs.readFileSync(path.join(RUNTIME_DIR, "prompts.js"), "ut
   .replace(/\r\n/g, "\n");
 const {
   BROWSER_PARTITION,
+  HEADER_CSS_PX,
   createWindowLifecycle,
 } = require("../window-lifecycle");
 const { registerCaptureSurface } = require("../capture-trust");
@@ -1305,6 +1306,48 @@ describe("window chrome controls", () => {
     assert.equal(lifecycle.chrome.setZoom(sender, 100), zoom, "setZoom returns the clamped factor");
     assert.ok(zoom < 100);
     assert.equal(placed.length, 2, "only windows carrying a dashboard view are reconciled");
+  });
+
+  it("repaints the Windows caption overlay on the Settings-stepper zoom path", () => {
+    // Regression for the reported bug's secondary half: Ctrl+/- and the
+    // Settings "Zoom Level" stepper changed the renderer zoom but never
+    // repainted the Windows title-bar overlay, so its HEIGHT (which scales with
+    // zoom, see titleBarOverlayOptions) stayed at the old zoom and the native
+    // caption buttons were no longer centred in the 42px header. applyZoom now
+    // reconciles the Windows overlay the same way it reconciles macOS traffic
+    // lights, so a zoom step repaints every dashboard window's overlay at the
+    // window's own (new) zoom factor.
+    let zoom = 1;
+    const painted = [];
+    const dashboard = {
+      _mcView: { webContents: { isDestroyed: () => false, getZoomFactor: () => zoom } },
+      isDestroyed: () => false,
+      setTitleBarOverlay: (opts) => painted.push(opts),
+    };
+    const lifecycle = createWindowLifecycle(validOptions({
+      platform: "win32",
+      electron: {
+        nativeTheme: { shouldUseDarkColors: true },
+        BaseWindow: { getAllWindows: () => [dashboard, { isDestroyed: () => false }] },
+      },
+    }));
+    const sender = {
+      getZoomFactor: () => zoom,
+      setZoomFactor: (factor) => { zoom = factor; },
+    };
+
+    const stepped = lifecycle.chrome.stepZoom(sender, 1);
+    assert.ok(stepped > 1, "a step-in raises the zoom factor");
+    assert.equal(painted.length, 1, "only the dashboard window carries an overlay to repaint");
+    // The overlay height tracks the NEW zoom factor (HEADER_CSS_PX * zoom),
+    // which is the whole point of the repaint.
+    assert.equal(painted[0].height, Math.round(HEADER_CSS_PX * zoom));
+
+    painted.length = 0;
+    lifecycle.chrome.setZoom(sender, 0.8);
+    assert.equal(zoom, 0.8);
+    assert.equal(painted.length, 1);
+    assert.equal(painted[0].height, Math.round(HEADER_CSS_PX * 0.8));
   });
 });
 

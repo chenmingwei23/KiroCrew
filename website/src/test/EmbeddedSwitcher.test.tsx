@@ -243,20 +243,27 @@ describe('EmbeddedHostBridge (option B relay)', () => {
   })
 
   it('keeps the embedded Windows reserves in lock-step with the local .win-electron rule (CSS pin)', () => {
-    // jsdom applies no stylesheet, so the widths are pinned against the
+    // jsdom applies no stylesheet, so the reserve is pinned against the
     // index.css source, the same way App.focusMode.test.tsx pins the local
-    // pair. 142 lives in four rules; the local two already have a drift check,
-    // and this is the drift check for the embedded two.
+    // pair. The caption reserve is now zoom-aware: all four
+    // .win-electron/.embedded-win-inset rules reference the single
+    // --mc-win-caption-reserve custom property, so they cannot drift by
+    // construction. The property derives the reserve from the Window Controls
+    // Overlay env() vars (tracking page zoom) with a static 142px fallback for
+    // non-WCO contexts (plain browser, jsdom, cross-origin embedded pane). This
+    // asserts both halves: the shared variable is used everywhere, and its
+    // fallback is still 142 (= WIN_CAPTION_OVERLAY_WIDTH + 4). */
     const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.css'), 'utf8')
-    const localHeader = css.match(/\.win-electron header\.topbar-glass\{[\s\S]*?padding-right:(\d+)px/)
-    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:(\d+)px\}/)
-    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:(\d+)px\}/)
-    expect(embeddedHeader).not.toBeNull()
-    expect(embeddedReserve).not.toBeNull()
-    // Same band the LOCAL header clears: the embedded header is the same
-    // surface rendered by a different document, so the two must not drift.
-    expect(embeddedHeader![1]).toBe(localHeader![1])
-    expect(embeddedReserve![1]).toBe(embeddedHeader![1])
+    const localHeader = css.match(/\.win-electron header\.topbar-glass\{\s*padding-right:var\(--mc-win-caption-reserve\)/)
+    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    expect(localHeader, 'local .win-electron header uses the shared reserve var').not.toBeNull()
+    expect(embeddedHeader, 'embedded header uses the shared reserve var').not.toBeNull()
+    expect(embeddedReserve, 'embedded focus reserve uses the shared reserve var').not.toBeNull()
+    // The custom property is defined once and its env() fallback is 142px, so a
+    // non-WCO context lays out exactly as the previous static rule did.
+    const fallback = css.match(/--mc-win-caption-reserve:calc\([\s\S]*?100vw - 142px[\s\S]*?\)/)
+    expect(fallback, 'the --mc-win-caption-reserve env() fallback resolves to 142px').not.toBeNull()
   })
 
   it('reads a model without winInset as false — an older host has no Windows inset to relay', async () => {
