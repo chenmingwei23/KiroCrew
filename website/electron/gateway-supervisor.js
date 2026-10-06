@@ -26,7 +26,7 @@ const {
   SPAWN_MARKER,
 } = require("./bundle-integrity");
 const { isPathFallback } = require("./find-bin");
-const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
+const { classifyAuthBlock, defaultedPort, appImageBundledCliPath } = require("./gateway-auth-hint");
 const {
   shouldRetryLocalTokenMint,
   tokenMintRetryDelayMs,
@@ -2240,8 +2240,24 @@ function createGatewaySupervisor({
         // a pending fullscreen-exit tray hide cannot re-hide the prompt.
         revealForUserDecision(window);
         leaveImmersiveModes(window);
+        // A packaged AppImage installs no `kirocrew` on PATH, so the page's
+        // "run kirocrew token" instruction is unrunnable for an AppImage-only
+        // user (#16258). The launcher ships inside the image, and
+        // resolveGatewayBin() resolves its absolute path; pass it so the page
+        // can name a command the user can actually run. Only for an AppImage
+        // ($APPIMAGE set) with an absolute, bundled launcher path — a normal
+        // install keeps the on-PATH wording, and a bare "kirocrew" fallback is
+        // not forwarded. The bundled CLI mints only against OUR gateway's own
+        // secret, so this changes the LOCAL recovery wording only and does not
+        // touch the refusal of a silent mint against an adopted gateway.
+        const bundledCliPath = appImageBundledCliPath(processObj.env, resolveGatewayBin);
         webContents.loadFile(path.join(dirname, "token-prompt.html"), {
-          query: { port: promptPort, kind, host: remoteHost },
+          query: {
+            port: promptPort,
+            kind,
+            host: remoteHost,
+            ...(bundledCliPath ? { cli: bundledCliPath } : {}),
+          },
         });
         return;
       }
