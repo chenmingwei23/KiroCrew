@@ -139,6 +139,15 @@ engine — `maximum-scale=1, user-scalable=no` in `index.html` (Blink, Gecko), a
 since iOS 10). Pointer-fine devices are untouched: ctrl+wheel and the trackpad pinch
 are a desktop convention this has no business changing.
 
+**Desktop zoom pans the whole shell; it does not clip.** Browser or app zoom narrows the
+CSS viewport without necessarily crossing the 768px mobile switch, so the desktop shell
+has a floor: while the Activity panel sits beside the chat in `#activity-bar-slot`, the
+content track keeps `CHAT_PANE_MIN_W` (`--mc-shell-chat-floor` in `index.css`), and the
+shell is `min-w-min`. The shell's minimum is then rail + chat minimum + panel width, and
+below it the app frame scrolls horizontally, moving rail, content and panel together. FILL
+mode (`data-panel-fill`) has no floor, because there the panel covers the chat column by
+design (#11114).
+
 The corollary is the part to get right. **A surface that must magnify owns its own
 zoom — it does not ask for `pinch-zoom` back.** `touch-action` is intersected from
 the hit-test target up to the root, so a descendant cannot re-grant a behaviour the

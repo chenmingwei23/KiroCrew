@@ -1418,6 +1418,14 @@ html:lang(ko) {
      Scoped with :has() so the onboarding and welcome views, which legitimately
      grow past the viewport, keep their document scroll. */
   body:has([data-testid="dashboard-shell"]){overflow:hidden}
+  /* Desktop shell floor (#11114): while the Activity panel sits BESIDE the chat
+     in the actbar track, the content track keeps CHAT_PANE_MIN_W
+     (pages/chat/SidePanel.tsx; pinned equal by shellZoomFloor.test.ts). The
+     shell is min-w-min, so its minimum becomes rail + this + panel width, and a
+     zoom-narrowed viewport scrolls the app frame horizontally rather than
+     clipping. FILL mode (data-panel-fill) is excluded: there the panel covers
+     the chat column by design, and a floor would only add dead scroll. */
+  [data-testid="dashboard-shell"]:has(#activity-bar-slot [data-testid="side-panel-root"]:not([data-panel-fill])){--mc-shell-chat-floor:320px}
   /* Global focus ring for keyboard navigation. Keyed on `:focus-visible` rather
      than `:focus` so a pointer click never paints it — the ring is drawn only
      for the keyboard and AT interactions that have no other cue to where focus

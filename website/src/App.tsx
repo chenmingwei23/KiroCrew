@@ -1643,9 +1643,11 @@ export default function App() {
        mobile: a 100vh shell extends under the browser's collapsible UI,
        which hides the bottom row (the chat composer) on phones.
        w-full, not w-screen: 100vw resolves independently of layout, so it can
-       disagree with the `(max-width: 767px)` query this shell branches on. */
+       disagree with the `(max-width: 767px)` query this shell branches on.
+       overflow-x-auto: the horizontal scroller for a shell held wider than the
+       viewport by its desktop floor (see `--mc-shell-chat-floor`, #11114). */
     <TerminalHostContext.Provider value={terminalPoppedOut ? 'detached' : 'docked'}>
-    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg"
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-y-hidden overflow-x-auto bg-bg"
       data-testid="app-frame"
       style={topReservePx ? { paddingTop: topReservePx } : undefined}>
       {/* Embedded remote panes receive their switcher model from the parent via
@@ -1662,7 +1664,7 @@ export default function App() {
     <div
       ref={shellRef}
       data-testid="dashboard-shell"
-      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      className={`relative z-[1] h-full min-w-min grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
       // target: `animationend` bubbles, and descendants (banners, cards) use
@@ -1674,9 +1676,15 @@ export default function App() {
       style={{
         gridTemplateAreas: isMobile ? '"topbar" "content"' : bottomDock ? '"topbar topbar" "nav content" "nav actbar"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
+          // The content track's floor is `--mc-shell-chat-floor` (index.css): 0
+          // unless a BESIDE-mode Activity panel sits in the actbar track, then
+          // CHAT_PANE_MIN_W. With `min-w-min` above, the shell's minimum is
+          // rail + floor + panel width, so browser zoom that narrows the CSS
+          // viewport below that overflows into the app frame's horizontal
+          // scroll instead of clipping the panel out of reach (#11114).
           gridTemplateColumns: bottomDock
             ? `${focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr)`
-            : `${focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr) auto`,
+            : `${focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(var(--mc-shell-chat-floor,0px),1fr) auto`,
           // Transition fires only when the template string itself changes (the
           // collapse toggle) — content-driven resizes of the auto track (e.g.
           // the Activity panel opening) don't alter the value, so keeping this

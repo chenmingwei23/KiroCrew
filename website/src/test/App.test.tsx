@@ -1300,14 +1300,16 @@ describe('App routing', () => {
     renderWithProviders(<App />, { route: '/chat', store })
 
     const shell = screen.getByTestId('dashboard-shell')
+    // Read the inline value directly: toHaveStyle's own CSS parser drops a
+    // var() inside minmax(), so it cannot compare the zoom floor (#11114).
+    expect(shell.style.gridTemplateColumns).toBe('236px minmax(var(--mc-shell-chat-floor,0px),1fr) auto')
     expect(shell).toHaveStyle({
-      gridTemplateColumns: '236px minmax(0,1fr) auto',
       transition: 'grid-template-columns 150ms cubic-bezier(0.2, 0, 0, 1)',
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Collapse sidebar' }))
+    expect(shell.style.gridTemplateColumns).toBe('74px minmax(var(--mc-shell-chat-floor,0px),1fr) auto')
     expect(shell).toHaveStyle({
-      gridTemplateColumns: '74px minmax(0,1fr) auto',
       transition: 'grid-template-columns 150ms cubic-bezier(0.2, 0, 0, 1)',
     })
     localStorage.removeItem('mc-nav')

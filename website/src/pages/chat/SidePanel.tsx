@@ -974,6 +974,7 @@ export default function SidePanel({
     <div
       ref={rootRef}
       data-testid="side-panel-root"
+      data-panel-fill={fillWidth != null ? '' : undefined}
       className={`shrink-0 flex flex-col bg-bg overflow-hidden relative ${isBottom ? 'min-w-0 w-full border-t border-border' : 'min-h-0 mt-0 mb-2 border-l border-t border-b border-border rounded-l-xl'}`}
       style={isBottom
         ? { height: effectiveHeight, maxHeight: '85vh', width: '100%', ...dimTransition }
