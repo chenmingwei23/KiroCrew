@@ -90,13 +90,14 @@ import { useCrewEditor } from '../../components/crew/useCrewEditor'
 import { AUTONUDGE_LOOPS_QUERY_KEY, type AutoNudgeLoop } from '../../components/autoNudgeLoop'
 import { skipToken, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { timeAgo } from '../../utils/timeAgo'
+import { errMessage } from '../../utils/thunkError'
 import { fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { selectSlotStreamState, selectSlotToolLog } from '../../store/chatSlice'
+import { createSlot, selectSlotStreamState, selectSlotToolLog } from '../../store/chatSlice'
 import { toolStatusLabel, type ToolStatusDetail } from '../../utils/toolStatusLabel'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
@@ -2349,6 +2350,28 @@ export default function MembersPage() {
   //    revealed. Without this the rail badge is permanent -- no code path
   //    clears a live member slot's unread until the slot itself is deleted.
   const dispatch = useAppDispatch()
+  // "New session" on a crewmate: mint a fresh chat slot bound to THIS member's
+  // identity (the member namespace, so a same-name template is not what answers)
+  // and jump to it on the chat page, where the full composer and sidebar live.
+  // Same create-then-navigate shape as the agent-templates "Chat with" action;
+  // it gives the member its own session, rather than one being reachable only
+  // from a worker that calls `session_create`. Routed through `leave` so a
+  // Schedules draft gets the host's discard confirm before `/members` is left.
+  const [newSessionBusy, setNewSessionBusy] = useState(false)
+  const [newSessionError, setNewSessionError] = useState('')
+  const startNewSession = useCallback(() => {
+    if (!activeName || newSessionBusy) return
+    const go = () => {
+      setNewSessionBusy(true)
+      setNewSessionError('')
+      void dispatch(createSlot({ agent: activeName, agent_kind: 'member' }))
+        .unwrap()
+        .then(() => { navigate('/chat') })
+        .catch((e) => { setNewSessionError(errMessage(e) || t('pages.membersPage.new_session_failed')) })
+        .finally(() => { setNewSessionBusy(false) })
+    }
+    leave(go, '/chat')
+  }, [activeName, newSessionBusy, dispatch, navigate, leave, t])
   const activeSlotUnread = useAppSelector(
     (s) => !!activeSlot && s.dashboard.unreadSlots.includes(activeSlot),
   )
@@ -4176,6 +4199,26 @@ export default function MembersPage() {
           // the session, in the card's row idiom.
           const sessionsBody = (
             <div className="flex flex-col gap-3" data-testid="crew-profile-sessions">
+              {/* Start a FRESH session bound to this crewmate. The gap #16339
+                  named: the Sessions list below is read-only (the worker
+                  sessions the crewmate is driving), and until now the only way
+                  to get a session was for an existing one to call
+                  `session_create`. This control opens one from the panel. */}
+              <button
+                type="button"
+                onClick={startNewSession}
+                disabled={newSessionBusy}
+                className="flex items-center justify-center gap-2 w-full h-10 rounded-2xl bg-accent text-white text-[13px] font-semibold hover:bg-accent-hover transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default"
+                data-testid="crew-profile-new-session"
+              >
+                {newSessionBusy
+                  ? <Loader2 size={15} className="animate-spin" aria-hidden="true" />
+                  : <Plus size={15} aria-hidden="true" />}
+                {t('pages.membersPage.new_session')}
+              </button>
+              {newSessionError && (
+                <ErrorNotice message={newSessionError} testId="crew-profile-new-session-error" />
+              )}
               {drivingSessions.length === 0 && !slotsLoaded ? (
                 <div className="space-y-2" aria-hidden>
                   <div className="h-12 rounded-2xl bg-bg-hover animate-pulse" />

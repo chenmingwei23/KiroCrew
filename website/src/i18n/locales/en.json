@@ -7436,6 +7436,8 @@
       "driving_idle": "Idle",
       "driving_show_all": "Show all ({{count}})",
       "driving_show_less": "Show less",
+      "new_session": "New session",
+      "new_session_failed": "Couldn't start a new session.",
       "patrol_cycles_unlimited": "{{n}} · no limit",
       "patrol_cycles_of": "{{n}} of {{max}}",
       "patrol_error_roster": "Couldn't load patrol status for the roster.",
