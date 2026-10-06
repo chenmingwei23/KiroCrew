@@ -2761,3 +2761,34 @@ per-session projection on create and resume; see [providers](../system-specs/mod
 The managed launcher is reconstructed before identity is attached, and broker
 claims retain their per-session ownership checks. A global dashboard entry has
 no verified session identity and cannot grant access by its name alone.
+
+### One process cannot hold two sessions' MCP identities
+
+Crew's control-plane servers are attested per session: the session-level
+`mcpServers` array carries this session's signed stub token, and a member session
+also mounts the dashboard dispatch and panel servers under its own session key.
+Two sessions on one agent process therefore declare the SAME server name with
+different environments.
+
+The KAS engine resolves that collision by name, process-wide. `KiroAgent`
+folds every local session's client servers into one map keyed by server name, so
+the later session's element replaces the earlier one's; it then reconciles that
+single merged set onto one process-wide pool, whose own server table is keyed by
+name as well; and the pool treats a changed `env` as a connection-level change,
+so the already-running child is torn down and respawned carrying the newest
+session's environment. Every co-tenant's control-plane calls are then served by
+that one child, which answers as whichever session joined last. Measured on
+three sessions sharing one pid, with the MCP gateway both off and on: each
+session's first turn resolved correctly, and after the third joined, the first
+two both answered as the third.
+
+No resolver guard repairs this. The child answering is a real session's own
+child with its own correct token, so nothing downstream can tell that the caller
+was a different tenant. The decision belongs to the placement, and
+`ACP_BACKENDS_SESSION_SCOPED_MCP` is where it is asked: a host enters that set
+only on measured evidence that two sessions on one of its processes keep separate
+MCP children. A chat session that would mount an identity-bearing server is
+refused a shared runtime on every host outside it, with the reason
+`mcp_identity_not_session_scoped`; a session whose spec declares no Crew-managed
+server mounts nothing identity-bearing and may still share. See
+[providers](../system-specs/modules/providers.md).

@@ -22,6 +22,7 @@ from kiro_crew.acp.chat_runtime_sharing import (
     chat_sharing_ineligible_reason,
     eligible_for_chat_sharing,
     member_launch_generation,
+    session_identity_mcp_servers,
 )
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
@@ -91,6 +92,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
     def test_bare_chat_slot_key_is_eligible(self):
@@ -99,6 +101,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
     @pytest.mark.parametrize("mode", ["incognito", "temporary"])
@@ -108,6 +111,7 @@ class TestChatSharingEligibility:
             memory_mode=mode,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
     def test_member_session_is_eligible_and_is_separated_by_the_key(self):
@@ -125,6 +129,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
         assert a_key(member_context=True, member_id="kirocrew-lead") != a_key(
             member_context=True, member_id="baymax"
@@ -136,6 +141,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=False,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
     def test_a_backend_without_multiplexed_sessions_is_not_eligible(self):
@@ -152,6 +158,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KAS,
+            identity_mcp_servers=False,
         )
         # Everything else identical, on a host that DOES multiplex.
         assert eligible_for_chat_sharing(
@@ -159,6 +166,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
     def test_chat_sharing_is_not_inherited_from_subagent_sharing(self):
@@ -184,6 +192,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_CODEX,
+            identity_mcp_servers=False,
         )
 
     @pytest.mark.parametrize(
@@ -204,6 +213,7 @@ class TestChatSharingEligibility:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
 
 
@@ -221,6 +231,7 @@ class TestTheRefusalNamesItsBranch:
             memory_mode="persistent",
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+            identity_mcp_servers=False,
         )
         base.update(overrides)
         return chat_sharing_ineligible_reason(**base)
@@ -252,7 +263,8 @@ class TestTheRefusalNamesItsBranch:
     @pytest.mark.parametrize("enabled", [True, False])
     @pytest.mark.parametrize("mode", ["persistent", "incognito"])
     @pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX])
-    def test_the_boolean_and_the_reason_never_disagree(self, enabled, mode, backend):
+    @pytest.mark.parametrize("identity", [True, False])
+    def test_the_boolean_and_the_reason_never_disagree(self, enabled, mode, backend, identity):
         """One decision, two spellings: a reason means refused, and no reason means
         eligible. A branch added to one and not the other would split them."""
         args = dict(
@@ -260,8 +272,344 @@ class TestTheRefusalNamesItsBranch:
             memory_mode=mode,
             sharing_enabled=enabled,
             backend=backend,
+            identity_mcp_servers=identity,
         )
         assert eligible_for_chat_sharing(**args) == (chat_sharing_ineligible_reason(**args) == "")
+
+
+class TestASessionCarryingItsOwnIdentityNeverSharesAProcess:
+    """The measured defect: on a shared runtime, identity follows the newest mount.
+
+    Crew's control plane is attested per session -- the runtime stamps this
+    session's signed stub token into every managed element of its session-level
+    ``mcpServers`` array -- so two sessions on one process declare the SAME server
+    NAME with different environments. A host that pools MCP children per PROCESS
+    keeps one of them, the newest, and then serves every co-tenant's
+    ``work_brief`` / ``work_report`` from it. Reproduced on a pod with three
+    sessions on one pid, with the MCP gateway both off and on: each session's
+    first turn resolved correctly, and after the third joined, the first two both
+    answered as the third.
+
+    The placement is therefore where it has to be refused, not the resolver: the
+    child answering is a real session's own child carrying its own correct token,
+    so nothing downstream can tell that the CALLER was a different tenant.
+    """
+
+    def _ask(self, **overrides) -> str:
+        base = dict(
+            session_key="dashboard:chat-12-1790000000",
+            memory_mode="persistent",
+            sharing_enabled=True,
+            backend=ACP_BACKEND_KAS,
+            identity_mcp_servers=True,
+        )
+        base.update(overrides)
+        return chat_sharing_ineligible_reason(**base)
+
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ACP_BACKEND_KIRO])
+    def test_an_identity_bearing_session_is_refused_on_every_chat_shareable_host(self, backend):
+        """Every member of the chat set, not just the one the leak was measured on.
+
+        ``ACP_BACKEND_KAS`` is where the pod reproduced it, and its engine says
+        why (one process-wide pool keyed by server name). ``ACP_BACKEND_KIRO`` is
+        UNPROVEN rather than proven safe: its chat-sharing cover measures the
+        teardown, not whether two sessions on one process keep separate MCP
+        children. An unmeasured host does not get to carry two identities.
+        """
+        assert backend in ACP_BACKENDS_CHAT_RUNTIME_SHARING
+        assert self._ask(backend=backend) == "mcp_identity_not_session_scoped"
+        assert not eligible_for_chat_sharing(
+            session_key="dashboard:chat-12-1790000000",
+            memory_mode="persistent",
+            sharing_enabled=True,
+            backend=backend,
+            identity_mcp_servers=True,
+        )
+
+    def test_a_session_mounting_nothing_identity_bearing_still_shares(self):
+        """The refusal is scoped to the hazard, not a switch-off of the feature.
+
+        A chat slot whose spec declares no Crew-managed server mounts no element
+        carrying its session token, so two of them on one process have nothing to
+        confuse -- and this branch must not refuse them.
+        """
+        assert self._ask(identity_mcp_servers=False) == ""
+
+    def test_the_refusal_would_lift_for_a_host_that_scopes_mcp_per_session(self):
+        """Keyed on a POSITIVE capability set, so the remedy is nameable.
+
+        A host whose MCP server set is per session can carry two identities on one
+        process, and the day one is measured to do that, putting it in
+        ``ACP_BACKENDS_SESSION_SCOPED_MCP`` is the whole change. Asked with a
+        fabricated member so the test states the rule rather than a host list.
+        """
+        import kiro_crew.acp.chat_runtime_sharing as mod
+
+        assert self._ask(backend=ACP_BACKEND_KAS) == "mcp_identity_not_session_scoped"
+        original = mod.ACP_BACKENDS_SESSION_SCOPED_MCP
+        try:
+            mod.ACP_BACKENDS_SESSION_SCOPED_MCP = frozenset({ACP_BACKEND_KAS})
+            assert self._ask(backend=ACP_BACKEND_KAS) == ""
+        finally:
+            mod.ACP_BACKENDS_SESSION_SCOPED_MCP = original
+
+    def test_no_chat_shareable_host_is_claimed_to_scope_mcp_per_session(self):
+        """The set is EMPTY today, and that is the measured state, not an oversight.
+
+        KAS is in the chat set and provably pools MCP per process; kiro-cli is in
+        it and unmeasured. So the intersection is empty, and a commit that adds a
+        host to the scoped set without evidence has to fail here and say so.
+        """
+        from kiro_crew.acp_backends import ACP_BACKENDS_SESSION_SCOPED_MCP
+
+        assert ACP_BACKENDS_SESSION_SCOPED_MCP == frozenset()
+        assert not (ACP_BACKENDS_CHAT_RUNTIME_SHARING & ACP_BACKENDS_SESSION_SCOPED_MCP), (
+            "a chat-shareable host now claims per-session MCP scoping: that claim needs "
+            "measured evidence that two sessions on one of its processes keep separate "
+            "MCP children, because without it every co-tenant answers as the newest"
+        )
+
+    def test_the_condition_is_not_left_to_the_compatibility_key(self):
+        """Why this is a refusal and not a key field.
+
+        The per-session identity rides in the MCP array, which is deliberately
+        absent from ``ChatRuntimeKey`` because ``create_session`` carries it per
+        session. So two identity-bearing sessions have EQUAL keys -- keying on it
+        would let them share with each other, which is the broken case rather
+        than a safe one.
+        """
+        assert a_key() == a_key(), "the key fixture is not varying anything here"
+        assert "identity_mcp_servers" not in ChatRuntimeKey.__dataclass_fields__
+        assert "mcp_servers" not in ChatRuntimeKey.__dataclass_fields__
+
+
+class TestWhatCountsAsASessionIdentityMcpServer:
+    """What the placement OBSERVES, rather than what it assumes.
+
+    Two sources, and the cheap one first: a member session always mounts the
+    dashboard dispatch server (which carries ``KIROCREW_SESSION_KEY``), and
+    otherwise the question is whether the spec the child will load declares any
+    name in ``kiro_crew.agent._MANAGED_MCP_SERVERS`` -- those are the entries the
+    runtime hoists with this session's signed token.
+    """
+
+    def _spec(self, agents_dir: Path, name: str, body: dict) -> None:
+        import json
+
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / f"{name}.json").write_text(json.dumps(body), encoding="utf-8")
+
+    def _ask(self, tmp_path: Path, monkeypatch, *, member_context: bool = False) -> bool:
+        import kiro_crew.agent as agent_mod
+
+        # The USER scope is pinned at an empty directory, so the developer's own
+        # ~/.kiro/agents can never decide this test either way.
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "user-agents")
+        (tmp_path / "user-agents").mkdir(parents=True, exist_ok=True)
+        return session_identity_mcp_servers(
+            tmp_path / "project",
+            "kirocrew",
+            member_context=member_context,
+        )
+
+    def test_a_member_session_is_answered_without_reading_anything(self, tmp_path, monkeypatch):
+        """It mounts the dispatch server whatever its spec says, so no read can change it."""
+        assert self._ask(tmp_path, monkeypatch, member_context=True) is True
+
+    @pytest.mark.parametrize("server", ["kirocrew-core", "kirocrew-work", "kirocrew-cron"])
+    def test_a_spec_declaring_a_managed_server_carries_identity(
+        self, tmp_path, monkeypatch, server
+    ):
+        """Each of these is hoisted into the session array with this session's token."""
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {server: {"command": "x"}}},
+        )
+        assert self._ask(tmp_path, monkeypatch) is True
+
+    def test_a_spec_declaring_only_third_party_servers_does_not(self, tmp_path, monkeypatch):
+        """A real NO, not a near miss: nothing in that array carries a Crew token."""
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"some-vendor-thing": {"command": "x"}}},
+        )
+        assert self._ask(tmp_path, monkeypatch) is False
+
+    def test_a_spec_with_no_server_block_declares_nothing(self, tmp_path, monkeypatch):
+        self._spec(tmp_path / "project" / ".kiro" / "agents", "kirocrew", {"name": "kirocrew"})
+        assert self._ask(tmp_path, monkeypatch) is False
+
+    def test_no_spec_in_either_scope_is_a_real_answer(self, tmp_path, monkeypatch):
+        """The child loads no spec and the runtime hoists nothing from one."""
+        assert self._ask(tmp_path, monkeypatch) is False
+
+    def test_the_user_scope_answers_when_the_project_has_no_spec(self, tmp_path, monkeypatch):
+        """Both scopes are observed, in the order the child searches them."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "user-agents")
+        self._spec(
+            tmp_path / "user-agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"kirocrew-core": {"command": "x"}}},
+        )
+        assert (
+            session_identity_mcp_servers(tmp_path / "project", "kirocrew", member_context=False)
+            is True
+        )
+
+    def test_the_project_scope_outranks_the_user_one(self, tmp_path, monkeypatch):
+        """kiro-cli searches ``<cwd>/.kiro/agents`` first, so this function does too."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "user-agents")
+        self._spec(
+            tmp_path / "user-agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"kirocrew-core": {"command": "x"}}},
+        )
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"some-vendor-thing": {"command": "x"}}},
+        )
+        assert (
+            session_identity_mcp_servers(tmp_path / "project", "kirocrew", member_context=False)
+            is False
+        )
+
+    def test_a_block_of_the_wrong_shape_fails_closed(self, tmp_path, monkeypatch):
+        """Not an observation, so it must not read as "declares nothing"."""
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": ["kirocrew-core"]},
+        )
+        assert self._ask(tmp_path, monkeypatch) is True
+
+    def test_a_spec_file_that_does_not_resolve_fails_closed(self, tmp_path, monkeypatch):
+        """A present-but-unparseable spec is NOT the same answer as an absent one.
+
+        ``agent_spec_path`` answers ``None`` for both, so absence alone cannot be
+        read off it: the direct-filename candidates are asked separately, and a
+        file sitting under one of those names means the generation could not be
+        observed. A start that cannot prove it mounts nothing founds its own
+        process -- one process is the cost of this direction, and the other
+        direction's cost is a session reporting as somebody else.
+        """
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "project" / ".kiro" / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "kirocrew.json").write_text("{not json", encoding="utf-8")
+        # The premise: this really is the None-with-a-file-present case, not a
+        # resolution that happened to succeed.
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "user-agents")
+        assert agent_mod.agent_spec_path("kirocrew", agents_dir=agents) is None
+        assert self._ask(tmp_path, monkeypatch) is True
+
+    def test_a_read_that_raises_after_resolution_fails_closed(self, tmp_path, monkeypatch):
+        """The hardened reader can refuse a file the resolver accepted.
+
+        Size cap, a resolved sensitive target, a link at the final component: the
+        resolution says "this is the spec" and the read still says no. That is a
+        failure to observe, so it must not read as "declares nothing".
+        """
+        import kiro_crew.agent_discovery as discovery
+
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"some-vendor-thing": {"command": "x"}}},
+        )
+        # Without the patch this spec answers False, so the patch is what the
+        # assertion is about rather than the fixture.
+        assert self._ask(tmp_path, monkeypatch) is False
+
+        def _refuse(path, *, operation, source):
+            raise OSError("refused by the fence")
+
+        monkeypatch.setattr(discovery, "read_agent_spec_strict", _refuse)
+        assert self._ask(tmp_path, monkeypatch) is True
+
+    def test_a_spec_that_is_not_an_object_fails_closed(self, tmp_path, monkeypatch):
+        """A parse that yields a list is not a spec, and not an observation either."""
+        import kiro_crew.agent_discovery as discovery
+
+        self._spec(
+            tmp_path / "project" / ".kiro" / "agents",
+            "kirocrew",
+            {"name": "kirocrew", "mcpServers": {"some-vendor-thing": {"command": "x"}}},
+        )
+        monkeypatch.setattr(
+            discovery, "read_agent_spec_strict", lambda path, **kw: ["not", "a", "spec"]
+        )
+        assert self._ask(tmp_path, monkeypatch) is True
+
+    def test_a_refused_resolution_fails_closed(self, tmp_path, monkeypatch):
+        """An ambiguous or raising resolver is a failure to observe, not a NO."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path / "user-agents")
+
+        def _boom(name, *, agents_dir=None):
+            raise RuntimeError("two specs declare this id")
+
+        monkeypatch.setattr(agent_mod, "agent_spec_path", _boom)
+        assert (
+            session_identity_mcp_servers(tmp_path / "project", "kirocrew", member_context=False)
+            is True
+        )
+
+
+class TestThePlacementAsksTheIdentityQuestionItself:
+    """Structural: the predicate being right is not the placement calling it.
+
+    What a later edit breaks is the WIRING -- the read landing on the off-loop
+    hop, the answer reaching the refusal, and the pre-read default being the
+    refusing one rather than the permissive one.
+    """
+
+    def _source(self) -> str:
+        from pathlib import Path as _Path
+
+        import kiro_crew.providers.acp as provider_mod
+
+        return _Path(provider_mod.__file__).read_text(encoding="utf-8")
+
+    def test_the_question_is_asked_on_the_off_loop_hop(self):
+        source = self._source()
+        start = source.index("def _read_chat_share_inputs()")
+        region = source[start : source.index("chat_share_enabled = bool(", start)]
+        assert "session_identity_mcp_servers(" in region, (
+            "the identity-MCP question is no longer read on the blocking hop, so either "
+            "it stalls the event loop or the placement stopped asking it"
+        )
+
+    def test_the_answer_reaches_the_refusal(self):
+        source = self._source()
+        start = source.index("chat_share_refusal = chat_sharing_ineligible_reason(")
+        region = source[start : start + 900]
+        assert "identity_mcp_servers=chat_share_identity_mcp" in region, (
+            "the placement computes the identity-MCP answer but no longer passes it, so "
+            "an identity-bearing session can join a shared runtime again"
+        )
+
+    def test_the_pre_read_default_is_the_refusing_one(self):
+        """The value in force if the hop never runs must be the SAFE one.
+
+        An unreadable config already leaves sharing off, but the initializer is
+        what holds if that ever changes: a start that could not observe its own
+        MCP array must found its own process.
+        """
+        source = self._source()
+        assert "chat_share_identity_mcp = True" in source, (
+            "the identity-MCP flag no longer defaults to the refusing value, so a start "
+            "whose read never ran would join a shared runtime unobserved"
+        )
+        assert "chat_share_identity_mcp = False" not in source
 
 
 class TestTheLaunchDocumentGeneration:
@@ -482,6 +830,7 @@ class TestChatRuntimeKey:
                     memory_mode="persistent",
                     sharing_enabled=True,
                     backend=ACP_BACKEND_KIRO,
+                    identity_mcp_servers=False,
                 ), "a member's dashboard slot must be allowed to share"
                 placements.append(
                     asyncio.run(table.acquire(a_key(**live), session, spawn, cap=1000000))

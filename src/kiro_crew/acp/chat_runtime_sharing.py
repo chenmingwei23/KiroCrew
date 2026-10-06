@@ -14,7 +14,9 @@ things that registry deliberately does not decide, plus the cap:
     its own process, and so does an incognito or temporary session -- see the
     function's own reasoning. A crew-member session MAY share, with the sessions
     of that same member; what keeps two different members apart is the key, not
-    this gate.
+    this gate. A session that would mount an MCP server carrying its OWN identity
+    is refused here too, on every host that has not been shown to keep one MCP
+    server set per session -- see ``session_identity_mcp_servers``.
 
 :class:`ChatRuntimeKey`
     WHICH process, as the registry's compatibility key. Two sessions may land on
@@ -41,7 +43,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CHAT_RUNTIME_SHARING
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_CHAT_RUNTIME_SHARING,
+    ACP_BACKENDS_SESSION_SCOPED_MCP,
+)
 from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.runtime_ownership import CHAT_RUNTIME_CAP
 
@@ -85,6 +90,7 @@ def chat_sharing_ineligible_reason(
     memory_mode: str,
     sharing_enabled: bool,
     backend: str,
+    identity_mcp_servers: bool,
 ) -> str:
     """WHY this session may not share a chat runtime, or ``""`` when it may.
 
@@ -97,11 +103,22 @@ def chat_sharing_ineligible_reason(
 
     Each value names the condition, never a session property worth hiding: a
     branch name carries no key, no path and no environment value.
+
+    ``identity_mcp_servers`` is the answer to
+    :func:`session_identity_mcp_servers` for this start: would it mount an MCP
+    server whose environment carries THIS session's own identity? It is a
+    REQUIRED keyword with no default on purpose. A default would have to be one
+    of two wrong things -- ``False`` reopens the hole for every caller that
+    forgets it, and ``True`` refuses every caller that does -- and the one
+    production caller always has the answer, because it reads the spec on the
+    same off-loop hop as the spec generation.
     """
     if not sharing_enabled:
         return "sharing_disabled"
     if backend not in ACP_BACKENDS_CHAT_RUNTIME_SHARING:
         return "backend_not_chat_shareable"
+    if identity_mcp_servers and backend not in ACP_BACKENDS_SESSION_SCOPED_MCP:
+        return "mcp_identity_not_session_scoped"
     if memory_mode not in _SHAREABLE_MEMORY_MODES:
         return "memory_mode_not_shareable"
     if telemetry_channel_of(session_key) != "dashboard":
@@ -115,6 +132,7 @@ def eligible_for_chat_sharing(
     memory_mode: str,
     sharing_enabled: bool,
     backend: str,
+    identity_mcp_servers: bool,
 ) -> bool:
     """Whether this session may join (or found) a shared chat runtime.
 
@@ -151,13 +169,141 @@ def eligible_for_chat_sharing(
     instead was correct only while nothing in the key could tell two members
     apart; it also refused every session of ONE member from sharing with itself,
     which is the common case on a dashboard where every slot carries a member.
+
+    A session that would mount an MCP server carrying its OWN identity IS refused
+    here, and that one cannot be left to the key for the reason the unsupported
+    backend above cannot: two such sessions have EQUAL keys -- the identity rides
+    in the per-session MCP array, which is deliberately not a key field because
+    ``create_session`` carries it per session -- so keying on it would let them
+    share with each other, which is the broken case. See
+    :func:`session_identity_mcp_servers` for what the condition observes and
+    ``ACP_BACKENDS_SESSION_SCOPED_MCP`` for why no host satisfies it today.
     """
     return not chat_sharing_ineligible_reason(
         session_key=session_key,
         memory_mode=memory_mode,
         sharing_enabled=sharing_enabled,
         backend=backend,
+        identity_mcp_servers=identity_mcp_servers,
     )
+
+
+def session_identity_mcp_servers(
+    work_dir: str | Path | None,
+    agent: str,
+    *,
+    member_context: bool,
+) -> bool:
+    """Would this start mount an MCP server whose ``env`` carries ITS OWN identity?
+
+    Crew's control plane is attested per session: the runtime stamps this
+    session's signed stub token into every managed element of its session-level
+    ``mcpServers`` array (``hoist_managed_servers``), and a member session also
+    gets the dashboard dispatch and panel servers, which carry
+    ``KIROCREW_SESSION_KEY``. Two sessions therefore declare the same server NAME
+    with different environments, and a host that pools MCP children per PROCESS
+    keeps only one of them -- the newest -- so every co-tenant's ``work_brief``,
+    ``work_report`` and every other control-plane call answers as that session.
+    That is why this is asked before a placement rather than repaired after one:
+    the child answering is a real session's own child with its own correct token,
+    and no resolver can tell that the CALLER was a different tenant.
+
+    Two observations, in cost order:
+
+    ``member_context``
+        A member session always mounts the dispatch server (and, when the panel
+        is not switched off, the panel server), each carrying its session key. No
+        spec read can change that answer, so it is taken first.
+
+    the agent spec's own ``mcpServers``
+        Whether the spec the child will load declares any name in
+        ``kiro_crew.agent._MANAGED_MCP_SERVERS``. Those are the entries the
+        runtime hoists with this session's token; a spec declaring only
+        third-party servers mounts nothing identity-bearing and is a real
+        "no" rather than a near miss.
+
+        ``agent_spec_path`` answers ``None`` both for an absent spec and for a
+        present one it could not parse, so the direct-filename candidates are
+        asked separately: absence is an observation, an unparseable file is not.
+
+    Resolved against the same two scopes, in the same order, as
+    :func:`agent_spec_generation` -- the project ``.kiro/agents`` the child
+    searches first, then the user-level directory -- because the question is
+    about the spec the SPAWN will load, not about whichever file happens to be
+    found first by some other rule.
+
+    Fails CLOSED: any failure to resolve or read answers ``True``. A start that
+    cannot prove it mounts no identity-bearing server founds its own process,
+    which costs one process; the other direction costs a session answering as
+    somebody else.
+
+    Blocking I/O: call it off the event loop.
+    """
+    if member_context:
+        return True
+    try:
+        from kiro_crew.agent import (
+            _MANAGED_MCP_SERVERS,
+            agent_spec_path,
+            kiro_agents_dir_path,
+        )
+        from kiro_crew.agent_discovery import read_agent_spec_strict
+        from kiro_crew.agent_spec_format import agent_spec_candidates
+        from kiro_crew.config.paths import project_agents_dir
+    except Exception:
+        return True
+    scopes: list[Path] = []
+    try:
+        if work_dir:
+            scopes.append(project_agents_dir(work_dir))
+        scopes.append(kiro_agents_dir_path())
+    except Exception:
+        return True
+    for scope in scopes:
+        try:
+            path = agent_spec_path(agent, agents_dir=scope)
+        except Exception:
+            # Ambiguous or malformed resolution: not an observation, so it is not
+            # allowed to read as "declares nothing".
+            return True
+        if path is None:
+            # ``agent_spec_path`` answers None for an ABSENT spec and for a
+            # present one it could not parse, and those are different answers
+            # here: absence is an observation, an unparseable file is not. So the
+            # direct-filename candidates are asked separately, and a file sitting
+            # under one of those names fails closed rather than reading as
+            # "declares nothing".
+            try:
+                present = any(c.is_file() for c in agent_spec_candidates(scope, agent))
+            except OSError:
+                return True
+            if present:
+                return True
+            # This scope holds no spec of that name. The next one may, and the
+            # child searches them in this order too.
+            continue
+        try:
+            # The hardened reader, not ``read_text``: an agents directory is
+            # agent-writable, so a symlinked or oversized entry must be refused
+            # rather than parsed. Same guards the KAS projection reads under.
+            spec = read_agent_spec_strict(
+                path, operation="chat_share_identity_mcp", source="unknown"
+            )
+        except Exception:
+            return True
+        if not isinstance(spec, dict):
+            return True
+        declared = spec.get("mcpServers")
+        if declared is None:
+            # A spec with no block declares no server, which IS an answer.
+            return False
+        if not isinstance(declared, dict):
+            # A block of the wrong shape is not an answer, so it fails closed.
+            return True
+        return any(name in _MANAGED_MCP_SERVERS for name in declared)
+    # No spec in either scope: the child loads none and the runtime hoists
+    # nothing, so nothing carries this session's token.
+    return False
 
 
 def _freeze_env(extra_env: dict[str, str] | None) -> tuple[tuple[str, str], ...]:

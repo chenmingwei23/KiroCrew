@@ -817,9 +817,7 @@ class AcpSessionProvider(LLMProvider):
                 send = functools.partial(send, allow_image=False)
             try:
                 async with aclosing(
-                    self.essential_delivery.stream(
-                        message, send, lambda: self.context_incarnation
-                    )
+                    self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
                 ) as events:
                     async for event in events:
                         yield event

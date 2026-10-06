@@ -20,6 +20,7 @@ from kiro_crew.acp.chat_runtime_sharing import (
     chat_runtime_cap,
     chat_sharing_ineligible_reason,
     member_launch_generation,
+    session_identity_mcp_servers,
 )
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
@@ -1244,20 +1245,26 @@ class AcpProvider(LLMProvider):
         chat_share_configured_cap = CHAT_RUNTIME_CAP
         chat_share_spec_generation = ""
         chat_share_launch_generation = ""
+        # Initialized to the REFUSING value, not to False: this is the answer the
+        # placement uses if the hop below never runs, and a start that could not
+        # observe its own MCP array must found its own process rather than join
+        # one it may then answer as.
+        chat_share_identity_mcp = True
         try:
             # Deferred: the config loader imports this provider module, so a
             # module-scope import here would close that cycle.
             from kiro_crew.config.loader import KiroCrewConfig
 
-            def _read_chat_share_inputs() -> tuple[object, str, str]:
+            def _read_chat_share_inputs() -> tuple[object, str, str, bool]:
                 """The blocking reads the placement needs, in ONE off-loop hop.
 
                 A config cache miss stats, reads and validates; the spec
                 generation stats two directories; the launch generation reads this
-                member's documents, and only for a member session. Any of them on
-                the event loop would stall every task on it, not just this start,
-                and separate hops cost a context switch each for values consumed
-                together.
+                member's documents, and only for a member session; the
+                identity-MCP question parses the spec this start will load. Any of
+                them on the event loop would stall every task on it, not just this
+                start, and separate hops cost a context switch each for values
+                consumed together.
                 """
                 cfg = KiroCrewConfig.load().agent
                 return (
@@ -1268,12 +1275,18 @@ class AcpProvider(LLMProvider):
                         agent or "kirocrew",
                         member_context=self.member_context,
                     ),
+                    session_identity_mcp_servers(
+                        work_dir,
+                        agent or "kirocrew",
+                        member_context=self.member_context,
+                    ),
                 )
 
             (
                 chat_agent_cfg,
                 chat_share_spec_generation,
                 chat_share_launch_generation,
+                chat_share_identity_mcp,
             ) = await asyncio.to_thread(_read_chat_share_inputs)
             chat_share_enabled = bool(getattr(chat_agent_cfg, "chat_runtime_sharing", False))
             chat_share_configured_cap = int(
@@ -1411,6 +1424,11 @@ class AcpProvider(LLMProvider):
             memory_mode=self.memory_mode,
             sharing_enabled=chat_share_enabled,
             backend=self._client.backend,
+            # Whether this start's own MCP array carries its session identity.
+            # Read on the off-loop hop above, beside the spec generation, because
+            # it is the same spec: the managed entries the runtime hoists with
+            # this session's signed token are the ones the spec declares.
+            identity_mcp_servers=chat_share_identity_mcp,
         )
         if not chat_share_refusal:
             chat_share_key = _build_chat_share_key()

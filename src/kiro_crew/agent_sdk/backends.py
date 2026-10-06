@@ -91,6 +91,10 @@ with no row here.
      - pre-session registry query (whether a top-level dashboard chat slot may
        share a runtime -- distinct from subagent sharing because the chat
        teardown must leave this session's own resume record intact)
+   * - ``ACP_BACKENDS_SESSION_SCOPED_MCP``
+     - pre-session registry query (whether one process keeps a SEPARATE MCP
+       server set per session, which is what lets two sessions on it mount the
+       same server name under their own identities)
    * - ``ACP_BACKENDS_MEMBER_CAPABILITIES``
      - pre-session registry query (whether enrolled members can load a full saved spec)
    * - ``ACP_BACKENDS_MEMBER_DISPATCH``
@@ -836,9 +840,7 @@ def resolve_selected_backend(value: object) -> str:
 # this is not a release decision — only the overnight-soak premise. If the
 # soak keeps kas in CHAT, keeping kas here will still need separate evidence
 # that spawn_continue tolerates a kas delete-on-teardown.
-ACP_BACKENDS_SESSION_SHARING = frozenset(
-    {ACP_BACKEND_KIRO, ACP_BACKEND_CODEX, ACP_BACKEND_KAS}
-)
+ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX, ACP_BACKEND_KAS})
 
 # Backends a top-level DASHBOARD CHAT slot may share a runtime on. Deliberately
 # SEPARATE from ``ACP_BACKENDS_SESSION_SHARING`` above, not an alias of it, for
@@ -888,6 +890,44 @@ ACP_BACKENDS_SESSION_SHARING = frozenset(
 # conflicting shared state), this is reverted and kas never joins a shared
 # runtime regardless of what the lock does.
 ACP_BACKENDS_CHAT_RUNTIME_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends whose MCP server set is scoped to a SESSION rather than to the
+# process. Membership is what lets two sessions on one process each mount the
+# same server NAME under their own identity -- and Crew's control-plane servers
+# (``kirocrew-core``, ``kirocrew-work``, the member dispatch server) are exactly
+# that: one element per session, carrying that session's signed token in ``env``.
+#
+# EMPTY, and asked as membership rather than as a per-host exclusion, so a host
+# is out until someone puts it in on evidence.
+#
+# KAS answers NO, and its own engine says so. In ``@kiro/agent`` 0.66.26
+# (``dist/server/acp-server.js``, the v3 engine kiro-cli 2.28.0 runs):
+#
+#   ``KiroAgent.desiredServersForSessions`` folds EVERY local session's
+#   ``clientMcpServers`` into one ``Map`` keyed by server NAME -- so for two
+#   sessions declaring one name, the later session's element simply overwrites
+#   the earlier one's.
+#
+#   ``KiroAgent.reconcileMcpForAllSessions`` then applies that single merged set
+#   to ONE process-wide pool (``this.mcpPool.updateServers(...)``), whose own
+#   ``serverStates`` is a ``Map`` keyed by name as well.
+#
+#   The pool's ``classifyConfigChange`` treats a changed ``env`` as a
+#   ``"connection"`` change, so the already-running child is torn down
+#   (``transitionOut``) and respawned carrying the NEWEST session's env.
+#
+# The consequence is not a race and not a startup ordering problem: every
+# co-tenant's tool calls are served by the one child the newest ``session/new``
+# installed, so on Crew's control plane every session resolves as whichever
+# session joined last. Measured on a pod with three sessions on one pid, with
+# the MCP gateway both off and on (see the chat-sharing identity suite).
+#
+# kiro-cli answers UNPROVEN, which is the same as no here. Its chat-sharing
+# cover measures the TEARDOWN (that a shared close leaves this session's resume
+# record intact), not whether two sessions on one process keep separate MCP
+# children, and its engine is not inspectable the way the KAS bundle is. An
+# unmeasured host does not get to carry two identities on one process.
+ACP_BACKENDS_SESSION_SCOPED_MCP: frozenset[str] = frozenset()
 
 # Backends that can load an enrolled member's full saved agent spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
