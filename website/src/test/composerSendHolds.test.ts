@@ -258,22 +258,46 @@ describe('composerSendHolds: quota-safe arrivals', () => {
 })
 
 describe('composerSendHolds: independent windows', () => {
+  const WINDOW_ID = 'mc-composer-window-id'
+  const openerWithId = (id: string) => ({
+    closed: false,
+    sessionStorage: { getItem: (key: string) => (key === WINDOW_ID ? id : null) },
+  })
+
   it('does not seed a popout from cloned session storage', () => {
+    // A popout's first load: its storage is a copy of the opener's, id included.
+    sessionStorage.setItem(WINDOW_ID, 'opener-window')
     sessionStorage.setItem('mc-composer-arrivals', JSON.stringify({ shared: ['/up/cloned.txt'] }))
-    vi.stubGlobal('opener', {})
-    const popout = __createComposerSyncForTests({
-      persistArrivals: true,
-    })
+    vi.stubGlobal('opener', openerWithId('opener-window'))
+    const popout = __createComposerSyncForTests()
     expect(popout.takeComposerArrivals('shared')).toEqual([])
+    // The popout dropped the clone from its own storage copy and took its own
+    // id, so a later load of it cannot resurrect files the opener has sent.
+    expect(sessionStorage.getItem('mc-composer-arrivals')).toBeNull()
+    expect(sessionStorage.getItem(WINDOW_ID)).not.toBe('opener-window')
 
     vi.stubGlobal('opener', null)
-    const primary = __createComposerSyncForTests({
-      persistArrivals: true,
-    })
-    expect(primary.takeComposerArrivals('shared')).toEqual(['/up/cloned.txt'])
+    sessionStorage.setItem('mc-composer-arrivals', JSON.stringify({ shared: ['/up/primary.txt'] }))
+    const primary = __createComposerSyncForTests()
+    expect(primary.takeComposerArrivals('shared')).toEqual(['/up/primary.txt'])
     vi.unstubAllGlobals()
     popout.close()
     primary.close()
+  })
+
+  it('hydrates a popout\'s own arrivals on any later load, not only a reload', () => {
+    sessionStorage.setItem(WINDOW_ID, 'opener-window')
+    vi.stubGlobal('opener', openerWithId('opener-window'))
+    const first = __createComposerSyncForTests()
+    first.landComposerAttachments('mine', ['/up/own.txt'])
+    first.close()
+
+    // An ordinary full-page navigation inside the popout: the opener is still
+    // there, and this window's stored arrivals are its own.
+    const next = __createComposerSyncForTests()
+    expect(next.takeComposerArrivals('mine')).toEqual(['/up/own.txt'])
+    vi.unstubAllGlobals()
+    next.close()
   })
 
   it('keeps upload cancellation local to the producing window', () => {

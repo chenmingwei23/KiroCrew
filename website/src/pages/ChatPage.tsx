@@ -1780,10 +1780,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // commits before any layout-phase arrival can mutate the composer.
       if (arrivalSlot !== activeSlotRef.current) return false
       const merge = (previous: string[]) => [...previous, ...paths.filter(path => !previous.includes(path))]
-      // The live list is the base only once the composer owns this slot; during
-      // the switch commit the passive restore still reads the slot's file draft,
-      // so the arrival goes into that draft too and survives the restore.
-      const base = composerSlotRef.current === arrivalSlot
+      // The live list is the base only once the draft restore has run for this
+      // slot (`prevSlot` advances in that effect). Before it, during a switch
+      // commit or on a fresh mount, where the layout-phase drain runs ahead of
+      // the passive restore, the live list is not yet this slot's, so the
+      // arrival goes into the stored draft and the restore picks up both.
+      const base = composerSlotRef.current === arrivalSlot && prevSlot.current === arrivalSlot
         ? pendingFilesRef.current
         : fileDrafts.current[arrivalSlot] ?? []
       const merged = merge(base)

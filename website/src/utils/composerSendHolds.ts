@@ -7,14 +7,47 @@ import { useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 
 type Slot = string | null | undefined
 
-type ComposerSyncOptions = {
-  persistArrivals?: boolean
-}
-
 const ARRIVALS_KEY = 'mc-composer-arrivals'
+/** This browsing context's id, kept beside the arrivals in sessionStorage. A
+ *  window opened by another starts with a copy of its opener's sessionStorage,
+ *  id included, which is how a clone is recognised. */
+const WINDOW_ID_KEY = 'mc-composer-window-id'
 
 function browserStorage(): Storage | null {
   try { return typeof sessionStorage === 'undefined' ? null : sessionStorage } catch { return null }
+}
+
+function newWindowId(): string {
+  try { if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID() } catch { /* fall through */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** The id the opener's sessionStorage holds, or null when there is no live
+ *  same-origin opener to read. */
+function openerWindowId(): string | null {
+  try {
+    if (typeof window === 'undefined') return null
+    const opener = window.opener as Window | null
+    if (!opener || opener.closed) return null
+    return opener.sessionStorage.getItem(WINDOW_ID_KEY)
+  } catch { return null }
+}
+
+/** Whether this window's stored arrivals are its own to hydrate. They are a
+ *  clone exactly when this window still carries its opener's id: that is a
+ *  popout's first load, before it has written anything of its own. The window
+ *  then takes a fresh id, so every later load (reload, back/forward, or an
+ *  ordinary navigation inside the popout) reads as its own. A window with no
+ *  id yet takes one and keeps whatever is stored. */
+function ownsStoredArrivals(): boolean {
+  const store = browserStorage()
+  if (!store) return true
+  try {
+    const mine = store.getItem(WINDOW_ID_KEY)
+    const cloned = !!mine && mine === openerWindowId()
+    if (!mine || cloned) store.setItem(WINDOW_ID_KEY, newWindowId())
+    return !cloned
+  } catch { return true }
 }
 
 class ComposerSync {
@@ -23,16 +56,23 @@ class ComposerSync {
   private readonly arrivals = new Map<string, string[]>()
   private readonly listeners = new Set<() => void>()
   private readonly arrivalListeners = new Map<string, Set<() => void>>()
-  private readonly persistArrivals: boolean
   private closed = false
 
-  constructor(options: ComposerSyncOptions = {}) {
-    this.persistArrivals = options.persistArrivals ?? false
-    if (!(typeof window !== 'undefined' && window.opener)) this.seedArrivals()
+  constructor() {
+    if (ownsStoredArrivals()) this.seedArrivals()
+    else this.dropClonedArrivals()
+  }
+
+  /** A popout's first load: its sessionStorage is its own copy of the
+   *  opener's, so the cloned arrivals are removed from that copy. Later loads
+   *  of the popout then hydrate only arrivals it wrote itself, never a clone
+   *  of files the opener has since sent. The opener's storage is a separate
+   *  copy and is untouched. */
+  private dropClonedArrivals() {
+    try { browserStorage()?.removeItem(ARRIVALS_KEY) } catch { /* unavailable storage holds no clone */ }
   }
 
   private seedArrivals() {
-    if (!this.persistArrivals) return
     const store = browserStorage()
     if (!store) return
     try {
@@ -47,7 +87,6 @@ class ComposerSync {
   }
 
   private mirrorArrivals() {
-    if (!this.persistArrivals) return
     const store = browserStorage()
     if (!store) return
     try {
@@ -175,7 +214,7 @@ class ComposerSync {
 }
 
 function createProductionSync(): ComposerSync {
-  return new ComposerSync({ persistArrivals: true })
+  return new ComposerSync()
 }
 
 let composerSync = createProductionSync()
@@ -219,13 +258,13 @@ export function useComposerUploadCancellable(slot: Slot) {
 }
 
 /** Independent logical window for deterministic tests. */
-export function __createComposerSyncForTests(options?: ComposerSyncOptions) {
-  return new ComposerSync(options)
+export function __createComposerSyncForTests() {
+  return new ComposerSync()
 }
 
 /** Restore the module singleton and clear its reload mirror between tests. */
 export function __resetComposerSendHoldsForTests() {
   composerSync.close()
-  try { browserStorage()?.removeItem(ARRIVALS_KEY) } catch { /* unavailable test storage */ }
+  try { browserStorage()?.removeItem(ARRIVALS_KEY); browserStorage()?.removeItem(WINDOW_ID_KEY) } catch { /* unavailable test storage */ }
   composerSync = createProductionSync()
 }

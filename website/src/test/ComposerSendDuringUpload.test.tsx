@@ -399,6 +399,26 @@ describe('ChatPage composer: a completed upload survives an empty host interval'
     expect(sendButton()).not.toBeDisabled()
   })
 
+  it('keeps a staged file when a late arrival lands on remount', async () => {
+    const slot = 'remount-keeps-staged-page'
+    const uploads = manualUploads()
+    const first = renderHost(<ChatPage key={`${slot}-first`} />, slot)
+    await waitFor(() => expect(first.container.querySelector('input[type="file"]')).toBeTruthy())
+    await act(async () => { pickFile(first.container, 'staged-first.txt') })
+    await waitFor(() => expect(uploads).toHaveLength(1))
+    await act(async () => { uploads[0]({ paths: ['/up/staged-first.txt'] }) })
+    await waitFor(() => expect(screen.getByText('staged-first.txt')).toBeInTheDocument())
+    await act(async () => { pickFile(first.container, 'late-second.txt') })
+    await waitFor(() => expect(uploads).toHaveLength(2))
+    first.unmount()
+
+    await act(async () => { uploads[1]({ paths: ['/up/late-second.txt'] }) })
+
+    renderHost(<ChatPage key={`${slot}-return`} />, slot)
+    await waitFor(() => expect(screen.getByText('late-second.txt')).toBeInTheDocument())
+    expect(screen.getByText('staged-first.txt')).toBeInTheDocument()
+  })
+
   it('keeps a file for its own session after a switch and leaving the chat page', async () => {
     const slot = 'switched-away-page'
     const uploads = manualUploads()
