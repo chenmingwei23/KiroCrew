@@ -1582,10 +1582,13 @@ def _is_shell_command_wrapper(argv: list[str], exe_base: str | None) -> bool:
     # link, and could then present a shell-shaped ``argv[0]`` with a ``-c`` and be
     # dropped from the scan. Nor is a shell-shaped FILENAME accepted on its own -- an
     # interpreter copied to ``/tmp/bash`` is not bash, so ``_trusted_program_base``
-    # answers ``None`` for it as well. No exemption on no evidence, so both cases now
-    # REPORT. The cost is bounded and lands on the right side: a process this uid
-    # cannot inspect is usually another user's, and ``_owner_class`` already sorts
-    # those into `foreign`/`unknown` rather than raising a fleet violation.
+    # answers ``None`` for it as well. No exemption on this evidence alone, so both
+    # cases REPORT here. When the link is unreadable outright, ``_host_lines`` asks
+    # the narrower ``_is_runner_in_shell_argument`` instead, which also requires the
+    # runner to sit in an operator-chained ``-c`` string. The cost is bounded and lands
+    # on the right side: a process this uid cannot inspect is usually another user's,
+    # and ``_owner_class`` already sorts those into `foreign`/`unknown` rather than
+    # raising a fleet violation.
     if exe_base is None:
         return False
     base = exe_base
@@ -1609,13 +1612,23 @@ def _is_shell_command_wrapper(argv: list[str], exe_base: str | None) -> bool:
             rest = rest[1:]
     if base not in SHELL_PROGRAMS:
         return False
-    # Only the LEADING option run is examined, and the scan stops at the first
-    # entry that is not an option, because that entry is the command string (or a
-    # script path) and everything after it is the shell's payload rather than the
-    # shell's own flags -- `bash -lc 'grep -c foo'` must be decided by the `-lc`,
-    # never by the `-c` inside the string it carries. A ``--long`` option cannot
-    # be a cluster, so it is skipped rather than ending the run.
+    return _command_string_index(rest) is not None
+
+
+def _command_string_index(rest: list[str]) -> int | None:
+    """Index in *rest* of the shell's command string, or None when no ``-c`` leads.
+
+    *rest* is a shell's argv after its program name. Only the LEADING option run is
+    examined, and the scan stops at the first entry that is not an option, because
+    that entry is the command string (or a script path) and everything after it is
+    the shell's payload rather than the shell's own flags -- `bash -lc 'grep -c foo'`
+    must be decided by the `-lc`, never by the `-c` inside the string it carries. A
+    ``--long`` option cannot be a cluster, so it is skipped rather than ending the
+    run. When a ``-c`` cluster leads but no operand follows, the answer is
+    ``len(rest)``: the shell still holds a command string, just none in argv.
+    """
     index = 0
+    has_c = False
     while index < len(rest):
         token = rest[index]
         if not token.startswith(("-", "+")):
@@ -1623,13 +1636,60 @@ def _is_shell_command_wrapper(argv: list[str], exe_base: str | None) -> bool:
         if token in _SHELL_OPTS_WITH_OPERAND:
             index += 2
             continue
-        if token.startswith("--"):
-            index += 1
-            continue
-        if "c" in token[1:]:
-            return True
+        if not token.startswith("--") and "c" in token[1:]:
+            has_c = True
         index += 1
-    return False
+    return index if has_c else None
+
+
+#: Operators whose presence inside an argv token proves it is a command string the
+#: pid handed to an interpreter (``bash -c '...'``), not the pid's own program.
+#: Every element is tested with ``in``, so the multi-character sequences are
+#: matched as substrings.
+_SHELL_OPERATORS = ("&&", "||", ";", "|", "\n")
+
+
+def _is_runner_in_shell_argument(argv: list[str], match_span: tuple[int, int]) -> bool:
+    """Does the match fall inside a shell's ``-c`` command string that chains commands?
+
+    Answers the wrapper question from argv alone, for a pid whose ``/proc/<pid>/exe``
+    cannot be read (a same-uid process in another namespace, which is most of what a
+    sandboxed probe scans). All three must hold:
+
+    * ``argv[0]`` names a shell (``SHELL_PROGRAMS``, with BusyBox's explicit
+      ``busybox sh`` dispatch resolved the same way ``_is_shell_command_wrapper``
+      does). An interpreter running pytest in-process from its own ``-c``
+      (``python3 -c "import pytest; pytest.main()" -n 8``) has no separate runner
+      pid to report, so it is never exempt here.
+    * the matched span lies wholly inside the argv entry that is that shell's
+      command string: the operand after its leading ``-c`` option run.
+    * that entry carries a shell operator (``&&``, ``||``, ``;``, ``|`` or a
+      newline), so the runner it names is one command of several the shell was
+      handed, and runs on its own pid where the scan reports it.
+
+    A real runner's name is its own argv entry and fails the first two conditions,
+    even when its ``-k`` selector or node id carries an operator in another entry.
+    """
+    if not argv:
+        return False
+    base = _basename(argv[0])
+    offset = 1
+    if base == "busybox" and len(argv) > 1 and not argv[1].startswith(("-", "+")):
+        base = _basename(argv[1])
+        offset = 2
+    if base not in SHELL_PROGRAMS:
+        return False
+    command_index = _command_string_index(argv[offset:])
+    if command_index is None or offset + command_index >= len(argv):
+        return False
+    command_index += offset
+    # Start of the command string within the joined cmdline: one space per entry.
+    pos = sum(len(token) + 1 for token in argv[:command_index])
+    command = argv[command_index]
+    start, end = match_span
+    if not (pos <= start and end <= pos + len(command)):
+        return False
+    return any(op in command for op in _SHELL_OPERATORS)
 
 
 #: The worker-count flags, as ARGV tokens rather than as text in a joined command line.
@@ -2494,6 +2554,27 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
                     continue
                 if matched in _BUILTIN_SHAPES and _is_shell_command_wrapper(
                     argv, _trusted_program_base(entry)
+                ):
+                    continue
+                # The kernel-link exemption above needs ``/proc/<pid>/exe`` to be
+                # readable, which it is NOT for a same-uid process in another
+                # namespace -- exactly the population a sandboxed probe scans. This
+                # fallback decides the same question from argv alone, and ONLY when
+                # that link cannot be read: a readable link is the kernel's answer,
+                # and an argv[0] that says ``bash`` over a link that says ``python3``
+                # (``exec -a``, a symlink) is the spoof, so it reports. With no link:
+                # a pid whose argv[0] is a shell, with the match inside its ``-c``
+                # command string and that string chaining commands with ``&&``,
+                # ``||``, ``;``, ``|`` or a newline, is a wrapper whose runner
+                # reports on its own pid. A real runner's name is its own argv entry,
+                # so it still reports, including a pytest whose ``-k`` selector or
+                # node id carries an operator. Scoped to the pytest rule, whose match
+                # span is the runner token itself; the vitest and versioned-alias
+                # shapes already decide the wrapper question from argv position above.
+                if (
+                    matched == DEFAULT_BANNED_RES[0]
+                    and _kernel_program_path(entry) is None
+                    and _is_runner_in_shell_argument(argv, match_span)
                 ):
                     continue
                 # A pid that reaches here under the built-in pytest rule and is NOT a

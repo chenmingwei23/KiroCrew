@@ -908,15 +908,22 @@ def test_a_pytest_filename_is_not_a_pytest_command(mod, tmp_path, monkeypatch):
     loud = {
         # A run whose worker count bypasses the budget.
         "207": ["pytest", *UNBUDGETED, "test/test_x.py"],
-        # The same step with an UNBUDGETED run beside it, in both orders. A count
-        # belongs to the command that carries it and can condemn no other, which is
-        # what a lookahead widened to the whole script text would break: scanning
-        # forward past the command's own end reaches the count on the line BELOW,
-        # and scanning backward would reach the one above.
+    }
+    # The same step with an UNBUDGETED run beside it, in both orders. A count
+    # belongs to the command that carries it and can condemn no other, which is
+    # what a lookahead widened to the whole script text would break: scanning
+    # forward past the command's own end reaches the count on the line BELOW,
+    # and scanning backward would reach the one above. The RULE must still
+    # select both; the shell pid itself is a wrapper (its script carries a
+    # newline), so it is exempt and the pytest child reports on its own pid.
+    wrappers = {
         "208": ["bash", "-c", "pytest -n 4 -q test/test_y.py\n" + CAPPED_STEP],
         "209": ["bash", "-c", CAPPED_STEP + "pytest -n 4 -q test/test_y.py\n"],
     }
-    for pid, argv in {**quiet, **loud}.items():
+    rule = re.compile(mod.DEFAULT_BANNED_RES[0])
+    for argv in wrappers.values():
+        assert rule.search(" ".join(argv)), argv
+    for pid, argv in {**quiet, **loud, **wrappers}.items():
         entry = proc_pid(root, pid, argv, starttime=50_000)
         make_dir_link(entry / "cwd", fleet)
     lines, host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
@@ -1348,9 +1355,13 @@ def test_a_separator_inside_one_argument_does_not_hide_the_runs_own_count(
         "389": ["pytest", "--deselect", "f.py::t[a|b]", "--numprocesses", "2"],
         # And behind a quoted one.
         "391": ["pytest", "'test/test_x.py::test_y[a|b]'", "--numprocesses=4"],
-        # A real pipe with the count BEFORE it: the first command is unbudgeted.
-        "392": ["bash", "-c", "pytest -n 4 test/test_x.py | tee out.log"],
     }
+    # A real pipe with the count BEFORE it: the first command is unbudgeted, so
+    # the rule selects it. The shell pid is a wrapper (its script carries ``|``)
+    # and is exempt; the pytest child reports on its own pid.
+    wrapper = ["bash", "-c", "pytest -n 4 test/test_x.py | tee out.log"]
+    assert re.compile(mod.DEFAULT_BANNED_RES[0]).search(" ".join(wrapper))
+    quiet["392"] = wrapper
     missed = {
         # The disclosed residual: an unquoted separator in an option value, then the
         # count. Asserted as quiet so a change in this behaviour is noticed, not so the
@@ -1545,6 +1556,114 @@ def test_host_lines_reports_the_wrapper_under_a_custom_rule(mod, tmp_path, monke
     )
     assert len(lines) == 1
     assert "pid=104" in lines[0]
+
+
+# --- the wrapper exemption without a readable exe link ----------------------
+#
+# A sandboxed probe cannot read ``/proc/<pid>/exe`` for a same-uid process in
+# another namespace, so the kernel-link exemption is inert exactly where it is
+# needed. These fixtures create NO ``exe`` link: the argv alone must decide.
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bash", "-c", "cd x && pytest -q -n4 t/"],
+        ["bash", "-c", "pytest -n4 t/ || true"],
+        ["sh", "-c", "cd x; pytest -n4"],
+        ["bash", "-c", "pytest -n4 | tee log"],
+        ["bash", "-c", "cd x\npytest -n4"],
+        ["bash", "-c", "cd x && /usr/bin/pytest -n4"],
+    ],
+)
+def test_host_lines_skips_a_command_string_without_an_exe_link(mod, tmp_path, monkeypatch, argv):
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    entry = proc_pid(root, "105", argv, starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    assert not (entry / "exe").exists()
+    lines, host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert lines == []
+    assert "banned 0 | foreign 0" in host
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pytest", "-q", *UNBUDGETED, "t/"],
+        ["pytest", *UNBUDGETED, "-k", "a&&b"],
+        ["pytest", *UNBUDGETED, "test/t.py::x[a|b]"],
+        ["pytest", *UNBUDGETED, "-k", "a or b; c"],
+        ["/usr/bin/pytest", *UNBUDGETED, "-k", "a||b"],
+        # A NON-shell interpreter whose own -c string names the runner beside an
+        # operator: only a shell's command string is exempt.
+        ["python3", "-c", "import os; pytest -n 4"],
+        # A real runner launched by path, where the path itself holds an operator.
+        ["python3", "/work/tools|cache/bin/pytest", *UNBUDGETED],
+        # A shell running a SCRIPT, with the runner named in a later argument.
+        ["bash", "run.sh", "cd x && pytest", *UNBUDGETED],
+    ],
+)
+def test_host_lines_still_reports_a_real_runner_whose_argument_has_an_operator(
+    mod, tmp_path, monkeypatch, argv
+):
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    entry = proc_pid(root, "106", argv, starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1, lines
+    assert "pid=106" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "exe_target",
+    ["/usr/bin/python3", "/home/someone/bin/bash", "/tmp/bash"],
+)
+def test_host_lines_reports_a_shell_shaped_argv_over_a_readable_non_shell_link(
+    mod, tmp_path, monkeypatch, exe_target
+):
+    """A readable ``exe`` link is the kernel's answer, and argv[0] cannot overrule it.
+
+    ``exec -a bash python3 -c '...'`` presents a shell-shaped argv over a python
+    binary; a shell copied outside a system directory is not trusted either. The
+    argv-only fallback is for a link that cannot be read at all.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    entry = proc_pid(root, "107", ["bash", "-c", "cd x && pytest -n4"], starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    (entry / "exe").symlink_to(exe_target)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1, lines
+    assert "pid=107" in lines[0]
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["bash", "-c", "cd x && pytest -n4"], True),
+        (["/bin/sh", "-euxc", "cd x; pytest -n4"], True),
+        (["bash", "-o", "pipefail", "-c", "cd x && pytest -n4"], True),
+        (["busybox", "sh", "-c", "cd x && pytest -n4"], True),
+        (["bash", "-c", "pytest -n4"], False),
+        (["bash", "-c"], False),
+        (["bash", "script.sh", "cd x && pytest -n4"], False),
+        (["bash", "-c", "true", "cd x && pytest -n4"], False),
+        (["python3", "-c", "import pytest; pytest.main()", "-n4"], False),
+        (["pytest", "-n4", "-k", "a&&b"], False),
+        (["pytest;x", "-n4"], False),
+        ([], False),
+    ],
+)
+def test_runner_in_shell_argument(mod, argv, expected):
+    cmd = " ".join(argv)
+    start = cmd.find("pytest")
+    span = (start, start + len("pytest")) if start >= 0 else (0, 0)
+    assert mod._is_runner_in_shell_argument(argv, span) is expected
 
 
 # --- the vitest rule: an invocation, never a mention ------------------------
