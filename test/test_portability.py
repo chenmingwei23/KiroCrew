@@ -104,56 +104,32 @@ def fake_kirocrew_home(tmp_path):
     # memory.db (SQLite)
     db_path = mc / "memory.db"
     conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE semantic_memory (key TEXT PRIMARY KEY, value_json TEXT, confidence REAL, source TEXT, created_at TEXT, updated_at TEXT, embedding BLOB, is_deleted INTEGER DEFAULT 0)"
-    )
-    conn.execute(
-        "INSERT INTO semantic_memory (key, value_json, confidence, source, created_at, updated_at, is_deleted) VALUES ('user.name', '\"Alice\"', 0.9, 'agent', '2026-01-01', '2026-01-01', 0)"
-    )
-    conn.execute(
-        "CREATE TABLE episodic_memories (id TEXT PRIMARY KEY, conversation_id TEXT, text TEXT, embedding BLOB, tags TEXT, importance REAL, created_at TEXT, last_accessed_at TEXT, is_deleted INTEGER DEFAULT 0)"
-    )
-    conn.execute(
-        "INSERT INTO episodic_memories (id, conversation_id, text, importance, created_at, last_accessed_at, is_deleted) VALUES ('ep1', 'conv1', 'user asked about deployment', 0.8, '2026-01-01', '2026-01-01', 0)"
-    )
-    conn.execute(
-        "CREATE TABLE knowledge_facts (subject TEXT, predicate TEXT, object TEXT, episode_id TEXT, created_at TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE knowledge_edges (source_key TEXT, target_key TEXT, relation TEXT, weight REAL, metadata TEXT, created_at TEXT)"
-    )
+    conn.execute("CREATE TABLE semantic_memory (key TEXT PRIMARY KEY, value_json TEXT, confidence REAL, source TEXT, created_at TEXT, updated_at TEXT, embedding BLOB, is_deleted INTEGER DEFAULT 0)")
+    conn.execute("INSERT INTO semantic_memory (key, value_json, confidence, source, created_at, updated_at, is_deleted) VALUES ('user.name', '\"Alice\"', 0.9, 'agent', '2026-01-01', '2026-01-01', 0)")
+    conn.execute("CREATE TABLE episodic_memories (id TEXT PRIMARY KEY, conversation_id TEXT, text TEXT, embedding BLOB, tags TEXT, importance REAL, created_at TEXT, last_accessed_at TEXT, is_deleted INTEGER DEFAULT 0)")
+    conn.execute("INSERT INTO episodic_memories (id, conversation_id, text, importance, created_at, last_accessed_at, is_deleted) VALUES ('ep1', 'conv1', 'user asked about deployment', 0.8, '2026-01-01', '2026-01-01', 0)")
+    conn.execute("CREATE TABLE knowledge_facts (subject TEXT, predicate TEXT, object TEXT, episode_id TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE knowledge_edges (source_key TEXT, target_key TEXT, relation TEXT, weight REAL, metadata TEXT, created_at TEXT)")
     conn.commit()
     conn.close()
 
     # memory_index.db (FTS5)
     idx_path = mc / "memory_index.db"
     conn = sqlite3.connect(str(idx_path))
-    conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path, content, tokenize='porter unicode61')"
-    )
-    conn.execute(
-        "INSERT INTO memory_fts (path, content) VALUES ('preferences.md', 'user prefers dark mode')"
-    )
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path, content, tokenize='porter unicode61')")
+    conn.execute("INSERT INTO memory_fts (path, content) VALUES ('preferences.md', 'user prefers dark mode')")
     conn.commit()
     conn.close()
 
     # workspace/memory/
     mem_dir = mc / "workspace" / "memory"
     mem_dir.mkdir(parents=True)
-    (mem_dir / "preferences.md").write_text(
-        "# User Preferences\n\n- Prefers dark mode\n- Uses vim\n"
-    )
-    (mem_dir / "projects.md").write_text(
-        "# Active Projects\n\n## KiroCrew\nWorking on portability feature\n"
-    )
+    (mem_dir / "preferences.md").write_text("# User Preferences\n\n- Prefers dark mode\n- Uses vim\n")
+    (mem_dir / "projects.md").write_text("# Active Projects\n\n## KiroCrew\nWorking on portability feature\n")
     hist_dir = mem_dir / "history"
     hist_dir.mkdir()
-    (hist_dir / "2026-05-17.md").write_text(
-        "# 2026-05-17\n\n#### 09:00 PDT\nDiscussed architecture\n"
-    )
-    (hist_dir / "2026-05-18.md").write_text(
-        "# 2026-05-18\n\n#### 10:00 PDT\nImplemented export feature\n"
-    )
+    (hist_dir / "2026-05-17.md").write_text("# 2026-05-17\n\n#### 09:00 PDT\nDiscussed architecture\n")
+    (hist_dir / "2026-05-18.md").write_text("# 2026-05-18\n\n#### 10:00 PDT\nImplemented export feature\n")
 
     # plan_memory/
     pm_dir = mc / "plan_memory"
@@ -163,9 +139,7 @@ def fake_kirocrew_home(tmp_path):
     # skills/
     sk_dir = mc / "skills" / "my-skill"
     sk_dir.mkdir(parents=True)
-    (sk_dir / "SKILL.md").write_text(
-        "---\nname: my-skill\ndescription: Test skill\n---\n# My Skill\n"
-    )
+    (sk_dir / "SKILL.md").write_text("---\nname: my-skill\ndescription: Test skill\n---\n# My Skill\n")
 
     # Credential files that must be EXCLUDED
     (mc / ".env").write_text("SLACK_BOT_TOKEN=xoxb-secret\nSLACK_APP_TOKEN=xapp-secret\n")
@@ -351,7 +325,9 @@ class TestExport:
         # Walking from the link would descend on every platform and prove nothing
         # about whether `workspace/`'s own walk ever gets there.
         reached = [
-            p for p in (patched_config_dir / "workspace").rglob("*") if p.name == "not-ours.md"
+            p
+            for p in (patched_config_dir / "workspace").rglob("*")
+            if p.name == "not-ours.md"
         ]
         assert reached, "the walk never descended the link, so nothing was under test"
         assert reached[0].is_file() and not reached[0].is_symlink()
@@ -360,11 +336,13 @@ class TestExport:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
         names = zf.namelist()
         zf.close()
-        assert not any(
-            "not-ours" in n for n in names
-        ), f"content from outside the crew dir was packaged: {names}"
+        assert not any("not-ours" in n for n in names), (
+            f"content from outside the crew dir was packaged: {names}"
+        )
 
-    def test_export_still_packages_a_real_nested_workspace_file(self, patched_config_dir):
+    def test_export_still_packages_a_real_nested_workspace_file(
+        self, patched_config_dir
+    ):
         """Negative control: ordinary nested content must still be exported."""
         nested = patched_config_dir / "workspace" / "memory" / "deep" / "keep.md"
         nested.parent.mkdir(parents=True, exist_ok=True)
@@ -453,14 +431,18 @@ class TestTheArchivedBytesAreTheValidatedBytes:
         nested.parent.mkdir(parents=True, exist_ok=True)
         nested.write_text("ours", encoding="utf-8")
 
-        fd = portability._open_verified(str(nested), os.path.realpath(patched_config_dir))
+        fd = portability._open_verified(
+            str(nested), os.path.realpath(patched_config_dir)
+        )
         assert fd is not None
         try:
             assert os.read(fd, 64) == b"ours"
         finally:
             os.close(fd)
 
-    def test_retargeting_the_link_after_validation_cannot_change_what_is_archived(self, tmp_path):
+    def test_retargeting_the_link_after_validation_cannot_change_what_is_archived(
+        self, tmp_path
+    ):
         """The race itself: a link accepted at validation is then retargeted out.
 
         The link resolves INSIDE the crew directory when the candidate is
@@ -509,9 +491,9 @@ class TestTheArchivedBytesAreTheValidatedBytes:
             # call touches what the link points at.
             _detach_dir_link(link)
             make_dir_link(link, outside)
-            assert (
-                candidate.read_text(encoding="utf-8") == "private notes"
-            ), "the swap did not take effect, so the race was never simulated"
+            assert candidate.read_text(encoding="utf-8") == "private notes", (
+                "the swap did not take effect, so the race was never simulated"
+            )
 
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 portability._add_from_fd(zf, fd, "export/note.md")
@@ -536,7 +518,9 @@ class TestTheArchivedBytesAreTheValidatedBytes:
         monkeypatch.setattr(portability.pinned_fs, "fd_real_path", lambda _fd: None)
         assert portability._open_verified(str(nested), root) is None
 
-    def test_a_sensitive_target_is_refused_on_the_descriptor(self, patched_config_dir, monkeypatch):
+    def test_a_sensitive_target_is_refused_on_the_descriptor(
+        self, patched_config_dir, monkeypatch
+    ):
         """`is_sensitive_path` runs again on the fd's real path, not only the name.
 
         Re-running it there is what keeps the protected-location rule from being
@@ -599,7 +583,9 @@ class TestTheArchivedBytesAreTheValidatedBytes:
         ordinary.write_text("ours", encoding="utf-8")
         assert os.stat(ordinary).st_nlink == 1
 
-        fd = portability._open_verified(str(ordinary), os.path.realpath(patched_config_dir))
+        fd = portability._open_verified(
+            str(ordinary), os.path.realpath(patched_config_dir)
+        )
         assert fd is not None
         os.close(fd)
 
@@ -625,10 +611,9 @@ class TestTheArchivedBytesAreTheValidatedBytes:
         zip_bytes, _ = create_export_zip()
 
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            assert (
-                zf.read(next(n for n in zf.namelist() if n.endswith("workspace/big.bin")))
-                == payload
-            )
+            assert zf.read(
+                next(n for n in zf.namelist() if n.endswith("workspace/big.bin"))
+            ) == payload
 
     def test_the_zip64_guard_can_actually_fail(self, patched_config_dir, monkeypatch):
         """Guard the guard: prove the lowered limit really selects the ZIP64 branch.
@@ -656,7 +641,10 @@ class TestTheArchivedBytesAreTheValidatedBytes:
         it reaches that, not turned into an unreadable archive entry."""
         adir = patched_config_dir / "workspace" / "adir"
         adir.mkdir(parents=True, exist_ok=True)
-        assert portability._open_verified(str(adir), os.path.realpath(patched_config_dir)) is None
+        assert (
+            portability._open_verified(str(adir), os.path.realpath(patched_config_dir))
+            is None
+        )
 
 
 pins_are_a_windows_property = pytest.mark.skipif(
@@ -742,9 +730,9 @@ class TestTheAncestorSwapIsRefusedNotDetected:
             )
         )
         try:
-            assert attempts and attempts[0].startswith(
-                "refused:"
-            ), f"the racing writer swapped a verified ancestor: {attempts}"
+            assert attempts and attempts[0].startswith("refused:"), (
+                f"the racing writer swapped a verified ancestor: {attempts}"
+            )
             assert found, "the guard refused every legitimate file; nothing proven"
             fd = next(fd for rel, fd in found if rel.name == "keep.md")
             assert os.read(fd, 64) == b"ours"
@@ -753,7 +741,9 @@ class TestTheAncestorSwapIsRefusedNotDetected:
                 with contextlib.suppress(OSError):
                     os.close(fd)
 
-    def test_the_same_rename_succeeds_once_nothing_is_pinned(self, patched_config_dir, tmp_path):
+    def test_the_same_rename_succeeds_once_nothing_is_pinned(
+        self, patched_config_dir, tmp_path
+    ):
         """Guard the guard: prove the refusal above is the pin and not the filesystem.
 
         Without this, the test above would pass just as happily on a host where that
@@ -796,7 +786,9 @@ class TestTheAncestorSwapIsRefusedNotDetected:
         finally:
             os.close(fd)
 
-    def test_an_ordinary_file_still_opens_through_the_no_follow_open(self, patched_config_dir):
+    def test_an_ordinary_file_still_opens_through_the_no_follow_open(
+        self, patched_config_dir
+    ):
         """Negative control for the leaf open: it must still return usable bytes.
 
         The descriptor is also the one `_add_from_fd` streams from, so it has to
@@ -862,9 +854,9 @@ class TestTheAncestorSwapIsRefusedNotDetected:
             == []
         )
         assert opened, "no component was pinned, so nothing was under test"
-        assert set(opened) <= set(
-            closed
-        ), f"pinned descriptors leaked: opened={opened} closed={closed}"
+        assert set(opened) <= set(closed), (
+            f"pinned descriptors leaked: opened={opened} closed={closed}"
+        )
 
 
 #: Calls that RESOLVE the pathname handed to them, i.e. follow a reparse point at
@@ -1039,7 +1031,9 @@ class TestNothingIsProbedThroughAPlantedReparsePoint:
         not platform_compat.IS_WINDOWS,
         reason="the recorder is exercised against a Windows junction",
     )
-    def test_the_recorder_actually_catches_a_probe(self, patched_config_dir, tmp_path, monkeypatch):
+    def test_the_recorder_actually_catches_a_probe(
+        self, patched_config_dir, tmp_path, monkeypatch
+    ):
         """Guard the guard: an oracle that can never fire proves nothing.
 
         Every call here is one the previous build made on this exact path, so this
@@ -1221,21 +1215,11 @@ class TestImportMerge:
             target.mkdir()
             dst_db = target / "memory.db"
             conn = sqlite3.connect(str(dst_db))
-            conn.execute(
-                "CREATE TABLE semantic_memory (key TEXT PRIMARY KEY, value_json TEXT, confidence REAL, source TEXT, created_at TEXT, updated_at TEXT, embedding BLOB, is_deleted INTEGER DEFAULT 0)"
-            )
-            conn.execute(
-                "INSERT INTO semantic_memory (key, value_json, confidence, source, created_at, updated_at, is_deleted) VALUES ('user.team', '\"Platform\"', 0.95, 'agent', '2026-01-01', '2026-01-01', 0)"
-            )
-            conn.execute(
-                "CREATE TABLE episodic_memories (id TEXT PRIMARY KEY, conversation_id TEXT, text TEXT, embedding BLOB, tags TEXT, importance REAL, created_at TEXT, last_accessed_at TEXT, is_deleted INTEGER DEFAULT 0)"
-            )
-            conn.execute(
-                "CREATE TABLE knowledge_facts (subject TEXT, predicate TEXT, object TEXT, episode_id TEXT, created_at TEXT)"
-            )
-            conn.execute(
-                "CREATE TABLE knowledge_edges (source_key TEXT, target_key TEXT, relation TEXT, weight REAL, metadata TEXT, created_at TEXT)"
-            )
+            conn.execute("CREATE TABLE semantic_memory (key TEXT PRIMARY KEY, value_json TEXT, confidence REAL, source TEXT, created_at TEXT, updated_at TEXT, embedding BLOB, is_deleted INTEGER DEFAULT 0)")
+            conn.execute("INSERT INTO semantic_memory (key, value_json, confidence, source, created_at, updated_at, is_deleted) VALUES ('user.team', '\"Platform\"', 0.95, 'agent', '2026-01-01', '2026-01-01', 0)")
+            conn.execute("CREATE TABLE episodic_memories (id TEXT PRIMARY KEY, conversation_id TEXT, text TEXT, embedding BLOB, tags TEXT, importance REAL, created_at TEXT, last_accessed_at TEXT, is_deleted INTEGER DEFAULT 0)")
+            conn.execute("CREATE TABLE knowledge_facts (subject TEXT, predicate TEXT, object TEXT, episode_id TEXT, created_at TEXT)")
+            conn.execute("CREATE TABLE knowledge_edges (source_key TEXT, target_key TEXT, relation TEXT, weight REAL, metadata TEXT, created_at TEXT)")
             conn.commit()
             conn.close()
 
@@ -1291,13 +1275,7 @@ class TestImportMerge:
                     apply_import_zip(zip_path, mode="merge")
 
             # Should still have only 1 entry (same ts)
-            lines = [
-                line
-                for line in (target / "notifications.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-                if line.strip()
-            ]
+            lines = [line for line in (target / "notifications.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
             assert len(lines) == 1
         finally:
             os.unlink(str(zip_path))
@@ -1329,9 +1307,9 @@ class TestImportMerge:
                     with pytest.raises(UnreadableRecord):
                         apply_import_zip(zip_path, mode="merge")
 
-            assert not (
-                target / "notifications.jsonl"
-            ).exists(), "an unvalidated prefix was installed where the reader will find it"
+            assert not (target / "notifications.jsonl").exists(), (
+                "an unvalidated prefix was installed where the reader will find it"
+            )
         finally:
             os.unlink(str(zip_path))
 
@@ -1514,7 +1492,7 @@ class TestCrewTemplateWarnings:
     @staticmethod
     def _agents_dir(tmp_path: Path) -> Path:
         agents = tmp_path / "kiro_agents"
-        agents.mkdir(exist_ok=True)
+        agents.mkdir()
         (agents / "by-stem.json").write_text(json.dumps({"name": "by-stem"}))
         (agents / "file.json").write_text(json.dumps({"name": "by-declared-name"}))
         return agents
@@ -1522,34 +1500,20 @@ class TestCrewTemplateWarnings:
     def test_refs_skip_rows_with_no_template_and_tolerate_a_bad_file(self, tmp_path):
         cfg = tmp_path / "config.json"
         cfg.write_text(
-            json.dumps(
-                {
-                    "agents": {
-                        "b": {"kiro_agent": "t2"},
-                        "a": {"kiro_agent": "t1"},
-                        "c": {"kiro_agent": ""},
-                        "d": "not-a-row",
-                        "m": {"kiro_agent": "kirocrew"},
-                        "w": {"kiro_agent": "kirocrew-worker"},
-                        "l": {"kiro_agent": "kirocrew-lite"},
-                    }
-                }
-            )
+            json.dumps({"agents": {"b": {"kiro_agent": "t2"}, "a": {"kiro_agent": "t1"},
+                                   "c": {"kiro_agent": ""}, "d": "not-a-row",
+                                   "m": {"kiro_agent": "kirocrew"},
+                                   "w": {"kiro_agent": "kirocrew-worker"},
+                                   "l": {"kiro_agent": "kirocrew-lite"}}})
         )
         assert portability.crew_template_refs(cfg) == [("a", "t1"), ("b", "t2")]
-        cfg.write_text(
-            json.dumps(
-                {
-                    "agent": {"default_agent": "d1"},
-                    "session": {"pool_agent": "p1"},
-                    "agents": {"a": {"kiro_agent": "t1"}},
-                }
-            )
-        )
+        cfg.write_text(json.dumps({
+            "agent": {"default_agent": "d1"},
+            "session": {"pool_agent": "p1"},
+            "agents": {"a": {"kiro_agent": "t1"}},
+        }))
         assert portability.crew_template_refs(cfg) == [
-            ("a", "t1"),
-            ("agent.default_agent", "d1"),
-            ("session.pool_agent", "p1"),
+            ("a", "t1"), ("agent.default_agent", "d1"), ("session.pool_agent", "p1")
         ]
         cfg.write_text("[not an object")
         assert portability.crew_template_refs(cfg) == []
@@ -1557,53 +1521,23 @@ class TestCrewTemplateWarnings:
         assert portability.crew_template_refs(cfg) == []
         assert portability.crew_template_refs(tmp_path / "absent.json") == []
 
-    def test_dashboard_author_ref_is_suppressed_as_a_plain_managed_name(
-        self, tmp_path, monkeypatch
-    ):
-        """FP item 4 subtraction: the ``kirocrew-dashboard-author`` stem is a managed name
-        suppressed from the portability warnings by NAME, the same plain treatment every
-        other owned template gets. Portability reads no content mark of its own; the install
-        gate alone carries the once-user-creatable protection (it never overwrites a user
-        file at the stem with the managed spec)."""
-        cfg = tmp_path / "config.json"
-        cfg.write_text(json.dumps({"agents": {"a": {"kiro_agent": "kirocrew-dashboard-author"}}}))
-        # Suppressed by name, regardless of any on-disk content.
-        assert portability.crew_template_refs(cfg) == []
-        # The other owned names stay suppressed too.
-        cfg.write_text(json.dumps({"agents": {"m": {"kiro_agent": "kirocrew"}}}))
-        assert portability.crew_template_refs(cfg) == []
-        # A genuinely unowned crew template still surfaces.
-        cfg.write_text(json.dumps({"agents": {"u": {"kiro_agent": "my-own-template"}}}))
-        assert portability.crew_template_refs(cfg) == [("u", "my-own-template")]
-
     def test_missing_matches_by_stem_or_declared_name(self, tmp_path, monkeypatch):
         monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
         cfg = tmp_path / "config.json"
-        cfg.write_text(
-            json.dumps(
-                {
-                    "agents": {
-                        "stem": {"kiro_agent": "by-stem"},
-                        "named": {"kiro_agent": "by-declared-name"},
-                        "gone": {"kiro_agent": "only-on-the-source"},
-                    }
-                }
-            )
-        )
+        cfg.write_text(json.dumps({"agents": {
+            "stem": {"kiro_agent": "by-stem"},
+            "named": {"kiro_agent": "by-declared-name"},
+            "gone": {"kiro_agent": "only-on-the-source"},
+        }}))
         assert portability.missing_crew_templates(cfg) == (
             [{"crew": "gone", "kiro_agent": "only-on-the-source"}],
             0,
         )
 
     def test_export_names_every_template_the_crews_use(self, patched_config_dir):
-        self._with_crews(
-            patched_config_dir,
-            {
-                "x": {"kiro_agent": "shared"},
-                "y": {"kiro_agent": "shared"},
-                "z": {"kiro_agent": "solo"},
-            },
-        )
+        self._with_crews(patched_config_dir, {
+            "x": {"kiro_agent": "shared"}, "y": {"kiro_agent": "shared"}, "z": {"kiro_agent": "solo"},
+        })
         assert portability.unbundled_agent_templates() == (["shared", "solo"], 0)
 
     def test_both_lists_are_bounded_in_count_and_length(
@@ -1626,13 +1560,9 @@ class TestCrewTemplateWarnings:
     def test_import_warns_about_the_missing_template_and_still_imports(
         self, patched_config_dir, tmp_path, monkeypatch, mode
     ):
-        self._with_crews(
-            patched_config_dir,
-            {
-                "ok": {"kiro_agent": "by-stem"},
-                "broken": {"kiro_agent": "only-on-the-source"},
-            },
-        )
+        self._with_crews(patched_config_dir, {
+            "ok": {"kiro_agent": "by-stem"}, "broken": {"kiro_agent": "only-on-the-source"},
+        })
         zip_path = TestImportMerge()._make_export(patched_config_dir)
         monkeypatch.setattr(portability, "kiro_agents_dir", lambda: self._agents_dir(tmp_path))
         target = tmp_path / "target_mc"
@@ -1668,9 +1598,7 @@ class TestCrewTemplateWarnings:
         finally:
             os.unlink(str(zip_path))
         assert "missing_agent_templates" not in summary
-        assert (
-            "broken" in json.loads((target / "config.json").read_text(encoding="utf-8"))["agents"]
-        )
+        assert "broken" in json.loads((target / "config.json").read_text(encoding="utf-8"))["agents"]
 
     def test_import_with_every_template_present_adds_no_warning(
         self, patched_config_dir, tmp_path, monkeypatch
@@ -1695,12 +1623,10 @@ class TestCrewTemplateWarnings:
 class TestExclusionLogic:
     def test_excludes_env_file(self):
         from pathlib import PurePosixPath
-
         assert _is_excluded(PurePosixPath(".env"))
 
     def test_excludes_local_secret(self):
         from pathlib import PurePosixPath
-
         assert _is_excluded(PurePosixPath(".local_secret"))
 
     def test_excludes_sel_hmac_key_at_trust_path(self):
@@ -1713,33 +1639,27 @@ class TestExclusionLogic:
 
     def test_excludes_pid_files(self):
         from pathlib import PurePosixPath
-
         assert _is_excluded(PurePosixPath("gateway.pid"))
         assert _is_excluded(PurePosixPath("some/nested/thing.pid"))
 
     def test_excludes_snapshots_dir(self):
         from pathlib import PurePosixPath
-
         assert _is_excluded(PurePosixPath("snapshots/backup.tar.gz"))
 
     def test_excludes_outbox_dir(self):
         from pathlib import PurePosixPath
-
         assert _is_excluded(PurePosixPath("outbox/file.txt"))
 
     def test_allows_config_json(self):
         from pathlib import PurePosixPath
-
         assert not _is_excluded(PurePosixPath("config.json"))
 
     def test_allows_memory_files(self):
         from pathlib import PurePosixPath
-
         assert not _is_excluded(PurePosixPath("workspace/memory/preferences.md"))
 
     def test_allows_skills(self):
         from pathlib import PurePosixPath
-
         assert not _is_excluded(PurePosixPath("skills/my-skill/SKILL.md"))
 
 
@@ -1770,9 +1690,7 @@ class TestRoundTrip:
                 _, manifest_b = create_export_zip()
 
         # Content counts should match
-        assert (
-            manifest_b["contents"]["workspace_files"] == manifest_a["contents"]["workspace_files"]
-        )
+        assert manifest_b["contents"]["workspace_files"] == manifest_a["contents"]["workspace_files"]
         assert manifest_b["contents"]["skill_count"] == manifest_a["contents"]["skill_count"]
 
     def test_export_import_preserves_semantic_memory(self, patched_config_dir, tmp_path):
@@ -2409,16 +2327,16 @@ class TestExclusionsSurviveAWindowsSeparator:
         ],
     )
     def test_an_excluded_basename_is_excluded_below_the_top_level(self, rel: str) -> None:
-        assert (
-            portability._keep_for_export(PureWindowsPath(rel)) is False
-        ), f"{rel} would be packaged on Windows"
+        assert portability._keep_for_export(PureWindowsPath(rel)) is False, (
+            f"{rel} would be packaged on Windows"
+        )
 
     @pytest.mark.parametrize("bad_dir", sorted(portability.EXCLUDE_DIRS))
     def test_an_excluded_directory_is_excluded_below_the_top_level(self, bad_dir: str) -> None:
         rel = PureWindowsPath(f"workspace/{bad_dir}/inner.txt")
-        assert (
-            portability._keep_for_export(rel) is False
-        ), f"workspace/{bad_dir}/ would be packaged on Windows"
+        assert portability._keep_for_export(rel) is False, (
+            f"workspace/{bad_dir}/ would be packaged on Windows"
+        )
 
     def test_an_ordinary_nested_file_is_still_kept(self) -> None:
         """Negative control: the rebuild must not start excluding everything."""
@@ -2659,7 +2577,9 @@ class TestTheCronSanitizerDecodesAsUtf8:
 
         assert dropped == [], "a valid UTF-8 store was reported as unreadable"
         assert paused == []
-        assert store.read_bytes() == original, "the imported store was rewritten or wiped"
+        assert (
+            store.read_bytes() == original
+        ), "the imported store was rewritten or wiped"
 
     def test_a_non_ascii_name_survives_the_sanitizers_pause_rewrite(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2691,7 +2611,9 @@ class TestTheCronSanitizerDecodesAsUtf8:
         dropped, paused = portability._sanitize_imported_crons(store)
 
         assert dropped == []
-        assert paused == [self.NAME], "the paused job should be reported by its real name"
+        assert paused == [
+            self.NAME
+        ], "the paused job should be reported by its real name"
         written = json.loads(store.read_bytes().decode("utf-8"))
         assert written["jobs"][0]["name"] == self.NAME, (
             "the sanitizer's rewrite mangled the job name; it must read and "

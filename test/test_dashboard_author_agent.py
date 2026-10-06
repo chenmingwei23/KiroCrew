@@ -234,7 +234,7 @@ def test_a_non_regular_pre_existing_file_is_left_untouched(
     elsewhere.write_text(json.dumps({"name": "x"}), encoding="utf-8")
     target.symlink_to(elsewhere)
 
-    worker_agent._install_dashboard_author_agent()  # must not raise
+    worker_agent._install_dashboard_author_agent()
 
     assert target.is_symlink()  # untouched, still points where it did
     assert target.resolve() == elsewhere.resolve()
@@ -376,6 +376,69 @@ def test_reset_model_on_the_managed_spec_keeps_it_attributable(
     assert _is_installers(target) is True
 
 
+def test_reset_model_does_not_stamp_a_user_file_at_the_stem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 / Opus 5.5 F1 (security): a user authored their own spec at the once-user-
+    creatable stem (NO recorded digest, so the installer refuses to touch it). They run
+    reset-model on it. The reset must NOT record the managed digest for the user's bytes --
+    doing so would make the next rebuild overwrite their charter. The gate: renew the digest
+    only when the PRE-edit content was already our confirmed managed write."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    user = {
+        "name": "kirocrew-dashboard-author",
+        "prompt": "the user's own hand-authored dashboard author",
+        "mcpServers": {"kirocrew-core": {}},
+        "model": "some-model",
+    }
+    target.write_text(json.dumps(user, indent=2) + "\n", encoding="utf-8")
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+    assert _is_installers(target) is False
+
+    agent.reset_agent_model("kirocrew-dashboard-author")
+
+    # No digest was recorded for the user's bytes -> still NOT ours -> a rebuild leaves it.
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+    assert _is_installers(target) is False
+    agent.rebuild_agent_config()
+    assert json.loads(target.read_text(encoding="utf-8"))["prompt"] == (
+        "the user's own hand-authored dashboard author"
+    )
+
+
+def test_hook_sweep_does_not_stamp_a_user_file_carrying_a_stale_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 / Opus 5.5 F1 (security), hook-sweep arm: a stale ownership digest exists for
+    the stem (from a managed install the user later REPLACED with their own file). The sweep
+    strips a legacy hook key from the user's file, but must NOT re-record the digest for the
+    user's bytes -- the renewal is gated on the PRE-sweep file already reproducing the
+    recorded digest, not merely on 'a digest exists'."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    # A user file at the stem carrying a legacy hook key.
+    user = {
+        "name": "kirocrew-dashboard-author",
+        "prompt": "the user's own file that replaced a managed install",
+        "mcpServers": {"kirocrew-core": {}},
+        "hooks": {"auto_approve_tools": ["x"]},
+    }
+    target.write_text(json.dumps(user, indent=2) + "\n", encoding="utf-8")
+    # A STALE digest recorded for some OTHER (managed) bytes -- the user's file does not match.
+    agent_state.set_managed_digest("kirocrew-dashboard-author", "staledigeststaledigest")
+    assert _is_installers(target) is False  # bytes do not reproduce the stale digest
+
+    agent._hooks_sanitized_mtimes.clear()
+    agent.repair_agent_configs()
+
+    # The legacy key was swept, but the digest was NOT renewed to the user's bytes.
+    swept = json.loads(target.read_text(encoding="utf-8"))
+    assert "auto_approve_tools" not in swept.get("hooks", {})
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") == "staledigeststaledigest"
+    assert _is_installers(target) is False  # still not ours -> a rebuild leaves it
+
+
 # --------------------------------------------------------------------------- #
 # GPT 6.1 install-gate branches (maintainer ruling): absent -> install; present +
 # digest reproduces -> refresh; present not reproducing OR read-fails -> untouched.
@@ -496,7 +559,9 @@ def test_a_present_file_whose_read_fails_is_left_untouched(
     """Branch 3 (read-fail): an existing file at the stem whose read FAILS (oversized,
     non-UTF-8, otherwise unparseable) cannot be confirmed as this installer's own write, so
     it is left untouched -- never overwritten on a failed read. A None from the capped
-    reader is NOT treated as 'ours to write'."""
+    reader is NOT treated as 'ours to write'. The install now RAISES (fail-closed) rather
+    than returning, so the rebuild cannot report success without rewriting the governed spec
+    (GPT 6.1: an unreadable present spec must not be recorded as projected)."""
     import kiro_crew.agent_materialization.worker_agent as wa
 
     rig = _Rig(tmp_path, monkeypatch)
@@ -506,7 +571,7 @@ def test_a_present_file_whose_read_fails_is_left_untouched(
     # The capped reader returns None for this file (unparseable); the gate must leave it.
     monkeypatch.setattr(wa.agent_mod, "_read_spec_capped", lambda p: None)
 
-    wa._install_dashboard_author_agent()  # must not raise, must not overwrite
+    wa._install_dashboard_author_agent()
 
     assert target.read_bytes() == raw  # untouched
 
@@ -535,3 +600,387 @@ def test_a_user_markdown_spec_at_the_stem_blocks_the_install(
     # The user's .md is untouched, and no .json was written beside it to shadow it.
     assert md.read_text(encoding="utf-8") == md_body
     assert not json_target.exists()
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 / Opus 5.5 F1 (on f6290180a9): a rebuild of a CONFIRMED managed spec
+# must preserve the user's explicitly-pinned model and skill mappings while
+# regenerating governed grants -- it must not silently reset them to defaults.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rebuild_preserves_the_pinned_model_and_skill_mappings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user pins a model and maps skills on the dashboard author via the dashboard (model
+    pin -> model_managed False; skills -> ``resources``). A later routine rebuild rebuilds the
+    governed grants from the shipped spec, but must carry the pinned model and the user skill
+    mappings across -- they are authorized, persisted settings, not transient edits. Only a
+    CONFIRMED managed spec contributes them."""
+    rig = _Rig(tmp_path, monkeypatch)
+    agent.rebuild_agent_config()
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    assert _is_installers(target) is True
+
+    # Simulate the authorized dashboard edits: an explicit model pin + a user skill mapping.
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    spec["model"] = "claude-user-pinned"
+    spec["resources"] = ["skill://user/mapped-one"]
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_model_managed("kirocrew-dashboard-author", False)  # explicit pick
+    agent_state.set_managed_digest("kirocrew-dashboard-author", agent_state.spec_digest(spec))
+    assert _is_installers(target) is True
+
+    agent.rebuild_agent_config()
+
+    refreshed = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    # The pinned model and the user skill mappings survived the rebuild.
+    assert refreshed["model"] == "claude-user-pinned"
+    assert refreshed.get("resources") == ["skill://user/mapped-one"]
+    # Governed grants were still regenerated from the shipped spec.
+    assert refreshed["name"] == "kirocrew-dashboard-author"
+    assert _is_installers(target) is True
+
+
+def test_a_rebuild_does_not_carry_a_pinned_model_from_an_unconfirmed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preservation reads from a CONFIRMED managed spec only. A user file at the stem
+    (no recorded digest) contributes nothing: the installer refuses to write over it at all,
+    so its model/resources are neither carried into a managed spec nor touched."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    user = {
+        "name": "kirocrew-dashboard-author",
+        "model": "a-user-model",
+        "resources": ["skill://user/private"],
+        "prompt": "the user's own charter",
+    }
+    target.write_text(json.dumps(user, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_model_managed("kirocrew-dashboard-author", False)
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+    assert _is_installers(target) is False
+
+    agent.rebuild_agent_config()
+
+    # Unconfirmed -> left entirely untouched; the user's own file stands.
+    assert json.loads(target.read_text(encoding="utf-8")) == user
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 F1/F2 (on b59007de01): the skill-URI migration is a managed writer and
+# must renew the digest for a confirmed spec; resources preservation must mirror
+# the key exactly (empty carried, absent removes the inherited default).
+# --------------------------------------------------------------------------- #
+
+
+def test_the_skill_uri_migration_renews_the_digest_for_a_confirmed_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 F1 (security): ``migrate_relocated_skill_uris`` rewrites the dashboard-author
+    spec to point a relocated skill at its new path. It is a managed writer, so it must renew
+    the ownership digest for a CONFIRMED managed spec -- otherwise the installer reads its own
+    migrated spec as foreign and stops re-filtering grants against a tightened ceiling."""
+    from kiro_crew import skills as skills_mod
+
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    # Stage the relocation first: old SKILL.md gone, new one present, mapped.
+    skills_root = tmp_path / "skills"
+    (skills_root / "new-skill").mkdir(parents=True)
+    (skills_root / "new-skill" / "SKILL.md").write_text("# moved\n", encoding="utf-8")
+    monkeypatch.setattr(skills_mod, "skills_dir", lambda: skills_root)
+    monkeypatch.setattr(skills_mod, "_RELOCATED_SKILLS", {"old-skill": "new-skill"})
+    old_uri = f"skill://{(skills_root / 'old-skill' / 'SKILL.md').as_posix()}"
+    new_uri = f"skill://{(skills_root / 'new-skill' / 'SKILL.md').as_posix()}"
+
+    # A confirmed managed spec that maps the relocated skill by its old (absolute) path.
+    agent.rebuild_agent_config()
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    spec["resources"] = [old_uri]
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_managed_digest("kirocrew-dashboard-author", agent_state.spec_digest(spec))
+    assert _is_installers(target) is True
+
+    rewritten = agent.migrate_relocated_skill_uris()
+
+    assert rewritten >= 1  # our spec was rewritten
+    migrated = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert migrated["resources"] == [new_uri]  # URI migrated
+    # The digest was renewed to the migrated bytes -> the file still confirms as ours.
+    assert _is_installers(target) is True
+
+
+def test_a_rebuild_preserves_an_explicitly_empty_resources_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 F2: an explicit remove-all-skills PATCH leaves ``resources`` present as ``[]``.
+    A rebuild must carry that empty selection through, not re-inherit a mapping from the
+    build default -- the user's removal must stick."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    agent.rebuild_agent_config()
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    spec["resources"] = []  # explicit "no skills"
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_managed_digest("kirocrew-dashboard-author", agent_state.spec_digest(spec))
+    assert _is_installers(target) is True
+
+    agent.rebuild_agent_config()
+
+    refreshed = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert refreshed.get("resources") == []  # the empty selection stuck
+    assert _is_installers(target) is True
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 F1 (on 99a0563711): a .md sibling must block only a FIRST-TIME install.
+# A confirmed managed .json is still refreshed despite the sibling, so a grant the
+# ceiling has revoked does not stay executable; the .md is left untouched.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_confirmed_json_is_refreshed_despite_a_markdown_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 F1 (security): once the ``.json`` is our confirmed managed write, a user
+    adding a same-stem ``.md`` must NOT freeze it. If the rebuild skipped the rewrite, a
+    revoked auto-approval (the ceiling now denies ``@kirocrew-core/skill_search``) would stay
+    in the on-disk ``allowedTools`` and execute without PreToolUse enforcement for later
+    sessions. The confirmed ``.json`` is refreshed in place -- the stale grant is filtered
+    out -- and the user's ``.md`` is left untouched."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    # A confirmed managed spec carrying a now-revoked auto-approval.
+    agent.rebuild_agent_config()
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert "@kirocrew-core/skill_search" in spec["allowedTools"]
+    spec["allowedTools"] = list(spec["allowedTools"]) + ["@kirocrew-core/revoked_grant"]
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_managed_digest("kirocrew-dashboard-author", agent_state.spec_digest(spec))
+    assert _is_installers(target) is True
+    # A user drops a markdown sibling at the stem AFTER the managed install.
+    md = rig.agents / "kirocrew-dashboard-author.md"
+    md_body = "---\nname: kirocrew-dashboard-author\n---\nThe user's own notes.\n"
+    md.write_text(md_body, encoding="utf-8")
+
+    agent.rebuild_agent_config()
+
+    # The confirmed .json was refreshed despite the sibling -> the stale grant is gone,
+    # the governed surface is back, and the file still confirms as ours.
+    refreshed = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert "@kirocrew-core/revoked_grant" not in refreshed["allowedTools"]
+    assert refreshed["name"] == "kirocrew-dashboard-author"
+    assert _is_installers(target) is True
+    # The user's markdown sibling is left untouched.
+    assert md.read_text(encoding="utf-8") == md_body
+
+
+def test_a_markdown_sibling_still_blocks_a_first_time_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sibling check is retained for first-time install: with NO confirmed ``.json``
+    (none recorded), a user ``.md`` at the stem still blocks the install so the managed
+    ``.json`` never shadows the user's markdown spec."""
+    import kiro_crew.agent_materialization.worker_agent as wa
+
+    rig = _Rig(tmp_path, monkeypatch)
+    md = rig.agents / "kirocrew-dashboard-author.md"
+    json_target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    md_body = "---\nname: kirocrew-dashboard-author\n---\nThe user's own markdown author.\n"
+    md.write_text(md_body, encoding="utf-8")
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") is None
+
+    wa._install_dashboard_author_agent()
+
+    assert md.read_text(encoding="utf-8") == md_body  # untouched
+    assert not json_target.exists()  # no .json written to shadow it
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 (on 15f0c5084d): a managed write interrupted between the file replace
+# and the digest finalize must NOT freeze the spec -- the file reproduces the
+# PENDING digest, so a rebuild still confirms and refreshes it.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_spec_left_pending_after_an_interrupted_write_is_still_refreshed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 (security): a managed writer records the new bytes' digest as PENDING, writes
+    the file, then finalizes. If the process dies between the write and finalize, the file
+    holds the new bytes and only the pending digest is recorded. The next rebuild must still
+    recognise the file as ours (bytes reproduce the pending digest) and refresh it -- a stale
+    grant from a since-tightened ceiling is filtered out, not frozen in place forever."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    agent.rebuild_agent_config()
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    # Simulate the interrupted state: a managed writer put new bytes on disk (carrying a
+    # now-revoked grant) and recorded them as PENDING, but crashed before finalize.
+    spec["allowedTools"] = list(spec["allowedTools"]) + ["@kirocrew-core/revoked_grant"]
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    agent_state.set_managed_digest("kirocrew-dashboard-author", None)  # finalized lost
+    agent_state.begin_managed_write(
+        "kirocrew-dashboard-author", agent_state.spec_digest(spec)
+    )  # only pending recorded, never finalized
+    assert _is_installers(target) is True  # pending digest confirms the on-disk bytes
+
+    agent.rebuild_agent_config()
+
+    # Refreshed, not frozen: the stale grant is gone and the file still confirms.
+    refreshed = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert "@kirocrew-core/revoked_grant" not in refreshed["allowedTools"]
+    assert _is_installers(target) is True
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 (on 81536c69a2): the hook-repair sweep must not FOLLOW a symlink at an
+# owned stem -- adding the dashboard-author name to OWNED_KIRO_AGENT_FILES must
+# not turn the sweep into a reader of an arbitrary symlink target.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_hook_sweep_does_not_follow_a_symlink_at_an_owned_stem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 (security): a symlink planted at the dashboard-author stem, pointing at a file
+    OUTSIDE the agents dir (standing in for a credential file), must be refused by the sweep
+    -- not stat-followed, not read through, not written back. The ``_spec_path_is_safe`` fence
+    the sweep now applies refuses the symlink before any read."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    secret = tmp_path / "outside" / "config.json"
+    secret.parent.mkdir()
+    secret.write_text(json.dumps({"hooks": {"auto_approve_tools": ["x"]}, "secret": "sh"}))
+    target.symlink_to(secret)
+    before = secret.read_text(encoding="utf-8")
+
+    agent._hooks_sanitized_mtimes.clear()
+    agent.repair_agent_configs()  # must not raise, follow, or rewrite
+
+    # The symlink target is untouched -- the sweep never followed the link to read or write it.
+    assert secret.read_text(encoding="utf-8") == before
+    assert target.is_symlink()  # the link itself is left as-is
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 (on 2505dcf9f7): an author-install write failure must set the hold
+# flag so priming/maintenance retain the governance retry rather than marking
+# the ceiling as projected.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_author_install_write_failure_sets_the_hold_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT 6.1 (security): a transient write failure on a confirmed managed spec (Windows
+    sharing violation, spec-lock timeout) must set ``_conductor_spec_held`` so
+    ``prime_ceiling_projection`` does not seed the ceiling as projected, and
+    ``retry_held_conductor_specs`` retries the rewrite on the next maintenance poll. Without
+    the hold, a tightened ceiling whose author-spec rewrite failed at boot leaves revoked
+    auto-approvals live for the process lifetime with no recovery path."""
+    _Rig(tmp_path, monkeypatch)
+
+    def _boom() -> None:
+        raise OSError("agents dir unwritable")
+
+    monkeypatch.setattr(worker_agent, "_install_dashboard_author_agent", _boom)
+
+    # Reset the hold to False before the rebuild so we can confirm it flips.
+    agent._conductor_spec_held = False
+
+    with pytest.raises(OSError, match="agents dir unwritable"):
+        agent.rebuild_agent_config()
+
+    # The hold flag must be True: the author-install failure must prevent priming
+    # from marking the ceiling as projected.
+    assert agent._conductor_spec_held is True
+
+
+# --------------------------------------------------------------------------- #
+# Opus 5.5 / Design Review (on 2505dcf9f7): a user file at the dashboard-author
+# stem must NOT crash the rebuild / kirocrew setup / gateway boot.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_user_file_at_the_stem_does_not_crash_the_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opus 5.5 / Design Review: a user-authored spec at the ``kirocrew-dashboard-author``
+    stem must be left untouched **and the rebuild returns normally** (the install is skipped,
+    not crashed). A raise here would make ``kirocrew setup`` abort before PATH shim/MCP purge,
+    and gateway boot would skip first-run setup on every restart until the user deletes their
+    own file."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    user = {"name": "user-template", "prompt": "keep me"}
+    target.write_text(json.dumps(user), encoding="utf-8")
+
+    # Must return normally -- not raise.
+    agent.rebuild_agent_config()
+
+    assert json.loads(target.read_text(encoding="utf-8")) == user  # untouched
+
+
+def test_a_lost_digest_does_not_crash_the_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opus 5.5 / Design Review: a managed spec whose ownership digest was lost (sidecar
+    pruned, corrupted) should skip the install, not crash the rebuild."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    # First, install normally.
+    agent.rebuild_agent_config()
+    assert target.exists()
+    # Now wipe the digest record.
+    agent_state.set_managed_digest("kirocrew-dashboard-author", None)
+    assert not _is_installers(target)
+
+    # Must return normally -- not raise. The file is left untouched.
+    agent.rebuild_agent_config()
+
+
+# --------------------------------------------------------------------------- #
+# Design Review (watch): every writer of kirocrew-dashboard-author.json goes
+# through the two-phase digest-renewing write.
+# --------------------------------------------------------------------------- #
+
+
+def test_every_managed_writer_calls_begin_and_finalize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Design Review (watch): ownership depends on every current and future writer of the
+    dashboard-author spec going through ``begin_managed_write``/``finalize_managed_write``.
+    This test pins that invariant: it patches the two-phase helpers to record calls, runs
+    each writer, and asserts both were called. A writer that forgets turns the managed spec
+    foreign with no signal."""
+    rig = _Rig(tmp_path, monkeypatch)
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    # Install once to seed the confirmed managed spec.
+    agent.rebuild_agent_config()
+    assert target.exists()
+
+    # Patch to record calls.
+    calls: list[str] = []
+    real_begin = agent_state.begin_managed_write
+    real_finalize = agent_state.finalize_managed_write
+
+    def _begin(*a: object, **kw: object) -> None:
+        calls.append("begin")
+        return real_begin(*a, **kw)
+
+    def _finalize(*a: object, **kw: object) -> None:
+        calls.append("finalize")
+        return real_finalize(*a, **kw)
+
+    monkeypatch.setattr(agent_state, "begin_managed_write", _begin)
+    monkeypatch.setattr(agent_state, "finalize_managed_write", _finalize)
+
+    # Run a rebuild (which invokes the installer -- the main writer).
+    calls.clear()
+    agent.rebuild_agent_config()
+    assert (
+        "begin" in calls and "finalize" in calls
+    ), "the installer writer must call begin_managed_write and finalize_managed_write"

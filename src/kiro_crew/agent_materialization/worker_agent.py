@@ -1266,10 +1266,9 @@ def _foreign_dashboard_author_spec_reason(spec: dict[str, Any] | None) -> str | 
     """
     if not isinstance(spec, dict):
         return None
-    recorded = agent_state.get_managed_digest(_MANAGED_OWNED_NAME, strict=True)
-    if not recorded:
-        return "no managed-ownership digest is recorded for this name"
-    if agent_state.spec_digest(spec) != recorded:
+    if not agent_state.managed_digest_matches(
+        _MANAGED_OWNED_NAME, agent_state.spec_digest(spec), strict=True
+    ):
         return "its bytes do not reproduce the installer-recorded ownership digest"
     return None
 
@@ -1278,19 +1277,22 @@ def _managed_dashboard_author_install_lands(path: Path) -> bool:
     """Would the managed install actually WRITE at *path* -- i.e. is the stem owned by a
     live installer that re-filters its grants every rebuild?
 
-    True only when :func:`_write_dashboard_author_spec` would land: NO candidate (the
-    ``.json`` or a ``.md`` sibling) blocks the install -- the ``.json`` is absent or
-    reproduces the installer-recorded ownership digest, AND no user ``.md`` sits beside it.
-    This is the F4 gate the fork governance loop needs: a private copy that reproduces the
-    digest but has a ``.md`` sibling makes the installer REFUSE, so no owned writer ever
-    re-filters that ``.json`` -- treating it as "owned" there would leave its approvals live
-    against a tightened ceiling. The answer matches the install gate exactly by reusing the
-    same per-candidate check.
+    True when :func:`_write_dashboard_author_spec` would land. The ``.json`` must not be
+    blocked (absent, or it reproduces the installer-recorded ownership digest). A ``.md``
+    sibling blocks only a FIRST-TIME install (an unconfirmed ``.json``, which the install
+    must not write beside a user markdown spec); once the ``.json`` is CONFIRMED ours, the
+    install refreshes it in place despite the sibling, so the fork-governance loop may treat
+    it as owned (an owned writer re-filters its grants every rebuild). Mirrors the install
+    gate exactly, so the two never disagree about whether this stem has a live writer.
     """
-    agents_dir = path.parent
-    stem = path.stem
-    for candidate in (path, agents_dir / (stem + ".md")):
-        if _present_spec_blocks_install(candidate) is not None:
+    if _present_spec_blocks_install(path) is not None:
+        return False
+    current_json = agent_mod._read_spec_capped(path) if path.is_file() else None
+    json_confirmed = isinstance(current_json, dict) and _is_confirmed_managed_dashboard_author(
+        current_json
+    )
+    if not json_confirmed:
+        if _present_spec_blocks_install(path.parent / (path.stem + ".md")) is not None:
             return False
     return True
 
@@ -1389,9 +1391,34 @@ def _install_dashboard_author_agent() -> None:
     # writer lock every other read-modify-writer of this directory holds (the worker
     # installer, the reset path, the fork refresh, the dashboard PATCH). Without it two
     # overlapping rebuilds could interleave their reads and writes. Holding the lock makes
-    # the content-mark attribution and the write one atomic step, as the sibling worker
+    # the ownership attribution and the write one atomic step, as the sibling worker
     # installer does.
     with agent_mod.agents_spec_lock(agents_dir):
+        # Preserve the two AUTHORIZED, persisted user settings a rebuild would otherwise
+        # discard, taken ONLY from a file this installer confirms is its own prior managed
+        # write (so a user file at the stem contributes nothing): an explicit ``model`` pin
+        # (``model_managed`` False, the dashboard PATCH / reset-model contract) and the user
+        # ``resources`` skill mappings. Everything else is regenerated from the shipped spec
+        # and the governance ceiling, so a grant the ceiling strips still goes. Read once,
+        # under the lock, so the carry-over cannot race the write.
+        existing = agent_mod._read_spec_capped(path)
+        if isinstance(existing, dict) and _is_confirmed_managed_dashboard_author(existing):
+            if agent_state.get_model_managed(_MANAGED_OWNED_NAME) is False:
+                pinned = existing.get("model")
+                if isinstance(pinned, str) and pinned.strip():
+                    config["model"] = pinned
+            # Mirror the confirmed spec's user skill mappings EXACTLY. "resources" PRESENT
+            # (even an empty list) is the user's saved selection and is carried as-is; the
+            # empty case matters -- an explicit remove-all-skills PATCH pops the key to [],
+            # and carrying only a non-empty list would let the build's inherited default
+            # (deep-merged from agent.json) restore the mapping the user removed. "resources"
+            # ABSENT means the user holds no selection, so any inherited default is dropped.
+            if "resources" in existing:
+                carried = existing["resources"]
+                if isinstance(carried, list):
+                    config["resources"] = carried
+            else:
+                config.pop("resources", None)
         _write_dashboard_author_spec(path, config)
 
 
@@ -1425,28 +1452,51 @@ def _write_dashboard_author_spec(path: Path, config: dict) -> None:
     agents_dir = path.parent
     stem = path.stem
     md_candidate = agents_dir / (stem + ".md")
-    for candidate in (path, md_candidate):
-        blocked = _present_spec_blocks_install(candidate)
-        if blocked is not None:
+    # Is the ``.json`` already our confirmed managed write? Decide this FIRST, because it
+    # changes whether a ``.md`` sibling may block. A ``.md`` at the stem must block a
+    # FIRST-TIME install (writing the ``.json`` would shadow the user's markdown spec), but
+    # it must NOT freeze an already-confirmed managed ``.json``: refusing to refresh that
+    # ``.json`` would leave its auto-approvals live after the ceiling revoked them, since a
+    # non-fork managed spec has no other writer to re-filter it. So a confirmed ``.json`` is
+    # refreshed in place and the sibling ``.md`` is left untouched.
+    current_json = agent_mod._read_spec_capped(path) if path.is_file() else None
+    json_confirmed = isinstance(current_json, dict) and _is_confirmed_managed_dashboard_author(
+        current_json
+    )
+    json_blocked = _present_spec_blocks_install(path)
+    if json_blocked is not None:
+        agent_mod.logger.warning(
+            "Not installing the managed %s: %s. Leaving it untouched; remove or rename "
+            "that file to let the managed agent install.",
+            _DASHBOARD_AUTHOR_AGENT_FILENAME,
+            json_blocked,
+        )
+        return
+    # The ``.md`` sibling blocks only a first-time install (unconfirmed ``.json``). Once the
+    # ``.json`` is confirmed ours, the ``.md`` does not stop the refresh.
+    if not json_confirmed:
+        md_blocked = _present_spec_blocks_install(md_candidate)
+        if md_blocked is not None:
             agent_mod.logger.warning(
                 "Not installing the managed %s: %s. Leaving it untouched; remove or rename "
                 "that file to let the managed agent install.",
                 _DASHBOARD_AUTHOR_AGENT_FILENAME,
-                blocked,
+                md_blocked,
             )
             return
     # Every candidate is free, or the ``.json`` reproduces the installer-recorded ownership
-    # digest (so a refresh is allowed): write it through ``_atomic_json_write`` (a tmp-file +
-    # atomic replace), the same writer every sibling installer uses, so a kiro-cli reader
-    # never sees partial JSON at an owned filename.
+    # digest (so a refresh is allowed). Two-phase digest commit so a crash never leaves the
+    # bytes and the record out of step: record the NEW bytes' digest as PENDING first, then
+    # replace the file (``_atomic_json_write`` -- a tmp-file + atomic replace), then finalize.
+    # At every instant the file reproduces either the old finalized digest or the pending
+    # one, so a later rebuild always re-confirms and re-filters instead of freezing.
+    new_digest = agent_state.spec_digest(config)
+    current_digest = (
+        agent_state.spec_digest(current_json) if isinstance(current_json, dict) else None
+    )
+    agent_state.begin_managed_write(_MANAGED_OWNED_NAME, new_digest, current=current_digest)
     agent_mod._atomic_json_write(path, config)
-    # Record the ownership digest of exactly what we just wrote, under the same spec lock
-    # that guards the write, so the recorded value and the bytes on disk move together. This
-    # is what a later rebuild (and the fork / capability gates) confirm the file against. A
-    # crash before this line leaves no digest, which fails CLOSED -- the next rebuild sees
-    # "no ownership recorded" and declines to overwrite rather than attributing a file it
-    # cannot confirm.
-    agent_state.set_managed_digest(_MANAGED_OWNED_NAME, agent_state.spec_digest(config))
+    agent_state.finalize_managed_write(_MANAGED_OWNED_NAME)
     agent_mod.logger.info("Installed dashboard-author agent config: %s", path)
 
 

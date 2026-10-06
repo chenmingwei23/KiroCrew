@@ -720,6 +720,7 @@ test/test_playwright_e2e.py
 test/test_pod_e2e_video_guard.py
 test/test_port_reclaim.py
 test/test_port_reclaim_cov80.py
+test/test_portability.py
 test/test_pptx_maker_decks.py
 test/test_pptx_maker_engine_source.py
 test/test_pptx_maker_library.py

@@ -2554,9 +2554,36 @@ def migrate_relocated_skill_uris() -> int:
                         present.add(new_uri)
                 if not changed:
                     continue
+                # The skill-URI migration is a managed WRITER of this spec. For the
+                # dashboard-author stem, decide ownership from the PRE-rewrite bytes and renew
+                # the digest after the write only when they were our confirmed managed write
+                # -- otherwise the installer would read its own migrated spec as foreign and
+                # stop re-filtering its grants against a tightened ceiling. A user file (no
+                # recorded digest) is never stamped. ``worker_agent`` is the module global
+                # bound by the core's tail import, resolved at call time.
+                pre_migration_confirmed = (
+                    str(name) == worker_agent._MANAGED_OWNED_NAME
+                    and spec_path.stem == (worker_agent._MANAGED_OWNED_NAME)
+                    and worker_agent._is_confirmed_managed_dashboard_author(data)
+                )
+                pre_migration_digest = (
+                    agent_state.spec_digest(data) if pre_migration_confirmed else None
+                )
                 data["resources"] = updated
                 try:
-                    _atomic_json_write(spec_path, data)
+                    if pre_migration_confirmed:
+                        # Two-phase: keep the current on-disk digest in the finalized slot,
+                        # record the migrated bytes' digest as pending, write, finalize -- so
+                        # an interruption leaves the file matching a recorded slot.
+                        agent_state.begin_managed_write(
+                            spec_path.stem,
+                            agent_state.spec_digest(data),
+                            current=pre_migration_digest,
+                        )
+                        _atomic_json_write(spec_path, data)
+                        agent_state.finalize_managed_write(spec_path.stem)
+                    else:
+                        _atomic_json_write(spec_path, data)
                     rewritten += 1
                 except OSError as exc:
                     logger.warning(
@@ -2852,21 +2879,33 @@ def reset_agent_model(name: str) -> tuple[Path, str]:
             raise FileNotFoundError(f"could not read agent spec {spec_path}: {exc}") from exc
         if not isinstance(data, dict):
             raise FileNotFoundError(f"agent spec {spec_path} is not readable as a JSON object")
+        # Snapshot the PRE-edit bytes to decide ownership BEFORE this writer mutates them:
+        # the digest is renewed below only when the file WAS already our confirmed managed
+        # write, never for a user file at the once-user-creatable stem.
+        pre_write_confirmed = name == worker_agent._MANAGED_OWNED_NAME and (
+            worker_agent._is_confirmed_managed_dashboard_author(data)
+        )
+        # Digest of the CURRENT on-disk bytes (pre-edit), captured before mutation so
+        # ``begin_managed_write`` can keep the file confirmable if this write is interrupted.
+        pre_write_digest = agent_state.spec_digest(data) if pre_write_confirmed else None
         previous = data.get("model") or ""
         clear_model_pin(data, name)
         # Same strip every spec writer runs: kiro-cli validates with
         # deny_unknown_fields and drops the whole agent on an unknown key.
         agent_state.lift_and_strip_bookkeeping(data, name)
         # An authorized reset of the managed dashboard-author spec legitimately rewrites its
-        # bytes. Ownership is the installer-recorded DIGEST, so after rewriting the bytes we
-        # must re-record the digest of what we just wrote -- otherwise the file would stop
-        # reproducing the recorded value and the installer would read its own just-edited
-        # spec as foreign and stop refreshing it. Done under this same spec lock, so the
-        # record and the file stay in step. Other owned stems carry no such record and need
-        # nothing here.
-        _atomic_json_write(spec_path, data)
-        if name == worker_agent._MANAGED_OWNED_NAME:
-            agent_state.set_managed_digest(name, agent_state.spec_digest(data))
+        # bytes. Ownership is the installer-recorded DIGEST, renewed ONLY when the PRE-edit
+        # content was already our confirmed managed write (``pre_write_confirmed``) -- a user
+        # file at the stem is never stamped. Two-phase so a crash cannot leave bytes and
+        # record out of step: record the new bytes' digest as pending, write, finalize.
+        if pre_write_confirmed:
+            agent_state.begin_managed_write(
+                name, agent_state.spec_digest(data), current=pre_write_digest
+            )
+            _atomic_json_write(spec_path, data)
+            agent_state.finalize_managed_write(name)
+        else:
+            _atomic_json_write(spec_path, data)
     return spec_path, str(previous)
 
 
@@ -3813,6 +3852,12 @@ def rebuild_agent_config(
         # reprojection memo behind so the next poll retries -- the safe direction the
         # success contract already documents for a post-write exception.
         dashboard_author_install_error = exc
+        # A tightened ceiling whose author-spec rewrite failed leaves revoked auto-
+        # approvals live. Mark the hold so ``prime_ceiling_projection`` does not seed
+        # the ceiling as projected, and ``retry_held_conductor_specs`` retries the
+        # rewrite on the next maintenance poll (GPT 6.1 F1: boot-time author install
+        # failures lose the governance retry).
+        _conductor_spec_held = True
         logger.warning(
             "kirocrew-dashboard-author agent install failed; completing independent repairs "
             "then failing the rebuild so a tightened ceiling is retried, not marked synced",
@@ -5372,13 +5417,24 @@ def _sanitize_agent_hooks() -> None:
     agents_dir = kiro_agents_dir_path()
     for filename in OWNED_KIRO_AGENT_FILES:
         f = agents_dir / filename
+        # Refuse a symlink or out-of-dir resolution BEFORE touching the file: the sweep
+        # reads every owned name, and following a link at an owned stem (e.g. one planted at
+        # kirocrew-dashboard-author.json pointing at ~/.docker/config.json) would read a
+        # file outside the agents dir. ``_spec_path_is_safe`` is the same no-follow fence the
+        # install and reset paths use; an absent file simply is not safe-and-present, so it
+        # is skipped here as before.
+        if not os.path.lexists(f) or not _spec_path_is_safe(f, agents_dir):
+            continue
         try:
             mtime = f.stat().st_mtime
         except OSError:
             continue
         if _hooks_sanitized_mtimes.get(str(f)) == mtime:
             continue
-        data = _load_json(f)
+        # Capped, no-follow read (the hardened spec reader) rather than ``_load_json``,
+        # which follows symlinks and is uncapped: a sweep over owned names must never slurp
+        # or launder a file the reader may not open.
+        data = _read_spec_capped(f)
         if not data:
             continue
         hooks = data.get("hooks")
@@ -5389,21 +5445,34 @@ def _sanitize_agent_hooks() -> None:
         if not removed_keys:
             _hooks_sanitized_mtimes[str(f)] = mtime
             continue
+        # Decide ownership from the PRE-sweep bytes: the digest is renewed below only when
+        # the file as READ already reproduced the recorded digest, i.e. it was our confirmed
+        # managed write. Keying on "a digest exists" (a stale record from a managed install
+        # the user later replaced at the stem) would stamp the user's swept bytes as managed
+        # and let the next rebuild overwrite them. ``worker_agent`` is a module global bound
+        # by the tail import below (like ``kiro_hooks`` above), resolved at call time.
+        stem = filename.removesuffix(".json")
+        pre_sweep_confirmed = stem == worker_agent._MANAGED_OWNED_NAME and (
+            worker_agent._is_confirmed_managed_dashboard_author(data)
+        )
+        pre_sweep_digest = agent_state.spec_digest(data) if pre_sweep_confirmed else None
         data["hooks"] = {
             key: value
             for key, value in hooks.items()
             if key not in kiro_hooks._LEGACY_KIROCREW_HOOK_KEYS
         }
-        _atomic_json_write(f, data)
-        # If this owned stem carries an installer-recorded ownership digest (today only the
-        # dashboard-author stem), the sweep just changed the bytes it was recorded against,
-        # so re-record the digest of what we wrote -- otherwise the installer would read its
-        # own swept file as foreign and stop refreshing it. A stem with no recorded digest
-        # (every other owned name) is unaffected: get returns None and set clears nothing.
-        if agent_state.get_managed_digest(filename.removesuffix(".json")) is not None:
-            agent_state.set_managed_digest(
-                filename.removesuffix(".json"), agent_state.spec_digest(data)
+        # The sweep changes the bytes the ownership digest was recorded against. Renew it to
+        # match -- but ONLY when the pre-sweep file was already our confirmed managed write
+        # (``pre_sweep_confirmed``); a user file is never stamped. Two-phase so a crash leaves
+        # bytes and record in step: record the swept bytes' digest as pending, write, finalize.
+        if pre_sweep_confirmed:
+            agent_state.begin_managed_write(
+                stem, agent_state.spec_digest(data), current=pre_sweep_digest
             )
+            _atomic_json_write(f, data)
+            agent_state.finalize_managed_write(stem)
+        else:
+            _atomic_json_write(f, data)
         _hooks_sanitized_mtimes[str(f)] = f.stat().st_mtime
         logger.info("Removed legacy Kiro Crew hook keys %s from %s", removed_keys, f.name)
         sel().log_api_access(
