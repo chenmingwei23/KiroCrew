@@ -6626,6 +6626,24 @@ class DashboardState:
             slot = self.get_slot(slot_key)
             if slot is None:
                 return
+            # Deferred card notes are slot-side buffers; the watchdog reset
+            # discards the runtime but not this slot, so the held notes are
+            # still in ``slot._deferred_notes`` here. Flush them before the
+            # banner below claims history is preserved, so they become
+            # delivered rows the normal save persists and the claim holds.
+            # Every interactive reset path (chat_orchestrator / chat_handlers /
+            # chat_runner) flushes at the same seam. The flush restores its
+            # unwritten suffix and keeps the durable hold on failure
+            # (at-least-once), so a raise here leaves the notes for the next
+            # restart to deliver rather than dropping them.
+            try:
+                slot.flush_deferred_notes()
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to flush deferred notes before recycling slot %s; "
+                    "they remain in the durable hold for the next restart",
+                    slot_key,
+                )
             message = _SESSION_RECYCLED_NOTICE.format(reason=reason)
             try:
                 # Tag kind="compaction" so the dashboard's follow-up [OPTIONS:]
