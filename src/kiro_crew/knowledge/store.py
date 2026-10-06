@@ -1429,6 +1429,138 @@ class KnowledgeStore:
             if self._graph_loaded:
                 self._load_graph()
 
+    def reclaim_agent_source_residue(self) -> int:
+        """Delete items in the ``agent://`` aggregate that no state row names.
+
+        The agent and artifact aggregates record which document owns a group of
+        items in a state table (``agent_item_state`` / ``artifact_item_state``),
+        and write that row from inside the ingest's uncancellable finalize hop
+        -- so a plain *cancellation* leaves the row written. A HARD KILL is
+        narrower and still open: the item chunks, the previous group's
+        ``delete_items_batch`` and the state-row write are separate commits on an
+        autocommit connection, so a process killed between the item commit and
+        the row commit leaves committed items that no row names. The replacement
+        path keys off that row, so the next add of the same document adds a
+        second copy instead of replacing the first -- the duplicate this sweep
+        repairs. Nothing on the agent path reaps by absence (there is no
+        reconcile pass, unlike the folder watcher and ``reconcile_artifacts``),
+        so the residue is permanent until this sweep removes it.
+
+        SCOPED TO THE ``agent://`` SOURCE ALONE, and that scope is load-bearing,
+        not tidiness. "No state row names this item" is a safe residue test ONLY
+        where every legitimate item is owned, and a bundle import is what breaks
+        that elsewhere: ``_BUNDLE_STATE_RESTORED_TABLES`` is ``{agent_item_state}``,
+        so a bundle restores an agent document's ownership row but deliberately
+        carries NO ``folder_file_state`` / ``artifact_item_state`` row (those two
+        tables are reaped by absence by their owners, so importing one would be an
+        order to delete the items the import just brought).
+        Folder- and artifact-backed items therefore arrive unowned BY DESIGN, and
+        a sweep keyed on absence would delete every one a bundle ever imported.
+        For the agent aggregate alone the ambiguity does not exist: a bundle
+        brings the owning row with the items, so an unowned agent-source item is
+        provably crash residue and never a legitimate import.
+
+        An item another source also holds (a dedup co-location) is DETACHED, not
+        destroyed: ``delete_items_batch_in_txn`` with ``owner_source_id`` moves
+        ownership to a surviving holder and drops only the agent source's
+        location row. Only an item no other source holds is removed outright.
+
+        Runs off the boot path inside ``maintenance_window`` like
+        :meth:`reclaim_orphans`: that waits for in-flight ingestion to drain and
+        holds new ingestion off, so an item still mid-ingest -- committed but not
+        yet named by its finalize hop -- is never read as residue. Returns the
+        number of residue items removed.
+        """
+        agent_src = self.get_source_by_uri("agent://")
+        if not agent_src:
+            return 0
+        source_id = agent_src["id"]
+
+        def _owned_ids() -> set[str] | None:
+            """Every item id a live state row names for this source.
+
+            A row left by a refused write owns an empty group and names nothing,
+            which is correct: its items were adopted by the winner's row and are
+            named THERE. Returns ``None`` -- "cannot tell, do not sweep" -- if
+            ANY row's ``item_ids`` is unreadable: the owned set would then be
+            missing items that are genuinely owned, and treating those as residue
+            would delete owned content. A stale item is recoverable; a
+            wrongly-deleted one is not, so the whole sweep stands down for this
+            source until the corruption is resolved.
+            """
+            ids_owned: set[str] = set()
+            for row in self.db.execute(
+                    "SELECT item_ids FROM agent_item_state WHERE source_id = ?",
+                    (source_id,)).fetchall():
+                raw = row["item_ids"]
+                if raw in (None, ""):
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, ValueError):
+                    return None
+                if isinstance(parsed, list):
+                    ids_owned.update(i for i in parsed if isinstance(i, str))
+            return ids_owned
+
+        owned = _owned_ids()
+        if owned is None:
+            return 0
+        # Active items under the agent source that no row owns. Read outside the
+        # transaction; each delete chunk re-derives ownership under the writer
+        # lock so a row written between the read and the delete still protects
+        # its items.
+        residue = [
+            row["id"] for row in self.db.execute(
+                "SELECT id FROM items WHERE source_id = ? AND status = 'active'",
+                (source_id,)).fetchall()
+            if row["id"] not in owned
+        ]
+        if not residue:
+            return 0
+        removed = 0
+        for offset in range(0, len(residue), _RECLAIM_CHUNK):
+            chunk = residue[offset:offset + _RECLAIM_CHUNK]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-read ownership under the lock: an ingest that committed its
+                # row after the candidate read above must not have its items
+                # swept. A row written in the gap names them now, so they drop
+                # out of ``still_residue`` and survive. An unreadable group that
+                # appeared in the gap stands the sweep down for the same
+                # fail-safe reason as the initial read.
+                owned_now = _owned_ids()
+                if owned_now is None:
+                    self.db.execute("COMMIT")
+                    break
+                # And the item must still exist and still belong to this source.
+                still_present = {
+                    r["id"] for r in self.db.execute(
+                        f"SELECT id FROM items WHERE source_id = ? "  # noqa: S608
+                        f"AND id IN ({','.join('?' * len(chunk))})",
+                        (source_id, *chunk)).fetchall()
+                }
+                still_residue = [
+                    i for i in chunk if i in still_present and i not in owned_now
+                ]
+                if still_residue:
+                    # owner_source_id => an item another source co-holds is
+                    # detached to that holder, only a truly single-held item is
+                    # destroyed. Same semantics the live delete paths use.
+                    self.delete_items_batch_in_txn(
+                        still_residue, owner_source_id=source_id)
+                    removed += len(still_residue)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        if removed:
+            self.reload_graph()
+            logger.info(
+                "knowledge: reclaimed %d orphaned item(s) in the agent aggregate "
+                "source left by an interrupted ingest", removed)
+        return removed
+
     def _prune_orphan_entities(self) -> None:
         """Delete entities nothing references any more -- no mention, no relation.
 
