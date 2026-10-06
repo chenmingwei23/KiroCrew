@@ -349,10 +349,12 @@ Each cycle:
    title, a file path a worker named. As a tool, the whole `items` document is a
    structured argument, so a `file` path carrying a single quote is just a string
    value — there is no shell to interpret it, no heredoc to get right, and no
-   `<this skill's dir>` path to resolve. Its calls pass the `hooks.on_tool_call`
-   gate like any other tool, so the sensitive-path floor governs a `file` path
-   and the denied-command floor governs anything it would run — neither of which
-   a bundled script invoked through `execute_bash` could reach.
+   `<this skill's dir>` path to resolve. The tool validates a `file` path through
+   the shared file-access gate (the Windows UNC trusted-root gate and the
+   sensitive-path check) before touching it, and it builds every command it runs
+   from a fixed template rather than from the spec — those two controls, not a
+   deny floor, are what keep a spec from naming a path or a command the tool
+   would act on.
 
    Evaluate **every `done` item in ONE call** — one batched call per cycle — then
    record each answer with `work_ledger_record` `action=verdict` (with `fails`
@@ -665,14 +667,13 @@ what the composer renders:
   every call is audit-logged and every call prompts. The evaluator is the
   `accept_eval` tool, and it accepts **no command, argv array, or shell string
   from a spec** — it builds every argv it runs from a fixed template, so
-  `pr_checks` becomes `gh pr checks <n>` and nothing else executes. That is
-  deliberate and load-bearing: a spec that could name a command would turn the
-  evaluator into a general way to run one. Because it is now an MCP tool rather
-  than a script behind `execute_bash`, its calls pass the `hooks.on_tool_call`
-  gate, so Kiro Crew's denied-command floor governs anything it would run and
-  the sensitive-path floor governs a `file` path — the floors a bundled script
-  invoked through `execute_bash` could not reach (the gate saw only the
-  `python3 <script>` command string, with the real argv on stdin). Widening
-  happens by adding a purpose-built kind that constructs its own argv — never by
-  accepting one. A `refused` verdict is a spec to re-express, never a list to
-  route around.
+  `pr_checks` becomes `gh pr checks <n>` and nothing else executes. That fixed
+  template is the real and only control over what the tool runs: the
+  `hooks.on_tool_call` deny floor matches the tool CALL (`accept_eval(items=…)`),
+  not a subprocess the tool spawns, so it never sees the `gh` argv — and a new
+  kind's binary runs auto-approved past no deny floor. A `file` path has a
+  second real control: the tool validates it through the shared file-access gate
+  (the Windows UNC trusted-root gate and `is_sensitive_path`) before touching it.
+  Widening happens by adding a purpose-built kind that constructs its own argv —
+  never by accepting one, because the template is what keeps the invariant. A
+  `refused` verdict is a spec to re-express, never a list to route around.

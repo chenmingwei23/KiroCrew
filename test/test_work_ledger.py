@@ -493,26 +493,49 @@ def test_apply_worker_report_has_no_conductor_field_parameter():
     assert not names & {"verdict", "state", "acceptance", "decision", "fails", "round_number"}
 
 
-def _ledger_conductor_accept_eval() -> Path:
-    """The evaluator copy the conductor actually runs.
-
-    ``goal-conductor`` is the skill that consumes ``accept_batch``, so the mirror in
-    :func:`work_ledger.is_acceptance_concrete` is pinned against ITS copy. The
-    deprecated ``goal-ledger-conductor`` ships a byte-identical copy for one release
-    (held so by ``test_ledger_conductor_agent.py``), and this helper names the live
-    consumer rather than that one.
-    """
-    script = (
+def _accept_eval_tool_source() -> Path:
+    """The source of the evaluator the conductor actually runs: the ``accept_eval``
+    MCP tool. ``is_acceptance_concrete`` mirrors this module's per-kind guards, so
+    the mirror is pinned against it rather than against a remembered reading."""
+    source = (
         Path(__file__).resolve().parents[1]
         / "src"
         / "kiro_crew"
-        / "builtin_skills"
-        / "goal-conductor"
-        / "scripts"
+        / "kiro_crew"
+        / "mcp_tools"
         / "accept_eval.py"
     )
-    assert script.is_file(), script
-    return script
+    # The package lives under src/kiro_crew/kiro_crew on some layouts and
+    # src/kiro_crew on others; resolve whichever exists.
+    if not source.is_file():
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "kiro_crew"
+            / "mcp_tools"
+            / "accept_eval.py"
+        )
+    assert source.is_file(), source
+    return source
+
+
+def _run_accept_eval_tool(batch: dict) -> dict:
+    """Evaluate *batch* through the real ``accept_eval`` tool handler, returning the
+    parsed ``{"results": [...]}``. Calls the handler in-process (no subprocess) with
+    the SEL writer stubbed, so the deterministic kinds are exercised exactly as the
+    conductor would run them."""
+    from unittest.mock import patch
+
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import accept_eval as _tool
+
+    class _NoopSel:
+        def log_tool_invocation(self, **kwargs: object) -> None:
+            return None
+
+    with patch.object(mcp_core, "sel", lambda: _NoopSel()):
+        out = _tool.accept_eval("accept_eval", {"items": batch["items"]})
+    return json.loads(out)
 
 
 def _claimed_pr_reaches_a_bar(batch: dict, claimed: int) -> bool:
@@ -686,25 +709,21 @@ def test_the_kind_vocabulary_is_derived_from_accept_eval_not_remembered():
     added there would otherwise make every item using it vanish from every batch under
     a misleading "not filled in yet". Read the chain and require agreement, so drift
     fails here instead of silently dropping work items."""
-    source = _ledger_conductor_accept_eval().read_text(encoding="utf-8")
+    source = _accept_eval_tool_source().read_text(encoding="utf-8")
     dispatched = set(re.findall(r'kind == "([a-z_]+)"', source))
     assert dispatched, "the dispatch chain could not be read — the pattern moved"
     assert dispatched == set(wl.ACCEPTANCE_READ_FIELDS), (dispatched, wl.ACCEPTANCE_KINDS)
 
 
 def test_the_concreteness_rules_are_exactly_accept_evals_error_only_guards():
-    """The predicate duplicates that script's guards across a process boundary, so pin
-    the two against each other rather than against a remembered reading of it: every
-    spec this store calls non-concrete must come back ``error``, and every spec it
-    passes must come back something else.
+    """The predicate duplicates the evaluator's guards, so pin the two against each
+    other rather than against a remembered reading of it: every spec this store calls
+    non-concrete must come back ``error``, and every spec it passes must come back
+    something else.
 
     Only specs that evaluate WITHOUT network are used — a valid ``pr_checks`` would
     shell out to ``gh``, so it is asserted concrete here and evaluated nowhere.
     """
-    import subprocess
-    import sys
-
-    script = _ledger_conductor_accept_eval()
     specs = [
         {"kind": "pr_checks", "pr": "TBD", "repo": "owner/name"},
         {"kind": "pr_checks", "repo": "owner/name"},
@@ -718,16 +737,7 @@ def test_the_concreteness_rules_are_exactly_accept_evals_error_only_guards():
         {"kind": "cmd", "argv": ["git", "status"]},
     ]
     batch = {"items": [{"id": f"it_{n:08d}", "accept": spec} for n, spec in enumerate(specs)]}
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        input=json.dumps(batch),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=60,
-    )
-    assert proc.returncode == 0, proc.stderr
-    verdicts = [row["verdict"] for row in json.loads(proc.stdout)["results"]]
+    verdicts = [row["verdict"] for row in _run_accept_eval_tool(batch)["results"]]
     assert len(verdicts) == len(specs)
     for spec, verdict in zip(specs, verdicts):
         concrete = wl.is_acceptance_concrete(spec)
@@ -801,32 +811,12 @@ def test_accept_batch_drops_terminal_items_and_items_with_no_bar():
 
 
 def test_accept_batch_is_what_accept_eval_reads_end_to_end():
-    """The keys are accept_eval.py's, not this store's: pipe the batch through the
-    real script and every item must come back under its own id, not a positional
-    fallback like ``#0``."""
-    import subprocess
-    import sys
-
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "kiro_crew"
-        / "builtin_skills"
-        / "goal-conductor"
-        / "scripts"
-        / "accept_eval.py"
-    )
+    """The keys are the ``accept_eval`` tool's, not this store's: run the batch
+    through the real tool and every item must come back under its own id, not a
+    positional fallback like ``#0``."""
     item_id = _new_item(acceptance={"kind": "human_approval"})
     batch = wl.accept_batch(wl.list_work_items(CONDUCTOR))
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        input=json.dumps(batch),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=60,
-    )
-    results = json.loads(proc.stdout)["results"]
+    results = _run_accept_eval_tool(batch)["results"]
     assert [r["id"] for r in results] == [item_id]
     assert results[0]["verdict"] in wl.VERDICTS
     assert results[0]["verdict"] != "error"

@@ -152,12 +152,12 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
         frozenset({"session", "report", "tool_search", "@kirocrew-core"})
         | _HISTORY_CORE_VERBS
         | {"@kirocrew-core/select_crew"}
-        # The acceptance evaluator, migrated from the bundled script to a core
-        # MCP tool in #5926. Added to the goal conductor and its ledger alias
-        # (the two specs that ship it via ``_CONDUCTOR_CORE_GRANTS``) rather
-        # than to the shared ``_HISTORY_CORE_VERBS``: the pipeline and security
-        # conductors do NOT ship it, and a shared entry would read as a
-        # retirement on those specs and trip the residue pin.
+        # The acceptance evaluator (the ``accept_eval`` core tool). Listed on
+        # the goal conductor and its ledger alias (the two specs that ship it
+        # via ``_CONDUCTOR_CORE_GRANTS``) rather than on the shared
+        # ``_HISTORY_CORE_VERBS``: the pipeline and security conductors do NOT
+        # ship it, and a shared entry would read as a retirement on those specs
+        # and trip the residue pin.
         | {"@kirocrew-core/accept_eval"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}

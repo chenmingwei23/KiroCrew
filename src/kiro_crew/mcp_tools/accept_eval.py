@@ -1,25 +1,33 @@
 """The acceptance evaluator MCP tool: one tool, kind-discriminated batches.
 
-Migrated from ``builtin_skills/goal-conductor/scripts/accept_eval.py`` so that
-every call passes ``hooks.on_tool_call`` and the floors (denied-command,
-sensitive-path, governance ceiling) apply structurally rather than by argument.
-
 ``schemas()`` returns the ADVERTISEMENT half; ``HANDLERS`` maps the name to the
 function that runs it. Both halves live here so the contract and behavior are
 read together (same template as ``logs.py``, ``skills.py``).
 
-THE SECURITY INVARIANT (carried from the script, do not weaken):
+THE SECURITY INVARIANT (do not weaken):
 
     No model-authored argv ever reaches subprocess.
 
-Every argv this handler runs is built HERE, from a fixed template, out of
-narrowly-typed spec fields. ``_SELF_BUILT_COMMANDS`` is the internal assertion
-that this stayed true.
+This is the real control, and it is the ONLY one over what the tool runs: the
+``hooks.on_tool_call`` gate matches its deny list against the tool CALL
+(``accept_eval(items=...)``) and never against a subprocess the handler spawns
+inside the server, so no deny floor backs ``gh``. Instead, every argv this
+handler runs is built HERE from a fixed template out of narrowly-typed spec
+fields — a spec names a PR number or a path, never a command, an argv array or a
+shell string. ``_SELF_BUILT_COMMANDS`` is the internal assertion that this
+holds: a handler that leaked spec input into an exec path fails closed.
+
+The ``file`` kind has a second, real control: it validates its path through
+``hooks.safe_reads.validate_file_path`` (the Windows UNC trusted-root gate, the
+link-target screen, and ``is_sensitive_path``) before any existence check, so a
+spec cannot make the tool touch ``\\\\host\\share`` or a credential path.
 
 HOW TO WIDEN IT (the supported path):
 
-    Add a new ``kind`` whose handler builds its own argv. Never re-introduce a
-    kind that takes a command, an argv array, or a shell string from the spec.
+    Add a new ``kind`` whose handler builds its own argv. Never add a kind that
+    takes a command, an argv array, or a shell string from the spec. A new
+    binary is auto-approved and reaches no deny floor, so the fixed-template
+    invariant — not a floor — is what makes adding one a reviewable decision.
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import mcp_core
-from kiro_crew.security.paths import is_sensitive_path
+from kiro_crew.hooks import validate_file_path
 from kiro_crew.validation import ACCEPT_EVAL_MAX_ITEMS
 
 # ── Constants ──
@@ -48,7 +56,7 @@ EVIDENCE_TAIL_CHARS = 500
 _GH_PENDING_EXIT = 8
 
 
-# ── Helpers (carried verbatim from the script) ──
+# ── Helpers ──
 
 
 def _tail(text: str) -> str:
@@ -145,20 +153,25 @@ def _evaluate(item: dict) -> tuple[str, str]:
         path = accept.get("path")
         if not isinstance(path, str) or not path:
             return ("error", "file spec needs a path")
-        # Consult the sensitive-path floor: the ``on_tool_call`` gate cannot see
-        # a path nested inside items[].accept.path, so the handler checks it
-        # explicitly.  This is the migration's core safety gain for the ``file``
-        # kind — the floor was unreachable when the evaluator ran as a script.
-        if is_sensitive_path(path):
-            return (
-                "refused",
-                "path is sensitive and cannot be checked by the evaluator",
-            )
         exists = accept.get("exists", True)
         if not isinstance(exists, bool):
             return ("error", "file spec needs a boolean exists")
+        # Validate the path through the shared file-access gate BEFORE any
+        # existence check. ``validate_file_path`` enforces the Windows UNC
+        # trusted-root gate (a bare ``Path(path).exists()`` on ``\\host\share``
+        # is itself an outbound SMB authentication), the link-target screen, and
+        # ``is_sensitive_path``, then canonicalizes — returning ``None`` on any
+        # rejection. The ``on_tool_call`` gate cannot see a path nested inside
+        # ``items[].accept.path``, so the handler applies this gate itself.
+        canonical = validate_file_path(path)
+        if canonical is None:
+            return (
+                "refused",
+                "path is sensitive, outside a trusted root, or not a checkable "
+                "file path, so the evaluator will not probe it",
+            )
         want = exists
-        have = Path(path).exists()
+        have = Path(canonical).exists()
         verdict = "pass" if have == want else "fail"
         return (verdict, f"{path} {'exists' if have else 'does not exist'}")
     if kind == "human_approval":
@@ -219,18 +232,14 @@ def accept_eval(name: str, args: dict[str, Any]) -> str:
             outcome="error",
             metadata={"error": "too many items", "count": len(items)},
         )
-        return json.dumps(
-            {"error": f"too many items: {len(items)} exceeds the {_MAX_ITEMS} cap"}
-        )
+        return json.dumps({"error": f"too many items: {len(items)} exceeds the {_MAX_ITEMS} cap"})
 
     results = []
     for position, item in enumerate(items):
         item_id = f"#{position}"
         try:
             if not isinstance(item, dict):
-                raise TypeError(
-                    f"item must be a JSON object, got {type(item).__name__}"
-                )
+                raise TypeError(f"item must be a JSON object, got {type(item).__name__}")
             item_id = str(item.get("id", item_id))
             verdict, evidence = _evaluate(item)
         except Exception as exc:
@@ -252,6 +261,7 @@ def accept_eval(name: str, args: dict[str, Any]) -> str:
 
 
 # ── Registration ──
+
 
 def schemas() -> list[dict[str, Any]]:
     """Descriptor for the acceptance evaluator tool."""

@@ -1,10 +1,9 @@
 """The ``accept_eval`` MCP tool: verdict vocabulary, the no-model-argv invariant,
-the sensitive-path floor the migration newly reaches, and batch isolation.
+the sensitive-path floor the ``file`` kind enforces, and batch isolation.
 
-Migrated from the bundled ``goal-conductor/scripts/accept_eval.py`` (#5926).
-The script stays in the tree as the ledger's pinned reference implementation;
-these tests assert the TOOL mirrors its behaviour and adds the floors it could
-not reach as a script invoked through ``execute_bash``.
+The tool is the sole acceptance evaluator — the work ledger's contract
+(`work_ledger.py`) is pinned to it, and `test_work_ledger.py` runs its
+`accept_batch` through this very handler.
 
 The handler is called directly — the registry wiring is covered by
 ``test_mcp_tool_registry`` — with ``mcp_core.sel`` stubbed so the real async SEL
@@ -34,8 +33,8 @@ class _NoopSel:
 
 
 @pytest.fixture(autouse=True)
-def _stub_sel(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mcp_core, "sel", lambda: _NoopSel())
+def _stub_sel(_floor_monkeypatch: pytest.MonkeyPatch) -> None:
+    _floor_monkeypatch.setattr(mcp_core, "sel", lambda: _NoopSel())
 
 
 def _eval(items: list) -> list[dict]:
@@ -65,7 +64,9 @@ def test_file_kind_pass_and_fail(tmp_path: Path) -> None:
 def test_file_absent_exists_key_defaults_to_presence(tmp_path: Path) -> None:
     present = tmp_path / "here"
     present.write_text("x", encoding="utf-8")
-    (verdict,) = (r["verdict"] for r in _eval([{"id": "1", "accept": {"kind": "file", "path": str(present)}}]))
+    (verdict,) = (
+        r["verdict"] for r in _eval([{"id": "1", "accept": {"kind": "file", "path": str(present)}}])
+    )
     assert verdict == "pass"
 
 
@@ -102,23 +103,25 @@ def test_pr_checks_rejects_a_non_integer_pr() -> None:
         assert "integer pr" in r["evidence"]
 
 
-# ── The sensitive-path floor the migration newly reaches ──
+# ── The sensitive-path floor the file kind enforces ──
 
 
 def test_a_sensitive_file_path_is_refused() -> None:
-    """A ``file`` spec that names a credential path is refused — the floor the
-    bundled script could not reach because the path arrived nested on stdin,
-    past the ``execute_bash`` gate. The tool consults ``is_sensitive_path``
-    directly because ``on_tool_call`` cannot see a path nested inside
-    ``items[].accept.path`` either."""
-    (r,) = _eval([{"id": "1", "accept": {"kind": "file", "path": str(Path.home() / ".aws" / "credentials")}}])
+    """A ``file`` spec naming a credential path is refused. The tool validates
+    the path through ``hooks.safe_reads.validate_file_path`` (sensitive-path +
+    the Windows UNC gate) because ``on_tool_call`` cannot see a path nested
+    inside ``items[].accept.path``."""
+    (r,) = _eval(
+        [{"id": "1", "accept": {"kind": "file", "path": str(Path.home() / ".aws" / "credentials")}}]
+    )
     assert r["verdict"] == "refused"
-    assert "sensitive" in r["evidence"]
 
 
-def test_a_sensitive_path_refusal_does_not_touch_the_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The refusal is decided on the spec, before any ``Path.exists`` — so a
-    sensitive path is never stat-ed, the point of a floor that governs reads."""
+def test_a_rejected_path_does_not_touch_the_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refusal is decided by ``validate_file_path`` returning ``None``,
+    BEFORE any existence check — so a path the gate rejects is never probed,
+    which is the point for a UNC path whose probe would be an outbound SMB
+    authentication."""
     import kiro_crew.mcp_tools.accept_eval as m
 
     called = {"exists": 0}
@@ -128,10 +131,30 @@ def test_a_sensitive_path_refusal_does_not_touch_the_filesystem(monkeypatch: pyt
         called["exists"] += 1
         return real_exists(self)
 
+    monkeypatch.setattr(m, "validate_file_path", lambda raw: None)
     monkeypatch.setattr(Path, "exists", counting_exists)
-    _eval([{"id": "1", "accept": {"kind": "file", "path": str(Path.home() / ".ssh" / "id_rsa")}}])
+    (r,) = _eval([{"id": "1", "accept": {"kind": "file", "path": "/anything"}}])
+    assert r["verdict"] == "refused"
     assert called["exists"] == 0
-    assert m  # module referenced
+
+
+def test_a_validated_path_is_the_one_probed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existence is checked on the CANONICAL path ``validate_file_path`` returns,
+    not on the raw spec string — so canonicalization (and its UNC/link screen)
+    is on the path to any filesystem touch."""
+    import kiro_crew.mcp_tools.accept_eval as m
+
+    probed: list[str] = []
+    real_exists = Path.exists
+
+    def recording_exists(self: Path) -> bool:
+        probed.append(str(self))
+        return real_exists(self)
+
+    monkeypatch.setattr(m, "validate_file_path", lambda raw: "/canonical/here")
+    monkeypatch.setattr(Path, "exists", recording_exists)
+    _eval([{"id": "1", "accept": {"kind": "file", "path": "/raw/spec"}}])
+    assert probed == [str(Path("/canonical/here"))]
 
 
 # ── The no-model-argv invariant ──
@@ -208,7 +231,9 @@ def test_items_must_be_a_list() -> None:
 
 
 def test_over_cap_batch_is_refused() -> None:
-    too_many = [{"id": str(i), "accept": {"kind": "human_approval"}} for i in range(tool._MAX_ITEMS + 1)]
+    too_many = [
+        {"id": str(i), "accept": {"kind": "human_approval"}} for i in range(tool._MAX_ITEMS + 1)
+    ]
     out = json.loads(tool.accept_eval("accept_eval", {"items": too_many}))
     assert "error" in out
     assert "too many items" in out["error"]

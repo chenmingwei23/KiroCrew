@@ -154,15 +154,14 @@ def test_the_doc_quotes_the_real_title_cap(doc_text: str) -> None:
 def test_the_doc_lists_every_acceptance_kind_the_evaluator_handles(doc_text: str) -> None:
     """The three kinds are named, and the removed ``cmd`` kind is not offered.
 
-    Read out of the evaluator's own dispatch rather than from a list: the script is
-    the thing a conductor runs, so its branches are the real vocabulary.
+    Read out of the evaluator's own dispatch rather than from a list: the
+    ``accept_eval`` tool is the thing a conductor runs, so its branches are the
+    real vocabulary.
     """
-    script = (
-        _REPO_ROOT / "src/kiro_crew/builtin_skills/goal-conductor/scripts/accept_eval.py"
-    ).read_text(encoding="utf-8")
+    source = (_REPO_ROOT / "src/kiro_crew/mcp_tools/accept_eval.py").read_text(encoding="utf-8")
     handled = {
         line.split('== "', 1)[1].split('"', 1)[0]
-        for line in script.splitlines()
+        for line in source.splitlines()
         if line.strip().startswith('if kind == "')
     }
     assert "cmd" in handled, "the cmd branch is what refuses a command-shaped spec"

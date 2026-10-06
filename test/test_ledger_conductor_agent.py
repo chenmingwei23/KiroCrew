@@ -276,26 +276,12 @@ def test_the_index_line_sends_a_reader_to_the_live_skill():
     assert "goal-conductor" in line
 
 
-def test_the_skill_ships_only_the_evaluator():
-    """The item-entry codec belongs to a conductor with no item store. This flow
-    has a store, so shipping the codec here would invite the double-bookkeeping
-    the procedure forbids."""
-    scripts = {p.name for p in (SKILL_DIR / "scripts").glob("*.py")}
-    assert scripts == {"accept_eval.py"}
-
-
-def test_the_evaluator_is_a_regular_file_not_a_symlink():
-    """The builtin-skill scope gate refuses a symlink before any read, and a wheel
-    carries one poorly. The copy is deliberate."""
-    script = SKILL_DIR / "scripts" / "accept_eval.py"
-    assert script.is_file()
-    assert not script.is_symlink()
-
-
-def test_the_evaluator_is_byte_identical_to_the_shipped_one():
-    """Two copies that drift are two acceptance bars. The RFC's whole reason for
-    storing ``acceptance`` verbatim is that ONE script parses it, so a divergence
-    here is a defect rather than a variant — and a session that loaded the old
-    skill name keeps a working evaluator until the name is removed."""
-    shipped = SKILL_DIR.parent / "goal-conductor" / "scripts" / "accept_eval.py"
-    assert (SKILL_DIR / "scripts" / "accept_eval.py").read_bytes() == shipped.read_bytes()
+def test_the_alias_ships_no_bundled_scripts():
+    """The evaluator is the ``accept_eval`` MCP tool, so the alias ships no
+    bundled script at all — a second on-disk copy would be a second acceptance
+    bar that could drift from the tool. The ``scripts`` directory is absent (or
+    empty) here; the procedure, including its patrol scripts, lives on
+    ``goal-conductor``."""
+    scripts_dir = SKILL_DIR / "scripts"
+    present = {p.name for p in scripts_dir.glob("*.py")} if scripts_dir.is_dir() else set()
+    assert present == set()

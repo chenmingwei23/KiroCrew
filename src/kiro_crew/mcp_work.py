@@ -142,7 +142,7 @@ _ACCEPTANCE_CAP_CHARS = 4_000
 
 _TRUNCATION_HINT = (
     "Over the read budget. Event tails were emptied, then oversized acceptances "
-    "elided (accept_eval.py answers error for an elided bar; shrink it with an "
+    "elided (the accept_eval tool answers error for an elided bar; shrink it with an "
     "accept write), then rows dropped: closed items first, then open items "
     "oldest-created first. The newest open item is always kept. Re-read with "
     "item_id=<id> for one item, state=open, or compact=true."
@@ -388,8 +388,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Read the work ledger this conductor session owns: the conductor "
                 "record, every item with all its fields, each item's derived 'orphaned', "
                 "'stale' and 'acceptance_concrete' flags, the newest events per item, and "
-                "a ready-to-pipe 'accept_batch' document for the goal-conductor skill's "
-                "accept_eval.py. The ledger is your own. With no arguments that is the "
+                "a ready-to-pass 'accept_batch' document for the goal-conductor skill's "
+                "accept_eval tool. The ledger is your own. With no arguments that is the "
                 "whole board, each item with its last 20 events; every argument NARROWS "
                 "it. compact=true is the cheap patrol read: per item only item_id, title, "
                 "state, created_at, status, summary, decision, verdict, pr, worker_session_key, "
@@ -406,7 +406,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "green pull request. It also leaves out every terminal item, and any "
                 "item whose bar is not concrete yet — an unknown kind, or a placeholder ('TBD', blank) or wrong type in a "
                 "field the evaluator reads for that kind, such as a pr_checks pr that is "
-                "not a positive integer — because accept_eval.py can only answer 'error' "
+                "not a positive integer — because the accept_eval tool can only answer 'error' "
                 "to those; a placeholder in a field it never reads costs an item nothing. "
                 "For an open item, its 'acceptance_concrete' flag is why it is missing, and an "
                 "'accept' write puts it back. Each entry carries that item's status so you can "
@@ -478,7 +478,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "acceptance; 'bind' attaches a worker session key to an item — do this "
                 "BEFORE seeding that session, so the worker never starts unbound; "
                 "'decide' records what you decided and why (the one field a worker reads "
-                "as an instruction); 'verdict' records accept_eval.py's verdict and the "
+                "as an instruction); 'verdict' records the accept_eval tool's verdict and the "
                 "fail count; 'accept' promotes a worker's claimed pr into the item's "
                 "acceptance once you have checked it; 'close' stamps a terminal state. "
                 "Caps refuse rather than truncate, naming the field. The whole write is "
@@ -519,7 +519,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "acceptance": {
                         "type": "object",
                         "description": (
-                            "create / accept: the accept_eval.py condition object, stored "
+                            "create / accept: the accept_eval tool's condition object, stored "
                             'verbatim — e.g. {"kind": "pr_checks", "pr": 123, '
                             '"repo": "owner/name"}.'
                         ),
@@ -538,7 +538,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "verdict": {
                         "type": "string",
                         "enum": ["pass", "fail", "pending", "refused", "error"],
-                        "description": "verdict: accept_eval.py's own five-value answer.",
+                        "description": "verdict: the accept_eval tool's own five-value answer.",
                     },
                     "state": {
                         "type": "string",

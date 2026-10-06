@@ -53,7 +53,7 @@ sequenceDiagram
     C->>L: work_ledger_record action=accept (item_id, acceptance with the real pr)
     L-->>C: the bar now names the checked pull request
 
-    C->>E: accept_eval.py over the promoted acceptance
+    C->>E: accept_eval tool over the promoted acceptance
     E-->>C: pass / fail / pending / refused / error
     C->>L: work_ledger_record action=verdict (item_id, verdict, fails)
 
@@ -77,7 +77,7 @@ sequenceDiagram
 
 **`done` is a claim.** A worker calling `work_report status=done` says it believes the acceptance condition is met and puts its evidence in `artifacts` and `pr`. It has no parameter that writes a verdict, a state, or an acceptance condition.
 
-**`verdict` is the evaluator's answer.** It carries `accept_eval.py`'s own five values — `pass`, `fail`, `pending`, `refused`, `error` — recorded under the conductor's key after the script ran. A claim and a verdict are therefore two different facts about the same item, and both are stored.
+**`verdict` is the evaluator's answer.** It carries the `accept_eval` tool's own five values — `pass`, `fail`, `pending`, `refused`, `error` — recorded under the conductor's key. A claim and a verdict are therefore two different facts about the same item, and both are stored.
 
 **`accept` is why a `pr` claim is not self-serving.** `accept_batch` is composed from each item's stored `acceptance` alone and deliberately ignores whatever `pr` a worker reported, so a worker cannot point the bar at someone else's green pull request. Promoting the number into the bar is a separate conductor write, made after the conductor has read and checked it, and it refuses to clear the bar rather than accepting an empty condition.
 

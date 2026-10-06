@@ -4,7 +4,7 @@ Pins what the conductor-work-ledger RFC (``docs/request-for-change/rfc-conductor
 revision v2) §Migration plan Phase 2 lists for the four tools and their routes: a
 worker's report reaches its own item and no other, asserted against a
 two-conductor two-worker fixture; every error code carries its tabulated HTTP
-status; ``accept_batch`` parses in the real ``accept_eval.py`` and ignores a
+status; ``accept_batch`` parses in the real ``accept_eval`` tool and ignores a
 worker's claimed ``pr``; a round trip through ``work_report`` writes no
 conductor-owned field, asserted field by field; and each of the four caller states
 in the dispatch table resolves as tabulated against both tool halves.
@@ -13,8 +13,6 @@ in the dispatch table resolves as tabulated against both tool halves.
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -598,26 +596,27 @@ async def test_a_restricted_session_is_refused(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_accept_batch_parses_in_the_real_accept_eval():
-    """Piped into the bundled script, unmodified, and read back as its verdicts."""
+    """Handed to the real ``accept_eval`` tool, unmodified, and read back as its
+    verdicts."""
     ids = await two_by_two()
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "src/kiro_crew/builtin_skills/goal-conductor/scripts/accept_eval.py"
-    )
-    assert script.is_file(), script
     _, body = await _read(CONDUCTOR_A)
     batch = body["accept_batch"]
     assert batch["items"], batch
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        input=json.dumps(batch).encode(),
-        capture_output=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, proc.stderr.decode()
-    parsed = json.loads(proc.stdout.decode())
-    # ``accept_eval.py`` answers ``{"results": [{"id", "verdict", "evidence"}]}`` —
-    # one verdict per item it was handed, which is what "the batch parses" means.
+
+    from unittest.mock import patch
+
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import accept_eval as _tool
+
+    class _NoopSel:
+        def log_tool_invocation(self, **kwargs: object) -> None:
+            return None
+
+    with patch.object(mcp_core, "sel", lambda: _NoopSel()):
+        out = _tool.accept_eval("accept_eval", {"items": batch["items"]})
+    parsed = json.loads(out)
+    # The tool answers ``{"results": [{"id", "verdict", "evidence"}]}`` — one
+    # verdict per item it was handed, which is what "the batch parses" means.
     evaluated = {row.get("id") for row in parsed["results"]}
     assert ids["item_a"] in evaluated, parsed
     verdicts = {row["verdict"] for row in parsed["results"]}

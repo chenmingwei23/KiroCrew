@@ -4724,14 +4724,12 @@ _CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
     "@kirocrew-core/send_message",
     "@kirocrew-core/send_notification",
     "@kirocrew-core/ask_question",
-    # The acceptance evaluator, migrated from the bundled ``accept_eval.py``
-    # (issue #5926). Auto-approved so a nudge-driven patrol cycle that verifies
-    # a ``done`` item never blocks on an approval nobody is there to give — the
-    # per-cycle prompt the old ``execute_bash`` invocation forced was the
-    # user-visible cost that migration removes. It CREATES nothing and MUTATES
-    # nothing: it answers a world-state question (are a PR's checks green, does
-    # a file exist) and its argv is built from a fixed template, never from the
-    # spec, so it is safe to auto-approve on the same rule as the reads above.
+    # The acceptance evaluator. Auto-approved so a nudge-driven patrol cycle
+    # that verifies a ``done`` item never blocks on an approval nobody is there
+    # to give. It CREATES nothing and MUTATES nothing: it answers a world-state
+    # question (are a PR's checks green, does a file exist) and its argv is built
+    # from a fixed template, never from the spec, so it is safe to auto-approve
+    # on the same rule as the reads above.
     "@kirocrew-core/accept_eval",
 )
 

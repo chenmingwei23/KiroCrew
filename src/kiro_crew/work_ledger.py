@@ -104,7 +104,7 @@ ITEM_STATES: frozenset[str] = frozenset(WORK_ITEM_STATES)
 #: States from which no further write is accepted.
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"accepted", "rejected", "abandoned"})
 
-#: ``accept_eval.py``'s own five values, reused rather than paralleled, so a verdict
+#: the ``accept_eval`` tool's own five values, reused rather than paralleled, so a verdict
 #: crosses from that script into this store with no translation.
 VERDICTS: frozenset[str] = frozenset(WORK_VERDICTS)
 
@@ -125,7 +125,7 @@ STALE_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"progress", "blocked", "que
 #: part of the shape rather than a typo. See :func:`is_acceptance_concrete`.
 ACCEPTANCE_PLACEHOLDERS: frozenset[str] = frozenset({"tbd", ""})
 
-#: Per ``kind``, the fields ``accept_eval.py`` actually READS. This is the whole
+#: Per ``kind``, the fields the ``accept_eval`` tool actually READS. This is the whole
 #: vocabulary :func:`is_acceptance_concrete` judges a bar by: a placeholder in a field
 #: that script consumes is what makes a bar unevaluable, and a placeholder anywhere
 #: else is in a field it never looks at, so it is none of this predicate's business.
@@ -1208,7 +1208,7 @@ def _require_choice(value: Any, allowed: frozenset[str], name: str, code: str) -
 def _require_acceptance(value: Any) -> dict[str, Any]:
     """``acceptance`` is stored VERBATIM and never interpreted here.
 
-    ``accept_eval.py`` is the only thing that decides whether an item passed, so
+    the ``accept_eval`` tool is the only thing that decides whether an item passed, so
     this store validates the container and not the contents — a shape check here
     would be a second, drifting copy of that script's contract.
     """
@@ -1276,7 +1276,7 @@ def _require_pr(value: Any) -> int | None:
     """A worker's CLAIMED pull-request number.
 
     A claim only, and the docstring says so because the shape nearly leaked here:
-    ``accept_eval.py`` needs an integer ``pr``, the worker is what learns the
+    the ``accept_eval`` tool needs an integer ``pr``, the worker is what learns the
     number, and filling ``acceptance.pr`` from this field would let a worker name
     any already-green pull request and pass. Promoting a claim into ``acceptance``
     is a conductor action.
@@ -1437,7 +1437,7 @@ def _worker_owns_next_move(item: WorkItem) -> bool:
 
 
 def is_acceptance_concrete(acceptance: Any) -> bool:
-    """Whether *acceptance* names a bar ``accept_eval.py`` can actually evaluate.
+    """Whether *acceptance* names a bar the ``accept_eval`` tool can actually evaluate.
 
     Derived at read time like :func:`is_stale` and :func:`is_orphaned`, and for the
     same reason: the answer changes when the conductor promotes the bar, so a stamped
@@ -1445,7 +1445,7 @@ def is_acceptance_concrete(acceptance: Any) -> bool:
 
     A conductor may dispatch an item before its bar is knowable and write ``"TBD"`` in
     the field until a worker reports the real value. Handed such a condition,
-    ``accept_eval.py`` answers ``error`` — "pr_checks spec needs an integer pr" — which
+    the ``accept_eval`` tool answers ``error`` — "pr_checks spec needs an integer pr" — which
     a conductor reading a column of verdicts is then tempted to take for a real failure
     of the work. So a non-concrete bar is left OUT of :func:`accept_batch` entirely
     until an ``accept`` promotion fills it in, and this predicate is what the read
@@ -1467,7 +1467,7 @@ def is_acceptance_concrete(acceptance: Any) -> bool:
     OPTIONAL read field is absence, which the evaluator handles, so it is concrete; in a
     required one the type rule refuses it.
 
-    Those type rules are ``accept_eval.py``'s own error-only guards, mirrored here so
+    Those type rules are the ``accept_eval`` tool's own error-only guards, mirrored here so
     the batch never carries a spec that script can answer nothing but ``error`` to. The
     mirror is deliberate duplication across a process boundary: the two must agree, and
     a test pins them against the script's real behaviour. It stops at the guards that
@@ -2118,7 +2118,7 @@ def apply_worker_report(
     There is no ``verdict``, ``state``, ``acceptance``, ``decision`` or ``round``
     parameter, so a worker cannot mark itself accepted or widen its own bar — the
     strongest thing it can say is ``status: done``, which is the TRIGGER for the
-    conductor to run ``accept_eval.py``, not a substitute for it.
+    conductor to run the ``accept_eval`` tool, not a substitute for it.
 
     *slot_key* and *item_id* are the CONDUCTOR's key and the bound item, which
     Phase 2 resolves from the caller's own binding via :func:`read_binding` rather
@@ -2178,7 +2178,7 @@ def read_work_brief(slot_key: str, item_id: str) -> dict[str, Any] | None:
 
 
 def accept_batch(items: list[WorkItem]) -> dict[str, Any]:
-    """The ``{"items": [...]}`` document ``accept_eval.py`` reads on stdin.
+    """The ``{"items": [...]}`` document the ``accept_eval`` tool reads.
 
     Composed from ``acceptance`` ALONE. The worker's claimed ``pr`` is deliberately
     absent: filling ``acceptance.pr`` from a worker's report would let a worker name
@@ -2195,11 +2195,11 @@ def accept_batch(items: list[WorkItem]) -> dict[str, Any]:
     ``status`` rides along on each entry, and the batch is deliberately NOT filtered by
     it. The conductor applies the "only ``done`` items" filter — that judgement is its
     own, and the seam is load-bearing — but it should not need a second lookup to
-    apply it. ``accept_eval.py`` reads ``id`` and ``accept`` and ignores the rest.
+    apply it. the ``accept_eval`` tool reads ``id`` and ``accept`` and ignores the rest.
     """
     return {
         "items": [
-            # ``id`` / ``accept`` are the keys accept_eval.py reads; ``item_id`` /
+            # ``id`` / ``accept`` are the keys the ``accept_eval`` tool reads; ``item_id`` /
             # ``acceptance`` are this store's field names. The rename happens here,
             # at the one seam between the two, so neither side learns the other's
             # vocabulary.
@@ -2238,7 +2238,7 @@ def apply_acceptance_update(
         # known yet — but a PROMOTION never legitimately clears one. Without this,
         # an ``accept`` that omitted its argument replaced the real condition with
         # ``{}``, :func:`accept_batch` then dropped the item for having no
-        # acceptance, ``accept_eval.py`` never evaluated it, and the caller was told
+        # acceptance, the ``accept_eval`` tool never evaluated it, and the caller was told
         # 200. That is conductor-owned state lost silently and unrecoverably, which
         # is the one outcome a cap-and-refuse store must not produce.
         raise WorkLedgerError(
