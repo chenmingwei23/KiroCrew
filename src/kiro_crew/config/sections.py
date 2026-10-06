@@ -1113,6 +1113,25 @@ class AgentConfig:
             "this host needs longer than the default allows.",
         ),
     )
+    file_explorer_extra_roots: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "File Explorer Extra Roots",
+            "Additional absolute filesystem roots the built-in File Explorer app "
+            "may browse, beyond its built-in defaults (home, the system temp dir, "
+            "and /home and /opt on POSIX). WIDEN-ONLY: entries are appended after "
+            "the defaults and run through the same resolve()+exists() filter, so a "
+            "missing or non-absolute entry is dropped rather than fatal, and the "
+            "built-in floor can never be narrowed or reordered (the frontend's "
+            "default folder, roots[0], stays home). Every path listed, read, or "
+            "searched still passes the unchanged sensitive-path and traversal "
+            "fences, so this only widens where browsing may START — it never widens "
+            "which sensitive files are reachable. This is an OPERATOR knob set in "
+            "the Kiro Crew config file: the file-explorer backend reads it from the "
+            "loaded config, not from its (minimal) process environment, so an agent "
+            "cannot widen its own browse scope by editing an app config.",
+        ),
+    )
     jail: str = field(
         default=JAIL_MODE_AUTO,
         metadata=_meta(

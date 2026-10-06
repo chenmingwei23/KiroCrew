@@ -3050,6 +3050,11 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             else section.default("apps_trusted_repositories")
         ),
         apps_ui_stream_timeout_secs=section.read("apps_ui_stream_timeout_secs", _safe_int, 5, 600),
+        file_explorer_extra_roots=(
+            [p for p in _fe_extra_roots if isinstance(p, str) and p]
+            if isinstance(_fe_extra_roots := section.get("file_explorer_extra_roots"), list)
+            else section.default("file_explorer_extra_roots")
+        ),
         jail=_normalize_jail(section.get("jail")),
         dangerously_skip_permissions=_read_skip_permissions(agent_data),
         yolo_duration=section.read("yolo_duration", _normalize_yolo_duration),

@@ -17,7 +17,10 @@ the root since KiroCrew strips the prefix):
 
 Path safety: callers may only access paths under the user's home dir or the
 system temp dir on any OS, plus ``/home/`` and ``/opt/`` on POSIX (after
-symlink resolution).  Paths outside the allow-list return 403.
+symlink resolution), plus any operator-configured extra roots from
+``agent.file_explorer_extra_roots`` in the Kiro Crew config (widen-only, same
+``exists()`` filter and the unchanged sensitive-path / traversal fences).
+Paths outside the allow-list return 403.
 
 Size / depth caps are tunable via env vars but have safe defaults.
 """
@@ -80,13 +83,69 @@ if _HOME == Path(_HOME.anchor):  # home resolved to the filesystem root — unus
 _TMP = Path(tempfile.gettempdir()).resolve()
 
 
-def _compute_allowed_roots(home: Path, tmp: Path) -> list[Path]:
-    """Ordered allow-list of browsing roots: home, tmp, then POSIX conventions.
+def _parse_extra_roots(raw) -> list[Path]:
+    """Config-provided extra browsing roots → resolved absolute Paths.
+
+    Only absolute string entries survive. Each is ``resolve()``-d so the
+    same symlink-followed, canonical form the containment check uses is what
+    lands in the allow-list; the ``exists()`` drop happens later in
+    ``_compute_allowed_roots`` alongside the defaults. A non-list, a
+    non-string entry, or a relative path is skipped, never fatal — a bad
+    config entry must not take the whole app down.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[Path] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            continue
+        try:
+            p = Path(entry)
+            if not p.is_absolute():
+                # Relative roots are meaningless for a backend whose cwd is
+                # not the user's — refuse rather than resolve against it.
+                continue
+            out.append(p.resolve())
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return out
+
+
+def _load_configured_extra_roots() -> list[Path]:
+    """Extra roots declared in the Kiro Crew config file, if any.
+
+    The file-explorer backend is spawned with a minimal environment, so an
+    env-var knob would be stripped before it is read. The config file, by
+    contrast, is loaded directly from disk by ``KiroCrewConfig.load()`` — the
+    same object ``main()`` already boots the platform with — so it is a seam
+    this process genuinely reads. Fails closed to no extras on any load error
+    (a broken config widens nothing).
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+        raw = getattr(cfg.agent, "file_explorer_extra_roots", None)
+    except Exception:  # noqa: BLE001 — never let config break the allow-list
+        return []
+    return _parse_extra_roots(raw)
+
+
+def _compute_allowed_roots(
+    home: Path, tmp: Path, extra: list[Path] | None = None
+) -> list[Path]:
+    """Ordered allow-list of browsing roots: home, tmp, POSIX conventions, extras.
 
     Order matters — the health endpoint serves this list and the frontend
     falls back to roots[0] as its default folder, so the dedupe must preserve
     insertion order (home first) rather than use a set, whose iteration order
     varies between interpreter runs.
+
+    ``extra`` are operator-configured roots. They are WIDEN-ONLY: appended
+    AFTER the built-in defaults, so they can neither narrow the built-in floor
+    nor displace ``roots[0]`` (home). They pass through the same ``exists()``
+    filter as the defaults — a configured root that is not present on this host
+    is silently dropped — and every later listing/read/search still runs the
+    unchanged sensitive-path and traversal fences, so widening a START root
+    never widens which sensitive files are reachable.
     """
     roots = [home, tmp]
     if platform_compat.IS_POSIX:
@@ -94,11 +153,13 @@ def _compute_allowed_roots(home: Path, tmp: Path) -> list[Path]:
         # to nonexistent C:\home / C:\opt and would be dropped by the
         # exists() filter.
         roots += [Path("/home").resolve(), Path("/opt").resolve()]
+    if extra:
+        roots += extra
     # De-dupe and only keep ones that exist
     return list(dict.fromkeys(p for p in roots if p.exists()))
 
 
-ALLOWED_ROOTS = _compute_allowed_roots(_HOME, _TMP)
+ALLOWED_ROOTS = _compute_allowed_roots(_HOME, _TMP, _load_configured_extra_roots())
 
 # Default ignore patterns for tree + search
 IGNORE_DIRS = {

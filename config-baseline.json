@@ -38,6 +38,7 @@
         "apps_trusted_local": [],
         "apps_trusted_repositories": {},
         "apps_ui_stream_timeout_secs": 30,
+        "file_explorer_extra_roots": [],
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -541,6 +542,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 30
+    },
+    {
+      "path": "agent.file_explorer_extra_roots",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "File Explorer Extra Roots",
+      "help": "Additional absolute filesystem roots the built-in File Explorer app may browse, beyond its built-in defaults (home, the system temp dir, and /home and /opt on POSIX). WIDEN-ONLY: entries are appended after the defaults and run through the same resolve()+exists() filter, so a missing or non-absolute entry is dropped rather than fatal, and the built-in floor can never be narrowed or reordered (the frontend's default folder, roots[0], stays home). Every path listed, read, or searched still passes the unchanged sensitive-path and traversal fences, so this only widens where browsing may START — it never widens which sensitive files are reachable. This is an OPERATOR knob set in the Kiro Crew config file: the file-explorer backend reads it from the loaded config, not from its (minimal) process environment, so an agent cannot widen its own browse scope by editing an app config.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.file_explorer_extra_roots.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "agent.jail",
