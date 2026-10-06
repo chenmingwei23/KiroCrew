@@ -2720,6 +2720,38 @@ def _status(args: argparse.Namespace) -> None:
     print(f"  Cron jobs:   {_format_count(data, 'cron_jobs')}")
     print(f"  Lessons:     {_format_count(data, 'lessons')}")
     print(f"  Memory:      {_format_memory_line(data)}")
+    _print_component_identity()
+
+
+def _print_component_identity() -> None:
+    """Print the selected-versus-running component version-skew section.
+
+    A local, read-only comparison (``kiro_crew.component_identity``) of the
+    selected package against each managed component. It identifies the
+    "listener healthy but one component still runs an earlier package" state
+    that ordinary gateway health cannot distinguish from a fully-aligned
+    install (issue #13086). Never fatal: a comparison that cannot run is
+    skipped silently rather than failing the whole ``status`` command.
+    """
+    try:
+        from kiro_crew import component_identity
+
+        report = component_identity.compare()
+    except Exception:
+        return
+    if report.result == component_identity.RESULT_SKEW:
+        age = int(report.mismatch_age_seconds)
+        print(f"\n  Components:  ⚠ version_skew — {report.reason} (skew age {age}s)")
+    else:
+        print("\n  Components:  aligned (all managed components run the selected package)")
+    for row in report.rows:
+        start = "—" if row.start_time is None else time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(row.start_time)
+        )
+        print(
+            f"    {row.role:<14} {row.product_version:<12} "
+            f"{row.build_identity:<20} {row.relation:<8} started {start}"
+        )
 
 
 def _format_count(data: dict, key: str) -> str:

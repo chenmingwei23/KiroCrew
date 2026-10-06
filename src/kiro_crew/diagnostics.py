@@ -1144,6 +1144,23 @@ def collect_bundle(
         result.included.append("versions.txt")
         result.redaction_summary["versions.txt"] = 0
 
+        # Selected-versus-running component version skew (issue #13086). A local,
+        # read-only comparison whose exported rows carry only bounded identity
+        # fields (role, version, build identity, start time, relation) — no
+        # path, hostname, command line, username, or PID. Still routed through
+        # the same scrub as every other member to keep the "nothing unscrubbed"
+        # invariant, and never fatal: a comparison that cannot run is skipped.
+        try:
+            from kiro_crew import component_identity
+
+            skew_text = json.dumps(component_identity.compare().as_dict(), indent=2)
+            clean_skew, n_skew = _scrub(skew_text)
+            zf.writestr("component-identity.json", clean_skew)
+            result.included.append("component-identity.json")
+            result.redaction_summary["component-identity.json"] = n_skew
+        except Exception:
+            result.skipped.append("component-identity.json")
+
         for member, src, _gated in text_sources:
             try:
                 # Never follow a symlink — a symlinked source could pull an
