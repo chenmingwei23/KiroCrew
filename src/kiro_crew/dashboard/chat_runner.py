@@ -10602,12 +10602,18 @@ async def _run_chat(
         # expansion with no crew log entry at all -- neither the accepted input nor
         # the refusal. Resolving it now lets the refusing branch record the same
         # pair the dispatch gates already do: the ``message/received`` for the
-        # accepted input and a ``turn/refused`` naming the reason. Nothing between
-        # here and the emit block appends a durable row or advances
-        # ``_disk_older_durable_count`` (the mid-turn clear that does is inside the
-        # stream loop, far below), so this single computation is exactly what the
-        # accepted path would otherwise have read -- the emit block reuses it rather
-        # than recomputing it. `durable_row_count` is the SHARED counting rule every
+        # accepted input and a ``turn/refused`` naming the reason. The accepted
+        # (``ok``) path can append one or more durable ``"system"`` rows after this
+        # point -- the ``_surface_prompt_chip`` chip and the ``_expand_dollar_skills``
+        # skill-load row, both of which ``durable_row_count`` counts -- so a fresh
+        # count at the emit block could read higher by an amount this site cannot
+        # predict. That is exactly why the ordinal is resolved ONCE here and both
+        # branches reuse this single pre-expansion value rather than recomputing it;
+        # the value is NOT a fixed offset from the emit-block count. Turn ordinals
+        # still cannot collide, because each turn first appends its own durable
+        # ``user`` row (the ``message/received``) before the runner is re-entered,
+        # so every turn starts from a strictly higher base.
+        # `durable_row_count` is the SHARED counting rule every
         # site that sets or advances that base uses, so the ordinal cannot disagree
         # with the base about which rows are durable.
         _crew_log_turn_no = int(
@@ -11571,10 +11577,11 @@ async def _run_chat(
         # `durable_row_count` is the SHARED counting rule every site that sets or
         # advances that base uses, so the ordinal cannot disagree with the base
         # about which rows are durable. It is resolved ONCE, above the @prompt
-        # expansion gate (see the hoist there), and reused here: nothing between
-        # the two points appends a durable row or advances the base, so the value
-        # this path reads is the value the refusal branch already recorded against.
-        # Recomputing it here would be the same expression twice.
+        # expansion gate (see the hoist there), and reused here because the accepted
+        # path may append one or more durable rows between the two points (the
+        # @prompt chip and the $skill load row); recomputing here could therefore
+        # read a different value, so the single pre-expansion ordinal is shared on
+        # purpose.
 
         # Append-only the session's log: the body the gateway accepted. This names
         # ``_crew_log_turn_no``, the one ordinal every entry of this turn uses, and
