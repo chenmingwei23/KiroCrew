@@ -1359,11 +1359,47 @@ class TestGatewayMemoryLines:
         assert "412 MiB" in rss and "4242" in rss
 
     def test_disabled_ceiling_is_called_out(self, monkeypatch) -> None:
+        from kiro_crew.doctor_checks import resources
+
         self._cfg(monkeypatch, 0)
         monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+        monkeypatch.setattr(resources, "_gateway_lock_indeterminate", lambda: False)
         ceiling, rss = cli_doctor._gateway_memory_lines()
         assert "disabled" in ceiling and "nothing bounds" in ceiling
         assert "not running" in rss
+
+    def test_indeterminate_lock_probe_is_not_reported_as_not_running(self, monkeypatch) -> None:
+        """A serving Windows gateway's lock reads as indeterminate, not absent.
+
+        The same run's Connectivity row says the gateway is running; this row
+        must say the probe could not locate it rather than contradict that.
+        """
+        from kiro_crew import gateway_lock
+
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+
+        def _indeterminate(home):
+            raise gateway_lock.LockProbeError(home / "gateway.lock", OSError("locked"))
+
+        monkeypatch.setattr(gateway_lock, "lock_holder", _indeterminate)
+        _ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "not running" not in rss
+        assert "could not locate the gateway process" in rss
+        assert "does not mean it is stopped" in rss
+
+    def test_free_lock_still_reads_as_not_running(self, monkeypatch) -> None:
+        from kiro_crew import gateway_lock
+
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_lock,
+            "lock_holder",
+            lambda home: gateway_lock.LockHolder(pid=None, alive=False, source="none"),
+        )
+        _ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "⏹ not running" in rss
 
     def test_unreadable_rss_and_config_never_raise(self, monkeypatch) -> None:
         monkeypatch.setattr(cli_doctor.KiroCrewConfig, "load", MagicMock(side_effect=OSError))

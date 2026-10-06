@@ -55,6 +55,24 @@ def _swap_total_kib() -> int | None:
     return None
 
 
+def _gateway_lock_indeterminate() -> bool:
+    """True when the gateway lock probe cannot say whether a gateway runs.
+
+    The distinction :func:`kiro_crew.cli_perf._read_gateway_pid` deliberately
+    collapses (it fails closed, since its caller must not profile the wrong
+    process) but a report must keep: "nobody holds the lock" is a fact about
+    the gateway, an indeterminate probe is a fact about the probe. Any other
+    exception propagates to the caller's own "probe failed" line.
+    """
+    from kiro_crew import gateway_lock
+
+    try:
+        gateway_lock.lock_holder(cli_doctor.config_dir())
+    except gateway_lock.LockProbeError:
+        return True
+    return False
+
+
 def _gateway_memory_lines() -> list[str]:
     """The ``session ceiling`` and ``gateway rss`` lines of the Memory Pressure section.
 
@@ -63,7 +81,8 @@ def _gateway_memory_lines() -> list[str]:
     usually asking "what stops a runaway session tree?"). The RSS is read from
     the live gateway's pid via the lock-holder oracle ``cli_perf`` already uses,
     so a stale recorded pid can never be reported as the gateway's memory; no
-    live gateway prints "not running". Every failure degrades to a line saying
+    live gateway prints "not running", and a lock probe that cannot answer says
+    so rather than reading as "not running". Every failure degrades to a line saying
     so — this is advisory and must never abort doctor.
     """
     lines: list[str] = []
@@ -84,7 +103,18 @@ def _gateway_memory_lines() -> list[str]:
             )
     try:
         pid = cli_doctor._read_gateway_pid()
-        if pid is None:
+        if pid is None and _gateway_lock_indeterminate():
+            # ``_read_gateway_pid`` folds "the probe could not answer" into the
+            # same None as "nobody holds the lock". On Windows a serving
+            # gateway holds its lock file under a mandatory lock, so the pid
+            # inside cannot be read and the probe is indeterminate -- printing
+            # "not running" there contradicts the Connectivity row of the same
+            # run. Say what is actually known instead.
+            lines.append(
+                "  gateway rss:     ⚠️  could not locate the gateway process to measure "
+                "it (lock probe indeterminate; this does not mean it is stopped)"
+            )
+        elif pid is None:
             lines.append("  gateway rss:     ⏹ not running")
         else:
             rss = cli_doctor._gateway_rss_bytes(pid)
