@@ -159,3 +159,50 @@ async def test_the_operator_dashboard_lists_every_configured_workspace(
         ("rule in client-a", "client-a"),
         ("rule in client-b", "client-b"),
     ]
+
+
+async def _create(state, tmp_path, session_key: str, body: dict):
+    """POST /api/lessons on the JSONL path; returns (response, stores)."""
+    stores = {name: LessonStore(base_dir=tmp_path / name) for name in ("global", "client-a")}
+    state.lessons = stores["global"]
+    state.context_builder = MagicMock()
+    state.context_builder.get_lessons_for = MagicMock(side_effect=stores.__getitem__)
+
+    request = MagicMock()
+    request.app = {"state": state}
+    request.headers = {"X-Session-Key": session_key}
+    configured = MagicMock()
+    configured.memory.persistence_enabled = True
+    with (
+        patch.object(cron, "read_bounded_json", new=AsyncMock(return_value=(body, None))),
+        patch.object(cron, "_recognize_session", new=AsyncMock(return_value=None)),
+        patch.object(cron, "_is_restricted_session", return_value=False),
+        patch.object(cron, "resolve_lesson_memory_store", new=AsyncMock(return_value=(None, None))),
+        patch.object(cron, "_prepare_member_lesson_store", new=AsyncMock(return_value=None)),
+        patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=None)),
+        patch.object(cron.KiroCrewConfig, "load", return_value=configured),
+    ):
+        resp = await cron.api_lessons_create(request)
+    return resp, stores
+
+
+@pytest.mark.asyncio
+async def test_a_slotless_workspace_write_is_refused_not_made_global(state, tmp_path):
+    _slot(state, "chat-busy", "client-b", 500)
+    resp, stores = await _create(
+        state, tmp_path, "cron:nightly-digest", {"rule": "keep it local", "scope": "workspace"}
+    )
+    assert resp.status == 400
+    assert json.loads(resp.text)["code"] == "workspace_required"
+    assert stores["global"].load_all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_slotted_workspace_write_lands_in_its_own_workspace(state, tmp_path):
+    mine = _slot(state, "chat-mine", "client-a", 1)
+    resp, stores = await _create(
+        state, tmp_path, slot_history_key(mine), {"rule": "keep it local", "scope": "workspace"}
+    )
+    assert resp.status == 200
+    assert [lesson.rule for lesson in stores["client-a"].load_all()] == ["keep it local"]
+    assert stores["global"].load_all() == []
