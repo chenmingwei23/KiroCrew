@@ -21,6 +21,10 @@ ESSENTIAL_MAX_CHARS = 64_000
 _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
 #: Source label of the in-band notice that names guides left out of the envelope.
 ESSENTIAL_OMISSION_SOURCE = "essential-context#omitted"
+#: Source-label prefix of the in-band notice that names wildcard entries pruned as
+#: managed state; the full label appends ``:<template>``.
+ESSENTIAL_MANAGED_SKIP_SOURCE = "essential-context#managed-skipped"
+_MAX_SKIPPED_LISTED = 10
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
 
@@ -224,8 +228,43 @@ def _omitted_guide(path: Path, root: Path) -> tuple[str, str]:
     )
 
 
-def _matches(root: Path, pattern: str) -> list[Path]:
-    """Expand a declared glob with bounded directory work and no link traversal."""
+def _skipped_managed_note(skipped: list[Path], template: str) -> tuple[str, str] | None:
+    """The in-band note naming wildcard entries pruned as managed state, or ``None``.
+
+    The prune is a name-prefix heuristic and stays fail-safe: an entry whose
+    top-level name starts with ``memory``/``lessons`` in a managed workspace is
+    never read. An ordinary project entry can share that prefix, so -- like the
+    ``#omitted`` note for a refused guide -- the agent is told which entries were
+    left out instead of the snapshot dropping them without a trace.
+
+    The source is keyed by *template*: a turn that merges the owner template's
+    documents with a different execution template's must see two distinct
+    sources, since each template's globs can skip different entries.
+    """
+    unique = list(dict.fromkeys(skipped))
+    if not unique:
+        return None
+    listed = ", ".join(str(path) for path in unique[:_MAX_SKIPPED_LISTED])
+    more = len(unique) - _MAX_SKIPPED_LISTED
+    if more > 0:
+        listed += f", and {more} more"
+    return (
+        f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:{template}",
+        f"PROJECT ENTRIES NOT LOADED. {len(unique)} entr{'y' if len(unique) == 1 else 'ies'} "
+        f"matched a declared resource pattern but were skipped because the name matches "
+        f"managed memory/lessons state: {listed}. Do not assume their contents. If one is "
+        "project content, ask the user to rename it so its name does not start with "
+        "'memory' or 'lessons'.",
+    )
+
+
+def _matches(root: Path, pattern: str, skipped: list[Path] | None = None) -> list[Path]:
+    """Expand a declared glob with bounded directory work and no link traversal.
+
+    An entry the glob would have used but the managed-source check prunes is
+    logged as a warning and, when *skipped* is given, appended to it, so the
+    caller can tell the agent which entries were left out.
+    """
     pieces = Path(pattern).parts
     if Path(pattern).is_absolute() or ".." in pieces:
         raise MemberEssentialContextError(
@@ -241,6 +280,7 @@ def _matches(root: Path, pattern: str) -> list[Path]:
         return [admitted_root / pattern]
     pending = [(admitted_root, 0)]
     result: set[Path] = set()
+    pruned: set[Path] = set()
     scanned = 0
     visited: set[tuple[Path, int]] = set()
     while pending:
@@ -289,6 +329,24 @@ def _matches(root: Path, pattern: str) -> list[Path]:
                     try:
                         _refuse_managed_source(path)
                     except _ManagedEssentialSourceError:
+                        # The prune keeps the name-prefix heuristic fail-safe, so
+                        # an ordinary project entry can be caught by it: say so
+                        # instead of dropping it silently. Only an entry the glob
+                        # would otherwise have descended into or returned counts.
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        if (is_dir and (component == "**" or offset + 1 < len(pieces))) or (
+                            not is_dir and offset == len(pieces) - 1
+                        ):
+                            if path not in pruned:
+                                pruned.add(path)
+                                logger.warning(
+                                    "Essential source %s skipped by %s: its name matches "
+                                    "managed memory/lessons state",
+                                    path,
+                                    pattern,
+                                )
+                                if skipped is not None:
+                                    skipped.append(path)
                         continue
                     if is_link_or_junction(path):
                         raise MemberEssentialContextError(
@@ -425,11 +483,21 @@ def documents_for_member(
 
     documents: list[tuple[str, str]] = []
     seen: set[Path] = set()
+    skipped: list[Path] = []
     project_root = _admitted_project_root(project)
 
     def _mark_core(source: str) -> None:
         if core_sources_out is not None:
             core_sources_out.add(source)
+
+    def _finish() -> list[tuple[str, str]]:
+        # A native-only read lists what the host itself loads; the note is not
+        # a host-native source, so it rides only in the essentials envelope.
+        note = None if native_only else _skipped_managed_note(skipped, template)
+        if note is not None:
+            documents.append(note)
+            _mark_core(note[0])
+        return documents
 
     def add(path: Path, root: Path, *, steering: bool = False, body: str | None = None) -> None:
         if Path(os.path.abspath(path)) in seen:
@@ -508,7 +576,7 @@ def documents_for_member(
     # the snapshot must not re-add the operator's global steering behind it.
     inherits = include_project and not native_only and inherits_default_resources
     if inherits:
-        for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
+        for path in _matches(Path.home(), ".kiro/steering/**/*.md", skipped):
             add(path, Path.home(), steering=True)
 
     if project_root is not None and include_project and not native_only:
@@ -526,14 +594,14 @@ def documents_for_member(
                     if name == "SOUL.md":
                         _mark_core(str(path))
         if inherits:
-            for path in _matches(project_root, ".kiro/steering/**/*.md"):
+            for path in _matches(project_root, ".kiro/steering/**/*.md", skipped):
                 add(path, project_root, steering=True)
 
     spec_path = resolve_template_path(template, project)
     if spec_path is None:
         if template != "kirocrew":
             raise MemberEssentialContextError(f"Essential template {template!r}: not found")
-        return documents
+        return _finish()
     spec = _read_agent_spec(spec_path, operation="member_essentials", source="context")
     if spec is None:
         raise MemberEssentialContextError(f"Essential template {spec_path}: cannot be read safely")
@@ -599,9 +667,9 @@ def documents_for_member(
     if include_project and isinstance(resources, list):
         if _declared_document_count(resources) > _MAX_DOCUMENTS:
             raise MemberEssentialContextError(f"Essential template {spec_path}: too many resources")
-        for match, root in _resource_paths(resources, source_root, absolute_root):
+        for match, root in _resource_paths(resources, source_root, absolute_root, skipped):
             add(match, root, steering="steering" in match.parts)
-    return documents
+    return _finish()
 
 
 def _resource_pattern(path: Path, root: Path) -> str:
@@ -651,7 +719,10 @@ def _resource_pattern(path: Path, root: Path) -> str:
 
 
 def _resource_paths(
-    resources: list[ResourceDeclaration], source_root: Path, absolute_root: Path
+    resources: list[ResourceDeclaration],
+    source_root: Path,
+    absolute_root: Path,
+    skipped: list[Path] | None = None,
 ) -> list[tuple[Path, Path]]:
     paths: list[tuple[Path, Path]] = []
     if _declared_document_count(resources) > _MAX_DOCUMENTS:
@@ -667,7 +738,7 @@ def _resource_paths(
             pattern = _resource_pattern(path, root)
         else:
             pattern = str(path)
-        for match in _matches(root, pattern):
+        for match in _matches(root, pattern, skipped):
             if match.suffix.lower() == ".md" and (match, root) not in paths:
                 paths.append((match, root))
                 if len(paths) > _MAX_DOCUMENTS:

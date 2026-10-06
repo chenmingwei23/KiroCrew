@@ -1551,7 +1551,14 @@ Wildcard-matched entries classified by the existing managed-source check are
 excluded before descent or content reads. A broad `*/AGENTS.md` resource therefore
 keeps ordinary project guides without scanning the workspace's managed memory or
 lessons. Literal managed prefixes and explicitly named managed files still refuse;
-other admission and read failures are not swallowed. Directory names alone do
+other admission and read failures are not swallowed. The managed-source check
+matches a top-level name by prefix (`memory*`, `lessons*`, `.lessons*`), so an
+ordinary project entry in a managed workspace can share it; the prefix is kept
+fail-safe rather than narrowed, and the prune is not silent: each pruned entry
+the glob would have descended into or returned is logged as a warning and named
+in one in-band `essential-context#managed-skipped:<template>` note per template
+(part of the member's core, so a size-limited envelope never drops it; never a
+host-native source, so a native-only read leaves it out). Directory names alone do
 not exclude an ordinary project outside the configured managed workspaces.
 Containment is judged on resolved paths on both sides: a declared root (the
 project root, or the owner's home for a resource outside it) is normalized the

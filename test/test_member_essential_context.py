@@ -1581,6 +1581,128 @@ def test_workspace_glob_excludes_managed_subtrees_before_scanning(env, monkeypat
     assert "WORKSPACE_CHILD_GUIDE" in message
     assert "MANAGED_CONTENT_MUST_NOT_LOAD" not in message
     assert "You are writer." in message
+    # The prune stays, but it names what it left out.
+    assert "[Essential source: essential-context#managed-skipped:writer-template]" in message
+    assert str(managed) in message
+
+
+def _write_template(agents: Path, name: str, resources: list[str]) -> None:
+    (agents / f"{name}.json").write_text(
+        json.dumps({"name": name, "resources": resources}), encoding="utf-8"
+    )
+
+
+def test_two_templates_skipping_different_entries_still_build(env):
+    """An owner and an execution template whose globs skip different
+    prefix-colliding entries each get their own note, so merging them
+    does not trip the changed-during-preparation guard."""
+    from kiro_crew.config import config_dir
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    (project / "lessons-notes.md").write_text("PREFIX_B", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://memory*.md"])
+    _write_template(agents, "runner-template", ["file://lessons*.md"])
+    message = env.builder._build_v2_essentials(
+        env.store,
+        member=env.member,
+        project=str(project),
+        execution_template="runner-template",
+    )
+    assert "essential-context#managed-skipped:writer-template" in message
+    assert "essential-context#managed-skipped:runner-template" in message
+    assert str(project / "memory-notes.md") in message
+    assert str(project / "lessons-notes.md") in message
+    assert "PREFIX_A" not in message
+    assert "PREFIX_B" not in message
+
+
+def test_native_reads_carry_no_skip_note(env):
+    """The note is not a host-native source: a native-only read and the
+    launch documents leave it out, so wire dedup cannot strip its body."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+        kiro_launch_documents,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://*.md"])
+    for documents in (
+        documents_for_member("writer-template", str(project), native_only=True),
+        kiro_launch_documents("writer-template", str(project)),
+    ):
+        assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
+    full = dict(documents_for_member("writer-template", str(project)))
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in full
+
+
+def test_workspace_glob_names_each_prefix_colliding_entry_it_skips(env, caplog):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes").mkdir()
+    (project / "memory-notes" / "guide.md").write_text("PREFIX_DIR_CONTENT", encoding="utf-8")
+    (project / "lessons-archive.md").write_text("PREFIX_FILE_CONTENT", encoding="utf-8")
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*.md", "file://*/guide.md"]}),
+        encoding="utf-8",
+    )
+    core: set[str] = set()
+    with caplog.at_level("WARNING", logger="kiro_crew.member_essential_context"):
+        documents = documents_for_member("writer-template", str(project), core_sources_out=core)
+    bodies = dict(documents)
+    joined = "\n".join(bodies.values())
+    assert "PLAIN_GUIDE" in joined
+    assert "PREFIX_DIR_CONTENT" not in joined
+    assert "PREFIX_FILE_CONTENT" not in joined
+    note = bodies[f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template"]
+    assert "entries matched a declared resource pattern" in note
+    assert str(project / "memory-notes") in note
+    assert str(project / "lessons-archive.md") in note
+    # A size-limited envelope must not drop the note silently.
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in core
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("memory-notes" in line for line in logged)
+    assert any("lessons-archive.md" in line for line in logged)
+
+
+def test_workspace_glob_without_prefix_collision_adds_no_skip_note(env):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    # A managed-named file the pattern could never return is not reported.
+    (project / "memory_index.db").write_text("", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*/AGENTS.md"]}),
+        encoding="utf-8",
+    )
+    documents = documents_for_member("writer-template", str(project))
+    assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
 
 
 @pytest.mark.parametrize("resource", ["memory/AGENTS.md", "memory/*.md", "memory/**/AGENTS.md"])
