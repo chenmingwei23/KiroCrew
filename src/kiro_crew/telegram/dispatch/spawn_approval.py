@@ -15,7 +15,12 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT
-from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, CHAT_TYPE_FORUM, parse_session_key
+from kiro_crew.messaging.link import (
+    CHAT_TYPE_DIRECT,
+    CHAT_TYPE_FORUM,
+    CHAT_TYPE_PRIVATE_TOPIC,
+    parse_session_key,
+)
 from kiro_crew.messaging.renderer import new_approval_nonce
 from kiro_crew.telegram.transport import forum_gate_outcome
 
@@ -271,7 +276,9 @@ def _spawn_chat_target(
     Reconstructs the conversation from the parent session key's grammar
     (``telegram:{agent}:{chat_type}:{scope…}``): a direct DM's scope is the
     peer's user id, and a Telegram private chat's id EQUALS that user id; a
-    forum route's scope is ``{chat_id}:{thread}``. A ``unified`` DM bucket
+    forum route's scope is ``{chat_id}:{thread}`` -- for a group forum Topic
+    (``direct_topic`` carries the same ``{chat_id}:{thread}`` shape, where the
+    chat_id is the peer's private-chat id). A ``unified`` DM bucket
     (``unified:{agent}``) parses as a non-telegram surface and returns None —
     it names no single conversation to post into, which is the same reason the
     origin mirror declines it. ``session_key`` is returned so the caller arms
@@ -282,7 +289,12 @@ def _spawn_chat_target(
     if parsed is None or parsed.surface != "telegram":
         return None
     try:
-        if parsed.chat_type == CHAT_TYPE_FORUM and len(parsed.scope) >= 2:
+        if (
+            parsed.chat_type in (CHAT_TYPE_FORUM, CHAT_TYPE_PRIVATE_TOPIC)
+            and len(parsed.scope) >= 2
+        ):
+            # Group forum Topic (scope ``{chat_id}:{thread}``) OR private-chat
+            # forum Topic (same scope shape; chat_id == the peer's user id).
             chat_id = int(parsed.scope[0])
             thread_id: int | None = int(parsed.scope[1])
         elif parsed.chat_type == CHAT_TYPE_DIRECT and len(parsed.scope) == 1:
