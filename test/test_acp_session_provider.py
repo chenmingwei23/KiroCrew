@@ -723,6 +723,28 @@ class TestAcpSessionProviderRound4Parity:
         handle.rebind_watchdog.assert_called_with("", settings=None)
         assert runtime._crew_agent == ""
 
+    def test_rekey_leaves_a_shared_runtimes_default_crew_alone(self):
+        """A claim is per-session; the runtime default is per-process.
+
+        On a shared chat runtime the co-tenants read that default, so writing
+        the claiming session's crew into it hands them this slot's identity and
+        discards another slot's. The live handle is still rebound -- that part IS
+        this session's -- and only the process-level write is withheld.
+        """
+        handle = _make_handle()
+        runtime = _make_runtime()
+        runtime._crew_agent = "founder-crew"
+        provider = AcpSessionProvider(handle, runtime, shared_runtime=True)
+        wd = WatchdogSettings(tool_stall_suspect_secs=123.0)
+
+        provider.rekey("dashboard:slot9", "chan-7", crew_agent="pr-reviewer", watchdog=wd)
+
+        assert runtime._crew_agent == "founder-crew"
+        handle.rebind_watchdog.assert_called_once_with("pr-reviewer", settings=wd)
+        # The rest of the claim is unchanged by the guard.
+        assert provider._session_key == "dashboard:slot9"
+        assert provider._channel_id == "chan-7"
+
     def test_rekey_resets_context_state(self):
         """The handoff must drop the previous session's context state
         (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so
@@ -1033,9 +1055,15 @@ class TestNewConversation:
 
         await provider.new_conversation()
 
-        # Fresh session/new on the SAME runtime (cwd+agent from the runtime).
+        # Fresh session/new on the SAME runtime (cwd+agent from the runtime),
+        # and the crew identity read off the handle being replaced -- "" here,
+        # because a bare mock handle carries no string one.
         runtime.create_session.assert_awaited_once_with(
-            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent", session_key=""
+            cwd="/tmp/ws",
+            agent="kirocrew",
+            memory_mode="persistent",
+            session_key="",
+            crew_agent="",
         )
         # Handle swapped to the fresh session → next prompt starts clean.
         assert provider._handle is new_handle
@@ -1064,6 +1092,46 @@ class TestNewConversation:
         await provider.new_conversation()
 
         assert runtime.create_session.await_args.kwargs["session_key"] == "slot:owner"
+
+    @pytest.mark.asyncio
+    async def test_the_fresh_session_keeps_this_sessions_crew_not_the_runtimes(self):
+        """The reset must not re-bind this slot to a co-tenant's crew.
+
+        ``crew_agent=None`` does not mean "no crew" at ``create_session``: it
+        means "read the RUNTIME's default", which on a shared chat process is
+        whichever co-tenant claimed it last. The identity is per SESSION and
+        lives on the handle, so the fresh session takes the replaced handle's
+        value -- here deliberately different from the runtime default, which is
+        what a co-tenanted process looks like.
+        """
+        old = _make_handle(session_id="old-session-1")
+        old._crew_agent = "atlas"
+        runtime, _new_handle = self._runtime_with_new_session()
+        runtime._crew_agent = "gpu-dev"  # a neighbour's claim, process-level
+        provider = AcpSessionProvider(old, runtime, shared_runtime=True)
+
+        await provider.new_conversation()
+
+        assert runtime.create_session.await_args.kwargs["crew_agent"] == "atlas"
+
+    @pytest.mark.asyncio
+    async def test_a_crewless_session_passes_empty_not_none(self):
+        """An empty crew and None are different answers at ``create_session``.
+
+        Empty says this session has no crew; None defers to the process. A
+        crewless slot means the first, so the argument must be present.
+        """
+        old = _make_handle(session_id="old-session-1")
+        old._crew_agent = ""
+        runtime, _new_handle = self._runtime_with_new_session()
+        runtime._crew_agent = "gpu-dev"
+        provider = AcpSessionProvider(old, runtime, shared_runtime=True)
+
+        await provider.new_conversation()
+
+        kwargs = runtime.create_session.await_args.kwargs
+        assert "crew_agent" in kwargs
+        assert kwargs["crew_agent"] == ""
 
     @pytest.mark.asyncio
     async def test_destroys_old_session_to_free_context(self):

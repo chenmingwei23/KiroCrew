@@ -116,6 +116,22 @@ of joining one. A constant fallback would read as a fix and keep the defect. An
 ineligible start pays nothing for the fragmentation: it never places a shared
 runtime at all.
 
+The key's other side is a rule about WRITES: a value the key leaves out because it
+is per-session must never be stored in process-level state, or a co-tenant reads it
+as its own. The crew identity is the case. `AcpRuntime._crew_agent` is the default
+`create_session(crew_agent=None)` resolves to, and the identity is a cfg.agents key
+that selects per-agent watchdog windows and config — so the session holder is
+`AcpSessionHandle._crew_agent`, moved by `rebind_watchdog` on a claim. Two paths
+therefore differ from the unshared ones. `AcpSessionProvider.rekey` writes the
+runtime default only when `shared_runtime` is False: a claim is one session's event
+and the write would hand every co-tenant the claiming slot's identity while
+discarding another slot's. And `AcpSessionProvider.new_conversation` passes
+`crew_agent` explicitly off the handle it is replacing, because `None` there does
+not mean "no crew" — it means "read the process default", which on a shared runtime
+is whichever co-tenant last founded or claimed it. Empty is a real answer and must
+travel as itself. Between the two, nothing on a chat-shared path reads the process
+default, which leaves it a fallback for the unshared callers it was written for.
+
 A lease is held by a CHAT session and by nothing else, and the difference matters
 to anyone reading a lease count as a tenancy count. `open_task_session` registers a
 session without one, the task-run path forces `_owns_runtime = False` on the

@@ -390,6 +390,15 @@ class AcpSessionProvider(LLMProvider):
         if not self._runtime.is_alive():
             raise AcpProcessDied("Runtime is not alive — cannot start a new conversation")
         old = self._handle
+        # Read as a str or not at all: every real handle carries one, and a
+        # non-string (a bare mock, a handle built by a path that never set it)
+        # must not be forwarded as an identity -- ``""`` is the right answer for
+        # "this session has no crew" and is NOT the same as omitting the
+        # argument. Mirrors ``session_identity_token``'s read of the sibling
+        # per-session field.
+        _old_crew = getattr(old, "_crew_agent", "")
+        if not isinstance(_old_crew, str):
+            _old_crew = ""
         # Create the fresh session BEFORE destroying the old one so a failure
         # leaves the provider still pointing at a usable handle (no window where
         # self._handle references a terminated session).
@@ -398,6 +407,21 @@ class AcpSessionProvider(LLMProvider):
             agent=self._runtime._agent or None,
             memory_mode=self.memory_mode,
             session_key=self._session_key,
+            # THIS session's crew identity, carried over from the handle being
+            # replaced. Passed explicitly because the parameter's default is not
+            # "no crew" but "read the RUNTIME's default", and on a shared chat
+            # runtime that default belongs to whichever co-tenant claimed the
+            # process last -- so omitting it binds this slot's fresh session to a
+            # neighbour's crew, and with it that neighbour's watchdog windows and
+            # per-agent config. The handle is the per-session holder of the
+            # identity (``rebind_watchdog`` moves it on a claim), which is why it
+            # is read from there rather than from the runtime.
+            #
+            # ``""`` is a real answer and must reach the call as itself: it means
+            # this session has no crew and rebinds to the globals. Only ``None``
+            # would fall back to the process-level default, and nothing on a
+            # shared runtime may.
+            crew_agent=_old_crew,
         )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
@@ -1114,16 +1138,31 @@ class AcpSessionProvider(LLMProvider):
         process is not idle-reaped.
 
         ``crew_agent`` is the claiming session's canonical crew identity: the
-        pooled runtime was spawned before any crew claimed it, so both the
-        runtime default (future sessions, e.g. new_conversation) and the live
-        handle's watchdog snapshot are rebound here — the identity travels
+        pooled runtime was spawned before any crew claimed it, so the live
+        handle's watchdog snapshot is rebound here — the identity travels
         with the session, not the pool key. Empty means "no crew" and rebinds
         to the globals, so a recycled runtime never carries a previous crew's
         windows. ``watchdog`` is the pre-resolved snapshot from the async
-        caller (resolved off-loop); None makes rebind load it synchronously."""
+        caller (resolved off-loop); None makes rebind load it synchronously.
+
+        The runtime's own default crew is rewritten only when this process serves
+        this session ALONE. It is process-level state and a claim is a per-session
+        event, so on a shared chat runtime the write would hand every co-tenant
+        the claiming session's identity: the next session created without an
+        explicit crew would inherit it, and the value it overwrote was another
+        slot's. Skipping the write leaves the default at what the founder spawned
+        with, which no shared-chat path reads — ``new_conversation`` passes this
+        session's own identity and the chat start passes the slot's — so the
+        default stays a fallback for the unshared callers it was written for.
+
+        A SUBAGENT provider also reads as unshared here (``_shared_runtime`` is
+        False for it) and keeps the write it always had: it reaches no rekey in
+        practice, having never been pooled, and narrowing a path no caller takes
+        would be a guess about which behaviour is wanted there."""
         self._session_key = session_key
         self._channel_id = channel_id
-        self._runtime._crew_agent = crew_agent
+        if not getattr(self, "_shared_runtime", False):
+            self._runtime._crew_agent = crew_agent
         self._handle.rebind_watchdog(crew_agent, settings=watchdog)
         self._handle.bind_session_key(session_key)
         self._runtime._last_activity = time.monotonic()
