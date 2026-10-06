@@ -86,6 +86,13 @@ class RepoUnreadable(RepoUnavailable):
 #: the config-derived source hint.
 _REPO_INVALID_MSG: str | None = None
 
+#: Set when a config file that IS present could not be parsed.  Distinct from
+#: ``_REPO_INVALID_MSG`` (a resolved-but-invalid *checkout* path) because the
+#: config-parse state exists with ``MAIN_REPO == ""`` and has to surface BEFORE
+#: the ``MAIN_REPO`` truthiness gate — otherwise the operator sees
+#: "no Kiro Crew checkout found" rather than which config file is broken.
+_REPO_CFG_UNREADABLE_MSG: str | None = None
+
 
 def _repo() -> str:
     """The resolved main checkout path, guaranteed usable.
@@ -102,6 +109,8 @@ def _repo() -> str:
     forgetting) its own guard. Sites that deliberately degrade catch
     ``RepoUnavailable`` and say what the degraded answer is.
     """
+    if _REPO_CFG_UNREADABLE_MSG:
+        raise RepoUnreadable(_REPO_CFG_UNREADABLE_MSG)
     if not MAIN_REPO:
         raise RepoNotConfigured("no Kiro Crew checkout found to manage")
     if _REPO_INVALID_MSG:
@@ -232,6 +241,45 @@ def _configured_main_repo_checked() -> tuple[str, bool]:
     section, whole = _load_dev_fleet_cfg_checked()
     configured = section.get("repo_path")
     return (configured.strip() if isinstance(configured, str) else ""), whole
+
+
+def _unparseable_cfg_hint() -> str:
+    """A plain-English message naming the config file(s) that could not be parsed.
+
+    Blocking (reads the config directory and stats files) — executor ONLY.
+    Called from the partial-read branch of ``ensure_main_repo_discovered`` to
+    compose the message ``_REPO_CFG_UNREADABLE_MSG`` carries.  Returns one
+    sentence that names the offending file(s), matching the ``RepoUnreadable``
+    banner precedent of backend-composed English rather than catalog keys.
+    """
+    try:
+        from kiro_crew.config.loader import config_dir
+
+        base = config_dir()
+    except Exception:  # noqa: BLE001
+        return "a Dev Fleet config file could not be read"
+    _unread = object()
+    failed: list[str] = []
+    for fname in ("config.json", "config.local.json"):
+        p = base / fname
+        try:
+            present = p.is_file()
+        except OSError:
+            failed.append(fname)
+            continue
+        if not present:
+            continue
+        raw = read_json_or(p, _unread, logger=logger, what=fname)
+        if raw is _unread:
+            failed.append(fname)
+    if not failed:
+        # Race: file was fixed between the checked read and this probe.
+        return "a Dev Fleet config file could not be read"
+    return (
+        ", ".join(failed)
+        + (" is" if len(failed) == 1 else " are")
+        + " present but could not be parsed"
+    )
 
 
 def _repo_source_hint() -> str:
@@ -426,7 +474,7 @@ async def ensure_main_repo_discovered() -> None:
     often still unresolved) cannot consume it unnoticed.
     """
     global _DISCOVERY_DONE, _DISCOVERY_LOCK, MAIN_REPO, MAIN_REPO_INFERRED, _REPO_INVALID_MSG
-    global _LATCHED_CONFIGURED
+    global _LATCHED_CONFIGURED, _REPO_CFG_UNREADABLE_MSG
     # A latched VALID resolution is final and returns here with no await at all, so an
     # install that has a fleet to serve pays nothing for the per-poll retry. Only the
     # latched-INVALID state falls through, and it settles under the lock so concurrent
@@ -456,19 +504,27 @@ async def ensure_main_repo_discovered() -> None:
         )
         if not configured_whole:
             # Publish the UNRESOLVED state rather than leaving the import-time hint
-            # standing. `_repo()` gates on `MAIN_REPO` alone and never consults
-            # `_DISCOVERY_DONE`, so returning with that hint in place lets every
-            # consumer operate on a checkout this attempt could not confirm: the
+            # standing. `_repo()` gates on `_REPO_CFG_UNREADABLE_MSG` first, then on
+            # `MAIN_REPO`, so the config-parse message surfaces even with an empty
+            # `MAIN_REPO`: the operator sees which config file is broken rather than
+            # "no checkout found".
+            #
+            # `_repo()` gates on that message and on `MAIN_REPO`, never on
+            # `_DISCOVERY_DONE`, so returning with the import-time hint in place lets
+            # every consumer operate on a checkout this attempt could not confirm: the
             # provisional value `_default_main_repo_state` picks before any config is
             # read, which `dev_fleet_startup` exists to replace and normalize. An
             # attempt that cannot read tier 2 has no basis for endorsing it, and the
             # alternative is `Pull + Build` running inside a checkout the operator may
-            # not have chosen. Cleared, `_repo()` raises `RepoNotConfigured`, the page
-            # shows the setup card, and the next poll retries against a settled file.
+            # not have chosen. Cleared, `_repo()` raises `RepoUnreadable` with the parse hint,
+            # the page shows the Discovery Error banner naming the file, and the next
+            # poll retries against a settled file.
             # `_DISCOVERY_DONE` is part of that clearing. The reopen path arrives here
             # holding it True, and the gate above returns early once the pair is empty,
             # so leaving it set strands the very poll this branch promises and freezes
             # the page until a restart -- the failure this whole attempt exists to end.
+            hint = await loop.run_in_executor(subprocess_executor(), _unparseable_cfg_hint)
+            _REPO_CFG_UNREADABLE_MSG = hint
             MAIN_REPO = ""
             MAIN_REPO_INFERRED = False
             _REPO_INVALID_MSG = None
@@ -509,6 +565,10 @@ async def ensure_main_repo_discovered() -> None:
         # an earlier attempt's invalid-path message, or `_repo()` would raise
         # RepoUnreadable against a path this process does not hold.
         _REPO_INVALID_MSG = invalid_msg
+        # A whole read clears the config-parse message: either the file was fixed
+        # between polls, or it was never set.  Leaving a stale parse message beside
+        # a resolved checkout would mask the resolution and keep showing the banner.
+        _REPO_CFG_UNREADABLE_MSG = None
         # Written with the rest of this attempt's state, so the staleness test compares
         # against the string THIS attempt read. `MAIN_REPO` is the resolved form of it
         # and is the wrong side of that comparison.
@@ -1708,6 +1768,7 @@ __all__ = (
     "_LATCHED_CONFIGURED",
     "_LOCAL_BASE_CANDIDATES",
     "_REPO_INVALID_MSG",
+    "_REPO_CFG_UNREADABLE_MSG",
     "_REPO_PATH_RE",
     "_UPSTREAM_REMOTE",
     "base_branch_mutation_refusal",
@@ -1750,6 +1811,7 @@ __all__ = (
     "_real_dirty",
     "_repo",
     "_repo_source_hint",
+    "_unparseable_cfg_hint",
     "_resolve_primary_checkout",
     "_same_path",
     "_upstream_remote",

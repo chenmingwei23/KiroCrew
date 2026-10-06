@@ -35,6 +35,7 @@ def fresh_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     monkeypatch.setattr(repository, "MAIN_REPO", "")
     monkeypatch.setattr(repository, "MAIN_REPO_INFERRED", False)
     monkeypatch.setattr(repository, "_REPO_INVALID_MSG", None)
+    monkeypatch.setattr(repository, "_REPO_CFG_UNREADABLE_MSG", None)
     monkeypatch.setattr(repository, "_LATCHED_CONFIGURED", "")
     monkeypatch.setattr(runtime, "_GIT_TRUSTED_HELPERS", None)
 
@@ -502,6 +503,47 @@ class TestAConfigReadThatFailedIsNotAConfigChange:
         assert section == {}
         assert whole is False
 
+    async def test_the_parse_hint_names_the_file_that_failed(self, monkeypatch, tmp_path) -> None:
+        """``_unparseable_cfg_hint`` reads the config dir and names the broken file.
+
+        This is the message the partial-read state carries so the operator is told
+        which file to fix instead of being sent to look for a missing checkout.
+        """
+        from kiro_crew.config import loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        (tmp_path / "config.json").write_text('{"dev_fleet": {}}', encoding="utf-8")
+        (tmp_path / "config.local.json").write_text("{not json", encoding="utf-8")
+        hint = repository._unparseable_cfg_hint()
+        assert "config.local.json" in hint
+        assert "config.json," not in hint  # the whole file is not named
+        assert "could not be parsed" in hint
+
+    async def test_the_parse_hint_names_both_files_when_both_fail(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from kiro_crew.config import loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        (tmp_path / "config.json").write_text("{bad", encoding="utf-8")
+        (tmp_path / "config.local.json").write_text("{also bad", encoding="utf-8")
+        hint = repository._unparseable_cfg_hint()
+        assert "config.json" in hint
+        assert "config.local.json" in hint
+        assert "are present but could not be parsed" in hint
+
+    async def test_the_parse_hint_degrades_when_the_config_dir_is_unresolvable(
+        self, monkeypatch
+    ) -> None:
+        from kiro_crew.config import loader as loader_mod
+
+        def _boom() -> object:
+            raise RuntimeError("no data home")
+
+        monkeypatch.setattr(loader_mod, "config_dir", _boom)
+        hint = repository._unparseable_cfg_hint()
+        assert hint  # a non-empty fallback sentence, never raises
+
 
 class TestAPartialReadAtDiscoveryLatchesNothing:
     """The second read is the dangerous one, because its latch can be FINAL.
@@ -526,7 +568,8 @@ class TestAPartialReadAtDiscoveryLatchesNothing:
         ``MAIN_REPO`` is seeded with the provisional import-time value on purpose. The
         fixture zeroes it, so asserting it stays empty would pass whether or not the
         attempt clears anything; a real install reaches this branch holding that hint,
-        and ``_repo()`` gates on ``MAIN_REPO`` alone, never on ``_DISCOVERY_DONE``.
+        and ``_repo()`` gates on ``_REPO_CFG_UNREADABLE_MSG`` first, then on
+        ``MAIN_REPO``, never on ``_DISCOVERY_DONE``.
         """
         calls: list[int] = []
 
@@ -537,6 +580,11 @@ class TestAPartialReadAtDiscoveryLatchesNothing:
         monkeypatch.setattr(repository, "MAIN_REPO", "/opt/import-time-hint")
         monkeypatch.setattr(repository, "MAIN_REPO_INFERRED", True)
         monkeypatch.setattr(repository, "_configured_main_repo_checked", lambda: ("", False))
+        monkeypatch.setattr(
+            repository,
+            "_unparseable_cfg_hint",
+            lambda: "config.local.json is present but could not be parsed",
+        )
         monkeypatch.setattr(repository, "_discover_main_repo", _discover)
         monkeypatch.setattr(repository, "_resolve_primary_checkout", lambda p: p)
         monkeypatch.setattr(repository, "_is_kirocrew_checkout", lambda p: True)
@@ -545,7 +593,9 @@ class TestAPartialReadAtDiscoveryLatchesNothing:
         assert repository.MAIN_REPO == ""
         assert repository.MAIN_REPO_INFERRED is False
         assert repository._DISCOVERY_DONE is False
-        with pytest.raises(repository.RepoNotConfigured):
+        assert repository._REPO_CFG_UNREADABLE_MSG is not None
+        assert "could not be parsed" in repository._REPO_CFG_UNREADABLE_MSG
+        with pytest.raises(repository.RepoUnreadable, match="could not be parsed"):
             repository._repo()
 
     async def test_a_torn_read_on_the_reopen_path_leaves_the_next_poll_reachable(
@@ -572,6 +622,11 @@ class TestAPartialReadAtDiscoveryLatchesNothing:
         monkeypatch.setattr(repository, "_REPO_INVALID_MSG", "not a kirocrew checkout")
         monkeypatch.setattr(repository, "_invalid_resolution_is_stale", lambda: True)
         monkeypatch.setattr(repository, "_configured_main_repo_checked", _checked)
+        monkeypatch.setattr(
+            repository,
+            "_unparseable_cfg_hint",
+            lambda: "config.json is present but could not be parsed",
+        )
         monkeypatch.setattr(repository, "_discover_main_repo", lambda configured=None: "")
         await repository.ensure_main_repo_discovered()
         assert len(reads) == 1

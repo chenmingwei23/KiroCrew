@@ -133,6 +133,29 @@ def test_repo_accessor_raises_on_unresolved_checkout(monkeypatch: pytest.MonkeyP
         repository._repo()
 
 
+def test_repo_accessor_surfaces_a_config_parse_failure_over_the_missing_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-parse message outranks the missing-checkout message.
+
+    When a config file is present but does not parse, Dev Fleet refuses to resolve a
+    checkout — the deliberate behaviour — so ``MAIN_REPO`` stays empty. A message
+    attached only to ``_REPO_INVALID_MSG`` would never surface, because ``_repo()``
+    tests ``MAIN_REPO`` for truthiness before it and would raise ``RepoNotConfigured``
+    ("no Kiro Crew checkout found"). ``_REPO_CFG_UNREADABLE_MSG`` is checked BEFORE
+    that gate, so the operator is told which file failed to parse rather than being
+    sent to look for a missing checkout.
+    """
+    monkeypatch.setattr(repository, "MAIN_REPO", "")
+    monkeypatch.setattr(
+        repository,
+        "_REPO_CFG_UNREADABLE_MSG",
+        "config.local.json is present but could not be parsed",
+    )
+    with pytest.raises(repository.RepoUnreadable, match="config.local.json"):
+        repository._repo()
+
+
 def test_repo_accessor_returns_resolved_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(repository, "MAIN_REPO", "/somewhere/kirocrew")
     assert repository._repo() == "/somewhere/kirocrew"
