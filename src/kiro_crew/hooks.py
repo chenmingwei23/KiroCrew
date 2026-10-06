@@ -157,6 +157,7 @@ from kiro_crew.hook_runtime.tool_identity import (  # noqa: F401
     set_builtin_app_agents,
     set_builtin_app_mcp_servers,
     set_builtin_app_names,
+    title_is_trusted_mcp_identity,
 )
 from kiro_crew.hook_runtime.windows_paths import (  # noqa: F401
     _fold_extended_length_local,
@@ -1125,11 +1126,21 @@ class HookManager:
         # itself (the normalized title when it IS the command, and ``command``)
         # is spared the resolver.
         exempt_command = command if (is_shell and command and not mcp_server_name) else None
+        # A title that is exactly the call's own verified ``@server/tool``
+        # identity names a tool, not a file, so it is not a path-tier target
+        # either. Only an exact match is spared; any other title, and
+        # every argument, stays gated.
         for target in security_targets:
             # Reason-or-None, like the two tiers below: a stall is refused with its
             # own wording (unverifiable, not a match) instead of being reported as
             # a credential hit on whatever the target happened to be.
-            reason = sensitive_path_refusal(target) if target != exempt_command else None
+            path_exempt = target == exempt_command or title_is_trusted_mcp_identity(
+                target,
+                mcp_server_name,
+                mcp_tool_name,
+                mcp_identity_trusted=mcp_identity_trusted,
+            )
+            reason = None if path_exempt else sensitive_path_refusal(target)
             if reason:
                 return ToolHookResult.deny(reason)
             # execute_bash (prefixed or bare) — IMDS reach, env-credential leaks,
