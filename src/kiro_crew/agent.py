@@ -2288,7 +2288,7 @@ def _refresh_dynamic_fields(
     # Imported lazily: config.loader imports this module, so a top-level import
     # would close the cycle. Warm by the time this runs (importing agent pulls
     # config.loader in), so the lookup costs nothing on the caller's thread.
-    from kiro_crew.config.loader import DEFAULT_MODEL, normalize_agent_model
+    from kiro_crew.config.loader import DEFAULT_MODEL, coerce_config_field, normalize_agent_model
 
     # Default-model tracking: when the model is managed (not an explicit user
     # pick), re-sync it from the shipped defaults.json so a default bump
@@ -2324,7 +2324,7 @@ def _refresh_dynamic_fields(
     # (` auto `, an int) from reaching a spec kiro-cli validates with
     # deny_unknown_fields — a spec it rejects wholesale, silently falling back to
     # the default agent.
-    mc_model = normalize_agent_model((mc_cfg.get("agent") or {}).get("model"))
+    mc_model = normalize_agent_model(coerce_config_field(mc_cfg, "agent", dict, {}).get("model"))
     if mc_model and not fork:
         config["model"] = mc_model
 

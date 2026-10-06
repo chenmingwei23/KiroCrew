@@ -9246,3 +9246,33 @@ class TestForkPromptRefreshGuard:
         inline = {"prompt": "You are a helpful crew."}
         _refresh_dynamic_fields(inline, fork=True)
         assert inline["prompt"] == "You are a helpful crew."
+
+
+class TestRefreshDynamicFieldsWrongTypedAgentSection:
+    """The spec builder reads the config ``agent`` section as a dict. A ``None``
+    or missing section means inherit; a truthy non-dict value (a list or a
+    string from a hand-edited config.json) also degrades to inherit rather than
+    reaching ``.get`` on a non-dict, matching the validated loader."""
+
+    @pytest.mark.parametrize("bad_agent", [["x"], "oops", 123, 1.5])
+    def test_a_truthy_non_dict_agent_section_does_not_raise(self, tmp_path, bad_agent):
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": bad_agent}), encoding="utf-8")
+        config = {"name": "kirocrew", "model": "sentinel"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        # No model was pulled from the malformed section, so the sentinel the
+        # builder started with is not overwritten by a config-derived pick.
+        assert config["model"] == "sentinel"
+
+    def test_a_valid_agent_model_is_still_applied(self, tmp_path):
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "claude-chosen"}}), encoding="utf-8")
+        config = {"name": "kirocrew", "model": "sentinel"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        assert config["model"] == "claude-chosen"
