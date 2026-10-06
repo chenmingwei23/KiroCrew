@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { addPendingFile, extendsConsumably, findUnreferencedAttachments, foldWinSep, isWindowsShapedPath, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseFiles, prepareSendPayload, buildFileLabels, resolveFileSegment, mdImageDest, mdImageDestToPath, restoreQueuedContent, restoreUnreferencedImages, serializeDirTokens } from '../utils/fileTokens'
+import { addPendingFile, extendsConsumably, findUnreferencedAttachments, foldWinSep, isWindowsShapedPath, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, mentionSpanAt, normalizeWindowsPath, parseFiles, prepareSendPayload, buildFileLabels, resolveFileSegment, mdImageDest, mdImageDestToPath, restoreQueuedContent, restoreUnreferencedImages, serializeDirTokens } from '../utils/fileTokens'
 
 describe('buildFileLabels uniqueness', () => {
   it('disambiguates paths that share a basename', () => {
@@ -793,5 +793,70 @@ describe('restoreUnreferencedImages (legacy pane rows: image only on meta.files)
 
   it('an image-only legacy row (empty caption) yields just the image line', () => {
     expect(restoreUnreferencedImages('', { files: ['/tmp/a.png'] })).toBe('![image](/tmp/a.png)')
+  })
+})
+
+describe('mentionSpanAt (atomic picked-mention delete, #14675)', () => {
+  const AL = ['@src/main.ts']
+  it('finds the whole span for a Backspace just past the mention end', () => {
+    const t = 'please review @src/main.ts for the bug'
+    const end = t.indexOf('@src/main.ts') + '@src/main.ts'.length
+    expect(mentionSpanAt(t, end, false, AL, false)).toEqual({ start: t.indexOf('@'), end })
+  })
+  it('finds the span for a Delete just before the mention start', () => {
+    const t = 'see @src/main.ts here'
+    const start = t.indexOf('@src/main.ts')
+    expect(mentionSpanAt(t, start, true, AL, false)).toEqual({ start, end: start + '@src/main.ts'.length })
+  })
+  it('finds the span for a caret inside the mention', () => {
+    const t = 'review @src/main.ts now'
+    const start = t.indexOf('@src/main.ts')
+    expect(mentionSpanAt(t, start + 6, false, AL, false)).toEqual({ start, end: start + '@src/main.ts'.length })
+  })
+  it('does NOT match a recorded alias inside a longer hand-typed word (fork GPT/Opus review)', () => {
+    // `@a.ts` recorded, text has `@a.tsx` -- a raw substring scan would carve
+    // `@a.ts` out and strand `x`. The shared boundary rejects it.
+    const t = 'review @a.tsx'
+    const before = t.indexOf('@a.tsx')
+    expect(mentionSpanAt(t, before, true, ['@a.ts'], false)).toBeNull()
+    expect(mentionSpanAt(t, t.length, false, ['@a.ts'], false)).toBeNull()
+  })
+  it('consumes a :line suffix with the mention', () => {
+    const t = 'see @src/main.ts:42 for the bug'
+    const end = t.indexOf(':42') + ':42'.length
+    expect(mentionSpanAt(t, end, false, AL, false)).toEqual({ start: t.indexOf('@'), end })
+  })
+  it('consumes an opening wrapper only when its matching closer follows (fork GPT/Opus review)', () => {
+    // `(@a.ts:42)` is one wrapped unit -- the span includes both parens.
+    const wrapped = 'look (@a.ts:42) ok'
+    const wEnd = wrapped.indexOf(')') + 1
+    expect(mentionSpanAt(wrapped, wEnd, false, ['@a.ts'], false)).toEqual({ start: wrapped.indexOf('('), end: wEnd })
+    // `(@a.ts + y)` -- the `(` opens an expression, not the mention; the span
+    // must NOT eat the `(`, or an unbalanced `)` ships.
+    const expr = 'look (@a.ts + y)'
+    const mEnd = expr.indexOf('@a.ts') + '@a.ts'.length
+    expect(mentionSpanAt(expr, mEnd, false, ['@a.ts'], false)).toEqual({ start: expr.indexOf('@a.ts'), end: mEnd })
+  })
+  it('ignores a text mention whose alias is absent from the passed set (fork GPT review F1)', () => {
+    // The caller passes ONLY currently-staged files' aliases. A removed
+    // chip's alias (kept recorded for undo) or a since-switched project's
+    // alias is NOT in that set, so its retyped-as-prose text is ordinary
+    // text here and the atomic delete never fires on it.
+    const t = 'please review @src/main.ts for the bug'
+    const end = t.indexOf('@src/main.ts') + '@src/main.ts'.length
+    // Same text, but the staged set does not contain this file's alias.
+    expect(mentionSpanAt(t, end, false, [], false)).toBeNull()
+    expect(mentionSpanAt(t, end, false, ['@other/thing.ts'], false)).toBeNull()
+  })
+  it('returns null when no mention is on or adjacent to the caret', () => {
+    const t = 'hello @src/main.ts'
+    expect(mentionSpanAt(t, 3, false, AL, false)).toBeNull()
+  })
+  it('prefers the longer of two prefix-sibling aliases the caret touches', () => {
+    // `@report` and `@report,` both staged; a caret at the end of `@report,`
+    // resolves to the longer mention, not a prefix of it.
+    const t = 'see @report, here'
+    const end = t.indexOf('@report,') + '@report,'.length
+    expect(mentionSpanAt(t, end, false, ['@report', '@report,'], false)).toEqual({ start: t.indexOf('@report,'), end })
   })
 })

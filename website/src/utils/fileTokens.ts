@@ -539,6 +539,67 @@ export const leadingMentionBoundary = /(?:^|\s)[($[{`"']?/.source
  *  `mentionBoundary`'s punctuation run, so a wrapped `(@a.ts:42)` counts. */
 export const MENTION_LINE_SUFFIX = /^:\d+(?=\s|$|[,.!?;:)\]}`"'])/
 
+/** The span of a recorded `@mention` on or adjacent to caret `at`, or null
+ *  when none is -- the one grammar behind atomic-mention editing (#14675),
+ *  SHARED with the reconciliation staleness check and the remove-chip strip
+ *  so a keystroke, the chip ✕ and the staleness test can never disagree
+ *  about where a mention begins and ends.
+ *
+ *  `aliases` is every recorded `@rel` of every currently-staged file (the
+ *  values of `pickedFileTokens` for the slot); `winShaped` is whether the
+ *  project is Windows-shaped, so separator spellings fold like everywhere
+ *  else. Occurrences are found through `mentionTokenRegex`, NOT a raw
+ *  substring scan: it applies `leadingMentionBoundary` before `@` and
+ *  `mentionBoundaryFor` after the alias, so a recorded `@a.ts` is never
+ *  matched inside a longer hand-typed word (`@a.tsx`) -- a bare `indexOf`
+ *  would carve `@a.ts` out and strand a `x` the reconciliation and the ✕
+ *  never treat as a mention (fork GPT/Opus review). A leading opening
+ *  wrapper joins the span ONLY when its matching closer follows the mention
+ *  (and its `:line` suffix): a lone `(` the user typed before an unwrapped
+ *  mention stays, as `removeFileChip` keeps it -- consuming it alone would
+ *  strand an unbalanced `)` in the sent text (fork GPT/Opus review).
+ *
+ *  Longer aliases are tried first so a caret abutting the shorter of two
+ *  prefix-sibling aliases (`@report` vs `@report,`) resolves to the mention
+ *  it is actually touching. `forward` picks the direction a boundary-abutting
+ *  caret belongs to: a Delete (forward) claims a caret just BEFORE the span,
+ *  a Backspace (not forward) one just AFTER it; a caret strictly inside
+ *  claims it either way. */
+export function mentionSpanAt(
+  text: string, at: number, forward: boolean, aliases: readonly string[], winShaped: boolean,
+): { start: number; end: number } | null {
+  const fold = foldWinSep(winShaped)
+  const folded = fold(text)
+  const bareAliases = [...new Set(aliases.map(a => fold(a.startsWith('@') ? a.slice(1) : a)))]
+  const siblingBare = new Set(bareAliases)
+  const byLongest = [...bareAliases].sort((a, b) => b.length - a.length)
+  for (const bare of byLongest) {
+    const others = new Set([...siblingBare].filter(s => s !== bare))
+    const re = mentionTokenRegex(bare, 'g', others)
+    for (let m = re.exec(folded); m !== null; m = re.exec(folded)) {
+      if (m[0].length === 0) { re.lastIndex++; continue }
+      const atSign = m.index + m[1].length
+      const coreEnd = atSign + 1 + bare.length
+      const lead = m[1]
+      const open = lead.length > 0 && WRAPPER_CLOSER[lead[lead.length - 1]] ? lead[lead.length - 1] : ''
+      const boundarySrc = mentionBoundaryFor(bare, others)
+      let afterCore = coreEnd
+      if (boundarySrc === mentionBoundary) {
+        const lineM = MENTION_LINE_SUFFIX.exec(folded.slice(coreEnd))
+        if (lineM) afterCore = coreEnd + lineM[0].length
+      }
+      const closesHere = !!open && folded[afterCore] === WRAPPER_CLOSER[open]
+      const spanStart = closesHere ? atSign - 1 : atSign
+      const spanEnd = closesHere ? afterCore + 1 : afterCore
+      const inside = at > spanStart && at < spanEnd
+      const abutsBack = !forward && at === spanEnd
+      const abutsFwd = forward && at === spanStart
+      if (inside || abutsBack || abutsFwd) return { start: spanStart, end: spanEnd }
+    }
+  }
+  return null
+}
+
 /** Markdown-safe destination for a local image path.
  *
  *  Raw paths break `![image](path)` in several ways (issue #3497):

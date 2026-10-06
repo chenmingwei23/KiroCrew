@@ -1207,6 +1207,207 @@ describe('ChatPage file-chip remove parity', { timeout: 15_000 }, () => {
     expect(ta.value).toBe('please check @main.ts ')
   })
 
+  it('Backspace at the end of a picked mention removes the whole mention and unstages the chip (#14675)', async () => {
+    // The bug: one Backspace at the end of `@src/main.ts` left `@src/main.t`
+    // in the text while the chip silently unstaged -- the message went out
+    // naming a file with no attachment. A picked mention is ONE atomic unit:
+    // a Backspace on it removes the whole reference AND the chip together, so
+    // no half-written form can ever exist.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: main.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'please review @src/main.ts for the bug' } })
+    await screen.findByLabelText('Remove')
+    // Caret just past the mention's final `s`.
+    const end = ta.value.indexOf('@src/main.ts') + '@src/main.ts'.length
+    ta.setSelectionRange(end, end)
+    fireEvent.keyDown(ta, { key: 'Backspace' })
+
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    // The whole mention is gone -- no `@src/main.t` half-reference survives --
+    // and the surrounding sentence keeps single spacing.
+    expect(ta.value).not.toContain('@src/main')
+    expect(ta.value).toBe('please review for the bug')
+  })
+
+  it('Delete at the start of a picked mention removes the whole mention and unstages the chip (#14675)', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: main.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'see @src/main.ts here' } })
+    await screen.findByLabelText('Remove')
+    // Caret right before the mention's `@`.
+    const start = ta.value.indexOf('@src/main.ts')
+    ta.setSelectionRange(start, start)
+    fireEvent.keyDown(ta, { key: 'Delete' })
+
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    expect(ta.value).not.toContain('@src/main')
+    expect(ta.value).toBe('see here')
+  })
+
+  it('Backspace inside a picked mention removes the whole mention, not one character (#14675)', async () => {
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: main.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'review @src/main.ts now' } })
+    await screen.findByLabelText('Remove')
+    // Caret in the middle of the path (`@src/ma|in.ts`).
+    const mid = ta.value.indexOf('@src/main.ts') + 6
+    ta.setSelectionRange(mid, mid)
+    fireEvent.keyDown(ta, { key: 'Backspace' })
+
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    expect(ta.value).not.toContain('@src/main')
+    expect(ta.value).toBe('review now')
+  })
+
+  it('Backspace on a wrapped file:line mention removes the wrapper and :line suffix with it (#14675)', async () => {
+    // The atomic span matches what the chip's own ✕ strips: `(@a.ts:42)` is
+    // one unit -- the wrapper pair and the `:42` go with the mention, never
+    // left behind as `(:42)` message text.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: a.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'look at (@a.ts:42) please' } })
+    await screen.findByLabelText('Remove')
+    // Caret just past the closing paren.
+    const end = ta.value.indexOf('(@a.ts:42)') + '(@a.ts:42)'.length
+    ta.setSelectionRange(end, end)
+    fireEvent.keyDown(ta, { key: 'Backspace' })
+
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    expect(ta.value).not.toContain('@a.ts')
+    expect(ta.value).not.toContain(':42')
+    expect(ta.value).not.toContain('(')
+    expect(ta.value).toBe('look at please')
+  })
+
+  it('Backspace on a mention leaves a staged sibling and ordinary text untouched (#14675)', async () => {
+    // Only the ONE occurrence adjacent to the caret is removed -- a second
+    // staged file keeps its own mention and chip, and the shared trailing
+    // segment of a sibling is never borrowed as this mention's span.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: main.ts'))
+    fireEvent.click(await screen.findByText('Add to chat: other/src/main.ts'))
+    await waitFor(() => expect(screen.getAllByLabelText('Remove')).toHaveLength(2))
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'see @src/main.ts and @other/src/main.ts here' } })
+    await waitFor(() => expect(screen.getAllByLabelText('Remove')).toHaveLength(2))
+    // Backspace at the end of the FIRST (shorter) mention.
+    const end = ta.value.indexOf('@src/main.ts') + '@src/main.ts'.length
+    ta.setSelectionRange(end, end)
+    fireEvent.keyDown(ta, { key: 'Backspace' })
+
+    // Only the edited file unstages; the untouched sibling stays.
+    await waitFor(() => expect(screen.getAllByLabelText('Remove')).toHaveLength(1))
+    expect(ta.value).toBe('see and @other/src/main.ts here')
+  })
+
+  it('Backspace with no mention at the caret falls through to native per-character delete (#14675)', async () => {
+    // The handler only claims the key when a recorded mention is on or
+    // adjacent to the caret. Ordinary text deletes one character as always.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: main.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'hello @src/main.ts' } })
+    await screen.findByLabelText('Remove')
+    // Caret far from the mention, in the middle of `hello`.
+    ta.setSelectionRange(3, 3)
+    const prevent = vi.fn()
+    fireEvent.keyDown(ta, { key: 'Backspace', preventDefault: prevent })
+    // Not consumed: the mention and its chip are untouched, and the native
+    // delete is left to the browser (nothing spliced the text here).
+    expect(ta.value).toContain('@src/main.ts')
+    expect(screen.queryByLabelText('Remove')).not.toBeNull()
+  })
+
+  it('atomic delete never fires inside a LONGER word that merely starts with a recorded alias (fork GPT/Opus review, #14675)', async () => {
+    // `@a.ts` is staged, but the user hand-typed `@a.tsx` (a different,
+    // unstaged word). A raw-substring scan would match `@a.ts` inside it
+    // and a Backspace would delete it, leaving a stray `x` -- text the
+    // reconciliation and the ✕ never treat as a mention. The shared
+    // mention boundary (`mentionBoundaryFor`) rejects the match, so the
+    // key falls through to a native one-character delete and the chip is
+    // left exactly as it was.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: a.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'review @a.tsx' } })
+    // The chip unstages on this edit (no recorded alias matches `@a.tsx`),
+    // which is the existing exact-or-nothing behavior.
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    // Delete with the caret right before `@a.tsx`.
+    const start = ta.value.indexOf('@a.tsx')
+    ta.setSelectionRange(start, start)
+    fireEvent.keyDown(ta, { key: 'Delete' })
+    // NOT atomically removed: the whole word stays (native would delete the
+    // single `@`, but nothing here spliced it). Crucially `@a.ts` was not
+    // carved out of `@a.tsx` leaving a stray `x`.
+    expect(ta.value).toBe('review @a.tsx')
+  })
+
+  it('atomic delete consumes an opening wrapper only when its matching closer is consumed too (fork GPT/Opus review, #14675)', async () => {
+    // `look at (@a.ts + y)`: the `(` opens an expression, not a wrapped
+    // mention -- the `)` closes `y)`, not the mention. Consuming the `(`
+    // with the mention would strand an unbalanced `)` in the message. The
+    // wrapper joins the span only when the matching closer follows the
+    // mention, so here the `(` stays, matching `removeFileChip`.
+    const store = makeStore('slot-a', [{ key: 'slot-a', project: '/repo' }])
+    await renderPage(store)
+
+    act(() => { store.dispatch(openActivityPanel()) })
+    fireEvent.click(await screen.findByText('Add to chat: a.ts'))
+    await screen.findByLabelText('Remove')
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    fireEvent.change(ta, { target: { value: 'look at (@a.ts + y)' } })
+    await screen.findByLabelText('Remove')
+    // Backspace just past `@a.ts` (before ` + y)`).
+    const end = ta.value.indexOf('@a.ts') + '@a.ts'.length
+    ta.setSelectionRange(end, end)
+    fireEvent.keyDown(ta, { key: 'Backspace' })
+
+    await waitFor(() => expect(screen.queryByLabelText('Remove')).toBeNull())
+    // The mention is gone; the user's own `(` and `)` are untouched.
+    expect(ta.value).not.toContain('@a.ts')
+    expect(ta.value).toBe('look at ( + y)')
+  })
+
   it('an ambiguous shortened form never keeps a file staged: only the untouched exact mention survives', async () => {
     // With both /repo/src/main.ts and /repo/other/src/main.ts staged, a
     // hand-typed `@main.ts` matches no recorded alias for either file --

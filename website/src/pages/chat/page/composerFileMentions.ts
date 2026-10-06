@@ -4,7 +4,7 @@ import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
 import { makeRelative, type FileKind } from '../../../components/FilePickerMenu'
 import {
   MENTION_LINE_SUFFIX, WRAPPER_CLOSER, addPendingFile, extendsConsumably, foldWinSep, isWindowsShapedPath,
-  leadingMentionBoundary, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath,
+  leadingMentionBoundary, mentionBoundary, mentionBoundaryFor, mentionSpanAt, mentionTokenRegex, normalizeWindowsPath,
   parseDirTokens, spliceDirTokens,
 } from '../../../utils/fileTokens'
 import { findTokenRanges } from '../../../utils/pasteTokens'
@@ -703,6 +703,94 @@ export function useFileMentionActions({
     const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
   }
+  // A picked file mention is ONE atomic unit on a hand edit (#14675). A
+  // Backspace or Delete on or inside it removes the WHOLE mention and
+  // its chip together, the same way a collapsed-paste token already
+  // deletes as a unit (chat-input/paste.ts `handleTokenKey`). Without
+  // this, a single Backspace at the end of `@src/main.ts` turned it into
+  // `@src/main.t`: the reconciliation effect unstaged the chip (the
+  // spelling no longer matched a recorded alias), but the half-written
+  // reference was left in the text and sent as plain prose naming a file
+  // with no attachment -- the exact failure the issue reports.
+  //
+  // The span deleted matches what the chip's own ✕ (`removeFileChip`)
+  // strips for the SAME mention occurrence: the `@alias`, an optional
+  // leading opening wrapper and its closing partner (`(@a.ts)`), and a
+  // `:line` suffix (`@a.ts:42`) -- so a keystroke and the ✕ can never
+  // disagree about where a mention begins and ends. Only the ONE
+  // occurrence adjacent to the caret is removed, never every mention of
+  // the file; the reconciliation effect then unstages the chip exactly
+  // when no recorded alias of that file is mentioned anymore.
+  //
+  // Scoped to the aliases of CURRENTLY-STAGED files only (`pendingFiles`
+  // ∩ `currentSlotTokens`): a typed or draft-restored `@rel` with no
+  // bookkeeping is ordinary text the user is editing by hand, and a
+  // folder token (`@src/`) has no file chip to keep in step -- both fall
+  // through to the native per-character edit. Intersecting with the live
+  // staged set also drops an alias whose chip was REMOVED (its aliases
+  // are deliberately kept recorded for undo, `removeFileChip`) or that
+  // belongs to a since-switched project: with no chip to keep in step
+  // that text is prose too, so the atomic delete must not eat it (fork
+  // GPT review F1). A removed/foreign alias retyped as prose therefore
+  // deletes one character natively, exactly like any other text.
+  //
+  // Returns true when it consumed the key (ChatInput then skips the
+  // default textarea handling), false otherwise.
+  // The mention span on/adjacent to the caret, via the SHARED pure
+  // `mentionSpanAt` in fileTokens.ts (fork First Principles review): the
+  // keystroke, the reconciliation staleness check and the remove-chip strip
+  // now read one grammar, so they cannot disagree about a mention's extent.
+  // This wrapper only supplies the slot's recorded aliases and the project's
+  // Windows-shape to the pure function.
+  const mentionSpanAtCaret = useCallback((text: string, at: number, forward: boolean) => {
+    // Only the aliases of files that still have a live chip (`pendingFiles`)
+    // -- a removed/foreign alias kept in the record for undo has no chip to
+    // keep in step, so its text is prose the user edits per-character (F1).
+    const known = currentSlotTokens() ?? {}
+    const aliases = pendingFilesRef.current.flatMap(p => known[p] ?? [])
+    return mentionSpanAt(text, at, forward, aliases, isWindowsShapedPath(currentProjectRef.current || ''))
+  }, [currentProjectRef, currentSlotTokens, pendingFilesRef])
+
+  // Returns the resulting text and caret when it recognizes the key as an
+  // atomic mention delete, or null to let the native per-character edit
+  // run. It does NOT apply the edit itself: ChatInput routes the result
+  // through its own `onChange` (the user-edit sink that clears follow-up
+  // ownership and arms the prefill-edited flag) and places the caret, the
+  // same path every other composer keystroke takes.
+
+  // Returns the resulting text and caret when it recognizes the key as an
+  // atomic mention delete, or null to let the native per-character edit
+  // run. It does NOT apply the edit itself: ChatInput routes the result
+  // through its own `onChange` (the user-edit sink that clears follow-up
+  // ownership and arms the prefill-edited flag) and places the caret, the
+  // same path every other composer keystroke takes.
+  const handleMentionKey = useCallback((e: {
+    key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean
+    selectionStart: number | null; selectionEnd: number | null
+    preventDefault: () => void
+  }): { value: string; caret: number } | null => {
+    const isDelete = e.key === 'Delete'
+    const isBackspace = e.key === 'Backspace'
+    if ((!isDelete && !isBackspace) || e.metaKey || e.ctrlKey || e.altKey) return null
+    const ss = e.selectionStart ?? 0
+    const se = e.selectionEnd ?? 0
+    if (ss !== se) return null // a range selection deletes natively
+    const text = inputRef.current
+    const span = mentionSpanAtCaret(text, ss, isDelete)
+    if (!span) return null
+    e.preventDefault()
+    // Collapse the orphaned space the mention leaves behind: a mention
+    // typically sits space-padded (`please review @a.ts for ...`), and
+    // dropping only its own characters would leave a double space. Prefer
+    // the trailing space so a leading `please review ` keeps its one
+    // space; fall back to the leading one at end-of-text.
+    let { start, end } = span
+    if (text[end] === ' ' && (start === 0 || text[start - 1] === ' ' || text[start - 1] === '\n')) end += 1
+    else if (text[start - 1] === ' ' && (end >= text.length || text[end] === ' ' || text[end] === '\n')) start -= 1
+    const value = text.slice(0, start) + text.slice(end)
+    return { value, caret: start }
+  }, [inputRef, mentionSpanAtCaret])
+
   // A folder pick is complete once ChatInput inserts its `@rel/`
   // token — the chip derives from the text, so there is no state
   // to stage here. Files stay list-backed (uploads have no token)
@@ -718,5 +806,5 @@ export function useFileMentionActions({
     if (token) recordSlotToken(canon, token)
     setPendingFiles(prev => addPendingFile(prev, canon))
   }
-  return { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile }
+  return { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile, handleMentionKey }
 }

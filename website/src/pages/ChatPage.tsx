@@ -2711,7 +2711,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; naming the enclosing object would make this a new function every render and churn renderMessage below
   }, [dispatch, activeSlot, boundStore, search.close])
   // `@`-mentions of files and folders and the file chips they stage.
-  const { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile } = useFileMentionActions({
+  const { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile, handleMentionKey } = useFileMentionActions({
     staging,
     inputRef,
     setInput,
@@ -6260,6 +6260,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // A tree row dropped on the composer is "Add to chat" by drag.
               onTreeEntryDrop={handleAddToContext}
               clampDropOffset={clampOutOfTokens}
+              onMentionKey={handleMentionKey}
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
               projectDetached={!projectGitError && !!projectGit?.detached}
