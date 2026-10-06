@@ -3234,7 +3234,8 @@
         "synced_many": "{{count}} eventi sincronizzati",
         "synced_one": "{{count}} evento sincronizzato",
         "synced_other": "{{count}} eventi sincronizzati",
-        "title": "Riunioni"
+        "title": "Riunioni",
+        "pastSection": "Riunioni passate"
       },
       "manifest": {
         "description": "Un assistente AI per le riunioni. Trascrive la riunione dal vivo, tiene note e diagrammi strutturati mentre procede, estrae le azioni da fare e ti lascia rivederle prima di registrarle.",

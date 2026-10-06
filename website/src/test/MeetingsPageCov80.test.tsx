@@ -127,6 +127,76 @@ describe('MeetingsPage list', () => {
     expect(planning.compareDocumentPosition(retro) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
   })
 
+  it('starts from the nearest upcoming date, then shows past meetings as activity (#12478)', async () => {
+    // The regression: the "All meetings" list opened on its FARTHEST-OUT entry.
+    // It must open on the NEAREST upcoming date (agenda order), with meetings
+    // already worked on sitting below as newest-first recent activity.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(new Date('2026-09-21T06:00:00Z'))
+    apiMocks.calendar.mockResolvedValue({
+      events: [
+        event({ event_id: 'zzz-far', title: 'zzz Far', start: '2026-09-28T09:00:00Z', end: '2026-09-28T10:00:00Z' }),
+        event({ event_id: 'zzz-near', title: 'zzz Near', start: '2026-09-21T09:00:00Z', end: '2026-09-21T10:00:00Z' }),
+      ],
+      provider: 'none',
+      configured: true,
+    })
+    apiMocks.meetings.mockResolvedValue({
+      meetings: [
+        meeting({ event_id: 'zzz-old', title: 'zzz Old', started_at: '2026-09-10T09:00:00Z', ended_at: '2026-09-10T10:00:00Z' }),
+        meeting({ event_id: 'zzz-recent', title: 'zzz Recent', started_at: '2026-09-19T09:00:00Z', ended_at: '2026-09-19T10:00:00Z' }),
+      ],
+    })
+    renderPage()
+    await screen.findByText('zzz Near')
+    const order = ['zzz Near', 'zzz Far', 'zzz Recent', 'zzz Old'].map(t => screen.getByText(t))
+    for (let i = 0; i < order.length - 1; i++) {
+      // Each row precedes the next in document order.
+      expect(order[i].compareDocumentPosition(order[i + 1]) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    }
+  })
+
+  it('marks the boundary where upcoming meetings give way to past ones (#12478)', async () => {
+    // The dates climb (upcoming, nearest first) then reverse (past, newest
+    // first); without a marker the reversal reads as a sorting bug. A single
+    // "past meetings" divider sits between the last upcoming row and the first
+    // past one — not above an all-upcoming or all-past list.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(new Date('2026-09-21T06:00:00Z'))
+    apiMocks.calendar.mockResolvedValue({
+      events: [event({ event_id: 'zzz-near', title: 'zzz Near', start: '2026-09-21T09:00:00Z', end: '2026-09-21T10:00:00Z' })],
+      provider: 'none',
+      configured: true,
+    })
+    apiMocks.meetings.mockResolvedValue({
+      meetings: [meeting({ event_id: 'zzz-recent', title: 'zzz Recent', started_at: '2026-09-19T09:00:00Z', ended_at: '2026-09-19T10:00:00Z' })],
+    })
+    renderPage()
+    const near = await screen.findByText('zzz Near')
+    const divider = screen.getByText('Past meetings')
+    const recent = screen.getByText('zzz Recent')
+    // Divider sits after the upcoming row and before the past row.
+    expect(near.compareDocumentPosition(divider) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(divider.compareDocumentPosition(recent) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  })
+
+  it('shows no section divider when every meeting is upcoming (#12478)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(new Date('2026-09-21T06:00:00Z'))
+    apiMocks.calendar.mockResolvedValue({
+      events: [
+        event({ event_id: 'zzz-near', title: 'zzz Near', start: '2026-09-21T09:00:00Z', end: '2026-09-21T10:00:00Z' }),
+        event({ event_id: 'zzz-far', title: 'zzz Far', start: '2026-09-28T09:00:00Z', end: '2026-09-28T10:00:00Z' }),
+      ],
+      provider: 'none',
+      configured: true,
+    })
+    apiMocks.meetings.mockResolvedValue({ meetings: [] })
+    renderPage()
+    await screen.findByText('zzz Near')
+    expect(screen.queryByText('Past meetings')).not.toBeInTheDocument()
+  })
+
   it('keeps the calendar start time for a meeting the app has also touched', async () => {
     apiMocks.calendar.mockResolvedValue({ events: [event({ event_id: 'zzz-retro', title: 'zzz Cal Retro' })], provider: 'none', configured: true })
     renderPage()

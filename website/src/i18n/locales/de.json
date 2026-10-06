@@ -3261,7 +3261,8 @@
         "syncFailed": "Der Kalender konnte nicht synchronisiert werden.",
         "synced_one": "{{count}} Termin synchronisiert",
         "synced_other": "{{count}} Termine synchronisiert",
-        "title": "Besprechungen"
+        "title": "Besprechungen",
+        "pastSection": "Frühere Besprechungen"
       },
       "manifest": {
         "description": "Ein KI-Assistent für Besprechungen. Transkribiert eine laufende Besprechung, führt dabei strukturierte Notizen und Diagramme, extrahiert Aufgaben und lässt dich sie prüfen, bevor sie angelegt werden.",

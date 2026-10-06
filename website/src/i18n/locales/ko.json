@@ -3202,7 +3202,8 @@
         "syncCalendar": "캘린더 동기화",
         "syncFailed": "캘린더를 동기화할 수 없습니다.",
         "synced_other": "일정 {{count}}개를 동기화했습니다",
-        "title": "회의"
+        "title": "회의",
+        "pastSection": "지난 회의"
       },
       "manifest": {
         "use_case_1": "실시간 회의를 캡처하는 동안 여러 에이전트가 대화 기록, 구조화된 노트, 다이어그램, 액션 아이템 검토를 병렬로 만듭니다.",

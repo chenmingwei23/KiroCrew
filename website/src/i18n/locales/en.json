@@ -1890,7 +1890,8 @@
         "syncFailed": "Could not sync the calendar.",
         "synced_one": "Synced {{count}} event",
         "synced_other": "Synced {{count}} events",
-        "title": "Meetings"
+        "title": "Meetings",
+        "pastSection": "Past meetings"
       },
       "manifest": {
         "description": "An AI meeting assistant. Transcribes a live meeting, keeps structured notes and diagrams as it goes, extracts action items, and lets you review them before filing.",

@@ -66,6 +66,16 @@ function deleteFailureMessage(error: unknown): string {
     : i18nT('apps.meetings.list.deleteFailed')
 }
 
+/**
+ * Is this row's start at or after `now` (an upcoming meeting) rather than in the
+ * past? `start` is an ISO-8601 instant, compared as bytes against the same `now`
+ * the list was partitioned with, so the render's section boundary agrees with
+ * the sort order exactly. An empty start is never upcoming — it sinks.
+ */
+function isUpcoming(start: string, now: string): boolean {
+  return start !== '' && start >= now
+}
+
 function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
   const byId = new Map<string, Row>()
   for (const event of events) {
@@ -95,11 +105,25 @@ function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
       touched: true,
     })
   }
+  // The list reads as two sections: upcoming events in agenda order (nearest
+  // first), then meetings already worked on as recent activity (newest first).
+  // A single descending comparator buried today under later events — the
+  // "what's next" list opening on its farthest-out entry (#12478); a single
+  // ascending one is the same defect reversed. `now` is captured once so the
+  // partition is stable across the sort.
   // Byte comparison, NOT compareText: these are ISO-8601 timestamps, which sort
   // correctly as bytes and must not be reordered by a locale's collation rules.
+  const now = new Date().toISOString()
   return [...byId.values()].sort((a, b) => {
     const [x, y] = [a.start || '', b.start || '']
-    return x === y ? 0 : x < y ? 1 : -1
+    const [xUpcoming, yUpcoming] = [isUpcoming(x, now), isUpcoming(y, now)]
+    if (xUpcoming !== yUpcoming) return xUpcoming ? -1 : 1
+    if (x === y) return 0
+    // A missing start always sinks, in either section.
+    if (x === '') return 1
+    if (y === '') return -1
+    // Upcoming: nearest date first (ascending). Past: newest first (descending).
+    return xUpcoming ? (x < y ? -1 : 1) : (x < y ? 1 : -1)
   })
 }
 
@@ -209,6 +233,15 @@ export default function MeetingsPage() {
     const query = filter.trim().toLowerCase()
     return query ? rows.filter(row => row.title.toLowerCase().includes(query)) : rows
   }, [rows, filter])
+
+  // The index of the first past meeting in the shown list, or -1 if the list is
+  // all upcoming (or all past). The divider is drawn before this row so the
+  // upcoming→past reversal reads as two sections, not a sorting glitch (#12478).
+  const firstPastIndex = useMemo(() => {
+    const now = new Date().toISOString()
+    const i = filtered.findIndex(row => !isUpcoming(row.start, now))
+    return i > 0 ? i : -1
+  }, [filtered])
 
   const liveRow = rows.find(row => row.status === 'active' || row.status === 'reviewing')
 
@@ -347,13 +380,27 @@ export default function MeetingsPage() {
             />
           ) : (
             <div className="flex flex-col gap-2">
-              {filtered.map(row => {
+              {filtered.map((row, index) => {
                 const rowDeleteError =
                   deleteMeeting.isError && deleteMeeting.variables?.eventId === row.eventId
                     ? deleteFailureMessage(deleteMeeting.error)
                     : ''
+                // `mergeRows` puts upcoming meetings (nearest first) above past
+                // ones (newest first); the dates climb and then reverse. Mark
+                // that one boundary so the reversal reads as two sections, not a
+                // sorting glitch (#12478).
+                const showPastDivider = index === firstPastIndex
                 return (
                   <div key={row.eventId} className="flex flex-col gap-1">
+                    {showPastDivider && (
+                      <div
+                        className="flex items-center gap-2 pt-2 text-[11px] font-medium uppercase tracking-wide text-muted"
+                        role="separator"
+                      >
+                        <span>{i18nT('apps.meetings.list.pastSection')}</span>
+                        <span className="flex-1 border-t border-border" aria-hidden="true" />
+                      </div>
+                    )}
                     <Clickable
                       onClick={() =>
                         setRoute({ view: 'meeting', eventId: row.eventId, title: row.title })

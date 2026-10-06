@@ -3320,7 +3320,8 @@
         "synced_many": "{{count}} événements synchronisés",
         "synced_one": "{{count}} événement synchronisé",
         "synced_other": "{{count}} événements synchronisés",
-        "title": "Réunions"
+        "title": "Réunions",
+        "pastSection": "Réunions passées"
       },
       "manifest": {
         "description": "Un assistant de réunion doté d’IA. Transcrit une réunion en direct, tient des notes et des schémas structurés au fil de l’eau, extrait les actions à suivre et te les fait relire avant enregistrement.",

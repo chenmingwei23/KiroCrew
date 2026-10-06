@@ -3116,7 +3116,8 @@
         "syncCalendar": "同步日历",
         "syncFailed": "无法同步日历。",
         "synced_other": "已同步 {{count}} 个日程",
-        "title": "会议"
+        "title": "会议",
+        "pastSection": "过往会议"
       },
       "manifest": {
         "use_case_1": "在实时会议中，由多个代理并行生成转录、结构化笔记、图示和待审阅的行动项。",
