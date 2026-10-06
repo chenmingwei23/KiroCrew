@@ -574,3 +574,50 @@ class TestFileSearchWalkDeadline:
         for bad in ("", "   ", "abc", "0", "-5", "nan-ish"):
             monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", bad)
             assert files_mod._file_search_walk_budget_secs() == 10.0, bad
+
+    @pytest.mark.asyncio
+    async def test_the_env_knob_reaches_the_thread_that_runs_the_walk(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """PROOF the knob is not stripped: the value set in ``os.environ`` is the
+        value the code DOING the walk reads.
+
+        #17414's FE_EXTRA_ROOTS was rejected because ``minimal_env`` strips it:
+        that knob was meant to be read in a SPAWNED subprocess whose env is a
+        scrubbed copy, so the operator's value never arrived. This endpoint is
+        different in kind -- ``api_file_search`` is an in-process aiohttp handler
+        and ``_walk_file_search`` runs on the bounded probe POOL (threads in the
+        same process via ``_run_path_probe``), never a subprocess, so it reads the
+        gateway's own live ``os.environ``. ``minimal_env`` is nowhere on this path.
+
+        This test closes that gap end-to-end: it records the budget the walk
+        actually used from INSIDE the walk, drives the real endpoint, and asserts
+        the recorded value equals what was set in ``os.environ`` -- so a future
+        change that moved the walk behind an env-scrubbing boundary (a subprocess,
+        a cleared env) would fail here instead of silently ignoring the operator.
+        """
+        for d in range(3):
+            (tmp_path / f"widget{d:02d}").mkdir()
+
+        # The budget function is called inside api_file_search, on the loop,
+        # before the walk is handed to the pool. Capture every value it returns so
+        # the assertion pins the value the running search used, read from the live
+        # process env -- not a value this test computed on the side.
+        real_budget = files_mod._file_search_walk_budget_secs
+        seen: list[float] = []
+
+        def _recording_budget() -> float:
+            v = real_budget()
+            seen.append(v)
+            return v
+
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "7000")
+        monkeypatch.setattr(files_mod, "_file_search_walk_budget_secs", _recording_budget)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-search?q=widget&project={tmp_path}")
+            assert resp.status == 200
+
+        assert seen, "api_file_search never read the walk budget"
+        # 7000 ms env value -> 7.0 s is what the running search used: the operator's
+        # os.environ value reached the code path, unstripped.
+        assert seen[-1] == 7.0

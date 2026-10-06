@@ -1598,6 +1598,13 @@ def _file_search_walk_budget_secs() -> float:
     the knob is for the rare slow mount, not something a local-disk user must know.
     Keep it below the client's 15s bound, or the client deadline fires first and
     the budget never gets to return its partial result.
+
+    The knob is read HERE, in the gateway process, by the in-process handler
+    (``api_file_search`` runs the walk on the bounded probe pool -- threads in this
+    same process, never a subprocess). So it reads the gateway's own live
+    ``os.environ`` and is NOT subject to ``apps.registry_pipeline.subprocess_env``'s
+    ``minimal_env``, which only scrubs the env handed to SPAWNED subprocesses. A
+    test pins this end-to-end (``test_the_env_knob_reaches_the_thread_that_runs_the_walk``).
     """
     raw = os.environ.get("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "").strip()
     if raw:
