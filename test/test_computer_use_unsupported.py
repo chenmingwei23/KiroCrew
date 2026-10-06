@@ -268,6 +268,27 @@ class TestRefusalsOnUnsupportedPlatform:
         assert driver.platform_id == PLATFORM_LINUX
         assert "Wayland" in driver.status().reason
 
+    def test_linux_reason_does_not_claim_macos_only(self, monkeypatch):
+        """Windows is supported, so the Linux refusal must not say "macOS-only".
+
+        ``WINDOWS_REASON`` was rewritten when the UI Automation driver landed, but
+        ``LINUX_REASON`` still read "computer use is macOS-only in this release" —
+        the string that Settings → Computer Use shows a Linux host verbatim. That
+        told every Linux user the feature was Mac-exclusive when it ships on
+        Windows too. The reason must name the two supported platforms and must not
+        imply Linux is the only one left out.
+        """
+        monkeypatch.setattr(platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(platform_compat, "IS_LINUX", True)
+        reason = select_default_backend().status().reason
+        assert "macOS and Windows" in reason
+        assert "macOS-only" not in reason
+        # The next-step and capture-fork facts the maintainer plan hangs on
+        # must survive the wording fix.
+        assert "AT-SPI" in reason
+        assert "Wayland" in reason
+
     def test_permission_probe_reports_unsupported_not_missing(self, unsupported_backend):
         # "missing" would send the user to a System Settings pane that cannot help.
         probe = unsupported_backend.probe_permissions()

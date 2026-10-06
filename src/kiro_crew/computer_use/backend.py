@@ -78,8 +78,8 @@ logger = logging.getLogger(__name__)
 #: a partial install, not a missing implementation.
 WINDOWS_REASON = "the Windows UI Automation driver could not be loaded on this host"
 LINUX_REASON = (
-    "the Linux AT-SPI driver is not implemented yet; computer use is macOS-only "
-    "in this release (Wayland has no unprivileged window capture)"
+    "the Linux AT-SPI driver is not implemented yet; computer use is macOS and "
+    "Windows only (Wayland has no unprivileged window capture)"
 )
 UNKNOWN_PLATFORM_REASON = "this operating system has no computer-use driver"
 DRIVER_IMPORT_REASON = "the native computer-use driver could not be loaded ({detail})"
