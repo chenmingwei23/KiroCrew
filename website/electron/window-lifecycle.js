@@ -59,6 +59,7 @@ const {
 const { createWindowPrompts } = require("./runtime/window/prompts");
 const { createSessionSecurity } = require("./runtime/window/session-security");
 const { injectLinuxCaptionControls } = require("./runtime/window/linux-captions");
+const { wireWillDownloadOnce } = require("./download-handler");
 const { attachBrowserPanels, dispatchBrowserOp } = require("./runtime/window/browser-panels");
 
 const BROWSER_PARTITION = "persist:kirocrew-browser";
@@ -545,6 +546,15 @@ function createWindowLifecycle(options) {
       delete details.requestHeaders.Referer;
       callback({ requestHeaders: details.requestHeaders });
     });
+
+    // Give renderer-triggered downloads (e.g. the Portability "Download Export
+    // (.zip)" button's <a download> blob) a real save path. The dashboard view
+    // is a WebContentsView under a BaseWindow, which Chromium cannot parent a
+    // native "Save As" dialog to, so without this the DownloadItem never
+    // resolves a path and nothing lands on disk (issue #13047). Attached once
+    // per session (every window shares the default session), so N windows do
+    // not stack N handlers.
+    wireWillDownloadOnce(view.webContents.session, { app, log: glog });
 
     return view;
   }

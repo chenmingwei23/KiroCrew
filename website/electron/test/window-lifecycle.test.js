@@ -1003,6 +1003,7 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
       webRequest: {
         onBeforeSendHeaders() { log.push("view.session.onBeforeSendHeaders"); },
       },
+      on(event) { log.push(`view.session.on:${event}`); return this; },
     },
     setWindowOpenHandler() { log.push("view.setWindowOpenHandler"); },
     insertCSS(css) { log.push(`view.insertCSS:${firstLine(css)}`); return Promise.resolve(); },
@@ -1123,6 +1124,7 @@ describe("dashboard window wiring order", () => {
       "win.on:focus",
       "view.setWindowOpenHandler",
       "view.session.onBeforeSendHeaders",
+      "view.session.on:will-download",
     ]);
     assert.deepEqual(onLoad, [
       "view.send:fullscreen-changed",
