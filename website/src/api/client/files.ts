@@ -37,9 +37,14 @@ type RevealResult = { copy?: string }
  *  (2s at most, then a coded 503) and round trips. The tree read's git steps carry per-step kill
  *  switches (`rev-parse` 5s, `ls-files` 15s) that sum PAST this bound on purpose: a git wedged that
  *  long is what the bound is for, and the read rejects here at 15s into the Refresh notice.
- *  The walk figures are local-disk only; a network-mount sample, and a slow-store escape if the
- *  headroom does not hold there, are tracked in #11419 -- until then a timed-out search's Retry /
- *  Refresh re-enters this same bound, deliberately (see lib/withDeadline.ts on retry).
+ *  The walk figures are local-disk only; on an NFS/SSHFS-class mount each stat is a network
+ *  round trip, so the SAME bounded number of calls can outrun this 15s and the headroom does
+ *  NOT hold there (#11419, measured against a simulated slow store). The escape hatch is on the
+ *  server, not here: the walk carries its own wall-clock budget (`_file_search_walk_budget_secs`,
+ *  default 10s, raise with `KIROCREW_FILE_SEARCH_WALK_BUDGET_MS`) and returns a partial result
+ *  marked `truncated` at that budget -- so the walk cannot outrun its own bound regardless of
+ *  store speed, this 15s client bound keeps its margin, and a slow mount yields a bounded partial
+ *  answer instead of a guaranteed timeout whose Retry re-enters the same bound.
  *
  *  One constant rather than one per surface: a caller's `limit` only caps rows returned
  *  (the server truncates before responding), so a wider page is not a longer walk. */
@@ -133,7 +138,7 @@ export function createFilesEndpoints({ post, put, del, j, checkSessionExpired, w
       if (kinds) p.set('kinds', kinds)
       if (limit) p.set('limit', String(limit))
       return withJournaledDeadline(FILE_SEARCH_TIMEOUT_MS, signal, '/api/file-search', s =>
-        fetch(`/api/file-search?${p}`, { signal: s }).then(j)) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
+        fetch(`/api/file-search?${p}`, { signal: s }).then(j)) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string; truncated?: boolean }>
     },
     /** One directory level of a project, for the composer's `./` path completion.
      *  `dir` is the literal prefix typed (`./`, `../src/`) and `q` the partial entry

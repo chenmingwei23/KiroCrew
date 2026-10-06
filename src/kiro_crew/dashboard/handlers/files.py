@@ -1571,6 +1571,55 @@ _WALK_MAX_SCAN_SCOPED = 50_000
 _WALK_MAX_SCAN_UNSCOPED = 5_000
 _WALK_MAX_DIRS_VISITED = 20_000
 
+
+def _file_search_walk_budget_secs() -> float:
+    """Wall-clock budget for one ``_walk_file_search`` pass, in seconds.
+
+    The scan/dirs ceilings above bound how MANY filesystem calls the walk makes,
+    not how LONG each one takes. On local disk a ceiling-reaching walk measured
+    4.20s worst, so the client's own 15s deadline (``FILE_SEARCH_TIMEOUT_MS`` in
+    ``api/client/files.ts``) has ~3.6x headroom there -- but that figure is local
+    disk only. On an NFS/SSHFS-class mount each ``os.stat``/``scandir`` is a
+    network round trip, so a healthy-but-slow store can make the same bounded
+    number of calls blow straight past the client's 15s; the retry re-enters the
+    same bound, so it fails every attempt (#11419, PR #7068's deferral).
+
+    This bounds the one term store speed inflates: the walk stops early and the
+    result is marked ``truncated`` -- the SAME observable outcome the entry/dir
+    ceilings already produce, now reached by elapsed time too. Default 10s keeps
+    the whole walk comfortably under the client's 15s with room for admission
+    (``_PATH_PROBE_ADMIT_TIMEOUT_SECS``) and round trips, so a slow mount yields
+    a bounded, partial answer instead of a guaranteed client timeout.
+
+    The slow-store escape hatch: an operator who mounts a store slow enough that
+    10s truncates too eagerly can raise it with ``KIROCREW_FILE_SEARCH_WALK_BUDGET_MS``
+    (milliseconds). It is read per call so a change takes effect without a restart,
+    and a missing / non-positive / unparseable value falls back to the default --
+    the knob is for the rare slow mount, not something a local-disk user must know.
+    Keep it below the client's 15s bound, or the client deadline fires first and
+    the budget never gets to return its partial result.
+    """
+    raw = os.environ.get("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "").strip()
+    if raw:
+        try:
+            ms = float(raw)
+            if ms > 0:
+                return ms / 1000.0
+        except ValueError:
+            logger.warning(
+                "ignoring non-numeric KIROCREW_FILE_SEARCH_WALK_BUDGET_MS=%r", raw
+            )
+    return 10.0
+
+
+#: How many entries one ``_collect`` scans between wall-clock checks in
+#: ``_walk_file_search``. A single enormous directory could otherwise overrun the
+#: budget between the per-directory checks, so the entry loop re-reads the clock
+#: every stride -- the same trick, and for the same reason, as the grep path's
+#: ``_GREP_ROW_DEADLINE_STRIDE``. Module-level so a test can shrink it.
+_WALK_DEADLINE_STRIDE = 512
+
+
 # Hard ceiling on the caller-supplied ``limit`` of /api/file-search. The walk
 # collects ``max_results * 10`` candidates per kind, so the limit multiplies real
 # filesystem work; a fixed server-side ceiling keeps a hostile ``?limit=`` from

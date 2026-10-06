@@ -276,6 +276,7 @@ _FACADE_DEFS = (
     "api_file_diff",
     "api_browse_dirs",
     "api_browse_files",
+    "_file_search_walk_budget_secs",
 )
 
 
@@ -550,7 +551,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
     }
     assert defined == set(_FACADE_DEFS)
     moved = {name for names in _BASE_OWNERS.values() for name in names}
-    assert len(defined | moved) == len(defined) + len(moved) == 134
+    assert len(defined | moved) == len(defined) + len(moved) == 135
 
 
 def test_the_owners_log_as_the_facade() -> None:

@@ -9,6 +9,7 @@ sensitivity check.
 from __future__ import annotations
 
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -449,3 +450,127 @@ class TestApiFileSearchDirs:
             f"walk descended {calls['n']} directories of {levels + 1} -- the "
             "dirs-visited ceiling did not stop the traversal"
         )
+
+
+class TestFileSearchWalkDeadline:
+    """The file-search walk's wall-clock budget and its slow-store escape hatch.
+
+    The entry/dir ceilings (``_WALK_MAX_*``) bound how MANY filesystem calls the
+    walk makes, not how LONG each one takes. On local disk a ceiling-reaching
+    walk measured 4.20s worst, under the client's 15s deadline with ~3.6x
+    headroom -- but that figure is local disk only. On an NFS/SSHFS-class mount
+    each ``os.stat``/``scandir`` is a network round trip, so the same bounded
+    number of calls can run many times longer and blow past the client bound,
+    and its Retry re-enters the same bound, failing every attempt (#11419).
+
+    Worker-1 has no network mount, so these tests SIMULATE a slow store: a thin
+    wrapper around ``os.walk`` sleeps per yielded directory, standing in for the
+    per-syscall latency a slow mount adds. The budget is patched DOWN to keep the
+    tests fast; the production default is 10s, read via
+    ``files_mod._file_search_walk_budget_secs()``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_slow_store_truncates_the_walk_at_the_wall_clock_budget(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """MEASUREMENT: the local-disk headroom does NOT hold on a slow store.
+
+        A tree small enough that neither the entry nor the dir ceiling fires, but
+        whose per-directory latency (the slow-store stand-in) sums past the walk
+        budget. Without a time bound the walk runs to completion; with it, the
+        walk stops early and the response is marked ``truncated``.
+        """
+        # 20 directories, each matching the query, none hitting a count ceiling.
+        for d in range(20):
+            (tmp_path / f"widget{d:02d}").mkdir()
+
+        real_walk = files_mod.os.walk
+
+        def slow_walk(*a, **kw):
+            for item in real_walk(*a, **kw):
+                # 60ms per directory: 20 dirs ~= 1.2s of walk, well past the 100ms
+                # budget below, standing in for a slow mount's per-dir latency.
+                time.sleep(0.06)
+                yield item
+
+        # Budget far below the simulated walk time, dir/entry ceilings far above
+        # it, so ONLY the wall-clock bound can stop this walk.
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "100")
+        with patch.object(files_mod.os, "walk", slow_walk):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/file-search?q=widget&project={tmp_path}")
+                assert resp.status == 200
+                body = await resp.json()
+
+        assert body["truncated"] is True, (
+            "a slow store that outruns the walk budget must mark the result "
+            "truncated, not run to completion"
+        )
+        # It still returns the matches it DID collect before the deadline -- a
+        # partial, bounded answer, not an empty one or a hang.
+        assert len(body["results"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_a_fast_store_is_not_truncated(self, tmp_path, mock_sel, monkeypatch):
+        """Control: with no artificial latency and the production-class budget, the
+        same tree finishes and ``truncated`` is False."""
+        for d in range(20):
+            (tmp_path / f"widget{d:02d}").mkdir()
+
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "10000")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-search?q=widget&project={tmp_path}")
+            assert resp.status == 200
+            body = await resp.json()
+
+        assert body["truncated"] is False
+        assert len(body["results"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_the_escape_hatch_lets_a_slow_store_finish(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """ESCAPE HATCH: an operator on a store slow enough that the default would
+        truncate can raise ``KIROCREW_FILE_SEARCH_WALK_BUDGET_MS`` and get a
+        complete walk. Same slow store as the truncation test, but a budget large
+        enough to let it finish -> ``truncated`` is False."""
+        for d in range(20):
+            (tmp_path / f"widget{d:02d}").mkdir()
+
+        real_walk = files_mod.os.walk
+
+        def slow_walk(*a, **kw):
+            for item in real_walk(*a, **kw):
+                time.sleep(0.06)
+                yield item
+
+        # The walk needs ~1.2s; a 10s budget clears it comfortably.
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "10000")
+        with patch.object(files_mod.os, "walk", slow_walk):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/file-search?q=widget&project={tmp_path}")
+                assert resp.status == 200
+                body = await resp.json()
+
+        assert body["truncated"] is False, (
+            "raising the budget past the slow store's walk time must let it finish"
+        )
+        assert len(body["results"]) >= 1
+
+    def test_the_budget_env_override_parsing(self, monkeypatch):
+        """The escape-hatch knob: a positive millisecond value is honoured; a
+        missing, empty, non-numeric or non-positive value falls back to the 10s
+        default, so a typo never silently sets a zero or negative budget."""
+        monkeypatch.delenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", raising=False)
+        assert files_mod._file_search_walk_budget_secs() == 10.0
+
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "250")
+        assert files_mod._file_search_walk_budget_secs() == 0.25
+
+        monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", "30000")
+        assert files_mod._file_search_walk_budget_secs() == 30.0
+
+        for bad in ("", "   ", "abc", "0", "-5", "nan-ish"):
+            monkeypatch.setenv("KIROCREW_FILE_SEARCH_WALK_BUDGET_MS", bad)
+            assert files_mod._file_search_walk_budget_secs() == 10.0, bad
