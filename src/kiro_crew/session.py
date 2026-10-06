@@ -3114,7 +3114,10 @@ class SessionManager:
         """Drop native conversation state while retaining channel linkage.
 
         Returns whether a session was actually torn down; False means
-        ``skip_if_busy`` refused because a turn was in flight. See
+        ``skip_if_busy`` refused because a turn was in flight. Raises
+        :class:`~kiro_crew.session_lifecycle.ConversationDiscardError` when an
+        await fails, carrying ``destroyed`` to say whether the native
+        conversation was already gone. See
         :meth:`SessionLifecycleService.discard_conversation` for the guard's
         atomicity contract.
         """

@@ -707,6 +707,41 @@ class SessionLifecycleDeps:
     monotonic: Callable[[], float]
 
 
+class ConversationDiscardError(RuntimeError):
+    """A :meth:`discard_conversation` await failed, and whether the native
+    conversation was torn down is a FACT this error carries rather than one the
+    caller must guess.
+
+    ``discard_conversation`` pops the session and clears its resume sid, then
+    runs three further awaits (queue unlink, ``provider.shutdown()``, child
+    cancellation + sub-agent runtime release). Those awaits can raise an ordinary
+    exception. Without this type a caller catching that exception cannot tell a
+    failure BEFORE the destruction point (nothing torn down, safe to report a
+    retryable failure) from one AFTER it (the conversation is already gone),
+    because the only other signal available to it -- the session-map sid -- reads
+    empty both when this teardown cleared it and when the session never had one.
+    So the callee, which is the only party that knows whether it passed its own
+    destruction point, states it here.
+
+    ``destroyed`` is True when ``clear_sid`` had already run before the raise and
+    False when it had not. The original exception is chained as ``__cause__`` and
+    kept as :attr:`cause` for callers that branch on it.
+    """
+
+    def __init__(self, *, destroyed: bool, cause: BaseException) -> None:
+        state = "after" if destroyed else "before"
+        super().__init__(
+            f"discard_conversation failed {state} its destruction point "
+            f"(native context {'already torn down' if destroyed else 'intact'}): "
+            f"{type(cause).__name__}: {cause}"
+        )
+        #: Whether the destruction point (``clear_sid``) had run when the failure
+        #: occurred. True => the native conversation is gone; False => intact.
+        self.destroyed = destroyed
+        #: The underlying failure. Also chained via ``raise ... from cause``.
+        self.cause = cause
+
+
 @dataclass(frozen=True, slots=True)
 class TornDown:
     """One teardown in flight under a key: the session its ``reset`` popped, and the process it named AT THE POP.
@@ -2622,6 +2657,14 @@ class SessionLifecycleService:
         erase a successor's pointer. Clearing it after the shutdown awaits would
         do exactly that, since the shutdown is the window a concurrent channel
         turn needs to create and map a new session under the same key.
+
+        Raises :class:`ConversationDiscardError` when an await fails, carrying
+        ``destroyed`` so the caller does not have to guess which side of the
+        destruction point (``clear_sid``) the failure fell on. ``destroyed`` is
+        True when the sid had already been cleared — the native conversation is
+        gone whatever this request goes on to report — and False when it had not,
+        so nothing was torn down. The underlying error is chained as ``__cause__``
+        and kept on ``.cause``.
         """
         owner = self._owner
         requested_key = key
@@ -2665,20 +2708,44 @@ class SessionLifecycleService:
         # ``clear_conversation``, which clears in this same position for this
         # same reason. Outside the lock rather than inside it because
         # ``clear_sid`` persists to disk, and the lock must not span blocking IO.
-        owner._session_map.clear_sid(key)
+        # ``clear_sid`` is this teardown's DESTRUCTION POINT: once it returns, the
+        # native resume pointer is gone and the conversation cannot be recovered.
+        # Everything that can raise is now classified by which side of this line it
+        # is on, and the answer is reported to the caller as a
+        # ``ConversationDiscardError`` carrying ``destroyed``, because the caller
+        # cannot derive it: the session-map sid reads empty both when this teardown
+        # cleared it and when the session never had one, so a per-caller heuristic
+        # either records destructions that never happened or stays silent on ones
+        # that did. The callee is the only party that knows whether it passed this
+        # line, so it states it rather than leaving the caller to guess.
         try:
-            if session:
-                await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
-                await session.provider.shutdown()
-        finally:
-            # See ``destroy``: in the finally because a shutdown that raises must not
-            # carry the exception past the cancel, and cancel before release.
-            await self._cancel_parent_children(key, teardown_children, verb="discard_conversation")
-            await owner.release_subagent_runtime(key)
-            self._deps.logger.info(
-                "Discarded native conversation (sid cleared, map entry kept): %s",
-                key,
-            )
+            owner._session_map.clear_sid(key)
+        except Exception as exc:
+            # Before the point: the sid clear itself failed, so the pointer still
+            # stands and nothing provider-side has been torn down.
+            raise ConversationDiscardError(destroyed=False, cause=exc) from exc
+        try:
+            try:
+                if session:
+                    await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
+                    await session.provider.shutdown()
+            finally:
+                # See ``destroy``: in the finally because a shutdown that raises must not
+                # carry the exception past the cancel, and cancel before release.
+                await self._cancel_parent_children(key, teardown_children, verb="discard_conversation")
+                await owner.release_subagent_runtime(key)
+                self._deps.logger.info(
+                    "Discarded native conversation (sid cleared, map entry kept): %s",
+                    key,
+                )
+        except ConversationDiscardError:
+            # A nested discard (not expected here, but keep the type idempotent).
+            raise
+        except Exception as exc:
+            # Past the point: ``clear_sid`` already ran, so the native conversation
+            # is gone regardless of this failure. Say so, so a caller records a
+            # determinate "destroyed" outcome instead of ``native_cleared=unknown``.
+            raise ConversationDiscardError(destroyed=True, cause=exc) from exc
         return True
 
     async def drain_active_turns(self, timeout: float | None = None) -> int:

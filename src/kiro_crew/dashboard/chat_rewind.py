@@ -47,6 +47,7 @@ from kiro_crew.dashboard.slot_ownership import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
+from kiro_crew.session_lifecycle import ConversationDiscardError
 from kiro_crew.session_map import _kiro_sessions_dir
 
 logger = logging.getLogger(__name__)
@@ -486,27 +487,34 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                     if discard_task.done() and not discard_task.cancelled():
                         discard_exc = discard_task.exception()
                         if discard_exc is not None:
-                            # Recorded, not swallowed: the trail gets the
-                            # undetermined outcome and the log gets the cause. The
-                            # catch above stays broad on purpose --
-                            # ``provider.shutdown()`` is provider transport and its
-                            # failure modes are not enumerable from here, and
-                            # letting an arbitrary error out of a
+                            # Recorded, not swallowed: the trail gets the outcome
+                            # and the log gets the cause. ``discard_conversation``
+                            # now classifies its own failure, so a
+                            # ``ConversationDiscardError`` tells us whether the
+                            # destruction point was passed; only a non-typed
+                            # failure stays genuinely undetermined. The catch stays
+                            # broad because letting an arbitrary error out of a
                             # ``CancelledError`` handler would REPLACE the client's
-                            # cancellation with an unrelated exception. It narrows
-                            # where it matters: ``Exception`` leaves
-                            # ``CancelledError``, ``KeyboardInterrupt`` and
-                            # ``SystemExit`` free to surface.
+                            # cancellation with an unrelated exception.
                             logger.warning(
                                 "rewind: the discard for %s raised while draining a "
-                                "cancellation, so whether the native context was "
-                                "torn down is undetermined",
+                                "cancellation (destroyed=%s)",
                                 session_key,
+                                getattr(discard_exc, "destroyed", "unknown"),
                                 exc_info=discard_exc,
                             )
-                            _sel_native_destroyed(
-                                "discard_cancelled_outcome_unknown", native_cleared="unknown"
-                            )
+                            if isinstance(discard_exc, ConversationDiscardError):
+                                _sel_native_destroyed(
+                                    "discard_cancelled_after_destruction"
+                                    if discard_exc.destroyed
+                                    else "discard_cancelled_before_destruction",
+                                    native_cleared="1" if discard_exc.destroyed else "0",
+                                )
+                            else:
+                                _sel_native_destroyed(
+                                    "discard_cancelled_outcome_unknown",
+                                    native_cleared="unknown",
+                                )
                         elif discard_task.result():
                             _sel_native_destroyed("discard_cancelled")
                     else:
@@ -521,23 +529,30 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                             "discard_cancelled_outcome_unknown", native_cleared="unknown"
                         )
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.warning(
                         "rewind: failed to discard ACP conversation for %s",
                         session_key,
                         exc_info=True,
                     )
-                    # The raise can land on either side of this teardown's own
-                    # destruction point: ``discard_conversation`` pops the session
-                    # and calls ``clear_sid`` before its remaining awaits, so a
-                    # failure inside it proves nothing either way. Record the
-                    # undetermined outcome rather than nothing -- a silent exit
-                    # here is indistinguishable in the trail from a refusal that
-                    # touched no state, which is exactly the confusion the audit
-                    # exists to remove.
-                    _sel_native_destroyed(
-                        "discard_failed_outcome_unknown", native_cleared="unknown"
-                    )
+                    # ``discard_conversation`` now reports which side of its own
+                    # destruction point (``clear_sid``) the failure fell on, so
+                    # the outcome is a fact rather than a guess. A
+                    # ``ConversationDiscardError`` carries ``destroyed``: True ==
+                    # the native context is already gone, False == nothing was
+                    # torn down. Only a non-typed failure (one that escaped before
+                    # the callee could classify it) remains genuinely undetermined.
+                    if isinstance(exc, ConversationDiscardError):
+                        _sel_native_destroyed(
+                            "discard_failed_after_destruction"
+                            if exc.destroyed
+                            else "discard_failed_before_destruction",
+                            native_cleared="1" if exc.destroyed else "0",
+                        )
+                    else:
+                        _sel_native_destroyed(
+                            "discard_failed_outcome_unknown", native_cleared="unknown"
+                        )
                     state.push_slots_update()
                     return web.json_response(
                         {

@@ -294,3 +294,129 @@ async def test_conversation_clearing_reset_suppresses_the_successor_replay(
     await manager.reset("key", clear_conversation=clear_conversation)
 
     assert manager.consume_replay_suppression("key") is suppressed
+
+
+@pytest.mark.asyncio
+async def test_discard_reports_destroyed_when_shutdown_fails_after_clear_sid(
+    cfg: KiroCrewConfig,
+) -> None:
+    """A post-destruction await failure is reported as ``destroyed=True``.
+
+    ``discard_conversation`` clears the resume sid, then runs ``provider.shutdown``
+    and the child/runtime teardown. If one of those raises, the native
+    conversation is already gone -- the sid clear ran -- so the callee says so
+    with ``ConversationDiscardError(destroyed=True)`` rather than leaving the
+    caller to guess from a session-map sid that reads empty for two unrelated
+    reasons. This is issue #8988's destruction-point contract (comments 4 and 6).
+    """
+    from kiro_crew.session_lifecycle import ConversationDiscardError
+
+    manager = SessionManager(cfg, provider_factory=lambda **_: _provider())
+    manager._session_map.clear_sid = MagicMock()  # type: ignore[method-assign]
+    manager.release_subagent_runtime = AsyncMock()  # type: ignore[method-assign]
+
+    boom = RuntimeError("provider transport fell over")
+
+    async def shutdown_raises() -> None:
+        raise boom
+
+    provider = _provider()
+    provider.shutdown = AsyncMock(side_effect=shutdown_raises)
+    manager._sessions["key"] = _Session(
+        provider=provider,
+        first_turn=FirstTurnState.NOTHING_ARMED,
+    )
+
+    with pytest.raises(ConversationDiscardError) as excinfo:
+        await manager.discard_conversation("key")
+
+    err = excinfo.value
+    assert err.destroyed is True
+    assert err.cause is boom
+    assert err.__cause__ is boom
+    # The destruction point ran before the failing await.
+    manager._session_map.clear_sid.assert_called_once_with("key")
+
+
+@pytest.mark.asyncio
+async def test_discard_reports_not_destroyed_when_clear_sid_fails(
+    cfg: KiroCrewConfig,
+) -> None:
+    """A failure AT the destruction point is reported as ``destroyed=False``.
+
+    If ``clear_sid`` itself raises, the resume pointer still stands and nothing
+    provider-side has been torn down, so the contract reports ``destroyed=False``
+    -- the caller may safely treat the native context as intact.
+    """
+    from kiro_crew.session_lifecycle import ConversationDiscardError
+
+    manager = SessionManager(cfg, provider_factory=lambda **_: _provider())
+    boom = RuntimeError("session map write failed")
+    manager._session_map.clear_sid = MagicMock(side_effect=boom)  # type: ignore[method-assign]
+    manager.release_subagent_runtime = AsyncMock()  # type: ignore[method-assign]
+
+    provider = _provider()
+    manager._sessions["key"] = _Session(
+        provider=provider,
+        first_turn=FirstTurnState.NOTHING_ARMED,
+    )
+
+    with pytest.raises(ConversationDiscardError) as excinfo:
+        await manager.discard_conversation("key")
+
+    err = excinfo.value
+    assert err.destroyed is False
+    assert err.cause is boom
+    # The provider was never shut down, because the clear failed first.
+    provider.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discard_reports_destroyed_when_runtime_release_fails(
+    cfg: KiroCrewConfig,
+) -> None:
+    """A failure in the ``finally`` teardown is also post-destruction.
+
+    ``release_subagent_runtime`` runs in the ``finally`` after ``clear_sid`` and
+    ``provider.shutdown`` have both completed, so a raise there still means the
+    native conversation is gone.
+    """
+    from kiro_crew.session_lifecycle import ConversationDiscardError
+
+    manager = SessionManager(cfg, provider_factory=lambda **_: _provider())
+    manager._session_map.clear_sid = MagicMock()  # type: ignore[method-assign]
+    boom = RuntimeError("runtime release failed")
+    manager.release_subagent_runtime = AsyncMock(side_effect=boom)  # type: ignore[method-assign]
+
+    provider = _provider()
+    manager._sessions["key"] = _Session(
+        provider=provider,
+        first_turn=FirstTurnState.NOTHING_ARMED,
+    )
+
+    with pytest.raises(ConversationDiscardError) as excinfo:
+        await manager.discard_conversation("key")
+
+    assert excinfo.value.destroyed is True
+    assert excinfo.value.cause is boom
+    manager._session_map.clear_sid.assert_called_once_with("key")
+
+
+@pytest.mark.asyncio
+async def test_discard_success_returns_true_and_raises_nothing(
+    cfg: KiroCrewConfig,
+) -> None:
+    """The happy path is unchanged: a clean discard still returns True."""
+    manager = SessionManager(cfg, provider_factory=lambda **_: _provider())
+    manager._session_map.clear_sid = MagicMock()  # type: ignore[method-assign]
+    manager.release_subagent_runtime = AsyncMock()  # type: ignore[method-assign]
+
+    provider = _provider()
+    manager._sessions["key"] = _Session(
+        provider=provider,
+        first_turn=FirstTurnState.NOTHING_ARMED,
+    )
+
+    assert await manager.discard_conversation("key") is True
+    manager._session_map.clear_sid.assert_called_once_with("key")
+    provider.shutdown.assert_awaited_once()
