@@ -8284,7 +8284,9 @@
       "rename": "Renomear",
       "reveal_in_sidebar": "Mostrar na barra lateral",
       "tags": "Etiquetas…",
-      "unpin": "Desafixar"
+      "unpin": "Desafixar",
+      "mute_sessions_it_opens": "Silenciar as sessões que ela abre",
+      "unmute_sessions_it_opens": "Reativar as sessões que ela abre"
     },
     "sessionColorSwatches": {
       "custom_color": "Cor personalizada",
@@ -15851,7 +15853,9 @@
         "allow_system_notifications": "Permitir notificações do sistema",
         "system_notifications_blocked": "Bloqueadas no seu navegador. Reative-as nas permissões do site.",
         "show_banner_for_new_notifications": "Mostrar um banner para novas notificações",
-        "show_banner_for_new_notifications_description": "Quando chega uma notificação, um cartão desliza sob a barra superior e depois se recolhe no sino."
+        "show_banner_for_new_notifications_description": "Quando chega uma notificação, um cartão desliza sob a barra superior e depois se recolhe no sino.",
+        "mute_sessions_opened_by_other_sessions": "Silenciar sessões abertas por outras sessões",
+        "mute_sessions_opened_by_other_sessions_description": "Uma sessão aberta por outra sessão (por exemplo, um trabalhador criado por um maestro) não produz som, aviso de conclusão em segundo plano nem selo de não lida. A sessão que a abriu mantém todos os seus sinais, e uma sessão aguardando sua aprovação ainda notifica."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Registrar métricas",

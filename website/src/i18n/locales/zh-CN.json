@@ -8046,7 +8046,9 @@
       "rename": "重命名",
       "reveal_in_sidebar": "在侧边栏中显示",
       "tags": "标签…",
-      "unpin": "取消置顶"
+      "unpin": "取消置顶",
+      "mute_sessions_it_opens": "静音它打开的会话",
+      "unmute_sessions_it_opens": "取消静音它打开的会话"
     },
     "sessionColorSwatches": {
       "custom_color": "自定义颜色",
@@ -15383,7 +15385,9 @@
         "allow_system_notifications": "允许系统通知",
         "system_notifications_blocked": "已被浏览器阻止。请在该网站的权限设置中重新开启。",
         "show_banner_for_new_notifications": "新通知显示横幅",
-        "show_banner_for_new_notifications_description": "通知到达时，一张卡片会从顶栏下方滑入，随后收进铃铛。"
+        "show_banner_for_new_notifications_description": "通知到达时，一张卡片会从顶栏下方滑入，随后收进铃铛。",
+        "mute_sessions_opened_by_other_sessions": "静音由其他会话打开的会话",
+        "mute_sessions_opened_by_other_sessions_description": "由另一个会话打开的会话（例如指挥者生成的工作者）不会产生提示音、后台完成提示或未读标记。打开它的会话保留其所有信号，等待你批准的会话仍会通知。"
       },
       "privacyPanel": {
         "recordMetricsLabel": "记录指标",

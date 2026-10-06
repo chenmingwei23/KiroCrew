@@ -8165,7 +8165,9 @@
       "rename": "Umbenennen",
       "reveal_in_sidebar": "In der Seitenleiste anzeigen",
       "tags": "Tags…",
-      "unpin": "Entpinnen"
+      "unpin": "Entpinnen",
+      "mute_sessions_it_opens": "Von ihr geöffnete Sitzungen stummschalten",
+      "unmute_sessions_it_opens": "Stummschaltung geöffneter Sitzungen aufheben"
     },
     "sessionColorSwatches": {
       "custom_color": "Benutzerdefinierte Farbe",
@@ -15617,7 +15619,9 @@
         "allow_system_notifications": "Systembenachrichtigungen erlauben",
         "system_notifications_blocked": "Im Browser blockiert. Schalte sie in den Berechtigungen der Website wieder ein.",
         "show_banner_for_new_notifications": "Banner für neue Benachrichtigungen anzeigen",
-        "show_banner_for_new_notifications_description": "Bei einer neuen Benachrichtigung gleitet eine Karte unter der oberen Leiste ein und verschwindet dann in der Glocke."
+        "show_banner_for_new_notifications_description": "Bei einer neuen Benachrichtigung gleitet eine Karte unter der oberen Leiste ein und verschwindet dann in der Glocke.",
+        "mute_sessions_opened_by_other_sessions": "Von anderen Sitzungen geöffnete Sitzungen stummschalten",
+        "mute_sessions_opened_by_other_sessions_description": "Eine von einer anderen Sitzung geöffnete Sitzung (etwa ein von einem Conductor erzeugter Worker) erzeugt keinen Signalton, keine Hintergrund-Fertig-Benachrichtigung und kein Ungelesen-Abzeichen. Die öffnende Sitzung behält alle ihre Signale, und eine auf Ihre Freigabe wartende Sitzung benachrichtigt weiterhin."
       },
       "privacyPanel": {
         "recordMetricsDescription": "Leistungsmetriken auf diesem Rechner erfassen.",

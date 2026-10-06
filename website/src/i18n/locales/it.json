@@ -8284,7 +8284,9 @@
       "rename": "Rinomina",
       "reveal_in_sidebar": "Mostra nella barra laterale",
       "tags": "Tag…",
-      "unpin": "Non fissare"
+      "unpin": "Non fissare",
+      "mute_sessions_it_opens": "Silenzia le sessioni che apre",
+      "unmute_sessions_it_opens": "Riattiva le sessioni che apre"
     },
     "sessionColorSwatches": {
       "custom_color": "Colore personalizzato",
@@ -15851,7 +15853,9 @@
         "allow_system_notifications": "Consenti le notifiche di sistema",
         "system_notifications_blocked": "Bloccate nel browser. Riattivale nelle autorizzazioni del sito.",
         "show_banner_for_new_notifications": "Mostra un banner per le nuove notifiche",
-        "show_banner_for_new_notifications_description": "Quando arriva una notifica, una scheda scivola sotto la barra superiore e poi si ritira nella campanella."
+        "show_banner_for_new_notifications_description": "Quando arriva una notifica, una scheda scivola sotto la barra superiore e poi si ritira nella campanella.",
+        "mute_sessions_opened_by_other_sessions": "Silenzia le sessioni aperte da altre sessioni",
+        "mute_sessions_opened_by_other_sessions_description": "Una sessione aperta da un'altra sessione (ad esempio un worker generato da un conductor) non produce suoni, avvisi di completamento in background o badge di non letto. La sessione che l'ha aperta mantiene tutti i suoi segnali, e una sessione in attesa della tua approvazione continua a notificare."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Registra le metriche",

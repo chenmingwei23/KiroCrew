@@ -43,6 +43,7 @@ from kiro_crew.dashboard.chat_folders import (  # noqa: F401
     api_chat_slot_folder,
     api_chat_slot_mode,
     api_chat_slot_pin,
+    api_chat_slot_mutes_opened,
 )
 from kiro_crew.dashboard.chat_fork import api_chat_slot_fork  # noqa: F401
 from kiro_crew.dashboard.chat_handlers import (  # noqa: F401

@@ -8165,7 +8165,9 @@
       "rename": "नाम बदलें",
       "reveal_in_sidebar": "साइडबार में दिखाएँ",
       "tags": "टैग…",
-      "unpin": "पिन हटाएँ"
+      "unpin": "पिन हटाएँ",
+      "mute_sessions_it_opens": "इसके द्वारा खोले गए सत्र म्यूट करें",
+      "unmute_sessions_it_opens": "इसके द्वारा खोले गए सत्र अनम्यूट करें"
     },
     "sessionColorSwatches": {
       "custom_color": "कस्टम रंग",
@@ -15617,7 +15619,9 @@
         "allow_system_notifications": "सिस्टम सूचनाओं की अनुमति दो",
         "system_notifications_blocked": "तुम्हारे ब्राउज़र ने इसे रोक दिया है। साइट की अनुमति सेटिंग में इसे फिर से चालू करो।",
         "show_banner_for_new_notifications": "नई सूचनाओं के लिए बैनर दिखाओ",
-        "show_banner_for_new_notifications_description": "सूचना आने पर एक कार्ड टॉप बार के नीचे से आता है, फिर घंटी में समा जाता है।"
+        "show_banner_for_new_notifications_description": "सूचना आने पर एक कार्ड टॉप बार के नीचे से आता है, फिर घंटी में समा जाता है।",
+        "mute_sessions_opened_by_other_sessions": "अन्य सत्रों द्वारा खोले गए सत्र म्यूट करें",
+        "mute_sessions_opened_by_other_sessions_description": "किसी अन्य सत्र द्वारा खोला गया सत्र (उदाहरण के लिए कंडक्टर द्वारा बनाया गया वर्कर) कोई चाइम, बैकग्राउंड-समाप्ति टोस्ट या अपठित बैज उत्पन्न नहीं करता। जिस सत्र ने इसे खोला उसके सभी संकेत बने रहते हैं, और आपकी स्वीकृति की प्रतीक्षा करने वाला सत्र फिर भी सूचित करता है।"
       },
       "privacyPanel": {
         "recordMetricsDescription": "इस मशीन पर परफ़ॉर्मेंस मेट्रिक इकट्ठा करो।",

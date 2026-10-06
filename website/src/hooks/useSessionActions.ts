@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../api/client'
 import { store, useAppDispatch } from '../store'
 import { deleteSlot, switchSlot } from '../store/chatSlice'
-import { updateSlotPin, markSlotRead, markSlotUnread, slotWriteStampOf } from '../store/dashboardSlice'
+import { updateSlotPin, updateSlotMutesOpened, markSlotRead, markSlotUnread, slotWriteStampOf } from '../store/dashboardSlice'
 import { emitSlotRead } from '../lib/slotReadRelay'
 import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
@@ -76,6 +76,8 @@ export interface SessionActions {
   toggleRead: (slotKey: string) => void
   /** Toggle pinned. */
   togglePin: (slotKey: string) => void
+  /** #13395: toggle the "mute sessions it opens" rule on a creating session. */
+  toggleMutesOpened: (slotKey: string) => void
   /** Copy the session's share link. */
   copyLink: (slotKey: string) => void
   /** Move to a folder (or root for null) — shared optimistic move + rollback. */
@@ -237,6 +239,23 @@ export function useSessionActions(mode?: string): SessionActions {
     },
   })
 
+  // #13395: a plain optimistic toggle. The authoritative value arrives as a
+  // `slot_patch` frame (or a full list on an older gateway), so an error just
+  // reverts the optimistic flip; no server re-read is scheduled, for the same
+  // reason the pin mutation does not.
+  const mutesOpenedMutation = useMutation({
+    mutationFn: ({ key, mutesOpened }: { key: string; mutesOpened: boolean }) =>
+      api.setSlotMutesOpened(key, mutesOpened),
+    onMutate: ({ key, mutesOpened }) => {
+      const prev = store.getState().dashboard.slots.find(s => s.key === key)?.mutes_opened ?? false
+      dispatch(updateSlotMutesOpened({ key, mutesOpened }))
+      return { key, prev }
+    },
+    onError: (_err, _vars, ctx) => {
+      if (ctx) dispatch(updateSlotMutesOpened({ key: ctx.key, mutesOpened: ctx.prev }))
+    },
+  })
+
   const pinMutation = useMutation({
     mutationFn: ({ key, pinned }: { key: string; pinned: boolean }) => setSlotPinInOrder(key, pinned),
     onMutate: ({ key, pinned }) => {
@@ -305,6 +324,7 @@ export function useSessionActions(mode?: string): SessionActions {
   // recreated on every render (the mutation result objects are new each render).
   const { mutate: forkMutate } = forkMutation
   const { mutate: pinMutate } = pinMutation
+  const { mutate: mutesOpenedMutate } = mutesOpenedMutation
   const { mutate: reloadMutate } = reloadMutation
 
   const duplicate = useCallback((slotKey: string) => { forkMutate(slotKey) }, [forkMutate])
@@ -327,6 +347,11 @@ export function useSessionActions(mode?: string): SessionActions {
     pinMutate({ key: slotKey, pinned: !isPinned })
   }, [pinMutate])
 
+  const toggleMutesOpened = useCallback((slotKey: string) => {
+    const current = store.getState().dashboard.slots.find(s => s.key === slotKey)?.mutes_opened ?? false
+    mutesOpenedMutate({ key: slotKey, mutesOpened: !current })
+  }, [mutesOpenedMutate])
+
   const copyLink = useCallback((slotKey: string) => {
     const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
     copySessionLink(slotKey, slot?.title, undefined, mode)
@@ -342,5 +367,5 @@ export function useSessionActions(mode?: string): SessionActions {
     if (!loadChatConfig().confirmCloseSession || confirm(i18nT('hooks.useSessionActions.close_this_session'))) dispatch(deleteSlot(slotKey))
   }, [dispatch])
 
-  return { duplicate, toggleRead, togglePin, copyLink, move, reload, close }
+  return { duplicate, toggleRead, togglePin, toggleMutesOpened, copyLink, move, reload, close }
 }

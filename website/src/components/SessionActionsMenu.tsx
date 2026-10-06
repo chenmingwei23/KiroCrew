@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork } from 'lucide-react'
+import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -128,7 +128,7 @@ export default function SessionActionsMenu({
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
 
   // Generic, surface-agnostic actions — one definition, wired straight to the store.
-  const { toggleRead, togglePin, copyLink, move, reload, close } = useSessionActions(mode)
+  const { toggleRead, togglePin, toggleMutesOpened, copyLink, move, reload, close } = useSessionActions(mode)
   // Popped-out window coordination (shared singleton — one channel for all menus).
   const { isPoppedOut, isSelfPopout, open: openPopout, focus: focusPopout, bringBack, returnSelfToMain } = useChatPopouts()
   // This menu also renders INSIDE a popout window (via the header). There the
@@ -146,6 +146,7 @@ export default function SessionActionsMenu({
   const isUnread = useAppSelector(s => s.dashboard.unreadSlots.includes(slotKey))
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
+  const isMutesOpened = !!slot?.mutes_opened
   const isRunning = !!slot?.running
   // The move-to submenu lists chat folders in the order the sidebar draws them.
   // A failed read (no body to draw from) is said once per screen, by the
@@ -194,6 +195,9 @@ export default function SessionActionsMenu({
       </Item>,
       <Item key="pin" onSelect={() => togglePin(slotKey)}>
         <Pin size={13} className="shrink-0 text-muted" /> {isPinned ? i18nT('components.sessionActionsMenu.unpin') : i18nT('components.sessionActionsMenu.pin')}
+      </Item>,
+      <Item key="mute-opened" onSelect={() => toggleMutesOpened(slotKey)}>
+        <BellOff size={13} className="shrink-0 text-muted" /> {isMutesOpened ? i18nT('components.sessionActionsMenu.unmute_sessions_it_opens') : i18nT('components.sessionActionsMenu.mute_sessions_it_opens')}
       </Item>,
       folders.length > 0 && (
         <FolderMoveSubmenu

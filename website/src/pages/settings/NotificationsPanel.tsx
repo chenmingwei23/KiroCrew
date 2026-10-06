@@ -13,6 +13,7 @@ import {
   loadSoundSettings, saveSoundSettings, playPreset, presetForKind,
 } from '../../hooks/useNotificationSound'
 import { loadChatCompleteNotify, saveChatCompleteNotify } from '../../hooks/chatCompleteNotify'
+import { loadMuteOpenedGlobal, saveMuteOpenedGlobal } from '../../hooks/sessionMute'
 import { loadBannerEnabled, saveBannerEnabled } from '../../hooks/notificationBanner'
 import { loadUnreadOnAttention, saveUnreadOnAttention } from '../../hooks/unreadOnAttention'
 import { useNotificationPermission } from '../../hooks/useNotificationPermission'
@@ -271,6 +272,7 @@ function SystemNotificationsRow() {
 export function NotificationsPanel({ basePath }: { basePath?: string } = {}) {
   const [settings, setSettings] = useState(() => loadSoundSettings())
   const [notifyChatComplete, setNotifyChatComplete] = useState(() => loadChatCompleteNotify())
+  const [muteOpenedGlobal, setMuteOpenedGlobal] = useState(() => loadMuteOpenedGlobal())
   const [bannerEnabled, setBannerEnabled] = useState(() => loadBannerEnabled())
   const [unreadOnAttention, setUnreadOnAttention] = useState(() => loadUnreadOnAttention())
 
@@ -423,6 +425,16 @@ export function NotificationsPanel({ basePath }: { basePath?: string } = {}) {
             hint={i18nT('pages.settings.notificationsPanel.unread_only_when_done_or_waiting_description')}
             checked={unreadOnAttention}
             onChange={v => { if (saveUnreadOnAttention(v)) setUnreadOnAttention(v) }}
+          />
+          {/* #13395: the global half of "mute the sessions a conductor opens".
+              When on, ANY session opened by another session (non-empty
+              created_by) is muted for attention, without needing the per-row
+              rule set on each creator. */}
+          <SettingsToggle
+            label={i18nT('pages.settings.notificationsPanel.mute_sessions_opened_by_other_sessions')}
+            hint={i18nT('pages.settings.notificationsPanel.mute_sessions_opened_by_other_sessions_description')}
+            checked={muteOpenedGlobal}
+            onChange={v => { setMuteOpenedGlobal(v); saveMuteOpenedGlobal(v) }}
           />
         </SettingsCard>
       </SettingsSection>

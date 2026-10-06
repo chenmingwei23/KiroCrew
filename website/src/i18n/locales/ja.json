@@ -8046,7 +8046,9 @@
       "rename": "名前変更",
       "reveal_in_sidebar": "サイドバーに表示",
       "tags": "タグ…",
-      "unpin": "ピン留め解除"
+      "unpin": "ピン留め解除",
+      "mute_sessions_it_opens": "このセッションが開くセッションをミュート",
+      "unmute_sessions_it_opens": "このセッションが開くセッションのミュートを解除"
     },
     "sessionColorSwatches": {
       "custom_color": "カスタムカラー",
@@ -15383,7 +15385,9 @@
         "allow_system_notifications": "システム通知を許可",
         "system_notifications_blocked": "ブラウザーでブロックされています。サイトの権限設定で再度オンにしてください。",
         "show_banner_for_new_notifications": "新しい通知をバナーで表示",
-        "show_banner_for_new_notifications_description": "通知が届くとカードがトップバーの下にスライドして表示され、その後ベルに収まります。"
+        "show_banner_for_new_notifications_description": "通知が届くとカードがトップバーの下にスライドして表示され、その後ベルに収まります。",
+        "mute_sessions_opened_by_other_sessions": "他のセッションが開いたセッションをミュート",
+        "mute_sessions_opened_by_other_sessions_description": "別のセッションが開いたセッション（たとえばコンダクターが生成したワーカー）は、チャイム、バックグラウンド完了トースト、未読バッジを生成しません。開いた側のセッションはすべての通知を保持し、承認待ちのセッションは引き続き通知します。"
       },
       "privacyPanel": {
         "recordMetricsDescription": "このマシンでパフォーマンスメトリクスを収集します。",

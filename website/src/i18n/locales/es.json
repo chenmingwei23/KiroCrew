@@ -8284,7 +8284,9 @@
       "rename": "Cambiar el nombre",
       "reveal_in_sidebar": "Mostrar en la barra lateral",
       "tags": "Etiquetas…",
-      "unpin": "Dejar de fijar"
+      "unpin": "Dejar de fijar",
+      "mute_sessions_it_opens": "Silenciar las sesiones que abre",
+      "unmute_sessions_it_opens": "Reactivar las sesiones que abre"
     },
     "sessionColorSwatches": {
       "custom_color": "Color personalizado",
@@ -15851,7 +15853,9 @@
         "allow_system_notifications": "Permitir notificaciones del sistema",
         "system_notifications_blocked": "Bloqueadas en tu navegador. Vuelve a activarlas en los permisos del sitio.",
         "show_banner_for_new_notifications": "Mostrar un banner con las notificaciones nuevas",
-        "show_banner_for_new_notifications_description": "Cuando llega una notificación, una tarjeta se desliza bajo la barra superior y luego se recoge en la campana."
+        "show_banner_for_new_notifications_description": "Cuando llega una notificación, una tarjeta se desliza bajo la barra superior y luego se recoge en la campana.",
+        "mute_sessions_opened_by_other_sessions": "Silenciar las sesiones abiertas por otras sesiones",
+        "mute_sessions_opened_by_other_sessions_description": "Una sesión abierta por otra sesión (por ejemplo, un trabajador que genera un conductor) no produce sonido, aviso de finalización en segundo plano ni insignia de no leído. La sesión que la abrió conserva todas sus señales, y una sesión que espera tu aprobación sigue notificando."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Registrar métricas",

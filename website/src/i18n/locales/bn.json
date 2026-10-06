@@ -8165,7 +8165,9 @@
       "rename": "নাম পরিবর্তন",
       "reveal_in_sidebar": "সাইডবারে দেখান",
       "tags": "ট্যাগ…",
-      "unpin": "পিন সরাও"
+      "unpin": "পিন সরাও",
+      "mute_sessions_it_opens": "এটি যে সেশনগুলি খোলে সেগুলি নীরব করুন",
+      "unmute_sessions_it_opens": "এটি যে সেশনগুলি খোলে সেগুলি সরব করুন"
     },
     "sessionColorSwatches": {
       "custom_color": "কাস্টম রং",
@@ -15617,7 +15619,9 @@
         "allow_system_notifications": "সিস্টেম বিজ্ঞপ্তির অনুমতি দাও",
         "system_notifications_blocked": "তোমার ব্রাউজার এটি আটকে দিয়েছে। সাইটের অনুমতি সেটিংসে আবার চালু করো।",
         "show_banner_for_new_notifications": "নতুন বিজ্ঞপ্তির জন্য ব্যানার দেখাও",
-        "show_banner_for_new_notifications_description": "বিজ্ঞপ্তি এলে একটি কার্ড উপরের বারের নিচ থেকে ঢুকে আসে, তারপর ঘণ্টায় গুটিয়ে যায়।"
+        "show_banner_for_new_notifications_description": "বিজ্ঞপ্তি এলে একটি কার্ড উপরের বারের নিচ থেকে ঢুকে আসে, তারপর ঘণ্টায় গুটিয়ে যায়।",
+        "mute_sessions_opened_by_other_sessions": "অন্য সেশন দ্বারা খোলা সেশন নীরব করুন",
+        "mute_sessions_opened_by_other_sessions_description": "অন্য একটি সেশন দ্বারা খোলা সেশন (যেমন একটি কন্ডাক্টর যে ওয়ার্কার তৈরি করে) কোনো চাইম, ব্যাকগ্রাউন্ড-সমাপ্তি টোস্ট বা অপঠিত ব্যাজ তৈরি করে না। যে সেশনটি এটি খুলেছে তার সব সংকেত থাকে, এবং আপনার অনুমোদনের অপেক্ষায় থাকা সেশন এখনও বিজ্ঞপ্তি দেয়।"
       },
       "privacyPanel": {
         "recordMetricsLabel": "মেট্রিক রেকর্ড করো",
