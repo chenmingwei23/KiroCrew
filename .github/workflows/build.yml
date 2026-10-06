@@ -22,18 +22,56 @@ concurrency:
   # full set, and the per-ref group stays as it is today: one running plus one
   # pending, and a later push evicts the pending one, so concurrent main builds
   # can never pile up hosted macOS jobs.
+  # NOTE: concurrency is evaluated at workflow START, so it cannot read
+  # `needs.queue-proof.outputs`; the variable is the right key here (see
+  # ci.yml's concurrency comment).
   group: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' && format('{0}-{1}', github.workflow, github.sha) || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Queue proof (issue #15566): the same self-verifying check ci.yml carries,
+  # duplicated here because a `needs:` edge cannot cross a workflow file. On a
+  # push to main this looks up a successful merge_group CI run for the commit
+  # and publishes `queue_proved`; build-wheel and desktop-matrix trim off the
+  # push path only when it is 'true', so a direct push that bypassed the queue
+  # builds everything instead of trusting the variable. Runs on every event,
+  # never skips, fail-safe to false. See .github/scripts/queue-proof.sh.
+  queue-proof:
+    name: Queue Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      queue_proved: ${{ steps.proof.outputs.queue_proved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Prove the merge queue tested this commit
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # CI's merge_group run is the proof: identical trigger set, so if the
+          # queue ran CI it ran build.yml too. One lookup proves all three.
+          WORKFLOW: ci.yml
+          QUEUE_ON: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' }}
+        run: bash .github/scripts/queue-proof.sh
+
   build-wheel:
     name: Build Wheel
-    # Skipped on a push to main only while the repository variable
-    # MERGE_QUEUE_ENABLED is 'true': the merge group built this wheel and the
-    # Windows installer that consumes it on this exact tree, so that push path
-    # is the macOS desktop build only. With the variable unset a push to main
-    # builds everything.
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    # Skipped on a push to main only when the queue is proved (queue-proof found
+    # a successful merge_group CI run for this commit): the merge group built
+    # this wheel and the Windows installer that consumes it on this exact tree,
+    # so that push path is the macOS desktop build only. With no proof a push to
+    # main builds everything.
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
@@ -259,17 +297,18 @@ jobs:
   # packaging input changed. A merge group NEVER builds it: the pull request
   # already did when its packaging inputs changed, and a mac runner wait of
   # hours inside the queue would time out the group's required check and
-  # dequeue a green pull request. A push to main depends on the repository
-  # variable MERGE_QUEUE_ENABLED: set to 'true', the push builds ONLY the mac
-  # leg -- the merge group built both Linux legs on this exact tree, and the
-  # mac build is the one artifact the queue cannot afford to wait for, so main
-  # pays for it after landing, once per commit, never evicted. Unset, the push
-  # builds all three, because no merge group vouched for this tree. The admin
-  # sets the variable in the same operation as enabling the queue in the
-  # ruleset and unsets it with unticking the queue. The release lane
+  # dequeue a green pull request. A push to main depends on the queue-proof
+  # job: when it confirms a successful merge_group CI run for this commit (the
+  # merge queue tested this tree), the push builds ONLY the mac leg -- the
+  # merge group built both Linux legs on this exact tree, and the mac build is
+  # the one artifact the queue cannot afford to wait for, so main pays for it
+  # after landing, once per commit, never evicted. Without proof (no matching
+  # merge_group run, or the variable is unset), the push builds all three,
+  # because no merge group vouched for this tree. The release lane
   # (build-desktop.yml) still ships every platform unconditionally.
   desktop-matrix:
     name: Resolve desktop matrix
+    needs: [queue-proof]
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -305,15 +344,17 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           DESKTOP_CHANGED: ${{ steps.filter.outputs.desktop }}
-          # The string 'true' or 'false': an unset variable compares unequal
-          # to 'true', so the expression is never empty under `set -u`.
-          QUEUE_ON: ${{ vars.MERGE_QUEUE_ENABLED == 'true' }}
+          # The string 'true' or 'false': whether queue-proof confirmed a
+          # merge_group CI run for this commit. Reading the proof, not the
+          # variable, is what makes the trim self-verifying -- a direct push
+          # that bypassed the queue resolves to false and builds all three legs.
+          QUEUE_PROVED: ${{ needs.queue-proof.outputs.queue_proved }}
         run: |
-          # push to main, queue variable set: macos-15 alone. push to main,
-          # queue variable unset: all three legs. pull_request: both Linux
-          # legs, plus macos-15 when a packaging-relevant path changed.
-          # merge_group: both Linux legs, never macos-15.
-          if [ "$EVENT" = "push" ] && [ "$QUEUE_ON" = "true" ]; then
+          # push to main, queue proved: macos-15 alone. push to main, no proof:
+          # all three legs. pull_request: both Linux legs, plus macos-15 when a
+          # packaging-relevant path changed. merge_group: both Linux legs,
+          # never macos-15.
+          if [ "$EVENT" = "push" ] && [ "$QUEUE_PROVED" = "true" ]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
           elif [ "$EVENT" = "push" ] || { [ "$EVENT" = "pull_request" ] && [ "$DESKTOP_CHANGED" = "true" ]; }; then
             echo 'os=["macos-15","ubuntu-22.04","ubuntu-22.04-arm"]' >> "$GITHUB_OUTPUT"
@@ -334,7 +375,7 @@ jobs:
         # arches (Linux cannot be cross-compiled -- build-desktop.sh RUNS the
         # interpreter it provisions -- so each arch needs its own runner), plus
         # macos-15 on a PR when a macOS-packaging input changed; on a push to
-        # main macos-15 alone when MERGE_QUEUE_ENABLED is 'true', all three
+        # main macos-15 alone when the queue is proved, all three
         # otherwise. build-desktop.yml stays the release matrix that
         # ships every platform unconditionally.
         os: ${{ fromJSON(needs.desktop-matrix.outputs.os) }}

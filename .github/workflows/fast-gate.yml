@@ -54,22 +54,63 @@ concurrency:
   # (one running plus one pending, a later push evicts the pending one); a
   # merge group's ref is unique to the group. Divergence from ci.yml here would
   # let a superseded gate run outlive the CI run that is waiting on it.
+  # NOTE: concurrency is evaluated at workflow START, before any job runs, so
+  # it cannot reference `needs.queue-proof.outputs`. The variable is the right
+  # key here (see ci.yml's concurrency comment for why).
   group: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' && format('{0}-{1}', github.workflow, github.sha) || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Queue proof (issue #15566): the same self-verifying check ci.yml carries,
+  # duplicated here because a `needs:` edge cannot cross a workflow file. On a
+  # push to main this looks up a successful merge_group CI run for the commit
+  # and publishes `queue_proved`; the gates below trim off the push path only
+  # when it is 'true', so a direct push that bypassed the queue runs every gate
+  # instead of trusting the variable. It runs on every event and never skips, so
+  # each gate reads a concrete output rather than the empty string a skipped job
+  # leaves. Fail-safe: a lookup error or no matching run yields false, i.e. every
+  # gate runs. See .github/scripts/queue-proof.sh.
+  queue-proof:
+    name: Queue Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      queue_proved: ${{ steps.proof.outputs.queue_proved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Prove the merge queue tested this commit
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # CI's merge_group run is the proof: if the queue ran CI, it ran these
+          # gates too (identical trigger set). One lookup proves all three.
+          WORKFLOW: ci.yml
+          QUEUE_ON: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' }}
+        run: bash .github/scripts/queue-proof.sh
+
   vendor-manifest:
     name: Vendored Tree Integrity
-    # Skipped on a push to main only while the repository variable
-    # MERGE_QUEUE_ENABLED is 'true': the merge group ran every gate here on
-    # this exact tree, and ci.yml's `await-fast-gate` skips on that path too.
-    # With the variable unset a push to main runs every gate. The same clause
-    # sits on every job below, so the queue-on push run is all-skipped.
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    # Skipped on a push to main only when the queue is proved (queue-proof found
+    # a successful merge_group CI run for this commit): the merge group ran every
+    # gate here on this exact tree, and ci.yml's `await-fast-gate` skips on that
+    # path too. With no proof a push to main runs every gate. The same needs +
+    # clause sits on every gate below, so the proved-queue push run is
+    # all-skipped.
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     # CodeBuild-hosted runner pilot (docs/ci/ci-and-reviews.md), the same
     # routing decision ci.yml's `changes` job resolves into a `linux_runner`
-    # output -- but no gate job here may carry a `needs:` or any `if:` beyond
-    # the one push/variable clause every job shares (see
+    # output -- but no gate job here may carry any `needs:` beyond queue-proof or
+    # any `if:` beyond the one push/proof clause every job shares (see
     # test_fast_gate_barrier.py's test_every_gate_skips_only_the_queued_push),
     # so the label is computed inline from `github.*` and `vars.*` instead of
     # a sibling job's output. Only admitted actors on same-repository PRs and
@@ -102,7 +143,8 @@ jobs:
 
   brand-lint:
     name: Brand Name Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -137,7 +179,8 @@ jobs:
 
   comment-history-lint:
     name: Comment History Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -170,7 +213,8 @@ jobs:
 
   focus-cue-lint:
     name: Focus Cue Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -203,7 +247,8 @@ jobs:
 
   feature-map-lint:
     name: Feature Map Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -238,7 +283,8 @@ jobs:
 
   changelog-history:
     name: Changelog History Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -283,7 +329,8 @@ jobs:
 
   decision-ledger-history:
     name: Decision Ledger Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -317,7 +364,8 @@ jobs:
 
   builtin-skill-scope:
     name: Builtin Skill Scope Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -353,7 +401,8 @@ jobs:
 
   loop-bound-locks:
     name: Loop-Bound Locks Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -382,7 +431,8 @@ jobs:
 
   testpaths-coverage:
     name: Testpaths Coverage Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -410,7 +460,8 @@ jobs:
 
   cwd-relative-repo-reads:
     name: Working-Directory Path Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -441,7 +492,8 @@ jobs:
 
   harness-parity:
     name: Harness Parity Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -480,7 +532,8 @@ jobs:
 
   memory-store-seam:
     name: Memory Store Seam Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
@@ -520,7 +573,8 @@ jobs:
 
   docs-lint:
     name: Docs Lint
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -555,7 +609,8 @@ jobs:
     # and, through merge_group, on the integrated tree. They stay in the
     # backend shards too; this job only moves the verdict earlier.
     name: Static Ratchet Gate
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:

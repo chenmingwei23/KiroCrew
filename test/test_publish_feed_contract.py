@@ -304,9 +304,11 @@ def test_pr_desktop_matrix_gates_macos_but_never_linux() -> None:
     )
     compute = next((s for s in jobs["desktop-matrix"]["steps"] if s.get("id") == "compute"), None)
     assert compute is not None, "desktop-matrix must have a `compute` step emitting os="
-    # The queue variable reaches the script as a fixed 'true'/'false' string, so
-    # the shell comparison below never sees an unset name.
-    assert compute["env"]["QUEUE_ON"] == "${{ vars.MERGE_QUEUE_ENABLED == 'true' }}"
+    # The queue PROOF reaches the script as a fixed 'true'/'false' string, so
+    # the shell comparison below never sees an unset name. It is the queue-proof
+    # job output (a confirmed merge_group CI run), not the bare variable: that is
+    # what makes the trim self-verifying (#15566).
+    assert compute["env"]["QUEUE_PROVED"] == "${{ needs.queue-proof.outputs.queue_proved }}"
     assert compute["env"]["EVENT"] == "${{ github.event_name }}"
     script_lines = compute["run"].splitlines()
     os_lines = [line for line in script_lines if "os=[" in line]
@@ -341,22 +343,22 @@ def test_pr_desktop_matrix_gates_macos_but_never_linux() -> None:
         "the mac-only branch must be tested FIRST, or the all-three push branch "
         f"below would shadow it, got: {mac_only_guard}"
     )
-    assert '"$EVENT" = "push"' in mac_only_guard and '"$QUEUE_ON" = "true"' in mac_only_guard, (
-        "the mac-only branch must be selected by a push WITH the queue variable "
-        f"set, got: {mac_only_guard}"
+    assert '"$EVENT" = "push"' in mac_only_guard and '"$QUEUE_PROVED" = "true"' in mac_only_guard, (
+        "the mac-only branch must be selected by a push WITH the queue proved "
+        f"(a confirmed merge_group CI run), got: {mac_only_guard}"
     )
 
     all_platforms_guard = nearest_guard(
         by_platforms[("macos-15", "ubuntu-22.04", "ubuntu-22.04-arm")]
     )
     assert '"$EVENT" = "push"' in all_platforms_guard, (
-        "a push with the queue variable unset must build all three, got: " f"{all_platforms_guard}"
+        "a push with the queue unproved must build all three, got: " f"{all_platforms_guard}"
     )
     assert '"$EVENT" = "pull_request"' in all_platforms_guard
     assert '"$DESKTOP_CHANGED" = "true"' in all_platforms_guard
     assert (
-        "$QUEUE_ON" not in all_platforms_guard
-    ), "the all-three push arm is the queue-unset fallback; it must not re-test the variable"
+        "$QUEUE_PROVED" not in all_platforms_guard
+    ), "the all-three push arm is the unproved fallback; it must not re-test the proof"
 
     linux_only_guard = nearest_guard(by_platforms[("ubuntu-22.04", "ubuntu-22.04-arm")])
     assert linux_only_guard == "else", (

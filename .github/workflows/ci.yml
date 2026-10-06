@@ -23,6 +23,13 @@ concurrency:
   # the per-ref group stays as it is today: one running plus one pending, and a
   # later push evicts the pending one, so concurrent main matrices can never
   # pile up hosted macOS jobs. A merge group's ref is unique to the group.
+  #
+  # NOTE: concurrency is evaluated at workflow START, before any job runs, so
+  # it CANNOT reference `needs.queue-proof.outputs`. The variable is the right
+  # key here: if it is wrongly set (queue off, variable on), the worst case is
+  # a per-commit group on a full-matrix push -- slightly less eviction, not a
+  # correctness problem. The self-verifying check that matters (whether to SKIP
+  # jobs) lives in queue-proof's output, not here.
   group: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' && format('{0}-{1}', github.workflow, github.sha) || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -45,6 +52,64 @@ concurrency:
 # -- not a deselect.
 
 jobs:
+  # ── Queue proof (issue #15566) ───────────────────────────────────────
+  # Makes the queue-on push path SELF-VERIFYING instead of trusting the
+  # repository variable alone. On a push to main while MERGE_QUEUE_ENABLED is
+  # 'true', the heavy jobs below trim to the macOS boot leg on the premise that
+  # the merge queue already ran the full matrix on this exact tree. Nothing used
+  # to check that premise per commit: an admin bypassing the queue, or the
+  # variable set while the ruleset is off, landed a commit with no Linux/Windows
+  # verdict. This job queries the API for a successful merge_group CI run whose
+  # head_sha is this commit (a merge group's head_sha becomes main's commit when
+  # the group lands) and publishes `queue_proved`. The trim clauses below read
+  # that output, not the variable, so a direct push with no merge group behind
+  # it falls back to today's full matrix.
+  #
+  # It runs on EVERY event and is never skipped, so dependents always read a
+  # concrete `queue_proved` rather than the empty string a skipped job leaves. On
+  # anything but a queue-on push the script short-circuits to false in milliseconds
+  # (QUEUE_ON is computed from the event and variable below), so the only real
+  # lookup is the queue-on push it exists to verify. Fail-safe in every direction:
+  # a lookup error, a rate limit, or no matching run all yield false, i.e. the full
+  # matrix -- there is no path that trims the matrix on an unconfirmed queue.
+  queue-proof:
+    name: Queue Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # actions:read is what lets this read merge_group runs of this workflow.
+      # Job-level permissions REPLACE the top-level grant, so contents:read is
+      # restated for the sparse checkout below.
+      actions: read
+      contents: read
+    outputs:
+      queue_proved: ${{ steps.proof.outputs.queue_proved }}
+    steps:
+      # Only .github/scripts is needed, so the checkout is sparse, shallow, and
+      # carries no credentials -- the gh read authenticates with GH_TOKEN, not
+      # the checkout token. Same reasoning as await-fast-gate's checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Prove the merge queue tested this commit
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # Which workflow's merge_group run counts as proof: CI itself. If the
+          # queue ran CI on the tree, build.yml and fast-gate.yml ran too (same
+          # trigger set), so one lookup proves all three.
+          WORKFLOW: ci.yml
+          # The only state that must be proved is a push to main with the queue
+          # variable set. Every other event already runs the full matrix, so the
+          # script short-circuits to false without an API call.
+          QUEUE_ON: ${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' }}
+        run: bash .github/scripts/queue-proof.sh
+
   # ── Surface detection (issue #1556) ──────────────────────────────────
   # Most tests only exercise their own surface, so a single-surface diff can
   # skip the opposite suite's *provably* single-surface files. The selector
@@ -60,13 +125,15 @@ jobs:
   # flags false and runs the full matrix (fails safe).
   changes:
     name: Detect changed surface
-    # Skipped on a push to main only while the repository variable
-    # MERGE_QUEUE_ENABLED is 'true': the merge queue ran this workflow's full
-    # matrix on the merge group whose tree IS this commit, so the push re-runs
-    # nothing but the macOS boot leg below, which needs no surface detection.
-    # With the variable unset a push to main runs this job and the full matrix
-    # behind it. Every heavy job `needs` this one, so skipping it skips them all.
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    # Skipped on a push to main only when the queue is PROVED: queue-proof found
+    # a successful merge_group CI run for this commit, so the merge queue already
+    # ran this workflow's full matrix on the merge group whose tree IS this
+    # commit, and the push re-runs nothing but the macOS boot leg below, which
+    # needs no surface detection. With no proof (any other event, or a push the
+    # queue did not test) this job runs and the full matrix behind it. Every
+    # heavy job `needs` this one, so skipping it skips them all.
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     # 15, not 5: the job's own work is seconds, but its `fetch-depth: 0`
     # checkout (paths-filter and the leaf resolver diff against the merge base
@@ -403,11 +470,14 @@ jobs:
   # run anyway and the log would claim it was cleared to.
   await-fast-gate:
     name: Await Fast Gate
-    # Skipped on a push to main only while MERGE_QUEUE_ENABLED is 'true': the
-    # merge group ran Fast Gate on this exact tree and nothing on the trimmed
-    # push path needs the barrier. With the variable unset, Fast Gate runs on
-    # the push too (fast-gate.yml has a push trigger) and this job consumes it.
-    if: github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'
+    needs: [queue-proof]
+    # Skipped on a push to main only when the queue is proved: queue-proof found
+    # a successful merge_group CI run for this commit, so the merge group ran
+    # Fast Gate on this exact tree and nothing on the trimmed push path needs
+    # the barrier. Without proof (any other event, or a push the queue did not
+    # test), Fast Gate runs on the push too (fast-gate.yml has a push trigger)
+    # and this job consumes it.
+    if: github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
@@ -2044,7 +2114,7 @@ jobs:
     # CodeBuild-hosted runner (pilot); artifact-only job, default size. Rollback: `ubuntu-latest`.
     runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}
     timeout-minutes: 10
-    needs: [coverage-combine, frontend-test, frontend-coverage-merge, backend-test, backend-test-ipv6, backend-test-kernel-lock-owner, changes]
+    needs: [coverage-combine, frontend-test, frontend-coverage-merge, backend-test, backend-test-ipv6, backend-test-kernel-lock-owner, changes, queue-proof]
     # Single source of truth for the floors -- referenced by the check steps,
     # their names, and the summary table so the three can never drift apart.
     #
@@ -2121,9 +2191,9 @@ jobs:
     # cancelled (a superseded revision, an evicted merge group) has no verdict to
     # give, while a job that hit its own timeout cancels only that job, so this
     # gate still runs and fails closed on it.
-    # Skipped on a push to main only while MERGE_QUEUE_ENABLED is 'true', where
-    # the matrix it judges does not run.
-    if: ${{ !cancelled() && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true') }}
+    # Skipped on a push to main only when the queue is proved, where the matrix
+    # it judges does not run.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true') }}
     steps:
       - name: Require upstream coverage jobs to have succeeded
         env:
@@ -2830,7 +2900,7 @@ jobs:
 
   frontend-coverage-merge:
     name: Frontend Coverage Merge
-    needs: [frontend-test, changes]
+    needs: [frontend-test, changes, queue-proof]
     # Runs whenever the sharded run collected coverage -- any diff that is not
     # backend-only. (A backend-only diff runs the frontend suite as a
     # coverage-free subset, so there is nothing to merge and the Coverage Gate
@@ -2844,7 +2914,7 @@ jobs:
     # to fix. A skipped shard set has nothing to stitch; a FAILED one still does.
     if: >-
       ${{ !cancelled()
-      && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true')
+      && (github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true')
       && needs.frontend-test.result != 'skipped'
       && needs.changes.outputs.only_backend != 'true' }}
     # CodeBuild-hosted runner (pilot), default size: a merge is one process
@@ -3410,16 +3480,16 @@ jobs:
   # token, no network and no cost. See docs/ci/e2e-gate.md.
   e2e-boot-matrix:
     name: E2E Gateway Boot (${{ matrix.os }})
-    needs: [changes, await-fast-gate]
+    needs: [changes, await-fast-gate, queue-proof]
     # On a pull request or merge group this runs behind the barrier like every
-    # heavy job. On a push to main with the repository variable
-    # MERGE_QUEUE_ENABLED set to 'true' it is the ONLY job that runs: `changes`
-    # and `await-fast-gate` are skipped there, so the condition admits that push
-    # outright. Any other event, including a push with the variable unset,
-    # requires both needs to have succeeded.
+    # heavy job. On a push to main where the queue is PROVED (queue-proof found a
+    # successful merge_group CI run for this commit) it is the ONLY job that
+    # runs: `changes` and `await-fast-gate` are skipped there, so the condition
+    # admits that push outright. Any other event -- including a push the queue
+    # did not test -- requires both needs to have succeeded.
     if: >-
       ${{ !cancelled()
-      && ((github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true')
+      && ((github.event_name == 'push' && needs.queue-proof.outputs.queue_proved == 'true')
           || (needs.changes.result == 'success'
               && needs.await-fast-gate.result == 'success')) }}
     strategy:
@@ -3432,20 +3502,20 @@ jobs:
         # Linux and Windows, no mac. The mac leg waited ~200 minutes for a
         # runner on every pull request, and it is the only leg that did; that
         # wait would hold every PR behind it in the merge queue too. A push to
-        # main with MERGE_QUEUE_ENABLED 'true': macos-15 alone -- the merge
-        # group booted the Linux and Windows legs on this exact tree, and the
-        # mac wait on main costs nobody a merge. A push to main with the
-        # variable unset: all three, because no merge group vouched for this
-        # tree. The admin sets the variable in the same operation as enabling
-        # the queue in the ruleset, and unsets it with unticking the queue, so
-        # main never runs with the trimmed matrix and no queue. Nightly's
-        # `pod-scenarios` boots a real service-managed gateway on macos-15 as
-        # well, so the real-Darwin boot is covered twice on main either way --
-        # just never in front of a pull request. `&&` binds tighter than `||`
-        # in GitHub expressions, so this reads as three guarded literals.
+        # main where the queue is proved: macos-15 alone -- the merge group
+        # booted the Linux and Windows legs on this exact tree, and the mac wait
+        # on main costs nobody a merge. A push to main with no proof (the queue
+        # did not test this commit): all three, because no merge group vouched
+        # for this tree. queue-proof keys this on an actual merge_group run, not
+        # on the variable, so a direct push that bypassed the queue falls back to
+        # all three legs. Nightly's `pod-scenarios` boots a real service-managed
+        # gateway on macos-15 as well, so the real-Darwin boot is covered twice
+        # on main either way -- just never in front of a pull request. `&&` binds
+        # tighter than `||` in GitHub expressions, so this reads as three guarded
+        # literals.
         os: ${{ fromJSON(github.event_name != 'push'
           && '["ubuntu-latest","windows-latest"]'
-          || vars.MERGE_QUEUE_ENABLED == 'true'
+          || needs.queue-proof.outputs.queue_proved == 'true'
           && '["macos-15"]'
           || '["ubuntu-latest","macos-15","windows-latest"]') }}
     # Keep matrix.os stable: names, readiness windows and artifact names use it.

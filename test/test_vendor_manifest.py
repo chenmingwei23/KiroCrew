@@ -283,7 +283,8 @@ def test_ci_wires_the_manifest_gate() -> None:
     ), "fast-gate.yml does not run the manifest gate"
 
     job = yaml.safe_load(text)["jobs"]["vendor-manifest"]
-    assert "needs" not in job, "vendor-manifest gained a dependency and can now be skipped"
+    assert job.get("needs") == ["queue-proof"], "vendor-manifest must need only queue-proof"
     assert (
-        job.get("if") == "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
-    ), "vendor-manifest's condition is not exactly the merge-queue push skip"
+        job.get("if")
+        == "github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'"
+    ), "vendor-manifest's condition is not exactly the self-verifying push skip (#15566)"

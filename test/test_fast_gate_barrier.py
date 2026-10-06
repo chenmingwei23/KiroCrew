@@ -62,21 +62,51 @@ _GATE_JOBS = (
     "harness-parity",
     "docs-lint",
 )
-# Every job in fast-gate.yml, in file order: the moved gates plus the one gate
-# that was born there. Explicit for the same reason as _GATE_JOBS -- a job added
-# without the push/variable clause would be the one job left running on a
-# queue-on push, and a file-derived list would admit it silently.
-_FAST_GATE_JOBS = _GATE_JOBS[:-1] + ("memory-store-seam", "docs-lint", "static-ratchets")
+# Every job in fast-gate.yml, in file order. queue-proof (issue #15566) is born
+# there and runs on every event, so it is NOT a gate -- it carries no push/proof
+# clause and is excluded from the gate contract below. The moved gates plus the
+# two gates born in fast-gate.yml follow. Explicit for the same reason as
+# _GATE_JOBS -- a gate added without the push/proof clause would be the one gate
+# left running on a proved-queue push, and a file-derived list would admit it
+# silently.
+_FAST_GATE_JOBS = (
+    ("queue-proof",)
+    + _GATE_JOBS[:-1]
+    + (
+        "memory-store-seam",
+        "docs-lint",
+        "static-ratchets",
+    )
+)
 
-#: The exact `if` clause that trims a job off the push path while the repository
-#: variable MERGE_QUEUE_ENABLED is 'true', and keeps it there while it is unset.
-_PUSH_SKIP_CLAUSE = "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
+#: The queue-proof job name, duplicated in every workflow a push to main runs
+#: because a `needs:` edge cannot cross a workflow file. It looks up a successful
+#: merge_group CI run for this commit and publishes `queue_proved`; the trim
+#: clauses below read that output instead of the variable, so a direct push that
+#: bypassed the queue falls back to the full matrix. See #15566.
+_QUEUE_PROOF = "queue-proof"
+
+#: The exact `if` clause that trims a gate/heavy job off the push path when the
+#: queue is PROVED (queue-proof found a merge_group CI run for this commit), and
+#: keeps it on the full-matrix path otherwise. Self-verifying: it reads the job
+#: output, not the repository variable, so an unproved push runs the matrix.
+_PUSH_SKIP_CLAUSE = (
+    "github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'"
+)
 #: The exact clause under which the boot leg admits a push with no needs to lean on.
-_PUSH_ADMIT_CLAUSE = "github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true'"
+_PUSH_ADMIT_CLAUSE = (
+    "github.event_name == 'push' && needs.queue-proof.outputs.queue_proved == 'true'"
+)
+#: The run-level concurrency group STILL keys on the variable, not queue_proved:
+#: concurrency is evaluated at workflow START, before any job runs, so it cannot
+#: reference `needs.*`. The variable is harmless here (a wrong setting changes
+#: only eviction behaviour, never whether jobs run); the self-verifying check
+#: that governs SKIPPING lives in the job clauses above. #15566.
+_CONCURRENCY_ADMIT_CLAUSE = "github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true'"
 #: The exact run-level concurrency group of every workflow a push to main runs:
 #: a group per COMMIT only on the queue-on push, the per-ref group otherwise.
 _PUSH_GROUP_EXPR = (
-    "${{ " + _PUSH_ADMIT_CLAUSE + " && format('{0}-{1}', github.workflow, github.sha)"
+    "${{ " + _CONCURRENCY_ADMIT_CLAUSE + " && format('{0}-{1}', github.workflow, github.sha)"
     " || format('{0}-{1}', github.workflow, github.ref) }}"
 )
 
@@ -93,6 +123,11 @@ _MUST_NOT_REACH: dict[str, str] = {
         "those outputs are empty strings and each consumer silently flips"
     ),
     "await-fast-gate": "is the barrier",
+    "queue-proof": (
+        "runs upstream of everything (changes and await-fast-gate both need it) and "
+        "must run on the trimmed push path to publish queue_proved; behind the "
+        "barrier it could never answer on the very push it exists to verify"
+    ),
 }
 
 # These DO reach the barrier, unavoidably -- they consume the shards' artifacts. What
@@ -183,8 +218,10 @@ def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
         "coverage-gate",
         "frontend-coverage-merge",
     }
-    # A bare `!= 'push'` anywhere else would trim a job off the push path with
-    # the variable unset, which is the state this contract keeps at full matrix.
+    # A bare `!= 'push'` anywhere else would trim a job off the push path when
+    # the queue is UNPROVED, which is the state this contract keeps at full
+    # matrix. queue-proof itself carries no `if:` (it runs on every event), so
+    # it never appears here.
     bare = {
         name
         for name, spec in jobs.items()
@@ -192,10 +229,13 @@ def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
     }
     assert (
         bare == skipped_on_push
-    ), f"push-skips not gated on MERGE_QUEUE_ENABLED: {bare - skipped_on_push}"
+    ), f"push-skips not gated on queue_proved: {bare - skipped_on_push}"
 
     for name, spec in jobs.items():
-        if name in skipped_on_push or name == "e2e-boot-matrix":
+        # queue-proof is upstream of changes and await-fast-gate: it must NOT
+        # need them, and it runs on the push path to publish the output they
+        # read. e2e-boot-matrix admits the proved push outright, checked below.
+        if name in skipped_on_push or name in ("e2e-boot-matrix", _QUEUE_PROOF):
             continue
         needs = spec.get("needs") or []
         direct_needs = {needs} if isinstance(needs, str) else set(needs)
@@ -212,19 +252,17 @@ def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
     boot_guard = str(boot["if"])
     assert _PUSH_ADMIT_CLAUSE in boot_guard
     assert "!cancelled()" in boot_guard
-    # The admission is the whole conjunction, never a bare push: with the
-    # variable unset a push must go through the needs like every other event.
+    # The admission is the whole conjunction, never a bare push: when the queue
+    # is unproved a push must go through the needs like every other event.
     assert boot_guard.count("github.event_name == 'push'") == 1
     assert "(github.event_name == 'push' ||" not in boot_guard
 
     matrix_os = str(boot["strategy"]["matrix"]["os"])
     sides = matrix_os.split("||")
-    assert (
-        len(sides) == 3
-    ), f"expected non-push / queue-on / queue-off matrix split, got: {matrix_os}"
+    assert len(sides) == 3, f"expected non-push / proved / unproved matrix split, got: {matrix_os}"
     non_push_side, queue_on_side, queue_off_side = sides
     assert "github.event_name != 'push'" in non_push_side
-    assert "vars.MERGE_QUEUE_ENABLED == 'true'" in queue_on_side
+    assert "needs.queue-proof.outputs.queue_proved == 'true'" in queue_on_side
     assert "&&" not in queue_off_side, "the fallback literal must be unguarded"
 
     def platforms(side: str) -> list[str]:
@@ -256,33 +294,49 @@ class TestTheGatesLiveInTheGateWorkflow:
 
     @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
     def test_every_gate_skips_only_the_queued_push(self, fast_gate: dict, job: str) -> None:
-        # A `needs:` lets a failed sibling skip it and an `if:` lets a diff shape
-        # dodge it. The ONE condition a gate may carry is the exact push/variable
-        # clause: on a push to main while MERGE_QUEUE_ENABLED is 'true' the merge
-        # group already ran every gate on this tree, so the push run skips
-        # whole -- and then neither this workflow nor ci.yml requests a fleet
-        # slot on the queue-on push path (only fleet-labelled jobs can be
-        # orphaned; build.yml's matrix resolver and the heal-exempt ratchet
-        # audit are what remain). Equality, not containment: an extra `&&` term is a way
-        # to dodge, and `==`/`!=` swapped would skip every PR instead.
+        # queue-proof is NOT a gate -- it runs on every event to publish the
+        # output the gates read, and it carries no `if:` or push/proof clause.
+        # Tested separately in TestQueueProofJob below.
+        if job == _QUEUE_PROOF:
+            return
+        # A `needs:` beyond queue-proof lets a failed sibling skip it, and an
+        # `if:` beyond the push/proof clause lets a diff shape dodge it. The
+        # only dependency a gate may carry is queue-proof (so it reads
+        # `queue_proved`), and the ONE condition it may carry is the exact
+        # push/proof clause: on a push to main where queue-proof confirmed a
+        # merge_group CI run for this tree, the proved push run is all-skipped
+        # -- and then neither this workflow nor ci.yml requests a fleet slot on
+        # that push path. Equality, not containment: an extra `&&` term is a
+        # way to dodge, and `==`/`!=` swapped would skip every PR instead.
         spec = fast_gate["jobs"][job]
-        assert "needs" not in spec, f"{job} gained a dependency and can now be skipped"
+        needs = spec.get("needs") or []
+        needs_list = [needs] if isinstance(needs, str) else list(needs)
+        assert needs_list == [_QUEUE_PROOF], f"{job} must need only queue-proof, got {needs_list!r}"
         assert (
             spec.get("if") == _PUSH_SKIP_CLAUSE
-        ), f"{job} must carry exactly the push/variable clause, got {spec.get('if')!r}"
+        ), f"{job} must carry exactly the push/proof clause, got {spec.get('if')!r}"
 
     def test_the_queued_push_run_is_all_skipped_not_failed(self, fast_gate: dict) -> None:
         # Job by job above, and here as a whole: the job list is pinned so a gate
-        # ADDED without the clause (which would be the one job left running on the
-        # queue-on push, holding a fleet slot) fails, and so does one dropped.
+        # ADDED without the clause (which would be the one gate left running on
+        # the proved-queue push, holding a fleet slot) fails, and so does one
+        # dropped. queue-proof IS in the list (it must exist) but is excluded from
+        # the clause check (it runs on every event).
         assert tuple(fast_gate["jobs"]) == _FAST_GATE_JOBS
         carrying = {
             name for name, spec in fast_gate["jobs"].items() if spec.get("if") == _PUSH_SKIP_CLAUSE
         }
-        assert carrying == set(_FAST_GATE_JOBS)
-        # No barrier or aggregate job exists to turn a skipped sibling into a
-        # failure: nothing in the file has a `needs:` at all.
-        assert not any("needs" in spec for spec in fast_gate["jobs"].values())
+        assert carrying == set(_FAST_GATE_JOBS) - {_QUEUE_PROOF}
+        # Every gate needs exactly queue-proof; queue-proof itself has no needs.
+        for name, spec in fast_gate["jobs"].items():
+            if name == _QUEUE_PROOF:
+                assert "needs" not in spec, "queue-proof must have no needs"
+            else:
+                needs = spec.get("needs") or []
+                needs_list = [needs] if isinstance(needs, str) else list(needs)
+                assert needs_list == [
+                    _QUEUE_PROOF
+                ], f"{name} must need only queue-proof, got {needs_list!r}"
 
     def test_the_gate_workflow_matches_ci_triggers(self, ci: dict, fast_gate: dict) -> None:
         """Re-derived stronger: pin both workflows' complete, identical trigger dictionaries."""
@@ -295,7 +349,7 @@ class TestTheGatesLiveInTheGateWorkflow:
             "merge_group": {"types": ["checks_requested"]},
         }
         assert ci_on == expected
-        # Fast Gate runs on a push too: with MERGE_QUEUE_ENABLED unset, ci.yml's
+        # Fast Gate runs on a push too: when the queue is unproved, ci.yml's
         # barrier consumes that run before the full push matrix.
         assert fg_on == expected, (
             "Fast Gate's triggers drifted from ci.yml's. A WIDER filter newly reviews "
@@ -318,16 +372,103 @@ class TestTheGatesLiveInTheGateWorkflow:
             "group": _PUSH_GROUP_EXPR,
             "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
         }
-        # The variable gates the per-SHA arm only; the per-ref fallback is unguarded.
+        # The variable gates the per-SHA arm only; the per-ref fallback is
+        # unguarded. Concurrency keys on the variable, NOT queue_proved, because
+        # it is evaluated at workflow start before any job runs (see #15566 and
+        # the concurrency comment in each workflow).
         sha_arm, _, ref_arm = _PUSH_GROUP_EXPR.partition(" || ")
-        assert sha_arm.startswith("${{ " + _PUSH_ADMIT_CLAUSE + " && ")
+        assert sha_arm.startswith("${{ " + _CONCURRENCY_ADMIT_CLAUSE + " && ")
         assert "github.sha" in sha_arm and "github.sha" not in ref_arm
+        assert "vars.MERGE_QUEUE_ENABLED" in sha_arm
         assert "vars." not in ref_arm and "github.ref" in ref_arm
 
     def test_a_push_to_main_reaches_exactly_the_macos_boot_leg(self, ci: dict) -> None:
-        """Re-derived stronger: pin the push path job by job under both states of
-        MERGE_QUEUE_ENABLED -- trimmed to the mac boot leg when set, full matrix when unset."""
+        """Re-derived stronger: pin the push path job by job under both proof
+        states -- trimmed to the mac boot leg when proved, full matrix when not."""
         _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci)
+
+
+class TestTheQueueProofJob:
+    """The self-verifying push path (issue #15566).
+
+    The queue-on push trims the matrix on the premise that the merge queue ran
+    the full tree. queue-proof is what checks that premise per commit: it reads a
+    successful merge_group CI run for this exact SHA and publishes queue_proved,
+    which the trim clauses key on instead of the repository variable. The job must
+    exist in every workflow a push to main runs (a `needs:` edge cannot cross a
+    workflow file), run on EVERY event (so dependents read a concrete output, not
+    the empty string a skipped job leaves), name only the script, and carry the
+    actions:read grant the lookup needs. Each property fails silently if it
+    regresses -- a skipped queue-proof flips every gate to the full matrix, a
+    missing permission 404s the lookup -- so each is asserted.
+    """
+
+    @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
+    def test_queue_proof_exists_runs_always_and_reads_the_right_grant(self, path: Path) -> None:
+        job = _workflow(path)["jobs"][_QUEUE_PROOF]
+        # Runs on every event: no `if:` and no `needs:`, so it is never skipped
+        # and always publishes a concrete queue_proved for its dependents.
+        assert "if" not in job, "queue-proof must run on every event (no `if:`)"
+        assert "needs" not in job, "queue-proof is upstream of everything (no `needs:`)"
+        # actions:read is what lets it list merge_group runs; contents:read for the
+        # sparse checkout. Job-level permissions REPLACE the top-level grant.
+        perms = job["permissions"]
+        assert perms.get("actions") == "read"
+        assert perms.get("contents") == "read"
+        # It publishes the output the trim clauses read.
+        assert job["outputs"]["queue_proved"] == "${{ steps.proof.outputs.queue_proved }}"
+
+    @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
+    def test_queue_proof_invokes_the_extracted_script_with_the_identity_env(
+        self, path: Path
+    ) -> None:
+        job = _workflow(path)["jobs"][_QUEUE_PROOF]
+        proof = next(step for step in job["steps"] if step.get("id") == "proof")
+        # The lookup logic lives in a script so its whole control flow runs under a
+        # stubbed gh (test_queue_proof.py). The step only NAMES it.
+        assert proof["run"].strip() == "bash .github/scripts/queue-proof.sh"
+        env = proof["env"]
+        for var in ("GH_TOKEN", "REPO", "SHA", "WORKFLOW", "QUEUE_ON"):
+            assert var in env, f"queue-proof no longer resolves {var}"
+        # github.sha is the landed commit on a push -- the SHA a merge group's
+        # head becomes when it lands, which is the whole premise.
+        assert env["SHA"] == "${{ github.sha }}"
+        # The proof is a CI merge_group run: one lookup covers all three workflows.
+        assert env["WORKFLOW"] == "ci.yml"
+        # Only a push with the variable set is worth a lookup; every other event
+        # short-circuits to false. The variable appears HERE (deciding whether to
+        # look), never in a trim clause (which read the output).
+        assert (
+            env["QUEUE_ON"]
+            == "${{ github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' }}"
+        )
+
+    @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
+    def test_the_trim_clauses_key_on_the_output_not_the_variable(self, path: Path) -> None:
+        # The defect this change fixes: a trim clause that trusts the variable
+        # alone lets a direct push bypass the matrix. Every job that trims off the
+        # push path must read needs.queue-proof.outputs.queue_proved, and no job's
+        # `if:` may trim on the bare variable. (concurrency groups legitimately key
+        # on the variable -- they cannot read job outputs -- so this scans job
+        # `if:` clauses only, not the whole file.)
+        jobs = _workflow(path)["jobs"]
+        for name, spec in jobs.items():
+            guard = str(spec.get("if", ""))
+            if "MERGE_QUEUE_ENABLED" in guard:
+                pytest.fail(
+                    f"{path.name}:{name} trims on the bare variable in its `if:` "
+                    f"({guard!r}); read needs.queue-proof.outputs.queue_proved instead"
+                )
+        # And at least one job in each workflow actually keys on the output, or the
+        # self-verifying path is not wired at all.
+        keyed = [
+            name
+            for name, spec in jobs.items()
+            if "needs.queue-proof.outputs.queue_proved" in str(spec.get("if", ""))
+            or "needs.queue-proof.outputs.queue_proved"
+            in str(spec.get("strategy", {}).get("matrix", {}).get("os", ""))
+        ]
+        assert keyed, f"{path.name} has no job keyed on queue_proved -- trim not wired"
 
 
 class TestFastGatePythonRuntime:
@@ -357,6 +498,10 @@ class TestFastGatePythonRuntime:
 
     @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
     def test_every_actual_job_sets_up_python_before_running(self, fast_gate: dict, job: str):
+        # queue-proof runs a bash+gh/jq lookup, not a Python gate, so it needs no
+        # Python runtime. Every actual gate does.
+        if job == _QUEUE_PROOF:
+            return
         self._assert_runtime(fast_gate["jobs"][job])
 
     @pytest.mark.parametrize(

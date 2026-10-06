@@ -19,10 +19,14 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
 
-# The one `if:` a Fast Gate job carries: skip a push to main only while the
-# repository variable MERGE_QUEUE_ENABLED is 'true', when the merge group
-# already ran the gate on that exact tree.
-_FAST_GATE_PUSH_SKIP_CLAUSE = "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
+# The one `if:` a Fast Gate GATE carries: skip a push to main only when the
+# queue is PROVED (queue-proof found a successful merge_group CI run for this
+# commit), when the merge group already ran the gate on that exact tree. Reads
+# the queue-proof job output, not the repository variable, so a direct push that
+# bypassed the queue runs every gate (issue #15566).
+_FAST_GATE_PUSH_SKIP_CLAUSE = (
+    "github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'"
+)
 
 _ACTOR_PREDICATE = "contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id)"
 _CANONICAL_ROUTING_EXPR = (
@@ -327,15 +331,26 @@ def test_every_ci_yml_resolver_consumer_reads_the_resolver_not_a_literal() -> No
 def test_all_fast_gates_skip_only_the_queued_push() -> None:
     """Every gate keeps the fleet route and carries exactly one condition.
 
-    The one `if:` a gate may carry is the push/variable clause: with the merge
-    queue on, a push to main already had every gate run on its merge group, so
-    the push run skips whole and holds no fleet job an orphan could sit on. Pinned
-    by equality so an extra term cannot dodge a gate on a PR or a merge group.
+    The one `if:` a gate may carry is the push/proof clause: when queue-proof
+    confirms a merge_group CI run for the commit, a push to main already had every
+    gate run on its merge group, so the push run skips whole and holds no fleet
+    job an orphan could sit on. Pinned by equality so an extra term cannot dodge a
+    gate on a PR or a merge group. queue-proof itself is NOT a gate -- it runs on
+    every event on a plain ubuntu-latest runner (no fleet route) to publish the
+    output the gates read -- so it is excluded here (issue #15566).
     """
     workflow = yaml.safe_load((_WORKFLOWS_DIR / "fast-gate.yml").read_text(encoding="utf-8"))
     assert workflow["jobs"]
     for job_id, spec in workflow["jobs"].items():
-        assert "needs" not in spec, job_id
+        if job_id == "queue-proof":
+            # Not a gate: no `if:`, no fleet route, no needs.
+            assert "if" not in spec
+            assert "needs" not in spec
+            assert spec["runs-on"] == "ubuntu-latest"
+            continue
+        needs = spec.get("needs") or []
+        needs_list = [needs] if isinstance(needs, str) else list(needs)
+        assert needs_list == ["queue-proof"], job_id
         assert spec.get("if") == _FAST_GATE_PUSH_SKIP_CLAUSE, job_id
         assert spec["runs-on"] == _CANONICAL_MERGE_GROUP_ROUTING_EXPR, job_id
 

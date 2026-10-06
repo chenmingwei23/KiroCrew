@@ -327,7 +327,8 @@ class TestTheCommittedTreeAgrees:
             (ROOT / ".github" / "workflows" / "fast-gate.yml").read_text(encoding="utf-8")
         )
         job = workflow["jobs"]["builtin-skill-scope"]
-        assert "needs" not in job, "builtin-skill-scope gained a dependency and can now be skipped"
+        assert job.get("needs") == ["queue-proof"], "builtin-skill-scope must need only queue-proof"
         assert (
-            job.get("if") == "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
-        ), "builtin-skill-scope's condition is not exactly the merge-queue push skip"
+            job.get("if")
+            == "github.event_name != 'push' || needs.queue-proof.outputs.queue_proved != 'true'"
+        ), "builtin-skill-scope's condition is not exactly the self-verifying push skip (#15566)"
