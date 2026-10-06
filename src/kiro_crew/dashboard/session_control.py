@@ -4262,6 +4262,34 @@ def _slot_object(state: "DashboardState", slot_key: str) -> "object | None":
         return None
 
 
+def _target_replaced(state: "DashboardState", slot_key: str, observed: "object | None") -> bool:
+    """Whether the slot under *slot_key* differs from *observed*, the captured session.
+
+    The identity read-back that a tree verb runs after its final authorization. *observed*
+    is the target slot object captured BEFORE the verb's first suspension; this re-reads
+    the object under the same key and reports whether it has changed. A close plus a
+    reopen under the SAME key inside the suspensions between capture and append puts a
+    different session's object there -- open, passing every fence, with a log of its own
+    -- which no key-only check can tell from the original. A verb that finds this true
+    refuses rather than appending an adoption or release against a session that never took
+    part, in an entry nothing later corrects.
+
+    Encapsulated rather than inlined for the reason :func:`_freshest_sid` is: the slot
+    captures a verb takes before its resolutions are what the capture-ordering invariant
+    rests on, and a bare :func:`_slot_object` read in the verb body AFTER the suspending
+    resolution would read as a late capture. The read-back lives here, where it is a
+    comparison and not a capture.
+
+    ``True`` when nothing is there now and something was (the target simply closed), which
+    is a refusal too -- a verb cannot record a change to a session that is gone. The pure
+    close is also caught earlier by the gate's own re-resolve, which is why the close
+    tests assert ``target_not_found``; this guard's own case is the reopen the gate admits.
+    A ``None`` capture (the target was never a held object) can only become non-``None``,
+    which is still a change, so the comparison stays correct at the edges.
+    """
+    return _slot_object(state, slot_key) is not observed
+
+
 def _freshest_sid(
     state: "DashboardState", slot_key: str, resolved: str, observed: "object | None"
 ) -> str:
@@ -4403,6 +4431,18 @@ async def adopt_target(
         caller_key = caller_slot_key(state, caller_session_key)
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, so the final
+        # authorization can tell the session it admitted apart from a same-key
+        # replacement. Everything about the target below -- the gate's re-resolve, the
+        # ``_live_sid_of`` mapping read -- is keyed by ``slot.key``, and a key is not an
+        # identity: the target can close and a NEW session can open under the same slot
+        # key in the awaits ahead (the gate's warm, the lock wait, the id resolution's
+        # store read), and every key-only check then answers for the replacement. The
+        # adoption would be appended against a conversation that was never adopted, in an
+        # entry nothing later corrects. The object itself does not move, so comparing it
+        # after the gate is what makes the refusal below possible.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # Checked FIRST because it is the PERMANENT one of the two refusals below: with
@@ -4482,6 +4522,25 @@ async def adopt_target(
                     "cannot be adopted",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted. The gate re-resolves BY
+            # KEY and ``_live_sid_of`` reads the mapping BY KEY, so a close plus a same-key
+            # reopen inside the awaits above leaves both answering for the replacement: an
+            # open session that passes every fence, whose log ``target_sid`` now names. The
+            # adoption would then be appended against a conversation that was never
+            # adopted, and the entry is append-only -- there is no later write that
+            # corrects it. The captured object is this process's identity for the admitted
+            # session; the replacement is a different object under the same key, so the
+            # ``is`` comparison is what the key-only checks cannot do. A caller may retry:
+            # a fresh attempt resolves the current session honestly.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "adoption would name a session that was never adopted -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # REFRESHED here, synchronously, for the same reason the resolutions happen
             # before the gate: the gate's own warm suspends, and either of these slots can
@@ -4567,6 +4626,16 @@ async def release_target(
         releasing_self = slot.key == caller_key
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, for the reason the
+        # adoption captures it: the gate re-resolves and ``_live_sid_of`` reads BY KEY, so
+        # a close plus a same-key reopen inside the awaits ahead would leave both naming a
+        # replacement session, and the release would be appended against a conversation
+        # that was never released -- append-only, so nothing later corrects it. The
+        # ``allow_self`` case is covered too: when the caller IS the target, this just
+        # captures the caller's own live object, and a same-key reopen there means a
+        # different session is now calling, which the final gate should likewise refuse.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # The permanent refusal first, for the reason the adoption checks it first.
@@ -4626,6 +4695,21 @@ async def release_target(
                     "cannot be released",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted, for the reason the adoption
+            # refuses: the gate and ``_live_sid_of`` both resolve BY KEY, so a same-key
+            # reopen inside the awaits above leaves them answering for a replacement, and
+            # the release would be appended against a session that was never released. The
+            # captured object is this process's identity for the admitted session; a caller
+            # may retry to act on the current one.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "release would name a session that was never released -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # Refreshed here, synchronously, for the reason the adoption refreshes: the
             # gate's warm suspends, and the parent can open its next store inside it.
