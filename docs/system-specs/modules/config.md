@@ -1263,7 +1263,7 @@ deleted in memory stays deleted — restore fills into existing records only.
 
 A top-level key the core does not model is captured into `_extra_sections` and
 round-tripped, and by default also reported as `Config: unrecognized top-level
-keys`. Two exclusions from that warning are named in code:
+keys`. Three exclusions from that warning are named in code:
 
 - `CONFIG_RESERVED_TOP_KEYS` in `resolution.py` (`meta`, retired keys) — stamped
   by `save()` itself or written by an older build; never parsed, never
@@ -1274,6 +1274,17 @@ keys`. Two exclusions from that warning are named in code:
   section, and NOT reported as unrecognized: the product told the operator to
   write it. Private to the warning that is its only consumer; a second member
   is the point at which this becomes an app-declared registration.
+- `validation._CORE_OWNED_TOP_KEYS` (`voice_reply`) — a section this core itself
+  writes and reads but does not model as a field. The settings UI persists it
+  (`slack/interactions.py`, `dashboard/chat_voice.py`) and the gateway reads it
+  back on startup via `load_voice_reply_config` (`slack/handler_runtime/voice.py`,
+  and read by `telegram/transport_dispatch.py`). Captured and round-tripped like any unknown
+  section, and NOT reported as unrecognized because the product wrote it itself.
+  A separate set from `_APP_OWNED_TOP_KEYS` because the owner is core, not an
+  app: it has no manifest to declare itself through, so the "second member →
+  app-declared registration" trigger on the app-owned set does not apply to it.
+  Both sets exempt only the shape the reader keeps — a JSON object — so a scalar
+  value still warns.
 
 A deprecated field is announced only when it holds something: `null` and an
 empty map, list or string carry nothing to migrate, so `validation` stays
