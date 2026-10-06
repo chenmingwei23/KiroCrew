@@ -26,6 +26,10 @@ retype every conversation.
 | Global (`user`) | `~/.kiro/steering/**/*.md` | every session |
 | Workspace (`workspace`) | `<project>/.kiro/steering/**/*.md` | sessions whose project directory is that project |
 
+For a single reference covering every asset type — skills, steering, agents —
+across user and project scope and whether each is shared with kiro-cli / Kiro
+IDE, see the [asset-location table in the Skills guide](skills.md).
+
 Two different mechanisms put them there. kiro-cli loads both roots itself: the
 global one for every session it starts, and the workspace one because the
 session subprocess runs with the chat slot's project directory as its working

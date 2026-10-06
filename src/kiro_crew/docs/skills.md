@@ -2,6 +2,39 @@
 
 Skills are directories containing `SKILL.md` files. Global skills live in `~/.kiro/crew/skills/`.
 
+## Where every asset lives (user vs project scope, and CLI/IDE sharing)
+
+Kiro Crew, kiro-cli, and Kiro IDE all read assets from `~/.kiro`, but the split
+between a Crew-specific root and a shared root differs by asset type. This table
+is the authoritative reference; it is grounded in the resolver functions in
+`src/kiro_crew/config/paths.py`, `src/kiro_crew/skills.py`, and
+`src/kiro_crew/context.py`, cited by name below so the entries survive refactors.
+
+| Asset | User scope | Project scope | Shared with kiro-cli / Kiro IDE? |
+|---|---|---|---|
+| **Skills** | `~/.kiro/crew/skills/` — the data home resolved by `config_dir()`, which `KIROCREW_HOME` can move — plus any read-only `skills.extra_paths` | `<project>/.kiro/skills/`, loaded last and only when `skills.project_skills_enabled` is on (the default) and you have granted that exact project directory trust | **No for the user root.** Crew resolves its own `~/.kiro/crew/skills/`, not the kiro-cli user root `~/.kiro/skills/`. The project directory `<project>/.kiro/skills/` is the same one kiro-cli uses. |
+| **Steering** (Crew has no separate "Rules" asset — steering files are the rules surface) | `~/.kiro/steering/**/*.md` | `<project>/.kiro/steering/**/*.md` | **Yes.** These are the kiro-cli conventions and Crew loads the same globs (`steering_target_admissible` / `_load_steering_resources` in `src/kiro_crew/context.py`). |
+| **Agents** | `~/.kiro/agents/` — the kiro-cli home resolved by `kiro_agents_dir()`, which `KIRO_HOME` can move | `<project>/.kiro/agents/` (`project_agents_dir()`), plus the Crew-only `<project>/.kiro/*.agent-spec.json` convention | **Yes** for both directories — the same ones kiro-cli resolves `--agent` against. |
+| **AGENTS.md** | n/a | `<project>/AGENTS.md` | **Yes**, the same file kiro-cli reads. |
+
+Two consequences worth stating explicitly:
+
+- **Two Crew asset types resolve from two different user roots in the same
+  install.** Skills come from the Crew data home (`config_dir()`), while agents
+  come from the shared kiro-cli home (`kiro_agents_dir()`). Setting
+  `KIROCREW_HOME` moves the first; `KIRO_HOME` moves the second.
+- **A skill installed into the kiro-cli user root `~/.kiro/skills/` is not
+  indexed by the Crew skill loader.** The dashboard lists it (read-only), but
+  `skill_search` in a Crew session does not see it. To make such a skill
+  discoverable in Crew today, either map it to an agent as a `skill://` resource
+  (see [Mapping Skills to an Agent](agents.md)) or add its directory to
+  `skills.extra_paths`. Making this automatic is tracked as a separate behavior
+  request.
+
+**Name collisions resolve differently from kiro-cli.** kiro-cli lets a workspace
+skill win over a user skill of the same name; Crew adds the project root *last*,
+so a global skill of the same name wins over the project one (`_project_skills_dir()`).
+
 ## How Skills Work
 
 - **Always-on skills**: `always: true` injects full content into every eligible session. A project's own always-on skills share a smaller project budget; one that does not fit is left out and listed in the session with a pointer to read it instead.
