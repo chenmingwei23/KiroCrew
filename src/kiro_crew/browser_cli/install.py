@@ -10,7 +10,9 @@ Installation is global within a product-owned npm prefix rather than ``npx``.
 expired registry token would take browsing down at use time. The managed prefix
 is ``<data-home>/playwright-cli``. Every agent sandbox exposes that leaf
 read-only, and gateway execution resolves it by absolute path before considering
-fixed, non-writable system locations. ``PATH`` is never an execution source.
+an edition-bundled prefix and then fixed, non-writable system locations. The
+bundled prefix and the system locations clear the same read-only floor. ``PATH``
+is never an execution source.
 
 Node is located through :func:`kiro_crew.env.find_node_tool` rather than bare
 ``shutil.which``: the gateway can run with a PATH that omits the version-manager
@@ -455,6 +457,45 @@ def _system_cli_candidates() -> tuple[Path, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
+def _edition_cli_candidates() -> tuple[Path, ...]:
+    """Entrypoint spellings under an edition-provided bundled CLI prefix.
+
+    An edition (for example a Toolbox-packaged build) ships ``@playwright/cli``
+    with the product instead of leaving the host to ``npm install`` it, and
+    points :data:`_STANDALONE_PREFIX_ENV` at that bundle. Without this source the
+    bundle has nowhere to be an *execution* candidate: it is neither the managed
+    leaf nor a fixed system directory, so :func:`cli_path` reports the CLI as
+    absent and the dashboard offers the npm install the bundle exists to avoid.
+
+    The prefix is operator/edition configuration, not a discovered ``PATH``
+    entry, but it is still passed through the same :func:`_system_candidate`
+    floor as a fixed system location: the entrypoint must resolve to a real
+    executable file that this gateway user cannot write, so a bundle an agent
+    could overwrite is refused exactly as a planted system binary would be. The
+    npm layouts (``<prefix>/bin`` on POSIX; ``<prefix>`` and ``<prefix>/bin`` on
+    Windows, plus the ``.cmd``/``.exe`` wrappers) are probed because a bundled
+    tree is produced by the same global-install shapes as the managed leaf.
+    """
+    prefix_override = os.environ.get(_STANDALONE_PREFIX_ENV, "").strip()
+    if not prefix_override:
+        return ()
+    prefix = Path(prefix_override)
+    if platform_compat.IS_WINDOWS:
+        return tuple(
+            dict.fromkeys(
+                (
+                    prefix / "bin" / f"{CLI_BIN}.cmd",
+                    prefix / "bin" / f"{CLI_BIN}.exe",
+                    prefix / "bin" / CLI_BIN,
+                    prefix / f"{CLI_BIN}.cmd",
+                    prefix / f"{CLI_BIN}.exe",
+                    prefix / CLI_BIN,
+                )
+            )
+        )
+    return (prefix / "bin" / CLI_BIN,)
+
+
 def _agent_writable_roots() -> tuple[Path, ...]:
     """Trees where an agent may replace an executable by design."""
     return github_runner.agent_writable_roots()
@@ -583,10 +624,16 @@ def cli_path() -> str | None:
     """Canonical trusted ``playwright-cli`` path, or ``None``.
 
     Resolution is absolute and ordered: the sandbox-sealed crew-home tools leaf
-    first, then fixed machine-install directories. ``PATH`` and the legacy
-    ``~/.local/bin/playwright-cli`` location are never execution sources. A PATH
-    hit is inspected only after every vetted location misses, so the refusal can
-    name the planted shim without ever running it.
+    first, then an edition-provided bundled prefix, then fixed machine-install
+    directories. ``PATH`` and the legacy ``~/.local/bin/playwright-cli`` location
+    are never execution sources. A PATH hit is inspected only after every vetted
+    location misses, so the refusal can name the planted shim without ever
+    running it.
+
+    The edition bundle and the system directories share the one
+    :func:`_system_candidate` floor, so a bundled payload is trusted only when it
+    is read-only to this gateway user -- the same bar a fixed system binary must
+    clear.
     """
     first_refusal: tuple[Path, str] | None = None
     for candidate in _managed_cli_candidates():
@@ -599,7 +646,7 @@ def cli_path() -> str | None:
             return str(resolved)
         if reason is not None and first_refusal is None:
             first_refusal = (candidate, reason)
-    for candidate in _system_cli_candidates():
+    for candidate in (*_edition_cli_candidates(), *_system_cli_candidates()):
         if not os.path.lexists(candidate):
             continue
         resolved, reason = _system_candidate(candidate)
@@ -815,10 +862,12 @@ def _standalone_node_modules() -> list[Path]:
     """``node_modules`` roots of the managed, unprivileged CLI install.
 
     The product-owned default is the sandbox-sealed tools leaf. An explicit
-    operator prefix remains useful to the standalone installer and is trusted as
-    operator configuration, but it never adds that prefix to executable
-    resolution: :func:`cli_path` still accepts only the managed leaf or fixed
-    system locations.
+    prefix in :data:`_STANDALONE_PREFIX_ENV` points at a standalone or
+    edition-bundled install and supplies its metadata here. Whether that prefix
+    is also an *execution* source is decided independently by
+    :func:`_edition_cli_candidates`, which passes its entrypoint through the
+    read-only :func:`_system_candidate` floor; reading a package manifest from a
+    prefix never on its own authorises running a launcher from it.
     """
     prefix_override = os.environ.get(_STANDALONE_PREFIX_ENV, "").strip()
     prefix = Path(prefix_override) if prefix_override else _managed_cli_root()

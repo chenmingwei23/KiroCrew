@@ -1204,6 +1204,96 @@ class TestCliPathTrust:
         assert repr(str(candidate.resolve())) in warning
         assert "writable by the gateway user" in warning
 
+    @staticmethod
+    def _all_unwritable(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Present every path as unwritable by this process (owner clears bit).
+
+        An edition bundle in ``tmp_path`` is gateway-writable in the test
+        sandbox and would be refused for that alone. These shims strip the write
+        bits and deny ``os.W_OK`` so the ``_gateway_writable_component`` floor
+        passes, isolating the edition-prefix wiring as the thing under test.
+        """
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            return os.stat_result((info.st_mode & ~0o022, *tuple(info)[1:]))
+
+        def fake_access(path, mode, **kwargs):
+            return mode != os.W_OK
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "access", fake_access)
+
+    def test_a_read_only_edition_bundle_prefix_is_resolved(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An edition points _STANDALONE_PREFIX_ENV at a read-only bundle.
+
+        Without this the bundle is neither the managed leaf nor a fixed system
+        directory, so the CLI reads as absent and the dashboard offers the npm
+        install the bundle exists to avoid (the reported bug).
+        """
+        self._isolate(tmp_path, monkeypatch)
+        bundle = tmp_path / "edition" / "browser" / "cli"
+        cli = self._executable(bundle / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv(mod._STANDALONE_PREFIX_ENV, str(bundle))
+        self._all_unwritable(monkeypatch)
+
+        assert mod.cli_path() == str(cli.resolve())
+
+    def test_a_gateway_writable_edition_bundle_is_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The bundle clears the same read-only floor as a fixed system binary.
+
+        A bundle an agent could overwrite is refused exactly as a planted system
+        binary is -- the trust is "read-only to the agent sandbox", not merely
+        "an edition named it".
+        """
+        self._isolate(tmp_path, monkeypatch)
+        bundle = tmp_path / "edition" / "browser" / "cli"
+        cli = self._executable(bundle / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv(mod._STANDALONE_PREFIX_ENV, str(bundle))
+
+        with caplog.at_level("WARNING", logger=mod.__name__):
+            assert mod.cli_path() is None
+
+        warning = next(record.getMessage() for record in caplog.records if record.levelno >= 30)
+        assert repr(str(cli.resolve())) in warning
+        assert "writable by the gateway user" in warning
+
+    def test_the_managed_leaf_wins_over_an_edition_bundle(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordering is leaf, then edition bundle, then system -- the leaf wins."""
+        _home, crew = self._isolate(tmp_path, monkeypatch)
+        leaf = self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+        bundle = tmp_path / "edition" / "browser" / "cli"
+        self._executable(bundle / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv(mod._STANDALONE_PREFIX_ENV, str(bundle))
+
+        assert mod.cli_path() == str(leaf.resolve())
+
+    def test_no_edition_prefix_leaves_resolution_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the env unset, _edition_cli_candidates contributes nothing."""
+        self._isolate(tmp_path, monkeypatch)
+        monkeypatch.delenv(mod._STANDALONE_PREFIX_ENV, raising=False)
+
+        assert mod._edition_cli_candidates() == ()
+        assert mod.cli_path() is None
+
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and permission semantics")
 class TestGatewayWritableComponentWalksEveryDirectory:
