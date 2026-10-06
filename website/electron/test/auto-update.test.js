@@ -2804,16 +2804,23 @@ test("the update runtime loads without Electron and without load-time effects", 
   const electronDir = nodePath.join(__dirname, "..");
   const updateFiles = [nodePath.join(electronDir, "auto-update.js")];
   const runtimeDir = nodePath.join(electronDir, "runtime", "update");
-  const owners = nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort();
-  assert.deepStrictEqual(owners, ["feed-lane.js", "managed-lane.js", "state-reporter.js"]);
+  const runtimeFiles = nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort();
+  assert.deepStrictEqual(runtimeFiles, ["feed-lane.js", "managed-lane.js", "state-reporter.js", "still-latest.js"]);
+  // Lane modules the facade composes directly. Pure helpers (still-latest.js)
+  // are required by a LANE, not the facade, so they are not in this set -- but
+  // every file in the directory, lane or helper, still owes the no-load-time
+  // -effects / no-facade-require guarantees checked below.
+  const owners = ["feed-lane.js", "managed-lane.js", "state-reporter.js"];
   const facade = nodeFs.readFileSync(updateFiles[0], "utf8");
   for (const owner of owners) {
-    updateFiles.push(nodePath.join(runtimeDir, owner));
     assert.match(facade, new RegExp(`require\\("\\./runtime/update/${owner.replace(/\.js$/, "")}"\\)`));
+  }
+  for (const name of runtimeFiles) {
+    updateFiles.push(nodePath.join(runtimeDir, name));
     assert.doesNotMatch(
-      nodeFs.readFileSync(nodePath.join(runtimeDir, owner), "utf8"),
+      nodeFs.readFileSync(nodePath.join(runtimeDir, name), "utf8"),
       /__dirname|require\(\s*["'](?:\.\.\/\.\.\/)?auto-update["']\s*\)/,
-      `${owner} must neither anchor on its own directory nor require the facade`,
+      `${name} must neither anchor on its own directory nor require the facade`,
     );
   }
   const cached = new Map();
@@ -2875,7 +2882,7 @@ test("every lane hands back the handle shape its callers read", () => {
     { keys: stub, disabled: "externally-managed" });
   assert.deepStrictEqual(keys({ isPackaged: false }), { keys: stub, disabled: "dev" });
   assert.deepStrictEqual(keys({ osPlatform: "freebsd" }), { keys: stub, disabled: "platform" });
-  assert.deepStrictEqual(keys({ appVersion: "1.0.0" }).keys, ["check", "download", "install", "getInfo", "isReady"]);
+  assert.deepStrictEqual(keys({ appVersion: "1.0.0" }).keys, ["check", "download", "install", "getInfo", "isReady", "stillLatest"]);
 
   const restoreTimers = (() => {
     const originalSetTimeout = global.setTimeout;

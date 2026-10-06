@@ -1,6 +1,8 @@
 // Every downloaded update is installed only after the gateway has stopped: see
 // the configureUpdater note in auto-update.js for why electron-updater's own
 // install-on-quit stays off on every platform.
+const { classifyFeedVerdict } = require("./still-latest");
+
 const FORCE_EXIT_AFTER_MS = 5 * 1000; // failsafe: guarantee exit after quitAndInstall
 
 /**
@@ -14,7 +16,7 @@ const FORCE_EXIT_AFTER_MS = 5 * 1000; // failsafe: guarantee exit after quitAndI
  * electron-updater events, points the feed, and arms the launch check and the
  * poll, in that order.
  *
- * @returns {{check: Function, download: Function, install: Function, getInfo: Function, isReady: Function}}
+ * @returns {{check: Function, download: Function, install: Function, getInfo: Function, isReady: Function, stillLatest: Function}}
  */
 function createFeedLane({
   app,
@@ -104,6 +106,40 @@ function createFeedLane({
 
   function pendingVersion() {
     return foundVersion || stagedVersion || app.getVersion();
+  }
+
+  /**
+   * The still-latest verdict for a feed response, via the pure
+   * `classifyFeedVerdict`. This closure's ONLY job is to gather the four facts
+   * the verdict is a function of from the lane's live state and hand them to
+   * the pure function -- it changes nothing and emits nothing, so the live
+   * handlers and a side-effect-free feed read can both ask the question the
+   * same way. `candidate` is the version the feed offered, or `null` for the
+   * feed's "nothing newer" (update-not-available) answer.
+   *
+   * The channel pairing matches the direction gate's long-standing contract:
+   * `followedChannel` is the channel THIS check's feed was configured for
+   * (feedChannel), captured at check time, NOT a live currentChannel() read --
+   * a preference that flipped mid-check must not pair the new channel with the
+   * old feed's candidate. It falls back to a live read only before the first
+   * configureFeed(). `defaultChannel` is the lane the running build follows
+   * with no preference, which folds promoted-insider bytes back to stable so
+   * only a preference that moves the install off its default lane reads as a
+   * deliberate channel switch.
+   *
+   * @param {string|null} candidate
+   * @returns {import("./still-latest").StillLatestVerdict}
+   */
+  function feedVerdict(candidate) {
+    const running = app.getVersion();
+    return classifyFeedVerdict({
+      stagedVersion: updateReady ? stagedVersion : null,
+      candidate,
+      followedChannel: feedChannel || currentChannel(),
+      runningVersion: running,
+      defaultChannel: resolveChannel(channelForVersion(running), ""),
+      shouldAutoOffer,
+    });
   }
 
   function configureFeed() {
@@ -520,12 +556,15 @@ function createFeedLane({
     recordLaneVersion(app.getVersion(), feedChannel);
     // Clear the STAGED state too, not just the found state. The feed reporting
     // "no update" while something is staged is exactly the retraction path
-    // (a feed repointed to the running version) and the channel-switch-back
-    // path -- and a stage left armed here would still install the withdrawn or
-    // wrong-channel build on the next quit, because deferredInstallOnQuit only
-    // checks updateReady. Disarm the quit hook as well or the listener
-    // survives to fire against a stage we just invalidated.
-    if (updateReady) {
+    // (verdict "retracted": a feed repointed to the running version) and the
+    // channel-switch-back path -- and a stage left armed here would still
+    // install the withdrawn or wrong-channel build on the next quit, because
+    // deferredInstallOnQuit only checks updateReady. Disarm the quit hook as
+    // well or the listener survives to fire against a stage we just
+    // invalidated. The verdict (candidate=null) is "retracted" iff a stage is
+    // held, "up-to-date" otherwise -- the same pure function the live
+    // update-available path uses, so a quiet feed read gets this answer too.
+    if (feedVerdict(null) === "retracted") {
       log.info(`[update] feed reports up to date -- discarding staged ${stagedVersion}`);
     }
     updateReady = false;
@@ -550,33 +589,22 @@ function createFeedLane({
     // publishes 0.4.1; you are running bytes it never shipped" instead of
     // folding its version to a stable release that does not exist.
     recordLaneVersion(foundVersion, feedChannel);
+    // The still-latest verdict, now a pure function (feedVerdict ->
+    // classifyFeedVerdict) the live path and a quiet feed read share. The
+    // handler's job is to MAP the verdict onto this lane's state transitions
+    // and emits; the decision itself -- direction gate, supersede, retraction
+    // -- no longer lives inline here.
+    const verdict = foundVersion ? feedVerdict(foundVersion) : "offer";
     // Direction gate — the fix for the "update to an OLDER version" nag.
     // electron-updater fires this for ANY feed version that DIFFERS from the
     // running one, because allowDowngrade=true — so on a build running ahead of
     // its channel's published latest it reports a DOWNGRADE as available. When
-    // this is a same-channel version that is not newer, suppress the automatic
-    // path entirely: discard any stage armed for it, report up to date, and do
-    // NOT download or nag. A deliberate channel switch (followed !== default
-    // lane) is exempt, and explicit user downloads are unaffected.
-    if (
-      foundVersion &&
-      !shouldAutoOffer({
-        candidate: foundVersion,
-        current: app.getVersion(),
-        // The channel THIS candidate's feed was configured for, captured at
-        // check time (feedChannel), NOT a live currentChannel() read. If the
-        // preference flipped while this check was in flight, a live read would
-        // pair the new channel with the OLD feed's candidate and wrongly treat
-        // a stale-feed downgrade as a deliberate switch. Falls back to a live
-        // read only before the first configureFeed() has run.
-        followedChannel: feedChannel || currentChannel(),
-        // The lane this build follows with NO preference. Folds a promoted
-        // stable build's insider-stamped bytes back to stable, so only an
-        // explicit preference that MOVES the install off its default lane reads
-        // as a deliberate channel switch (see shouldAutoOffer).
-        defaultChannel: resolveChannel(channelForVersion(app.getVersion()), ""),
-      })
-    ) {
+    // this is a same-channel version that is not newer (verdict "suppress"),
+    // suppress the automatic path entirely: discard any stage armed for it,
+    // report up to date, and do NOT download or nag. A deliberate channel
+    // switch (followed !== default lane) is exempt, and explicit user downloads
+    // are unaffected.
+    if (verdict === "suppress") {
       log.info(
         `[update] feed offers ${foundVersion} but running ${app.getVersion()} is not older `
           + "on the same channel — treating as up to date (suppressing downgrade nag)",
@@ -596,14 +624,14 @@ function createFeedLane({
     }
     // A stage is only useful if it is still the latest thing on the feed.
     // Because the RUNNING version never changes mid-session, the updater
-    // reports "available" for the staged version too — so the comparison
-    // below is what separates the two cases.
-    if (updateReady && stagedVersion) {
-      if (foundVersion === stagedVersion) {
-        log.info(`[update] ${stagedVersion} already downloaded — awaiting install`);
-        emit("downloaded", { version: stagedVersion, notes: stagedNotes });
-        return;
-      }
+    // reports "available" for the staged version too — so the verdict
+    // ("still-latest" vs "superseded") is what separates the two cases.
+    if (verdict === "still-latest") {
+      log.info(`[update] ${stagedVersion} already downloaded — awaiting install`);
+      emit("downloaded", { version: stagedVersion, notes: stagedNotes });
+      return;
+    }
+    if (verdict === "superseded") {
       // Superseded: drop the stale stage so the next download takes the NEWEST
       // build rather than installing an already-old one.
       log.info(`[update] staged ${stagedVersion} superseded by ${foundVersion} — discarding stage`);
@@ -700,6 +728,15 @@ function createFeedLane({
     install: () => applyUpdateAndRestart(),
     getInfo,
     isReady: () => updateReady,
+    // The still-latest verdict as a SIDE-EFFECT-FREE query. A caller that has
+    // read the feed quietly (no emits, no download, no shared in-flight state)
+    // passes the version the feed offered -- or `null` for the feed's "nothing
+    // newer" answer -- and gets the same verdict the live update-available /
+    // update-not-available handlers act on, via the one pure function they all
+    // share (classifyFeedVerdict). It reads the lane's current staged/channel
+    // facts but changes nothing, so it is safe to call from a freshness gate
+    // that must not drive the real update lifecycle.
+    stillLatest: (candidate) => feedVerdict(candidate ?? null),
   };
 }
 

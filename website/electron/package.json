@@ -165,6 +165,7 @@
       "runtime/update/state-reporter.js",
       "runtime/update/managed-lane.js",
       "runtime/update/feed-lane.js",
+      "runtime/update/still-latest.js",
       "update-logger.js",
       "bundle-location.js",
       "gateway-auth-hint.js",
