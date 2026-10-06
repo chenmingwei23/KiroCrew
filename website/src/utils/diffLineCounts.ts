@@ -307,6 +307,34 @@ type PatchLineKind =
   | 'meta'
 
 /**
+ * Where a file begins in a unified diff, decided once for every reader of a
+ * patch. True when a `--- `/`+++ ` header pair starts at `minus` (so
+ * `lines[minus]` is the `--- ` side and `lines[minus + 1]` the `+++ ` side).
+ *
+ * `insideHunkBody` is the caller's own answer to "are we past a `@@` and inside
+ * its content?" — the two readers track that differently (`walkPatch` carries
+ * an `inHunk` flag as it scans; `normalizePatchHunks` precomputes a body map),
+ * which is why it is a parameter rather than recomputed here. Outside a hunk
+ * body a pair is always a header. Inside one a `--- `/`+++ ` pair is
+ * indistinguishable by shape from a deletion of `-- x` beside an addition of
+ * `++ x`, so it is a header only where it announces itself the way a real file
+ * section does: a `diff ` line immediately above, or a `@@` hunk header
+ * immediately below. A header's declared counts never decide it — a hand- or
+ * model-written patch gets them wrong in both directions — so a pair that
+ * nothing announces stays content whatever the counts say.
+ */
+export function startsFileHeaderPair(
+  lines: readonly string[],
+  minus: number,
+  insideHunkBody: boolean,
+): boolean {
+  if (!(lines[minus] ?? '').startsWith('--- ')) return false
+  if (!(lines[minus + 1] ?? '').startsWith('+++ ')) return false
+  if (!insideHunkBody) return true
+  return (lines[minus - 1] ?? '').startsWith('diff ') || (lines[minus + 2] ?? '').startsWith('@@')
+}
+
+/**
  * The positional walk `splitPatchSections` reads, so what counts as a header,
  * a hunk line or a preamble is decided once.
  *
@@ -328,8 +356,12 @@ function walkPatch(lines: readonly string[], visit: (kind: PatchLineKind, line: 
   }
   let inHunk = false
   // A `--- `/`+++ ` pair that a `@@` right below announces as the next file's
-  // header — the one reading of such a pair a hunk body allows.
-  const announcedPair = (i: number) => lines[i].startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ') && isHunkHeader(lines[i + 2] ?? '')
+  // header — the one reading of such a pair a hunk body allows. The shared
+  // `startsFileHeaderPair` decides it, told we are inside a hunk body; a
+  // `diff ` line above would announce one too, but `walkPatch` has already read
+  // that `diff ` as a preamble and left the hunk, so inside a hunk here the
+  // `@@`-below arm is the only one that fires.
+  const announcedPair = (i: number) => startsFileHeaderPair(lines, i, true)
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     if (isHunkHeader(line)) {

@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest'
 // react-markdown, katex and highlight.js into this fork — measured 144.65s, of
 // which 51ms was the tests.
 import { createTwoFilesPatch } from 'diff'
-import { countLines, countDiffStats, changedLineSpan, splitPatchSections, plainPatchHunks } from '../utils/diffLineCounts'
+import { countLines, countDiffStats, changedLineSpan, splitPatchSections, plainPatchHunks, startsFileHeaderPair } from '../utils/diffLineCounts'
 
 describe('countLines (diff stats)', () => {
   it('returns zeros for identical content', () => {
@@ -572,5 +572,49 @@ describe('changedLineSpan (bounded change locality)', () => {
 
   it('treats a whole-file replacement as a full-range span', () => {
     expect(changedLineSpan(['a', 'b'], ['x', 'y', 'z'])).toEqual({ oldStart: 0, oldEnd: 2, newStart: 0, newEnd: 3 })
+  })
+})
+
+describe('startsFileHeaderPair (shared file-boundary predicate)', () => {
+  const at = (patch: string) => patch.split('\n')
+
+  it('reads a `--- `/`+++ ` pair outside a hunk body as a header', () => {
+    const lines = at('--- a/one.ts\n+++ b/one.ts\n@@ -1 +1 @@')
+    expect(startsFileHeaderPair(lines, 0, false)).toBe(true)
+  })
+
+  it('requires both sides of the pair', () => {
+    expect(startsFileHeaderPair(at('--- a/one.ts\n context'), 0, false)).toBe(false)
+    expect(startsFileHeaderPair(at('+++ b/one.ts\n context'), 0, false)).toBe(false)
+  })
+
+  it('is false where there is no `--- ` at the anchor', () => {
+    const lines = at('@@ -1 +1 @@\n-old\n+new')
+    expect(startsFileHeaderPair(lines, 0, false)).toBe(false)
+  })
+
+  it('inside a hunk body reads an unannounced pair as content, not a header', () => {
+    // A deletion of `-- note` beside an addition of `++ note`: by shape it is
+    // `--- note` / `+++ note`, but nothing announces it as a new file.
+    const lines = at('--- note\n+++ note\n context')
+    expect(startsFileHeaderPair(lines, 0, true)).toBe(false)
+  })
+
+  it('inside a hunk body reads a pair announced by a `@@` below as a header', () => {
+    const lines = at('--- a/two.ts\n+++ b/two.ts\n@@ -1 +1 @@')
+    expect(startsFileHeaderPair(lines, 0, true)).toBe(true)
+  })
+
+  it('inside a hunk body reads a pair announced by a `diff ` above as a header', () => {
+    const lines = at('diff --git a/two.ts b/two.ts\n--- a/two.ts\n+++ b/two.ts')
+    expect(startsFileHeaderPair(lines, 1, true)).toBe(true)
+  })
+
+  it('a header-shaped content pair with neither announcement stays content in a hunk body', () => {
+    const lines = at('--- a/doc.md\n+++ b/doc.md\n context\n more')
+    // the pair at index 0 is a real header outside a body…
+    expect(startsFileHeaderPair(lines, 0, false)).toBe(true)
+    // …but the same shape inside a body with no `@@`/`diff ` announcement is content.
+    expect(startsFileHeaderPair(lines, 0, true)).toBe(false)
   })
 })
