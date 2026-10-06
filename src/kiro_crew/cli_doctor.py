@@ -2017,6 +2017,40 @@ def _doctor_trust_root() -> None:
     print("               restart the gateway if another process relocated it.")
 
 
+def _doctor_unprotected_secrets() -> None:
+    """Report secret-bearing files whose Windows owner-only lockdown failed.
+
+    ``atomic_write(restrict_to_owner=True, restrict_on_error="warn")`` writes the
+    file anyway when the lockdown fails — the caller chose that — but on Windows
+    there is no second mechanism (``fchmod_safe`` is a no-op), so the file lands
+    under its inherited ACL and may be readable by other users. That degradation
+    was invisible after the fact; :func:`atomic_write.read_unprotected_secrets`
+    reads the breadcrumb that records it, so the doctor names each affected file
+    instead of leaving the exposure silent.
+
+    Advisory, so it never joins ``issues`` (the exit-code channel): a failed
+    DACL rewrite is a host condition, not a Kiro Crew fault, and the file was
+    written on purpose. The remedy is in the operator's hands — re-apply
+    owner-only permissions to the named file, or re-run whatever wrote it once
+    the DACL cause is cleared. Imported locally to keep the common healthy run
+    from paying for the lookup; the empty-list case prints nothing.
+    """
+    from kiro_crew import atomic_write
+
+    affected = atomic_write.read_unprotected_secrets()
+    if not affected:
+        return
+    print(f"  ⚠ owner-only permissions: {len(affected)} secret file(s) could not be locked down")
+    for dest in affected[:10]:
+        print(f"               {dest}")
+    if len(affected) > 10:
+        print(f"               (+{len(affected) - 10} more)")
+    print("               These were written anyway (restrict_on_error='warn') but on Windows")
+    print("               landed under their inherited ACL, so other users on this host may be")
+    print("               able to read them. Re-apply owner-only permissions to each file, or")
+    print("               re-run what wrote it once the permission cause is fixed.")
+
+
 def _doctor_name_grant_platform_scope() -> None:
     """Report whether hook auto-approve can be satisfied on this host.
 
@@ -4799,6 +4833,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     _doctor_deprecated_agent_specs(cfg, issues)
     _doctor_path_launcher()
     _doctor_trust_root()
+    _doctor_unprotected_secrets()
     _doctor_name_grant_platform_scope()
     _doctor_strict_identity(cfg)
     _doctor_mcp_gateway_daemon(issues)

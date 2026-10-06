@@ -4142,3 +4142,39 @@ class TestDoctorSkillViewCensus:
         line = self._line(self._run(tmp_path, monkeypatch, capsys))
         assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
         assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line
+
+
+class TestUnprotectedSecretsDoctor:
+    """The doctor row for #12367: Windows secrets that could not be locked down."""
+
+    def test_silent_when_nothing_recorded(self, monkeypatch, capsys):
+        from kiro_crew import atomic_write
+
+        monkeypatch.setattr(atomic_write, "read_unprotected_secrets", lambda: [])
+        cli_doctor._doctor_unprotected_secrets()
+        assert capsys.readouterr().out == ""
+
+    def test_names_each_affected_file(self, monkeypatch, capsys):
+        from kiro_crew import atomic_write
+
+        monkeypatch.setattr(
+            atomic_write,
+            "read_unprotected_secrets",
+            lambda: ["C:\\\\Users\\\\me\\\\.kirocrew\\\\sel.key", "C:\\\\x\\\\token.secret"],
+        )
+        cli_doctor._doctor_unprotected_secrets()
+        out = capsys.readouterr().out
+        assert "owner-only permissions" in out
+        assert "2 secret file(s)" in out
+        assert "sel.key" in out and "token.secret" in out
+        assert "read them" in out
+
+    def test_truncates_a_long_list_but_names_the_overflow(self, monkeypatch, capsys):
+        from kiro_crew import atomic_write
+
+        files = [f"C:\\\\x\\\\secret-{i}" for i in range(15)]
+        monkeypatch.setattr(atomic_write, "read_unprotected_secrets", lambda: files)
+        cli_doctor._doctor_unprotected_secrets()
+        out = capsys.readouterr().out
+        assert "secret-0" in out and "secret-9" in out
+        assert "+5 more" in out

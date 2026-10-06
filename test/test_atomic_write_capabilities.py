@@ -197,15 +197,96 @@ def test_restrict_on_error_warn_publishes_the_file_anyway(tmp_path, monkeypatch)
     ``sel.py`` hard-fails every ``SecurityEventLog()`` init if its HMAC key is
     missing, and ``dashboard/refresh_tokens.py`` loses refresh-token
     reuse-detection state if its store is not persisted. For those two, dropping
-    the write is the worse outcome, so the lockdown failure must not abort it.
+    the write is the worse outcome, so the lockdown failure must not abort it —
+    on EITHER platform. ``"warn"`` is a per-caller choice and this function does
+    not reverse it; the Windows-vs-POSIX difference is only in what lands on disk
+    (owner-only on POSIX, inherited ACL on Windows), pinned by the two tests
+    below. The ``monkeypatch`` of ``IS_WINDOWS`` keeps this deterministic on the
+    Linux test host.
     """
     _failing_restrict(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
 
     target = tmp_path / "hmac.key"
     aw.atomic_write(target, b"k" * 32, restrict_to_owner=True, restrict_on_error="warn")
 
     assert target.read_bytes() == b"k" * 32
     assert list(tmp_path.glob("*.tmp")) == [], "the temp must still be cleaned up"
+
+
+def test_restrict_on_error_warn_still_writes_on_windows(tmp_path, monkeypatch):
+    """A failed lockdown under "warn" writes the file on Windows too.
+
+    The fix for #12367 must NOT reverse the per-caller fail-soft choice: callers
+    that passed ``restrict_on_error="warn"`` (sel.py, config/loader.py,
+    refresh_tokens.py and ~20 more) chose to keep the write even when the file
+    cannot be locked down. On Windows the file lands under its inherited ACL —
+    that is the exposure those callers accept — and the degradation is surfaced
+    by a breadcrumb (pinned by the next test), not by refusing the write.
+
+    Stubs ``IS_WINDOWS`` True since the test host is Linux; the breadcrumb path
+    is redirected to a temp data home so the test writes nothing real.
+    """
+    _failing_restrict(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(aw, "_unprotected_secrets_path", lambda: tmp_path / "breadcrumb.log")
+
+    target = tmp_path / "hmac.key"
+    aw.atomic_write(target, b"k" * 32, restrict_to_owner=True, restrict_on_error="warn")
+
+    assert target.read_bytes() == b"k" * 32, "the write is still honoured on Windows"
+    assert list(tmp_path.glob("*.tmp")) == [], "the temp must still be cleaned up"
+
+
+def test_restrict_on_error_warn_records_a_breadcrumb_on_windows(tmp_path, monkeypatch):
+    """The Windows degradation leaves a durable, readable signal naming the file.
+
+    This is the surface half of the #12367 fix: a secret that landed under its
+    inherited ACL on Windows is recorded so the doctor can report it, instead of
+    degrading silently (the one warning log it emits does not fire in normal
+    operation and nothing read it back). The reader deduplicates and returns the
+    affected destination paths.
+
+    Stubs ``IS_WINDOWS`` True and redirects the breadcrumb to a temp path. Not
+    run on a real Windows host — the Windows branch is exercised by the stub.
+    """
+    _failing_restrict(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    breadcrumb = tmp_path / "state" / "breadcrumb.log"
+    monkeypatch.setattr(aw, "_unprotected_secrets_path", lambda: breadcrumb)
+
+    target = tmp_path / "token.secret"
+    aw.atomic_write(target, b"s" * 16, restrict_to_owner=True, restrict_on_error="warn")
+
+    recorded = aw.read_unprotected_secrets()
+    assert str(target) in recorded, "the affected file must be recorded for the doctor"
+    assert target.read_bytes() == b"s" * 16, "the write is still honoured"
+
+    # A second write of the same file does not pile up a duplicate for the reader.
+    aw.atomic_write(target, b"s" * 16, restrict_to_owner=True, restrict_on_error="warn")
+    assert aw.read_unprotected_secrets().count(str(target)) == 1
+
+
+def test_recording_the_breadcrumb_never_breaks_the_write(tmp_path, monkeypatch):
+    """A breadcrumb that cannot be written must not undo the caller's "warn" write."""
+    _failing_restrict(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+
+    def _boom() -> None:
+        raise OSError("no data home")
+
+    # The resolver itself raising is the worst case; the write must still land.
+    monkeypatch.setattr(aw, "_unprotected_secrets_path", _boom)
+
+    target = tmp_path / "hmac.key"
+    aw.atomic_write(target, b"k" * 32, restrict_to_owner=True, restrict_on_error="warn")
+    assert target.read_bytes() == b"k" * 32
+
+
+def test_read_unprotected_secrets_is_empty_when_no_breadcrumb(tmp_path, monkeypatch):
+    """The healthy case: no breadcrumb file means nothing to report."""
+    monkeypatch.setattr(aw, "_unprotected_secrets_path", lambda: tmp_path / "absent.log")
+    assert aw.read_unprotected_secrets() == []
 
 
 @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="POSIX permission bits")
@@ -229,6 +310,7 @@ def test_restrict_on_error_warn_still_applies_the_posix_mode(tmp_path, monkeypat
 def test_restrict_on_error_warn_does_not_log_the_payload(tmp_path, monkeypatch, caplog):
     """The warning fires on a secret write, so it must name the path, not the key."""
     _failing_restrict(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
 
     secret = b"correct-horse-battery-staple"
     target = tmp_path / "hmac.key"
