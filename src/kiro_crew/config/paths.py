@@ -268,6 +268,40 @@ def _valid_override_home() -> Path | None:
     return p
 
 
+#: Environment override pointing the managed scratch root at an explicit
+#: directory, INDEPENDENT of ``KIROCREW_HOME``. The scratch tree is bulky,
+#: disposable per-process data (staged self-update installers, clones, build
+#: logs) that on Windows otherwise fills the system drive, so an operator may
+#: want it on a data drive without relocating the whole data home. See #11708.
+SCRATCH_ROOT_ENV = "KIROCREW_SCRATCH_ROOT"
+
+
+def valid_scratch_root_override() -> Path | None:
+    """Return the resolved ``KIROCREW_SCRATCH_ROOT`` override iff set AND valid.
+
+    Mirrors :func:`_valid_override_home`: a filesystem/drive root or a known
+    system directory is refused via the SAME :func:`_is_unsafe_home` predicate,
+    so the scratch override and the data-home override agree on what is too
+    dangerous to write under. When refused, ``agent_scratch.scratch_root()``
+    ignores it and falls back to ``config_dir()/scratch`` with a one-line
+    warning, exactly as :func:`config_dir` does for an unsafe ``KIROCREW_HOME``.
+
+    This is the supported alternative to junctioning the scratch directory onto
+    another drive, which the auto-improvement clone-setup refuses for safety.
+    The returned path is used AS the managed root (not with a ``scratch``
+    subcomponent appended), which keeps ``agent_scratch``'s own link/junction
+    refusal on the managed root intact: the override names a real directory,
+    not a link planted at the ``scratch`` leaf.
+    """
+    override = os.environ.get(SCRATCH_ROOT_ENV)
+    if not override:
+        return None
+    p = Path(override).expanduser().resolve()
+    if _is_unsafe_home(p):
+        return None
+    return p
+
+
 def shared_kiro_settings_writable() -> bool:
     """False when this process must not write the user's kiro-cli settings.
 

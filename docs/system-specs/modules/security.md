@@ -373,9 +373,14 @@ withholds the carve-out, so the owning backend cannot write that state and an un
 has nothing to expose; refusing there would let one optional app's on-disk layout stop every
 sandboxed spawn on the host. That case warns too.
 
-`scratch` and `backup` were checked for a supported second name and refuse: each resolves
-to one managed path (`agent_scratch.scratch_root()` is `config_dir() / "scratch"`) with no
-override, so a link there is not a relocation the product offers.
+`scratch` and `backup` were checked for a supported second name and refuse a planted
+*link* at the component: `backup` resolves to one managed path with no override, and
+`scratch` relocates only through the explicit `KIROCREW_SCRATCH_ROOT` env var
+(`agent_scratch.scratch_root()`, which otherwise is `config_dir() / "scratch"`). That
+override names a REAL directory used as the managed root itself, so it is not a link at
+the `scratch` component — the link refusal still fires on whatever root is in force. A
+link planted at the default `scratch` leaf is therefore still not a relocation the product
+offers; the supported relocation is the env var.
 
 Masking a credential leaf as a FILE leaves its publish temp to account for separately,
 because a mask covers a path and the temp has a different one. The gateway's two auth

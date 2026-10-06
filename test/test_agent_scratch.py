@@ -44,6 +44,48 @@ class TestAllocate:
         assert sc.allocate_scratch("a") != sc.allocate_scratch("a")
 
 
+class TestScratchRootOverride:
+    """``KIROCREW_SCRATCH_ROOT`` relocates the managed scratch root (#11708)."""
+
+    def test_default_is_data_home_scratch(self, scratch_root: Path, monkeypatch) -> None:
+        monkeypatch.delenv("KIROCREW_SCRATCH_ROOT", raising=False)
+        assert sc.scratch_root() == scratch_root
+
+    def test_valid_override_is_used_as_the_root(self, tmp_path: Path, monkeypatch) -> None:
+        # A real directory on another "drive" becomes the managed root itself,
+        # with no ``scratch`` subcomponent appended -- and allocations land
+        # under it, so the override reaches the allocator, not just the getter.
+        other = tmp_path / "data-drive" / "kirocrew-scratch"
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(other))
+        assert sc.scratch_root() == other.resolve()
+        allocated = sc.allocate_scratch("chat-7")
+        assert allocated.parent == other.resolve()
+        assert allocated.is_dir()
+
+    def test_unsafe_override_is_ignored_with_one_warning(
+        self, scratch_root: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A drive/filesystem root is refused by the shared ``_is_unsafe_home``
+        # predicate and falls back to the default, logging exactly as an unsafe
+        # ``KIROCREW_HOME`` does. ``Path.cwd().anchor`` is the drive root on
+        # Windows (``C:\``) and ``/`` on POSIX -- the ``p == p.parent`` case the
+        # predicate refuses on every OS, so the file is never created.
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", Path.cwd().anchor)
+        with caplog.at_level("WARNING"):
+            assert sc.scratch_root() == scratch_root
+        warnings = [r for r in caplog.records if "KIROCREW_SCRATCH_ROOT" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "is a system directory, ignoring" in warnings[0].getMessage()
+
+    def test_unset_override_does_not_warn(
+        self, scratch_root: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.delenv("KIROCREW_SCRATCH_ROOT", raising=False)
+        with caplog.at_level("WARNING"):
+            sc.scratch_root()
+        assert not [r for r in caplog.records if "KIROCREW_SCRATCH_ROOT" in r.getMessage()]
+
+
 class TestEnv:
     def test_exports_temp_triple_and_scratch_alias(self, tmp_path: Path, monkeypatch) -> None:
         # Where the cap can bound the log, the pin rides along with the triple.

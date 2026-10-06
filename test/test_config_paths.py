@@ -71,6 +71,34 @@ class TestConfigDir:
         assert result == tmp_path / ".kiro" / "crew"
 
 
+class TestScratchRootOverride:
+    """``valid_scratch_root_override()`` validates ``KIROCREW_SCRATCH_ROOT`` with
+    the same ``_is_unsafe_home`` predicate as ``KIROCREW_HOME`` (#11708)."""
+
+    def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KIROCREW_SCRATCH_ROOT", raising=False)
+        assert paths.valid_scratch_root_override() is None
+
+    def test_valid_override_is_resolved(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "scratch-elsewhere"
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
+        assert paths.valid_scratch_root_override() == target.resolve()
+
+    def test_system_dir_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same refusal shape as ``KIROCREW_HOME``: a drive/filesystem root is
+        # refused on every OS (``p == p.parent``) without being created.
+        if sys.platform == "win32":
+            system_dir = Path.cwd().anchor
+        else:
+            system_dir = "/usr"
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", system_dir)
+        assert paths.valid_scratch_root_override() is None
+
+
 class TestLedgerRoot:
     def test_link_is_refused_without_touching_its_target(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

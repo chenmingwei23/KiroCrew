@@ -90,7 +90,11 @@ from typing import Literal
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import (
+    SCRATCH_ROOT_ENV,
+    config_dir,
+    valid_scratch_root_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +181,35 @@ class SharedScratchJoinError(ScratchBoundaryError):
 
 
 def scratch_root() -> Path:
-    """The managed root: ``<data home>/scratch``."""
+    """The managed root: ``KIROCREW_SCRATCH_ROOT`` if set and safe, else
+    ``<data home>/scratch``.
+
+    The override points the bulky, disposable scratch tree at an explicit
+    directory independent of ``KIROCREW_HOME`` -- its reason to exist is the
+    Windows case where staged self-update installers under scratch fill the
+    system drive (#11708). An override naming a filesystem/drive root or a known
+    system directory is refused by :func:`valid_scratch_root_override` and
+    logged once, falling back to ``config_dir()/scratch`` -- the same
+    ignore-and-fall-back contract :func:`config_dir` applies to an unsafe
+    ``KIROCREW_HOME``. ``KIROCREW_SCRATCH`` (no ``_ROOT``) is unrelated: it is an
+    OUTPUT written by :func:`scratch_env` to tell child processes where their
+    scratch is, and setting it changes nothing here.
+
+    The override is used AS the managed root, so the subdirectory the sweep and
+    allocator operate on is the overridden path itself. The link/junction
+    refusal in :func:`allocate_scratch` still judges that root on every
+    allocation, so pointing it at a planted link is refused exactly as it is for
+    the default location.
+    """
+    override = valid_scratch_root_override()
+    if override is not None:
+        return override
+    if os.environ.get(SCRATCH_ROOT_ENV):
+        logger.warning(
+            "%s=%s is a system directory, ignoring",
+            SCRATCH_ROOT_ENV,
+            os.environ.get(SCRATCH_ROOT_ENV),
+        )
     return config_dir() / _SUBDIR
 
 
