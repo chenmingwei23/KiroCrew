@@ -5718,6 +5718,9 @@ class SubagentManager:
     async def _sweep_stuck_waves_async(self, now: float) -> None:
         return await self._waves._sweep_stuck_waves_async_impl(now)
 
+    async def _sweep_stranded_queue_entries(self, now: float) -> None:
+        return await self._monitor._sweep_stranded_queue_entries_impl(now)
+
     def _sweep_digest_holds(self, now: float) -> None:
         return self._waves._sweep_digest_holds_impl(now)
 

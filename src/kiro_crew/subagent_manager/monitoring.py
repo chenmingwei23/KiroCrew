@@ -26,6 +26,23 @@ _glue_logger = _logging.getLogger(__name__)
 #: a capacity wait and is deliberately not counted as a memory wait.
 _START_QUEUE_MAX_SECS = 1800.0
 
+#: Longest an in-memory ``_queue`` entry (a fresh spawn held behind the
+#: stagger/concurrency gate) may sit before it is reaped as never started.
+#: A queued member lives only in ``_queue`` -- never in ``_agents`` -- so the
+#: reaper's per-agent loop, the startup watchdog, and the stuck-wave sweep (which
+#: skips any wave holding a queued member) all miss it; its only exit is a slot
+#: freeing, so a fan-out wider than the concurrency cap parks its tail with no
+#: deadline of its own, bounded only by the ~3 h wall clock of the runners ahead.
+#: This gives such an entry an independent pre-execution deadline
+#: measured from when the reaper first saw it (stamped lazily into the entry;
+#: see ``QUEUED_AT_KEY``). Entries with their own owner are excluded:
+#: a memory-deferred row (``MEMORY_WAIT_UNTIL_KEY``) is bounded by
+#: ``agent.subagent_queue_max_wait_secs``, and a resume / approval-released entry
+#: is a resident run or an approval flow, not a spawn waiting on capacity.
+#: Symmetric with ``_START_QUEUE_MAX_SECS`` -- a start parked behind holders and a
+#: spawn parked in the queue are the same wait seen from either side of admission.
+_QUEUE_STRAND_MAX_SECS = 1800.0
+
 #: Longest a start may stay silent after its runtime is up (``_pid`` is recorded
 #: only once the session exists) with no frame on its own session and no turn,
 #: before it is reaped as never answering its first prompt. Without it, a runtime
@@ -961,6 +978,16 @@ class OrphanStallMonitor(ManagerComponent):
                 await self._manager._sweep_stuck_waves_async(now)
             except Exception:
                 logger.debug("Reaper: stuck-wave sweep failed", exc_info=True)
+            # Pre-execution deadline for the fan-out tail: a fresh spawn held in
+            # the in-memory ``_queue`` lives in no collection the per-agent loop
+            # below walks, so a wave wider than the concurrency cap would park
+            # its queued members with no bound of their own. Fail any
+            # that have outlived ``_QUEUE_STRAND_MAX_SECS`` so the queued tail
+            # never inherits the 3 h wall clock of the runners ahead of it.
+            try:
+                await self._manager._sweep_stranded_queue_entries(now)
+            except Exception:
+                logger.debug("Reaper: stranded-queue sweep failed", exc_info=True)
             # Digest hold deadline: release completed wave results that a
             # straggler (or a hung member) has been withholding.
             try:
@@ -1104,6 +1131,103 @@ class OrphanStallMonitor(ManagerComponent):
                     logger.info("Reaper: pruned %d stale tombstone(s)", pruned)
             except Exception:
                 logger.debug("Reaper: tombstone pruning failed", exc_info=True)
+
+    async def _sweep_stranded_queue_entries_impl(self, now: float) -> None:
+        """Fail in-memory ``_queue`` entries that have outlived the pre-execution
+        deadline (``_QUEUE_STRAND_MAX_SECS``).
+
+        A fresh spawn held behind the stagger/concurrency gate lives only in
+        ``_queue`` and is never registered in ``_agents``; the reaper's per-agent
+        loop, the startup watchdog, and the stuck-wave sweep (which skips any
+        wave holding a queued member) therefore all miss it. Its only exit is a
+        slot freeing, so a fan-out wider than the concurrency cap parks its tail
+        with no deadline of its own, bounded only by the ~3 h wall clock of the
+        runners ahead of it. This gives such an entry an
+        independent deadline measured from its wall-clock first-seen stamp
+        (``QUEUED_AT_KEY``, written lazily on the first sweep that sees it).
+
+        Excluded (each has its own owner, so none is reaped here):
+
+        * a resident resume (``_resume_id`` without ``_startup_release``) -- its
+          run is already counted where running runs are;
+        * an approval-released start (``_startup_release``) -- metered by the
+          pump's own release phase;
+        * a memory-deferred row (``MEMORY_WAIT_UNTIL_KEY``) -- bounded by
+          ``agent.subagent_queue_max_wait_secs``.
+
+        A failed member is removed from ``_queue`` and announced through
+        ``_announce_rejection`` so a batch member's terminal state reaches the
+        wave accounting (otherwise a wave whose final submission is a stranded
+        queued member strands every held sibling digest forever). The queue
+        depth is re-emitted so the parent's chip stops counting it as waiting.
+        """
+        from kiro_crew.subagent_manager.admission.types import (
+            MEMORY_WAIT_UNTIL_KEY,
+            QUEUED_AT_KEY,
+        )
+        from kiro_crew.subagent_manager.monitoring import _QUEUE_STRAND_MAX_SECS
+
+        queue = self._manager._queue
+        if not queue:
+            return
+        stranded: list[dict[str, Any]] = []
+        for params in list(queue):
+            # Entries with their own owner are never reaped here.
+            if params.get("_startup_release"):
+                continue
+            if params.get("_resume_id"):
+                continue
+            if MEMORY_WAIT_UNTIL_KEY in params:
+                continue
+            queued_at = params.get(QUEUED_AT_KEY)
+            if queued_at is None:
+                # A legacy or re-appended entry with no stamp: start its clock
+                # now, never retroactively, so it is reaped a full window later
+                # rather than on first sight.
+                params[QUEUED_AT_KEY] = now
+                continue
+            if (now - float(queued_at)) > _QUEUE_STRAND_MAX_SECS:
+                stranded.append(params)
+        for params in stranded:
+            try:
+                queue.remove(params)
+            except ValueError:
+                continue  # drained between the scan and here
+            agent_id = str(params.get("_preassigned_id") or "")
+            parent_key = str(params.get("parent_session_key") or "")
+            batch_id = str(params.get("batch_id") or "")
+            waited = now - float(params.get(QUEUED_AT_KEY) or now)
+            logger.warning(
+                "Reaper: queued subagent %s never started: parked in the spawn "
+                "queue for %.0fs (> %ds) with no slot, failing it",
+                agent_id or "<unknown>",
+                waited,
+                int(_QUEUE_STRAND_MAX_SECS),
+            )
+            info = SubagentInfo(
+                id=agent_id,
+                task=str(params.get("task") or ""),
+                agent=str(params.get("agent") or ""),
+                parent_session_key=parent_key,
+                queued=True,
+                done=True,
+                error=(
+                    "spawn failed: queued for a concurrency slot that never "
+                    f"freed within {int(_QUEUE_STRAND_MAX_SECS)}s"
+                ),
+                batch_id=batch_id,
+                batch_total=max(0, int(params.get("batch_total") or 0)),
+            )
+            try:
+                self._manager._announce_rejection(info)
+            except Exception:
+                logger.exception(
+                    "Reaper: failed to announce stranded queued subagent %s", agent_id
+                )
+            try:
+                self._manager._emit_queue_depth(parent_key, batch_id)
+            except Exception:
+                logger.debug("Reaper: queue-depth emit after strand failed", exc_info=True)
 
     def _is_startup_stalled_impl(self, info: SubagentInfo, now: float) -> bool:
         """True if a subagent is wedged in startup and should be reaped early.

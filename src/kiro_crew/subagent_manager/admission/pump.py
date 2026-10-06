@@ -40,6 +40,7 @@ class _PumpMixin(ManagerComponent):
     if TYPE_CHECKING:
         # Sibling-mixin methods this module reaches through ``self``; typing only.
         MEMORY_WAIT_UNTIL_KEY: str
+        QUEUED_AT_KEY: str
 
         def taskq_store(self) -> "_taskq.TaskStore | None": ...
 
@@ -788,6 +789,10 @@ class _PumpMixin(ManagerComponent):
         params = self._manager._queue.pop(index)
         params.pop("_lane", None)
         params.pop(self.MEMORY_WAIT_UNTIL_KEY, None)
+        # The stranded-queue reaper's lazy first-seen stamp
+        # (``QUEUED_AT_KEY``) is an internal queue-entry key like the two
+        # above; ``spawn`` takes no such keyword, so drop it before re-entry.
+        params.pop(self.QUEUED_AT_KEY, None)
         # The floor mark is one-shot: the gate re-checks the floor now and sets
         # it again if the row is deferred on it again.
         self._manager._floor_deferred_ids.discard(str(params.get("_preassigned_id") or ""))

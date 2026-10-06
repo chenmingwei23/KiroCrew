@@ -35,6 +35,21 @@ WINDOW_ENTRY_RECOVERING = "_recovering_row"
 #: ``next_run_at``. Popped with ``_lane`` before the entry reaches ``spawn``.
 MEMORY_WAIT_UNTIL_KEY = "_memory_wait_until"
 
+#: A ``_queue`` entry's WALL-CLOCK (``time.time()``) first-seen instant, stamped
+#: lazily by the stranded-queue reaper
+#: (``monitoring._sweep_stranded_queue_entries``) the first time it sees an entry
+#: and read on later sweeps to bound a fresh spawn parked behind the
+#: stagger/concurrency gate. A queued member lives only in ``_queue`` -- never in
+#: ``_agents`` -- so without this bound the fan-out tail of a wave wider than the
+#: concurrency cap has no deadline of its own and is bounded only by the ~3 h wall
+#: clock of the runners ahead of it. Stamped by the sweep rather than
+#: at enqueue so it never leaks into ``spawn(**params)`` on a drain round-trip
+#: (``spawn`` takes no such keyword); the one-interval slack this costs is
+#: negligible against the ~30 min deadline. Wall clock, not
+#: ``MEMORY_WAIT_UNTIL_KEY``'s ``time.monotonic``: the reaper measures elapsed on
+#: ``time.time()``.
+QUEUED_AT_KEY = "_queued_at"
+
 
 def outcome_task_state(outcome: str) -> str | None:
     """The terminal task state of a run's recorded outcome (``SubagentInfo.outcome``).

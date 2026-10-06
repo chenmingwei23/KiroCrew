@@ -7,27 +7,25 @@ turn 0. Two watchdogs are meant to bound that state:
   window :data:`_STARTUP_TIMEOUT_SECS`), and
 * the stuck-wave sweep (:meth:`SubagentManager._sweep_stuck_waves`).
 
-These tests record two states that neither watchdog covers. Each assertion
-that encodes the gap is marked in its docstring as the currently observed
-behaviour that a fix is expected to change, so a change closing the gap has
-to edit these tests deliberately rather than silently pass them:
+This file covers two pre-execution states against the reaper's bounds.
+The first is a wave member still sitting in the spawn
+queue (``_queue``, never in ``_agents``): it carries an independent
+pre-execution deadline measured from its wall-clock enqueue stamp, enforced by
+:meth:`SubagentManager._sweep_stranded_queue_entries` from the reaper loop. The
+tests below assert that coverage; a direct test of the sweep is
+added at the end.
 
-1. A wave member still sitting in the spawn queue lives only in ``_queue`` --
-   never in ``_agents`` -- so the reaper's per-agent loop and the startup
-   watchdog never see it, and the stuck-wave sweep skips any wave holding a
-   queued member.
-2. A registered run that has not entered ``_run_inner`` (``_exec_started is
-   None`` -- e.g. parked on a spawn approval) is invisible to the startup
-   watchdog, whose predicate returns ``False`` for it.
-
-In both states the only remaining backstop is the wall-clock reaper at
-``_default_timeout``: at any instant short of that deadline the reaper's
-per-agent decision leaves the run in place. The tests assert that no bound
-shorter than the wall clock exists, not the wall-clock value itself.
+The second state -- a registered run with ``_exec_started is None`` (e.g. parked
+on a spawn approval) -- is deliberately NOT bounded by a fast reaper here: it is
+owned by the approval window (2 h on the dashboard/Slack paths), which denies an
+unanswered prompt and ends the run as ``spawn rejected``. Those tests still pin
+that the reaper's per-agent loop adds no shorter bound, which is correct and
+intended.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import MagicMock
 
@@ -37,6 +35,8 @@ from kiro_crew.subagent import (
     SubagentInfo,
     SubagentManager,
 )
+from kiro_crew.subagent_manager.admission.types import QUEUED_AT_KEY
+from kiro_crew.subagent_manager.monitoring import _QUEUE_STRAND_MAX_SECS
 
 
 def _make_manager(max_concurrent: int = 1) -> SubagentManager:
@@ -62,21 +62,22 @@ def _reaper_would_terminate(mgr: SubagentManager, info: SubagentInfo, now: float
     return (now - info.started) > mgr._default_timeout
 
 
-# --- Gap 1: a queued wave member is invisible to every reaper ---------
+# --- A queued wave member carries a pre-execution deadline ----
 
 
-def test_gap_queued_member_absent_from_agents_so_no_reaper_sees_it():
+def test_queued_member_absent_from_agents_but_covered_by_strand_sweep():
     """A wave member behind the stagger/concurrency gate lives only in
-    ``_queue``; it is never registered in ``_agents``, the only collection the
-    reaper's per-agent loop and the startup watchdog iterate.
+    ``_queue``; it is never registered in ``_agents``, so the reaper's per-agent
+    loop and the startup watchdog never see it.
 
-    Currently observed and expected to change: a queued member has no reaper
-    coverage of any kind. A fix that gives queued runs a deadline should make
-    the queued member reachable (in ``_agents`` or a swept collection), which
-    will change this assertion.
+    The member carries a wall-clock enqueue stamp and
+    the reaper's stranded-queue sweep reaps it once it outlives
+    ``_QUEUE_STRAND_MAX_SECS``, so a queued member stays visible to
+    the reaper.
     """
     mgr = _make_manager(max_concurrent=1)
     batch_id = "wave"
+    now = time.time()
     mgr._queue.append(
         {
             "task": "t",
@@ -85,24 +86,29 @@ def test_gap_queued_member_absent_from_agents_so_no_reaper_sees_it():
             "batch_id": batch_id,
             "batch_total": 2,
             "_preassigned_id": "queued_member",
+            QUEUED_AT_KEY: now - _QUEUE_STRAND_MAX_SECS - 100,
         }
     )
     assert "queued_member" not in mgr._agents
 
+    asyncio.run(mgr._sweep_stranded_queue_entries(time.time()))
 
-def test_gap_stuck_wave_sweep_skips_a_wave_with_a_queued_member():
+    # The stranded member is reaped out of the queue by its own deadline.
+    assert all(p.get("_preassigned_id") != "queued_member" for p in mgr._queue)
+
+
+def test_stuck_wave_sweep_reconciles_once_the_strand_sweep_clears_the_queue():
     """The stuck-wave sweep reconciles a wave only when nothing of it is still
-    queued. A wave with a lost submission (submitted < expected), all
-    registered members terminal, and no progress for the grace window is left
-    untouched while any member remains in ``_queue``.
+    queued, and it skips a wave with a lost submission while any
+    member remains in ``_queue``.
 
-    Currently observed and expected to change: a wave stranded on a
-    never-draining queue is closed by neither the sweep nor a completion event.
-    A fix that reaps or re-queues stranded members should let the sweep
-    reconcile such a wave, which will change these assertions.
+    The stranded-queue sweep removes the queued member first,
+    after which ``_sweep_stuck_waves`` reconciles the lost-submission wave and
+    ``batch_members_pending`` reads it as not pending.
     """
     mgr = _make_manager(max_concurrent=1)
     batch_id = "wave"
+    now = time.time()
     terminal = SubagentInfo(
         id="done_member", task="t", agent="", batch_id=batch_id, batch_total=2, done=True
     )
@@ -115,24 +121,92 @@ def test_gap_stuck_wave_sweep_skips_a_wave_with_a_queued_member():
             "batch_id": batch_id,
             "batch_total": 2,
             "_preassigned_id": "queued_member",
+            QUEUED_AT_KEY: now - _QUEUE_STRAND_MAX_SECS - 100,
         }
     )
     # Lost-submission shape: 1 of 2 submitted, past the grace window.
     mgr._batch_submitted[batch_id] = [1, 2]
-    mgr._batch_progress_ts[batch_id] = time.time() - _WAVE_STUCK_SECS - 100
+    mgr._batch_progress_ts[batch_id] = now - _WAVE_STUCK_SECS - 100
 
+    # While the member is queued the stuck-wave sweep still skips it.
     before = list(mgr._batch_submitted[batch_id])
+    mgr._sweep_stuck_waves(now)
+    assert list(mgr._batch_submitted[batch_id]) == before
+
+    # The strand sweep clears the queued member...
+    asyncio.run(mgr._sweep_stranded_queue_entries(time.time()))
+    assert all(p.get("batch_id") != batch_id for p in mgr._queue)
+
+    # ...and the stuck-wave sweep is now free of the queued-member block.
     mgr._sweep_stuck_waves(time.time())
-    after = list(mgr._batch_submitted[batch_id])
-
-    # Untouched: the queued-member guard short-circuits the sweep.
-    assert before == after
-    # And the wave still reads as pending, so no digest closes it.
-    assert mgr.batch_members_pending(batch_id) is True
+    assert mgr.batch_members_pending(batch_id) is False
 
 
-# --- Gap 2: a run that never entered execution is invisible to the ----
-#           fast startup watchdog; only the wall clock backstops it.
+def test_strand_sweep_leaves_a_fresh_queued_member_in_place():
+    """A queued member that has NOT outlived the deadline is untouched -- a
+    legitimate long-queued fan-out tail keeps waiting for its slot.
+    """
+    mgr = _make_manager(max_concurrent=1)
+    now = time.time()
+    mgr._queue.append(
+        {
+            "task": "t",
+            "parent_session_key": "p",
+            "agent": "amzn-builder",
+            "batch_id": "wave",
+            "batch_total": 2,
+            "_preassigned_id": "fresh_member",
+            QUEUED_AT_KEY: now,  # just enqueued
+        }
+    )
+    asyncio.run(mgr._sweep_stranded_queue_entries(now + 10))
+    assert any(p.get("_preassigned_id") == "fresh_member" for p in mgr._queue)
+
+
+def test_strand_sweep_stamps_a_legacy_entry_rather_than_reaping_it():
+    """An entry with no enqueue stamp (legacy or re-appended) is stamped on
+    first sight and left in place, so its clock starts now and it is only reaped
+    a full window later -- never retroactively on the first sweep.
+    """
+    mgr = _make_manager(max_concurrent=1)
+    entry = {
+        "task": "t",
+        "parent_session_key": "p",
+        "agent": "amzn-builder",
+        "batch_id": "wave",
+        "batch_total": 2,
+        "_preassigned_id": "legacy_member",
+    }
+    mgr._queue.append(entry)
+    now = time.time()
+    asyncio.run(mgr._sweep_stranded_queue_entries(now))
+    # Still queued, now carrying a stamp set to ~now.
+    assert any(p.get("_preassigned_id") == "legacy_member" for p in mgr._queue)
+    assert abs(float(entry[QUEUED_AT_KEY]) - now) < 5.0
+
+
+def test_strand_sweep_excludes_entries_with_their_own_owner():
+    """A resume, an approval-released start, and a memory-deferred row each have
+    their own bound, so the strand sweep never reaps them even past the deadline.
+    """
+    from kiro_crew.subagent_manager.admission.types import MEMORY_WAIT_UNTIL_KEY
+
+    mgr = _make_manager(max_concurrent=1)
+    old = time.time() - _QUEUE_STRAND_MAX_SECS - 100
+    mgr._queue.extend(
+        [
+            {"_preassigned_id": "resume", "_resume_id": "r1", QUEUED_AT_KEY: old},
+            {"_preassigned_id": "released", "_startup_release": True, QUEUED_AT_KEY: old},
+            {"_preassigned_id": "memwait", MEMORY_WAIT_UNTIL_KEY: 0.0, QUEUED_AT_KEY: old},
+        ]
+    )
+    asyncio.run(mgr._sweep_stranded_queue_entries(time.time()))
+    ids = {p.get("_preassigned_id") for p in mgr._queue}
+    assert ids == {"resume", "released", "memwait"}
+
+
+# --- Gap 2 (NOT a reaper's job): a run awaiting approval is owned by the ---
+#     approval window, not the reaper. The reaper adds no shorter bound.
 
 
 def test_gap_startup_watchdog_ignores_a_run_that_never_entered_execution():
@@ -141,10 +215,15 @@ def test_gap_startup_watchdog_ignores_a_run_that_never_entered_execution():
     e.g. awaiting a spawn approval no surface answered) is not seen by the fast
     watchdog, no matter how long it has been registered.
 
-    Currently observed and expected to change: the fast watchdog never fires
-    for a pre-execution run. A fix that gives such a run a deadline measured
-    from registration should make the watchdog (or an equivalent reaper) fire,
-    which will change this assertion.
+    Intended behaviour, not a gap to close here: a run parked awaiting a spawn
+    approval is bounded by the approval window (2 h on the dashboard/Slack
+    paths), which denies an unanswered prompt and ends the run as ``spawn
+    rejected``. The fast startup watchdog deliberately does not fire for it --
+    the ``_exec_started``-keyed clock measures time spent executing, and this
+    run has not entered execution -- so a reaper-level deadline here would risk
+    killing a legitimate run whose approval the user still intends to answer.
+    The reaper bounds the queued (``_queue``) tail, which has no owner of its own;
+    this approval-parked case already has one.
     """
     mgr = _make_manager(max_concurrent=1)
     info = SubagentInfo(id="parked", task="t", agent="")
@@ -163,10 +242,11 @@ def test_gap_pre_execution_run_has_no_bound_shorter_than_the_wall_clock():
     the wall-clock ``_default_timeout`` -- the startup watchdog cannot see it,
     so the wall clock is the only bound.
 
-    Currently observed and expected to change: the sole backstop is the wall
-    clock. A fix adding a pre-execution deadline should terminate the run
-    before ``_default_timeout``, which will change this assertion. The test
-    pins the absence of a shorter bound, not the wall-clock value.
+    Intended behaviour: the reaper adds no bound shorter than the wall clock
+    for an approval-parked run, because that case is owned by the 2 h approval
+    window, not the reaper (see the test above). The reaper adds a shorter bound
+    only for the ownerless ``_queue`` tail. The test pins the absence of a
+    shorter reaper-level bound, not the wall-clock value.
     """
     mgr = _make_manager(max_concurrent=1)
     info = SubagentInfo(id="parked", task="t", agent="")

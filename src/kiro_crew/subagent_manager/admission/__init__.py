@@ -50,6 +50,7 @@ from .taskq_bridge import _TaskqBridgeMixin
 from .types import (
     FAIRNESS_SETTINGS_TTL_SECS,
     MEMORY_WAIT_UNTIL_KEY,
+    QUEUED_AT_KEY,
     TASK_STORE_UNAVAILABLE_CODE,
     WINDOW_ENTRY_RECOVERING,
     CapacityView,
@@ -89,6 +90,7 @@ class SpawnAdmissionCoordinator(
     TASK_STORE_UNAVAILABLE_CODE = TASK_STORE_UNAVAILABLE_CODE
     WINDOW_ENTRY_RECOVERING = WINDOW_ENTRY_RECOVERING
     MEMORY_WAIT_UNTIL_KEY = MEMORY_WAIT_UNTIL_KEY
+    QUEUED_AT_KEY = QUEUED_AT_KEY
 
 
 def _hoist_impls(cls: type) -> None:
