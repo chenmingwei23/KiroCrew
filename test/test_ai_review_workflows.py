@@ -15234,7 +15234,7 @@ _NOTICE_LANES = (
         "fork-first-principles-review.yml",
         "Post/update first-principles review comment",
         True,
-        False,
+        True,
     ),
     ("fork-gpt-review.yml", "Post/update summary comment", False, False),
     ("fork-opus-review.yml", "Post/update summary comment", False, False),
@@ -15837,14 +15837,18 @@ class TestNoticeSlotLookupLicensesEveryCreate:
             "verdict=OVERRIDE"
         ) == 1
 
-    def test_a_skip_arm_with_an_empty_slot_asks_nothing_about_the_head(
+    def test_a_skip_arm_with_an_empty_slot_creates_a_head_stamped_notice(
         self, tmp_path: Path
     ) -> None:
-        # The complement, and the case that made the head question premature: a
-        # skip arm only ever replaces a comment already in the slot. With the
-        # slot readable and empty there is no write to license, so asking makes
-        # a run annotate a notice this arm was never going to make -- the normal
-        # outcome on a docs-only revision whose head moved on.
+        # #13595: a whole-design lane that declines to review must leave a slot
+        # that NAMES the head it declined, so readiness can tell "did not
+        # review this head" (slot present, head named) from "could not publish"
+        # (slot absent on a `success` conclusion). The skip arm therefore
+        # confirms the head and CREATES the keyed comment when the slot is empty
+        # -- it no longer silently writes nothing, which was the fail-open the
+        # issue describes (readiness could not distinguish the two, so a
+        # backend-only PR either wedged on a permanent pending or scored as
+        # reviewed).
         bash = _bash()
         if bash is None or shutil.which("jq") is None:
             pytest.skip("notice slot-lookup test requires Bash and jq")
@@ -15862,17 +15866,17 @@ class TestNoticeSlotLookupLicensesEveryCreate:
         gh_stub = stub_dir / "gh"
         gh_stub.write_text(
             "#!/usr/bin/env bash\n"
-            "# The slot read answers and reports the slot empty. Any head read\n"
-            "# is recorded and refused, so one taken here is visible as a call\n"
-            "# and as a warning.\n"
+            "# The slot read answers and reports the slot empty. The head read\n"
+            "# answers and confirms the head is unchanged, so the create arm\n"
+            "# fires and the body it posts is recorded.\n"
             'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
             '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
             "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
-            "  echo 'api blip' >&2\n"
-            "  exit 1\n"
+            "  printf '%s\\n' \"$HEAD\"\n"
+            "  exit 0\n"
             "fi\n"
             'if [ "$1" = "api" ]; then\n'
             "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
@@ -15880,6 +15884,10 @@ class TestNoticeSlotLookupLicensesEveryCreate:
             "fi\n"
             'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
             "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            '  while [ "$#" -gt 0 ]; do\n'
+            '    if [ "$1" = "--body-file" ]; then cat "$2" >> "$STUB_CALLS/create-body.txt"; fi\n'
+            "    shift\n"
+            "  done\n"
             "  exit 0\n"
             "fi\n"
             "exit 0\n",
@@ -15922,18 +15930,19 @@ class TestNoticeSlotLookupLicensesEveryCreate:
         )
 
         assert result.returncode == 0, result.stderr.decode()
-        # The assertion that names the defect: no head was read at all, because
-        # no write was pending.
-        assert not (calls_dir / "head-calls.txt").exists()
-        # So the run says nothing about a notice it was never going to write.
-        stdout = result.stdout.decode()
-        assert "::warning::" not in stdout, stdout
-        assert "was not written" not in stdout, stdout
-        # And it wrote nothing, on either arm.
+        # The head WAS read -- a create is pending, so the arm licenses it on a
+        # confirmed head rather than writing blind.
+        assert (calls_dir / "head-calls.txt").exists()
+        # The slot was consulted and reported empty, so the arm CREATED the
+        # notice rather than patching or doing nothing.
+        assert (calls_dir / "create-calls.txt").exists()
         assert not (calls_dir / "patch-calls.txt").exists()
-        assert not (calls_dir / "create-calls.txt").exists()
-        # The slot was in fact consulted, and the lane still reported its skip.
-        assert (calls_dir / "read-calls.txt").exists()
+        # And the created body names THIS head in prose: that is the per-head
+        # marker readiness scopes the skip exemption on (pr_status.py
+        # `slots_naming_head`).
+        created = (calls_dir / "create-body.txt").read_text(encoding="utf-8")
+        assert head in created, created
+        # The lane still reported its skip.
         assert "verdict=SKIPPED" in (tmp_path / "gh-output.txt").read_text(encoding="utf-8")
 
     def test_a_create_arm_reads_the_slot_after_the_head_backoff(self, tmp_path: Path) -> None:
