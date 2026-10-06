@@ -652,6 +652,17 @@ class TestContextTrace:
         assert out["totals"] == {}
         assert out["injected_chars"] == 0
 
+    def test_the_payload_says_whether_the_crew_log_is_recording(self, monkeypatch):
+        """An empty list cannot say why it is empty, so the payload does.
+
+        With the switch on, an empty session fills on its next turn; with it off,
+        nothing will ever arrive, and the panel must not promise otherwise.
+        """
+        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+        assert usage_mod.context_trace("chat-never", 14)["recording"] is True
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
+        assert usage_mod.context_trace("chat-never", 14)["recording"] is False
+
     def test_an_unreadable_fold_reads_as_nothing_folded(self, monkeypatch, caplog):
         """A damaged log is not a 500. The panel renders an empty trace instead."""
 
@@ -1216,6 +1227,7 @@ class TestContextTraceParityWithTheShardScan:
             "peak_context_used": 12_500,
             "context_window": 200_000,
             "window_days": 14,
+            "recording": True,
         }
         # A stamp is an ISO-8601 UTC string, which is what the declared shape says and
         # what the scan's rows carried.

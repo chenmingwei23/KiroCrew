@@ -42,6 +42,10 @@ export interface ContextTrace {
   peak_context_used: number
   context_window: number
   window_days: number
+  /** Whether the gateway is recording at all. `false` means nothing will ever arrive
+   *  while the switch stays off, so the empty state must not promise otherwise. Absent
+   *  on a payload from a gateway older than the field, which reads as recording. */
+  recording?: boolean
 }
 
 /** The user's own text, and the labels the backend groups under one bucket. */
@@ -463,7 +467,14 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
       }`}
       onClick={() => onSelect(turn.n)}
     >
-      <span>{i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.displayN) })}</span>
+      <span>
+        {/* Each row is a session-start COMPOSITION, and a unit emits one per start or
+            rebuild. Only turn 1 is the session's beginning; a later one is a rebuild,
+            and labelling it "session start" reads as a session that began there. */}
+        {turn.displayN === 1
+          ? i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.displayN) })
+          : i18nT('pages.contextBreakdown.rebuild_row', { n: fmtN(turn.displayN) })}
+      </span>
       <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">
         {i18nT('pages.contextBreakdown.turn_button_chars', { chars: fmtN(turn.total) })}
       </span>
@@ -528,9 +539,15 @@ export function ContextBreakdownPanel({
       </div>
     )
   } else if (!trace || trace.turns.length === 0) {
+    // Four roads lead here and only one is final. A session recorded before the fold,
+    // one with no completed turn yet, and one whose rows all fall outside the day
+    // window each fill on the next turn, so "yet" is true for them. With recording
+    // switched off nothing ever arrives, and the payload says so.
     body = (
-      <div className="text-muted text-[11px] py-6 text-center">
-        {i18nT('pages.contextBreakdown.empty')}
+      <div className="text-muted text-[11px] py-6 text-center" data-testid={trace?.recording === false ? 'context-breakdown-off' : undefined}>
+        {trace?.recording === false
+          ? i18nT('pages.contextBreakdown.empty_off')
+          : i18nT('pages.contextBreakdown.empty')}
       </div>
     )
   } else {
@@ -581,6 +598,21 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
     ? starts.filter(t => t.displayN < firstShown.displayN).length
     : 0
   const hidden = firstShown ? Math.max(0, firstShown.displayN - 1 - startsBeforeFirstShown) : 0
+  // Worded as the RANGE of earlier turns, not a count. A count reads as a set you could
+  // open, and the fold keeps no detail for most of these turns; a range also reconciles
+  // on sight with the first turn the chart draws, and naming the session-start rows
+  // explains why the range is wider than the turns it hides.
+  const lastEarlier = firstShown ? firstShown.displayN - 1 : 0
+  const earlierText =
+    startsBeforeFirstShown > 0
+      ? i18nT('pages.contextBreakdown.earlier_range_starts', {
+          first: fmtN(1),
+          last: fmtN(lastEarlier),
+          count: startsBeforeFirstShown,
+        })
+      : lastEarlier === 1
+        ? i18nT('pages.contextBreakdown.earlier_single', { n: fmtN(1) })
+        : i18nT('pages.contextBreakdown.earlier_range', { first: fmtN(1), last: fmtN(lastEarlier) })
   const newest = all.length
   const selectable = new Set([...starts, ...shown].map(t => t.n))
   const selected = pinned !== null && selectable.has(pinned) ? pinned : newest
@@ -626,8 +658,8 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
               <span className="text-[12px] text-muted">{i18nT('pages.contextBreakdown.scope_unit')}</span>
             </div>
             {hidden > 0 ? (
-              <p className="m-0 mb-2 text-[12px] text-muted">
-                {i18nT('pages.contextBreakdown.earlier_hidden', { count: hidden })}
+              <p className="m-0 mb-2 text-[12px] text-muted" data-testid="earlier-turns">
+                {earlierText}
               </p>
             ) : null}
 
