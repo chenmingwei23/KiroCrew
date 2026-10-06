@@ -1443,3 +1443,130 @@ def test_a_readable_proc_tree_is_never_platform_limited(tmp_path):
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN
     assert not evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
+
+
+# ── InFlightToolTracker: the shared hand-off rule ──
+#
+# The one implementation both AcpSessionHandle and the sub-agent reaper use to
+# answer "which tool call is judged right now". These tests pin the rule itself;
+# the two callers' own tests (test_stale_watchdog_rearm.py and
+# test_subagent_stall_attribution.py) pin the integration.
+
+
+def _ts(title: str = "t") -> ToolCallState:
+    return ToolCallState(title=title, command="{}", dispatch_ts=1.0)
+
+
+def test_tracker_dispatch_makes_the_call_the_judged_one():
+    tr = liveness.InFlightToolTracker()
+    state = _ts()
+    changed = tr.dispatch("a", state, aux="interactive-a")
+    assert changed is True
+    assert tr.current is state
+    assert tr.current_id == "a"
+    assert tr.current_aux == "interactive-a"
+    assert tr.any_active is True
+
+
+def test_tracker_terminal_result_for_the_judged_call_clears_it():
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("a", _ts())
+    assert tr.result("a", terminal=True) is True
+    assert tr.current is None
+    assert tr.current_id == ""
+    assert tr.any_active is False
+
+
+def test_tracker_non_terminal_result_is_a_no_op():
+    tr = liveness.InFlightToolTracker()
+    state = _ts()
+    tr.dispatch("a", state)
+    assert tr.result("a", terminal=False) is False
+    assert tr.current is state
+
+
+def test_tracker_sibling_terminal_does_not_change_the_judged_call():
+    """A parallel call finishing out of order must leave the judged call — and
+    so the oracle baseline — untouched."""
+    tr = liveness.InFlightToolTracker()
+    first = _ts("first")
+    second = _ts("second")
+    tr.dispatch("a", first)
+    tr.dispatch("b", second)  # b is now judged (newest dispatch)
+    assert tr.current is second
+    # a (the older sibling) finishes first: judged call is still b.
+    assert tr.result("a", terminal=True) is False
+    assert tr.current is second
+    assert tr.current_id == "b"
+
+
+def test_tracker_judged_call_falls_back_to_newest_remaining():
+    tr = liveness.InFlightToolTracker()
+    first = _ts("first")
+    second = _ts("second")
+    tr.dispatch("a", first)
+    tr.dispatch("b", second)
+    # b (the judged, newest) finishes: judged falls back to a, the one still open.
+    assert tr.result("b", terminal=True) is True
+    assert tr.current is first
+    assert tr.current_id == "a"
+
+
+def test_tracker_clear_drops_everything():
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("a", _ts())
+    tr.dispatch("b", _ts())
+    assert tr.clear() is True
+    assert tr.current is None
+    assert tr.current_id == ""
+    assert tr.any_active is False
+    assert tr.clear() is False  # nothing to clear a second time
+
+
+def test_tracker_single_slot_shape_overwrites_on_next_dispatch():
+    """The sub-agent's shape: an id-less call is judged but held in a separate
+    slot (not the running set), so it never appears in ``active_calls`` and the
+    next id-less dispatch overwrites it (a native child's result never reaches
+    that loop, so nothing would ever pop a stored entry)."""
+    tr = liveness.InFlightToolTracker()
+    one = _ts("one")
+    two = _ts("two")
+    tr.dispatch("", one)
+    assert tr.current is one
+    assert tr.active_calls == {}
+    assert tr.any_active is False
+    tr.dispatch("", two)
+    assert tr.current is two
+    assert tr.active_calls == {}
+
+
+def test_tracker_idless_judged_call_hands_off_on_a_terminal_result():
+    """A surviving stored call plus a finished stored call and an id-less judged
+    call (a native child): the agent's own terminal result drops the id-less
+    judgement and the slot passes to the stored call still running, rather than
+    leaving the finished child judged."""
+    tr = liveness.InFlightToolTracker()
+    survivor = _ts("survivor")
+    finished = _ts("finished")
+    child = _ts("child")
+    tr.dispatch("survivor-1", survivor)
+    tr.dispatch("finished-1", finished)
+    tr.dispatch("", child)  # native child: judged, not stored
+    assert tr.current is child
+    assert set(tr.active_calls) == {"survivor-1", "finished-1"}
+
+    changed = tr.result("finished-1", terminal=True)
+    assert changed is True
+    assert tr.current is survivor
+    assert set(tr.active_calls) == {"survivor-1"}
+
+
+def test_tracker_idless_judged_call_clears_when_nothing_remains():
+    """An id-less judged call with no stored sibling clears to None on the next
+    terminal result (the slot cannot be handed to anything)."""
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("", _ts("child"))
+    changed = tr.result("stored-gone", terminal=True)
+    assert changed is True
+    assert tr.current is None
+    assert tr.active_calls == {}
