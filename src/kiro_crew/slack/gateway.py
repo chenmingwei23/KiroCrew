@@ -2594,6 +2594,9 @@ class GatewayOrchestrator:
 
         # Trigger skill extraction when sessions expire (idle/orphan)
         self.sessions.on_session_expire = self.consolidator.consolidate_session
+        # A span abandoned at the consolidation attempt cap is otherwise only a
+        # log WARNING; surface it in the notification bell.
+        self.consolidator.on_abandoned = self._notify_consolidation_abandoned
 
         # Same expiry paths, the other direction: a parent with a completion
         # injection in flight must not be expired under it. This counter is the
@@ -8400,6 +8403,31 @@ class GatewayOrchestrator:
         except Exception:
             logger.debug("AutoNudge expiry notification failed", exc_info=True)
             return False
+
+    def _notify_consolidation_abandoned(self, key: str, message_count: int, reason: str) -> None:
+        """Tell the user a session span was dropped from memory consolidation.
+
+        The consolidator gives up on a span after its attempt cap and marks it
+        consolidated so it stops re-billing; that span's history, preferences
+        and lessons are never extracted. This note is the user-visible record
+        of that, since a marked span does not appear in any pending listing.
+        """
+        state = self.dashboard_state
+        if state is None:
+            return
+        title = "Memory consolidation gave up on a session"
+        body = (
+            f"{message_count} messages from session {key} were dropped from memory "
+            f"after repeated consolidation failures ({reason}). Their history, "
+            "preferences and lessons were not extracted. The gateway log has the "
+            "underlying error."
+        )
+        state.notify(
+            "agent",
+            title,
+            body,
+            meta={"session_key": key, "kind": "consolidation-abandoned"},
+        )
 
     @staticmethod
     def _defer_queued_delivery(

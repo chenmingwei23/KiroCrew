@@ -816,6 +816,11 @@ class HistoryConsolidator:
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Called as ``on_abandoned(key, message_count, reason)`` when a span is
+        # abandoned at the attempt cap, so the owner can tell the user. Without
+        # it the only trace of the dropped span is a WARNING in a rotating log.
+        # Set by the gateway once its notification surface exists; None skips it.
+        self.on_abandoned: Callable[[str, int, str], None] | None = None
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         # ``_last_activity`` lives in memory only, so after a restart a session
@@ -982,6 +987,14 @@ class HistoryConsolidator:
             self._logger.warning(
                 "Could not mark abandoned consolidation for %s", key, exc_info=True
             )
+        callback = self.on_abandoned
+        if callback is not None:
+            try:
+                callback(key, span.prompted - span.offset, reason)
+            except Exception:
+                self._logger.debug(
+                    "Abandoned-consolidation callback failed for %s", key, exc_info=True
+                )
 
     async def _note_environment_failure(self, key: str, reason: str) -> None:
         """Arm the backoff for a consolidation that never reached the provider.

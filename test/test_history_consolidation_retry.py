@@ -1140,6 +1140,64 @@ class TestAttemptCap:
 
         assert c.retry_eligible(KEY) is False
 
+    @pytest.mark.asyncio
+    async def test_abandoning_a_span_reports_it_to_the_owner(self, tmp_path):
+        """The abandon path tells its owner which span it dropped and why."""
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        seen: list[tuple[str, int, str]] = []
+        c.on_abandoned = lambda key, count, reason: seen.append((key, count, reason))
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(
+                KEY,
+                {
+                    "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
+                    "consolidation_retry_at": 0.0,
+                },
+            )
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
+            await c._consolidate(KEY, include_history=True)
+
+        assert seen == [(KEY, 3, "empty LLM result")]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_attempt_below_the_cap_reports_nothing(self, tmp_path):
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        seen: list[tuple[str, int, str]] = []
+        c.on_abandoned = lambda key, count, reason: seen.append((key, count, reason))
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
+            await c._consolidate(KEY, include_history=True)
+
+        assert seen == []
+        assert log.unconsolidated_count(KEY) == 3
+
+    @pytest.mark.asyncio
+    async def test_a_raising_owner_callback_does_not_undo_the_abandon(self, tmp_path):
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+
+        def _boom(key: str, count: int, reason: str) -> None:
+            raise RuntimeError("bell unavailable")
+
+        c.on_abandoned = _boom
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(
+                KEY,
+                {
+                    "consolidation_attempts": _CONSOLIDATION_MAX_ATTEMPTS - 1,
+                    "consolidation_retry_at": 0.0,
+                },
+            )
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
+            await c._consolidate(KEY, include_history=True)
+
+        assert log.unconsolidated_count(KEY) == 0
+        assert log.consolidation_retry_state(KEY) == (0, 0.0)
+
 
 class TestSuccessClearsTheAccounting:
     @pytest.mark.asyncio
