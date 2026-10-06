@@ -31,6 +31,25 @@ export function matchSkillToken(before: string): string | null {
 }
 
 /**
+ * #-mention (people picker) query at the caret, or null.
+ *
+ * `#` is a distinct reserved sigil (issue #10639): `@` already multiplexes
+ * files, folders and the server-side saved-prompt expansion, so a fourth
+ * category on the same menu would make a fragment ambiguous (filename or
+ * person?). A separate character keeps the people namespace unambiguous.
+ *
+ * The alias charset (`[a-z0-9][a-z0-9._-]*`) matches the person reference the
+ * picker inserts — a member slug (lowercase, digits, hyphen; see `slugify`)
+ * plus `.` and `_` so a `first.last`-style alias completes too. A bare `#` at a
+ * word boundary returns "" so "type `#` then browse" works; `#1` (an issue ref)
+ * still opens the list, which simply shows no match and closes on the next key.
+ */
+export function matchPeopleToken(before: string): string | null {
+  const m = before.match(/(^|[\s])#([a-z0-9][a-z0-9._-]*)?$/)
+  return m ? (m[2] ?? '') : null
+}
+
+/**
  * The path-completion token ending at the caret, used to REPLACE it on select.
  * Group 1 is the word-boundary prefix, as `replaceTokenAtCaret` requires.
  */

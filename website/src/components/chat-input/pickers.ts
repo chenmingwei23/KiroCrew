@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { skillsCacheStaleTime } from '../../lib/skillsCache'
-import { matchFileToken, matchPathToken, matchSkillToken, replaceTokenAtCaret } from '../composerTokens'
+import { matchFileToken, matchPathToken, matchPeopleToken, matchSkillToken, replaceTokenAtCaret } from '../composerTokens'
 import type { ComposerControl } from '../composerControl'
 import type { ChatInputProps } from './props'
 import { terminalCommand } from '../../hooks/useTerminalCommand'
@@ -41,6 +41,11 @@ export function useComposerPickers({ project, onFileSelect, typedCommandMenus, t
   const [fileQuery, setFileQuery] = useState('')
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
+  // `#` people picker (issue #10639). Its own open/query pair, parallel to the
+  // skill picker's: a token at the caret starts with exactly one sigil, so only
+  // one of these menus is ever open at a time.
+  const [peoplePickerOpen, setPeoplePickerOpen] = useState(false)
+  const [peopleQuery, setPeopleQuery] = useState('')
   // Project skill awaiting consent, together with the exact chat/project/request
   // that initiated it. A grant can outlive this dialog, so completion must not
   // write into a different draft or supersede a newer consent request.
@@ -56,11 +61,12 @@ export function useComposerPickers({ project, onFileSelect, typedCommandMenus, t
    *  prompt-history keys and the dictation Escape both yield to it. */
   const anyPickerOpenRef = useRef(false)
   const terminalActive = !!terminalCommands && terminalCommand(value) !== null
-  anyPickerOpenRef.current = !terminalActive && (slashMenuOpen || filePickerOpen || skillPickerOpen || pathPickerOpen)
+  anyPickerOpenRef.current = !terminalActive && (slashMenuOpen || filePickerOpen || skillPickerOpen || peoplePickerOpen || pathPickerOpen)
   const closePickers = useCallback(() => {
     setSlashMenuOpen(false)
     setFilePickerOpen(false); setFileQuery('')
     setSkillPickerOpen(false); setSkillQuery('')
+    setPeoplePickerOpen(false); setPeopleQuery('')
     setPathPickerOpen(false); setPathQuery('')
   }, [])
   useEffect(() => { if (terminalActive) closePickers() }, [terminalActive, closePickers])
@@ -82,6 +88,11 @@ export function useComposerPickers({ project, onFileSelect, typedCommandMenus, t
     const skillQ = fileQ === null ? matchSkillToken(before) : null
     if (typedCommandMenus && skillQ !== null) { setSkillPickerOpen(true); setSkillQuery(skillQ) }
     else { setSkillPickerOpen(false); setSkillQuery('') }
+    // `#` people: a distinct sigil, so mutually exclusive with @ and $ by the
+    // same single-sigil-per-token rule. Gated on typedCommandMenus like $.
+    const peopleQ = fileQ === null && skillQ === null ? matchPeopleToken(before) : null
+    if (typedCommandMenus && peopleQ !== null) { setPeoplePickerOpen(true); setPeopleQuery(peopleQ) }
+    else { setPeoplePickerOpen(false); setPeopleQuery('') }
     const pathQ = pathTokenAt(before)
     if (pathQ !== null) { setPathPickerOpen(true); setPathQuery(pathQ) }
     else { setPathPickerOpen(false); setPathQuery('') }
@@ -119,6 +130,7 @@ export function useComposerPickers({ project, onFileSelect, typedCommandMenus, t
   return {
     slashMenuOpen, setSlashMenuOpen, filePickerOpen, setFilePickerOpen, fileQuery, setFileQuery,
     pathPickerOpen, setPathPickerOpen, pathQuery, setPathQuery, skillPickerOpen, setSkillPickerOpen, skillQuery, setSkillQuery,
+    peoplePickerOpen, setPeoplePickerOpen, peopleQuery, setPeopleQuery,
     nextTrustRequestIdRef, activeTrustRequestIdRef, trustPrompt, setTrustPrompt, skillSlotKey, skillSlotKeyRef, skillProjectRef,
     anyPickerOpenRef, closePickers, openPickersForText, prefetchSkills, applyPickedToken,
   }

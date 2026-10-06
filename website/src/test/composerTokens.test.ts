@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { matchFileToken, matchPathToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret, splitPathToken } from '../components/composerTokens'
+import { matchFileToken, matchPathToken, matchPeopleToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret, splitPathToken } from '../components/composerTokens'
 
 // These matchers take the text BEFORE the caret. A returned string is the query
 // (the picker opens); null means the caret is not inside a token (picker closed).
@@ -44,8 +44,41 @@ describe('matchSkillToken (caret-relative $ detection)', () => {
   })
 })
 
-describe('matchFileToken (caret-relative @ detection)', () => {
-  it('opens on a bare @ and captures the query up to the caret', () => {
+describe('matchPeopleToken (caret-relative # detection, issue #10639)', () => {
+  it('opens on a bare # at start or after whitespace (full list)', () => {
+    expect(matchPeopleToken('#')).toBe('')
+    expect(matchPeopleToken('ask #')).toBe('')
+  })
+
+  it('captures the alias up to the caret', () => {
+    expect(matchPeopleToken('#rma')).toBe('rma')
+    expect(matchPeopleToken('ping #release-captain')).toBe('release-captain')
+    expect(matchPeopleToken('#first.last')).toBe('first.last')
+    expect(matchPeopleToken('#ops_lead')).toBe('ops_lead')
+  })
+
+  it('fires mid-sentence: caret right after the token, text follows AFTER the caret', () => {
+    expect(matchPeopleToken('check with #rma')).toBe('rma')
+    expect(matchPeopleToken('line one\n#rm')).toBe('rm')
+  })
+
+  it('does NOT fire when the # token is not the token at the caret', () => {
+    expect(matchPeopleToken('#rma more')).toBeNull()
+    expect(matchPeopleToken('# ')).toBeNull()
+    expect(matchPeopleToken('foo#bar')).toBeNull() // # not at a word boundary
+  })
+
+  it('excludes uppercase-led shapes (alias charset is [a-z0-9]-led)', () => {
+    expect(matchPeopleToken('#RMA')).toBeNull()
+  })
+
+  it('opens on #digit (an issue-ref lookalike) — the empty match list just closes it', () => {
+    expect(matchPeopleToken('#1')).toBe('1')
+    expect(matchPeopleToken('see #42')).toBe('42')
+  })
+})
+
+describe('matchFileToken (caret-relative @ detection)', () => {  it('opens on a bare @ and captures the query up to the caret', () => {
     expect(matchFileToken('@')).toBe('')
     expect(matchFileToken('open @src/App')).toBe('src/App')
   })
@@ -120,6 +153,15 @@ describe('replaceTokenAtCaret (caret-relative insertion)', () => {
   it('preserves the word-boundary prefix (leading space) before the token', () => {
     const next = replaceTokenAtCaret('a $c', 4, /(^|[\s])\$[a-z0-9/_-]*$/, '$cr-review ')
     expect(next.value).toBe('a $cr-review ')
+  })
+
+  it('replaces the #person token at the caret and preserves text after the caret', () => {
+    // "ping #rel| today" -> caret after "#rel"
+    const value = 'ping #rel today'
+    const caret = 'ping #rel'.length
+    const next = replaceTokenAtCaret(value, caret, /(^|[\s])#[a-z0-9._-]*$/, '#release-captain ')
+    expect(next.value).toBe('ping #release-captain  today')
+    expect(next.caret).toBe('ping #release-captain '.length)
   })
 })
 

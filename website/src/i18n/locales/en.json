@@ -4316,7 +4316,10 @@
       "used": "Used",
       "sketch": "Sketch",
       "sketch_desc": "Draw a sketch; attaches an image plus its editable source",
-      "more_actions": "More actions"
+      "more_actions": "More actions",
+      "person": "Person",
+      "reference_a_person": "Reference a person",
+      "complete_a_colleagues_alias_to_name_them": "Complete a colleague's alias to name them"
     },
     "chatPane": {
       "agent_list": "Agent list",

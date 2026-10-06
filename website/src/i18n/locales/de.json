@@ -6273,7 +6273,10 @@
       "terminal_review": "Prüfen und im Terminal ausführen",
       "terminal_force_stop": "Agent stoppen",
       "terminal_pending": "Warte, bis die Sitzungsdetails geladen sind, oder wähle eine andere Sitzung.",
-      "terminal_run_review": "Terminalbefehl prüfen"
+      "terminal_run_review": "Terminalbefehl prüfen",
+      "person": "Person",
+      "reference_a_person": "Reference a person",
+      "complete_a_colleagues_alias_to_name_them": "Complete a colleague's alias to name them"
     },
     "chatPane": {
       "agent_list": "Agenten-Liste",
@@ -9407,6 +9410,16 @@
       "moreCols": "mehr Spalten",
       "fewerRows": "weniger Zeilen",
       "moreRows": "mehr Zeilen"
+    },
+    "peoplePickerMenu": {
+      "loading_ctrl_enter_held": "Loading people… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "loading_enter_held": "Loading people… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "no_matching_people": "No matching people",
+      "no_matching_people_ctrl_enter_sends": "No matching people — Ctrl+Enter sends the message",
+      "no_matching_people_enter_sends": "No matching people — Enter sends the message",
+      "load_failed": "Couldn’t load people",
+      "load_failed_ctrl_enter_sends": "Couldn’t load people — Ctrl+Enter sends the message",
+      "load_failed_enter_sends": "Couldn’t load people — Enter sends the message"
     }
   },
   "hooks": {

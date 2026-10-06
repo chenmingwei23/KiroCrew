@@ -6174,7 +6174,10 @@
       "terminal_review": "確認してターミナルで実行",
       "terminal_force_stop": "エージェントを停止",
       "terminal_pending": "セッション情報の読み込みを待つか、別のセッションを選択してください。",
-      "terminal_run_review": "ターミナルコマンドを確認"
+      "terminal_run_review": "ターミナルコマンドを確認",
+      "person": "Person",
+      "reference_a_person": "Reference a person",
+      "complete_a_colleagues_alias_to_name_them": "Complete a colleague's alias to name them"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -9281,6 +9284,16 @@
       "moreCols": "列を増やす",
       "fewerRows": "行を減らす",
       "moreRows": "行を増やす"
+    },
+    "peoplePickerMenu": {
+      "loading_ctrl_enter_held": "Loading people… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "loading_enter_held": "Loading people… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "no_matching_people": "No matching people",
+      "no_matching_people_ctrl_enter_sends": "No matching people — Ctrl+Enter sends the message",
+      "no_matching_people_enter_sends": "No matching people — Enter sends the message",
+      "load_failed": "Couldn’t load people",
+      "load_failed_ctrl_enter_sends": "Couldn’t load people — Ctrl+Enter sends the message",
+      "load_failed_enter_sends": "Couldn’t load people — Enter sends the message"
     }
   },
   "hooks": {

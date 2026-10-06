@@ -6273,7 +6273,10 @@
       "terminal_review": "পর্যালোচনা করে টার্মিনালে চালাও",
       "terminal_force_stop": "এজেন্ট থামাও",
       "terminal_pending": "সেশনের তথ্য লোড হওয়া পর্যন্ত অপেক্ষা করো অথবা অন্য সেশন বেছে নাও।",
-      "terminal_run_review": "টার্মিনাল কমান্ড দেখে নাও"
+      "terminal_run_review": "টার্মিনাল কমান্ড দেখে নাও",
+      "person": "Person",
+      "reference_a_person": "Reference a person",
+      "complete_a_colleagues_alias_to_name_them": "Complete a colleague's alias to name them"
     },
     "chatPane": {
       "agent_list": "এজেন্ট তালিকা",
@@ -9407,6 +9410,16 @@
       "moreCols": "বেশি কলাম",
       "fewerRows": "কম সারি",
       "moreRows": "বেশি সারি"
+    },
+    "peoplePickerMenu": {
+      "loading_ctrl_enter_held": "Loading people… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "loading_enter_held": "Loading people… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "no_matching_people": "No matching people",
+      "no_matching_people_ctrl_enter_sends": "No matching people — Ctrl+Enter sends the message",
+      "no_matching_people_enter_sends": "No matching people — Enter sends the message",
+      "load_failed": "Couldn’t load people",
+      "load_failed_ctrl_enter_sends": "Couldn’t load people — Ctrl+Enter sends the message",
+      "load_failed_enter_sends": "Couldn’t load people — Enter sends the message"
     }
   },
   "hooks": {

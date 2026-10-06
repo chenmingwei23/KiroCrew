@@ -1,6 +1,7 @@
 import SlashCommandMenu from '../SlashCommandMenu'
 import FilePickerMenu from '../FilePickerMenu'
 import SkillPickerMenu from '../SkillPickerMenu'
+import PeoplePickerMenu from '../PeoplePickerMenu'
 import ProjectSkillsTrustDialog from '../ProjectSkillsTrustDialog'
 import { PATH_TOKEN_RE } from '../composerTokens'
 import type { SendMode } from '../../pages/chat/ChatSettings'
@@ -24,6 +25,7 @@ export function ComposerPickerMenus({ pickers, value, onChange, composerAnchorRe
   const {
     slashMenuOpen, setSlashMenuOpen, filePickerOpen, setFilePickerOpen, fileQuery, setFileQuery,
     pathPickerOpen, setPathPickerOpen, pathQuery, setPathQuery, skillPickerOpen, setSkillPickerOpen, skillQuery, setSkillQuery,
+    peoplePickerOpen, setPeoplePickerOpen, peopleQuery, setPeopleQuery,
     nextTrustRequestIdRef, activeTrustRequestIdRef, trustPrompt, setTrustPrompt, skillSlotKey, skillSlotKeyRef, skillProjectRef,
     applyPickedToken,
   } = pickers
@@ -99,6 +101,21 @@ export function ComposerPickerMenus({ pickers, value, onChange, composerAnchorRe
           setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
         }}
         onClose={() => { setSkillPickerOpen(false); setSkillQuery('') }}
+      />}
+      {typedCommandMenus && <PeoplePickerMenu
+        query={peopleQuery}
+        anchorRef={composerAnchorRef}
+        open={peoplePickerOpen}
+        sendOnEnter={sendOnEnter}
+        onSelect={({ alias }) => {
+          // Insert the full, well-formed alias as a `#alias` token — literal
+          // text the user sees, the same shape the $skill picker inserts. The
+          // alias charset matches matchPeopleToken's, so the detect→insert span
+          // agrees and no drift leaks trailing text (see composerTokens tests).
+          applyPickedToken(/(^|[\s])#[a-z0-9._-]*$/, `#${alias} `)
+          setPeoplePickerOpen(false); setPeopleQuery('')
+        }}
+        onClose={() => { setPeoplePickerOpen(false); setPeopleQuery('') }}
       />}
       <ProjectSkillsTrustDialog
         key={trustPrompt?.requestId ?? 0}

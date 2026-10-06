@@ -19,7 +19,7 @@ export function usePlusMenu({ pickers, value, onChange, composerControl }: {
   onChange: (v: string) => void
   composerControl: () => ComposerControl | null
 }) {
-  const { setSlashMenuOpen, setFilePickerOpen, setFileQuery, setSkillPickerOpen, setSkillQuery } = pickers
+  const { setSlashMenuOpen, setFilePickerOpen, setFileQuery, setSkillPickerOpen, setSkillQuery, setPeoplePickerOpen, setPeopleQuery } = pickers
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [sketchOpen, setSketchOpen] = useState(false)
@@ -49,14 +49,15 @@ export function usePlusMenu({ pickers, value, onChange, composerControl }: {
     setPlusOpen(o => !o)
   }
   // Open an in-input trigger picker from the + menu (mirrors typing the sigil):
-  //  '/' slash commands (whole-input), '@' file mention, '$' skill. Appends the
-  //  sigil at a word boundary, opens the matching picker, then refocuses the box.
-  const openTrigger = (sigil: '/' | '@' | '$') => {
+  //  '/' slash commands (whole-input), '@' file mention, '$' skill, '#' person.
+  //  Appends the sigil at a word boundary, opens the matching picker, then
+  //  refocuses the box.
+  const openTrigger = (sigil: '/' | '@' | '$' | '#') => {
     setPlusOpen(false)
     let nextValue = '/'
     if (sigil === '/') {
       onChange(nextValue)
-      setSlashMenuOpen(true); setFilePickerOpen(false); setSkillPickerOpen(false)
+      setSlashMenuOpen(true); setFilePickerOpen(false); setSkillPickerOpen(false); setPeoplePickerOpen(false)
     } else {
       // Append at the end, exactly as the base textarea path always has —
       // the menu gesture is "start a mention", not "insert at caret", and the
@@ -66,8 +67,9 @@ export function usePlusMenu({ pickers, value, onChange, composerControl }: {
       nextValue = value + sep + sigil
       onChange(nextValue)
       setSlashMenuOpen(false)
-      if (sigil === '@') { setFilePickerOpen(true); setFileQuery(''); setSkillPickerOpen(false) }
-      else { setSkillPickerOpen(true); setSkillQuery(''); setFilePickerOpen(false) }
+      if (sigil === '@') { setFilePickerOpen(true); setFileQuery(''); setSkillPickerOpen(false); setPeoplePickerOpen(false) }
+      else if (sigil === '$') { setSkillPickerOpen(true); setSkillQuery(''); setFilePickerOpen(false); setPeoplePickerOpen(false) }
+      else { setPeoplePickerOpen(true); setPeopleQuery(''); setFilePickerOpen(false); setSkillPickerOpen(false) }
     }
     // Engine-neutral twin of the base `el.setSelectionRange(n, n)`: place the
     // caret at the end of the new value in whichever composer is live.
@@ -267,6 +269,18 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   <div className="min-w-0">
                     <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.skill')}</div>
                     <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.apply_a_ready_made_set_of_instructions')}</div>
+                  </div>
+                </button>}
+                {typedCommandMenus && <button
+                  type="button"
+                  onClick={() => openTrigger('#')}
+                  title={i18nT('components.chatInput.reference_a_person')}
+                  className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
+                >
+                  <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">#</span>
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.person')}</div>
+                    <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.complete_a_colleagues_alias_to_name_them')}</div>
                   </div>
                 </button>}
               </div>
