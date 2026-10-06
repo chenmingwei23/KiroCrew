@@ -232,6 +232,14 @@ class QueuePoller:
         self._plan_next_retry_at = 0
         self._watch_spawn_count = 0
         self._watch_window_start = 0
+        # Freestyle agent-task spawn budget: the window counter that bounds the
+        # route=="execute" spawn block the way the watch storm breaker bounds
+        # watch checks. A host that keeps DECLINING a spawn (admission deferring
+        # for low memory) must not drive the freestyle block into a tight
+        # per-poll retry. Every ATTEMPT in the window counts regardless of its
+        # outcome, so a decline costs budget the same as a success.
+        self._freestyle_spawn_count = 0
+        self._freestyle_window_start = 0
         self._first_launch_grace = False
         self._grace_deadline: int | None = None
         # Serial spawn wait: pending future + its timeout deadline + spawn id.
@@ -557,9 +565,44 @@ class QueuePoller:
             return
 
         # 7. route == 'execute': freestyle agent tasks, serially.
+        #
+        # Budgeted the same way the watch block above is: a host that keeps
+        # DECLINING spawns for low memory must not drive every due freestyle
+        # task into a per-poll retry with no backoff. The attempt is counted
+        # BEFORE the host is called, so a decline (a low-memory deferral raises
+        # SpawnError, caught below without marking the task done) costs the
+        # hour's budget exactly like a success. Once the window's cap is
+        # reached, no further freestyle spawn is attempted until the window
+        # rolls over.
+        now = self._clock()
+        budget = self._budget_provider() if self._budget_provider is not None else None
+        if budget is not None:
+            fs_window_ms = 3_600_000  # the budget contract is per-hour
+            fs_max_spawns = budget.max_spawns_per_hour
+        else:
+            # No provider, or the unlimited tier: the vendored storm-breaker
+            # constants apply (the same fallback the watch block uses).
+            fs_window_ms = WATCH_STORM_WINDOW_MS
+            fs_max_spawns = MAX_WATCH_SPAWNS_PER_WINDOW
+        if now - self._freestyle_window_start > fs_window_ms:
+            self._freestyle_window_start = now
+            self._freestyle_spawn_count = 0
         for task in due_tasks:
             if task.get("type") not in AGENT_TYPES:
                 continue
+            if self._freestyle_spawn_count >= fs_max_spawns:
+                # Budget spent for this window: stop attempting (and stop
+                # logging) until it rolls over. The due task is left undone, so
+                # it is retried in a later window — the same deferral semantics
+                # the watch floor and missed-notify recovery already use.
+                logger.warning(
+                    "[QueuePoller] freestyle spawn budget spent: %d spawns in "
+                    "%dmin window, deferring the rest",
+                    self._freestyle_spawn_count,
+                    fs_window_ms // 60_000,
+                )
+                break
+            self._freestyle_spawn_count += 1
             try:
                 await self._spawn_agent_task_serial(task)
             except Exception:  # noqa: BLE001
