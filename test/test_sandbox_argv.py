@@ -652,6 +652,97 @@ class TestBuildSeatbeltProfile:
         )
         assert isinstance(excinfo.value.__cause__, OSError)
 
+    def test_voice_guard_admits_a_missing_runtime_path_disjoint_from_workspace(
+        self, monkeypatch, tmp_path
+    ):
+        """An absent runtime path is not a cannot-verify failure."""
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        workspace = tmp_path / "workspace"
+        (tmp_path / "data").mkdir()
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+
+        sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+    def test_voice_guard_missing_runtime_still_rejects_workspace_aliasing_its_parent(
+        self, monkeypatch, tmp_path
+    ):
+        """The identity walk starts at the nearest existing ancestor of the absent path."""
+        data = tmp_path / "data"
+        runtime = data / "run" / "voice-runtime"
+        workspace = tmp_path / "workspace"
+        data.mkdir()
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+        real_stat = sandbox_mod.os.stat
+        data_info = real_stat(data)
+
+        def alias_stat(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(str(workspace)):
+                return data_info
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(sandbox_mod.os, "stat", alias_stat)
+
+        with pytest.raises(RuntimeError, match="aliases"):
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+    def test_voice_guard_missing_workspace_still_fails_closed(self, monkeypatch, tmp_path):
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+
+        with pytest.raises(RuntimeError, match="cannot verify"):
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(tmp_path / "absent")
+
+    def test_voice_guard_dangling_runtime_symlink_still_fails_closed(self, monkeypatch, tmp_path):
+        """An entry that exists but cannot be followed is not 'absent'."""
+        run = tmp_path / "data" / "run"
+        run.mkdir(parents=True)
+        runtime = run / "voice-runtime"
+        runtime.symlink_to(tmp_path / "nowhere")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+
+        with pytest.raises(RuntimeError, match="cannot verify"):
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+        with pytest.raises(RuntimeError, match="cannot verify"):
+            sandbox_mod.bind_voice_safe_agent_workspace(workspace)
+
+    def test_voice_bind_admits_a_missing_runtime_path_disjoint_from_workspace(
+        self, monkeypatch, tmp_path
+    ):
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        workspace = tmp_path / "workspace"
+        (tmp_path / "data").mkdir()
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+
+        path, descriptor = sandbox_mod.bind_voice_safe_agent_workspace(workspace)
+        try:
+            assert path == os.fspath(workspace)
+            assert descriptor is not None
+        finally:
+            os.close(descriptor)
+
+    def test_voice_bind_missing_runtime_still_rejects_workspace_above_it(
+        self, monkeypatch, tmp_path
+    ):
+        data = tmp_path / "data"
+        runtime = data / "run" / "voice-runtime"
+        data.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", lambda: (str(runtime),))
+
+        with pytest.raises(RuntimeError, match="contains"):
+            sandbox_mod.bind_voice_safe_agent_workspace(data)
+
     def test_macos_workspace_binding_uses_opened_ancestor_identities(self, monkeypatch):
         monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
         monkeypatch.setattr(

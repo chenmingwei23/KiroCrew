@@ -5460,6 +5460,33 @@ def voice_runtime_workspace_conflict(workspace: str | os.PathLike[str]) -> str |
     return None
 
 
+def _nearest_existing_ancestor_of_missing(path: str) -> str | None:
+    """Return the nearest existing ancestor of *path* when *path* is truly absent.
+
+    Returns ``None`` when *path* itself exists, so the caller keeps its normal
+    identity checks. "Absent" means no directory entry at all (``lstat`` raises
+    ``FileNotFoundError``): a dangling symlink still has an entry and is
+    returned as ``None`` too, so its follow-``stat`` failure keeps the guard
+    fail-closed. Any error other than ``FileNotFoundError`` propagates.
+    """
+    current = os.path.abspath(path)
+    try:
+        os.lstat(current)
+        return None
+    except FileNotFoundError:
+        pass
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+        try:
+            os.stat(current)
+        except FileNotFoundError:
+            continue
+        return current
+
+
 def assert_voice_runtime_outside_agent_workspace(workspace: str | os.PathLike[str]) -> None:
     """Fail closed when a macOS agent workspace can reach decoder snapshots.
 
@@ -5510,20 +5537,36 @@ def assert_voice_runtime_outside_agent_workspace(workspace: str | os.PathLike[st
     # Path spelling is only a fast reject. Compare filesystem identities too,
     # walking both ancestor directions so case, normalization, symlink, and
     # firmlink aliases on an existing APFS workspace cannot evade the guard.
+    #
+    # A runtime path that does not exist yet (deleted after priming, or not
+    # created on this host) cannot itself be aliased, but the workspace can
+    # still be an ancestor of where it will appear. Walk from its nearest
+    # existing ancestor instead of failing closed on ENOENT. A missing
+    # WORKSPACE, and every other OSError, still fails closed below.
     try:
         workspace_identities = tuple(
             (info.st_dev, info.st_ino) for info in (os.stat(path) for path in raw_workspace_paths)
         )
-        runtime_identities = tuple(
-            (info.st_dev, info.st_ino) for info in (os.stat(path) for path in raw_runtime_paths)
-        )
+        present_runtime: list[tuple[str, tuple[int, int]]] = []
+        walk_roots: list[tuple[str, str]] = []
+        for runtime_path in raw_runtime_paths:
+            try:
+                info = os.stat(runtime_path)
+            except FileNotFoundError:
+                existing_ancestor = _nearest_existing_ancestor_of_missing(runtime_path)
+                if existing_ancestor is None:
+                    raise
+                walk_roots.append((runtime_path, existing_ancestor))
+                continue
+            present_runtime.append((runtime_path, (info.st_dev, info.st_ino)))
+            walk_roots.append((runtime_path, runtime_path))
         for workspace_identity in workspace_identities:
-            for runtime_path in raw_runtime_paths:
-                if _identity_in_ancestor_chain(workspace_identity, runtime_path):
+            for runtime_path, walk_root in walk_roots:
+                if _identity_in_ancestor_chain(workspace_identity, walk_root):
                     raise RuntimeError(
                         _voice_runtime_guard_message(original_workspace_path, runtime_path, "alias")
                     )
-        for runtime_path, runtime_identity in zip(raw_runtime_paths, runtime_identities):
+        for runtime_path, runtime_identity in present_runtime:
             for workspace_path in raw_workspace_paths:
                 if _identity_in_ancestor_chain(runtime_identity, workspace_path):
                     raise RuntimeError(
@@ -5614,7 +5657,25 @@ def bind_voice_safe_agent_workspace(
         workspace_ancestors = set(_directory_ancestor_identities(workspace_fd))
 
         for runtime_path in runtime_paths:
-            runtime_fd = _open_directory_descriptor(runtime_path)
+            try:
+                runtime_fd = _open_directory_descriptor(runtime_path)
+            except FileNotFoundError:
+                # The runtime path is absent: nothing can live inside it, but
+                # the workspace may still be an ancestor of where it appears.
+                existing_ancestor = _nearest_existing_ancestor_of_missing(runtime_path)
+                if existing_ancestor is None:
+                    raise
+                ancestor_fd = _open_directory_descriptor(existing_ancestor)
+                runtime_fds.append(ancestor_fd)
+                if workspace_id in set(_directory_ancestor_identities(ancestor_fd)):
+                    raise RuntimeError(
+                        _voice_runtime_guard_message(
+                            os.path.abspath(workspace_path),
+                            os.path.abspath(runtime_path),
+                            "contains",
+                        )
+                    ) from None
+                continue
             runtime_fds.append(runtime_fd)
             runtime_identity = os.fstat(runtime_fd)
             runtime_id = (runtime_identity.st_dev, runtime_identity.st_ino)
