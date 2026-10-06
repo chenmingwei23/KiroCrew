@@ -57,6 +57,7 @@ import { AttachMenu, usePlusMenu } from './chat-input/attach'
 import { BusySendControls, CompactingIndicator, useComposerSend } from './chat-input/busySend'
 import { CollapsedComposerBar, collapseMenuRowElement, useComposerCollapse } from './chat-input/collapse'
 import { useComposerFocus, useComposerKeyDown, useEditorInput } from './chat-input/keyboard'
+import { useComposerVim } from './chat-input/useComposerVim'
 import { INPUT_DRAG_MIN_H, useManualHeight, useStripHeights, useTextareaAutosize } from './chat-input/sizing'
 import { usePromptHistory, useUndoHistory } from './chat-input/draftHistory'
 import { usePromptOptimizer } from './chat-input/optimizer'
@@ -298,6 +299,13 @@ function ChatInput({
   const storedSendMode = useComposerSendMode()
   const sendOnEnter = sendOnEnterProp ?? storedSendMode
 
+  // Opt-in Vim keybindings for the plain-textarea composer (#6321). When the
+  // setting is off, `vim.enabled` is false and the driver is a no-op, so the
+  // textarea behaves exactly as before (Escape and every key keep standard
+  // behaviour). The driver owns the Normal/Insert mode and intercepts keys only
+  // while Normal mode is active.
+  const vim = useComposerVim()
+
   // Stop button: killing-state escape hatch (re-enable after 15s)
   const { escaped: killingEscaped } = useStopEscapeHatch(stopState)
   // Timed client-side from the frame that carried the decline; see the hook.
@@ -480,8 +488,11 @@ function ChatInput({
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
     promptHistory.exitIfDiverged(value)
+    // A send/clear returns the composer to a plain-typing state: start the next
+    // draft in Insert mode, not stuck in Normal from the last one.
+    if (value === '' && prevValueRef.current !== '') vim.reset()
     prevValueRef.current = value
-  }, [value, resetHeight, closePickers, promptHistory])
+  }, [value, resetHeight, closePickers, promptHistory, vim])
 
   // ChatInput is one instance shared by every slot, so a switch would carry the
   // previous tab's menu over; an unsent draft never hits the clear above.
@@ -1027,7 +1038,15 @@ function ChatInput({
           onDragLeave={e => { treeDrop.onDragLeave(e); e.stopPropagation() }}
           onDrop={e => { e.preventDefault(); treeDrop.onDrop(e); e.stopPropagation() }}
           onChange={handleTextareaChange}
-          onKeyDown={e => { listContinuation.onKeyDown(e); handleKeyDown(e) }}
+          onKeyDown={e => {
+            // Vim mode (opt-in) gets first look. When it consumes the key it
+            // has already preventDefault()'d and rewritten the textarea, so the
+            // list-continuation and ordinary composer handlers must not also run
+            // for this event. When Vim mode is off, `handleKeyDown` returns
+            // false immediately and nothing changes.
+            if (vim.handleKeyDown(e, e.currentTarget, onChange)) return
+            listContinuation.onKeyDown(e); handleKeyDown(e)
+          }}
           {...ime.bindComposition<HTMLTextAreaElement>({
             // The paste-hover preview dismisses on blur; the guard's latch reset rides
             // in the binding itself, so these handlers only carry what is local here.
@@ -1058,6 +1077,21 @@ function ChatInput({
         {/* Bottom icon row */}
         <div className={`flex items-center justify-between px-2.5 pb-2 pt-0.5${terminal.active ? ' flex-wrap gap-y-1' : ''}`}>
           <div className="flex items-center gap-0.5 min-w-0">
+            {vim.enabled && (
+              /* Vim mode indicator (#6321). Present only when the opt-in setting
+                 is on; `aria-live="polite"` so a mode switch is announced to
+                 assistive tech. The label text (NORMAL / INSERT) is the source
+                 of truth for the mode — colour only reinforces it. */
+              <span
+                data-testid="composer-vim-mode"
+                role="status"
+                aria-live="polite"
+                aria-label={i18nT('components.chatInput.vim_mode_indicator', { mode: vim.mode === 'normal' ? i18nT('components.chatInput.vim_mode_normal') : i18nT('components.chatInput.vim_mode_insert') })}
+                className={`mr-1 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide ${vim.mode === 'normal' ? 'bg-accent text-text-strong' : 'bg-bg-accent text-muted'}`}
+              >
+                {vim.mode === 'normal' ? i18nT('components.chatInput.vim_mode_normal') : i18nT('components.chatInput.vim_mode_insert')}
+              </span>
+            )}
             <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} directFilePicker={directFilePicker} collapsible={collapsible} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} isMobile={isMobile} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus && !terminal.active} onFileSelect={terminal.active ? undefined : onFileSelect} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.

@@ -6174,7 +6174,10 @@
       "terminal_review": "確認してターミナルで実行",
       "terminal_force_stop": "エージェントを停止",
       "terminal_pending": "セッション情報の読み込みを待つか、別のセッションを選択してください。",
-      "terminal_run_review": "ターミナルコマンドを確認"
+      "terminal_run_review": "ターミナルコマンドを確認",
+      "vim_mode_indicator": "Vim mode: {{mode}}",
+      "vim_mode_normal": "Normal",
+      "vim_mode_insert": "Insert"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -15007,7 +15010,9 @@
         "message_font_size_desc": "会話のフォントサイズ（すべてのセッションに適用）：メッセージのテキスト、コード、表、返信候補、メッセージ入力欄。コンパクトなコンテンツ幅もそれに合わせて広がります。サイドバー、セッション一覧、その他のUIには影響しません。",
         "remove_the_agents_pin": "固定を解除",
         "failed_to_clear_agent_model_pin": "エージェントの固定モデルを解除できませんでした（{{error}}）。もう一度お試しください。",
-        "failed_to_clear_agent_model_pin_no_reason": "エージェントの固定モデルを解除できませんでした。もう一度お試しください。"
+        "failed_to_clear_agent_model_pin_no_reason": "エージェントの固定モデルを解除できませんでした。もう一度お試しください。",
+        "vim_mode": "Vim keybindings",
+        "vim_mode_desc": "Edit messages with Vim motions and commands in the composer. Normal and Insert modes, with a mode indicator. Off by default; Escape and standard editing are unchanged when off."
       },
       "computerUsePanel": {
         "accessibility": "アクセシビリティ",

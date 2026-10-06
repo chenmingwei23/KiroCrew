@@ -52,6 +52,12 @@ export interface ChatConfig {
    *  `spellCheck={false}` so the browser draws no red misspelled-word
    *  underlines. Default true — the behaviour every install has always had. */
   spellcheck: boolean
+  /** Opt in to Vim keybindings in the message composer (#6321). Default false:
+   *  with the setting off the composer is a plain textarea and the engine is
+   *  never invoked, so Escape and every other key keep their standard
+   *  behaviour. When on, the textarea composer gains Normal/Insert modes with
+   *  core motions and edits; a mode indicator shows which mode is active. */
+  vimMode: boolean
   /** Opt in to giving a folder that holds nothing no body at all, so it costs one
    *  row instead of two. Default false: this changes how every empty folder in
    *  the sidebar reads, and the row it removes is the only labelled "New chat in
@@ -105,7 +111,7 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, doubleClickToEdit: false, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, doubleClickToEdit: false, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE, vimMode: false }
 
 const clampMessageFontSize = (n: number): number =>
   Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
@@ -145,6 +151,9 @@ export function loadChatConfig(): ChatConfig {
     // Coerced, not trusted: a stored non-boolean must not decide whether the
     // composer draws the browser's red spellcheck underlines.
     if (typeof cfg.spellcheck !== 'boolean') cfg.spellcheck = true
+    // Coerced, not trusted: a stored non-boolean must not turn on the Vim
+    // keymap interception, which would otherwise ride on a truthy string.
+    if (typeof cfg.vimMode !== 'boolean') cfg.vimMode = false
     // Coerced, not trusted: a stored non-boolean would otherwise make the empty
     // folder shape depend on a truthy string.
     if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false

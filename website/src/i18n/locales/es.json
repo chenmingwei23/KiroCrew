@@ -6372,7 +6372,10 @@
       "terminal_review": "Revisar y ejecutar en el terminal",
       "terminal_force_stop": "Detener agente",
       "terminal_pending": "Espera a que se carguen los detalles de la sesión o selecciona otra sesión.",
-      "terminal_run_review": "Revisar comando de terminal"
+      "terminal_run_review": "Revisar comando de terminal",
+      "vim_mode_indicator": "Vim mode: {{mode}}",
+      "vim_mode_normal": "Normal",
+      "vim_mode_insert": "Insert"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -15475,7 +15478,9 @@
         "message_font_size_desc": "Tamaño de fuente de la conversación, en todas las sesiones: texto de los mensajes, código, tablas, respuestas sugeridas y el cuadro de entrada de mensajes. El ancho de contenido compacto crece en proporción. La barra lateral, la lista de sesiones y el resto de la interfaz no se ven afectados.",
         "remove_the_agents_pin": "Quitar su fijación",
         "failed_to_clear_agent_model_pin": "No se pudo quitar el modelo fijado del agente ({{error}}). Inténtalo de nuevo.",
-        "failed_to_clear_agent_model_pin_no_reason": "No se pudo quitar el modelo fijado del agente. Inténtalo de nuevo."
+        "failed_to_clear_agent_model_pin_no_reason": "No se pudo quitar el modelo fijado del agente. Inténtalo de nuevo.",
+        "vim_mode": "Vim keybindings",
+        "vim_mode_desc": "Edit messages with Vim motions and commands in the composer. Normal and Insert modes, with a mode indicator. Off by default; Escape and standard editing are unchanged when off."
       },
       "computerUsePanel": {
         "accessibility": "Accesibilidad",

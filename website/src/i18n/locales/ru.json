@@ -6471,7 +6471,10 @@
       "terminal_review": "Проверить и выполнить в терминале",
       "terminal_force_stop": "Остановить агента",
       "terminal_pending": "Дождись загрузки сведений о сеансе или выбери другой сеанс.",
-      "terminal_run_review": "Проверить команду терминала"
+      "terminal_run_review": "Проверить команду терминала",
+      "vim_mode_indicator": "Vim mode: {{mode}}",
+      "vim_mode_normal": "Normal",
+      "vim_mode_insert": "Insert"
     },
     "chatPane": {
       "agent_list": "Список агентов",
@@ -15709,7 +15712,9 @@
         "message_font_size_desc": "Размер шрифта беседы во всех сессиях: текст сообщений, код, таблицы, предлагаемые ответы и поле ввода сообщения. Компактная ширина содержимого растёт соответственно. Боковая панель, список сессий и остальной интерфейс не затрагиваются.",
         "remove_the_agents_pin": "Снять закрепление",
         "failed_to_clear_agent_model_pin": "Не удалось снять закреплённую модель агента ({{error}}). Попробуй ещё раз.",
-        "failed_to_clear_agent_model_pin_no_reason": "Не удалось снять закреплённую модель агента. Попробуй ещё раз."
+        "failed_to_clear_agent_model_pin_no_reason": "Не удалось снять закреплённую модель агента. Попробуй ещё раз.",
+        "vim_mode": "Vim keybindings",
+        "vim_mode_desc": "Edit messages with Vim motions and commands in the composer. Normal and Insert modes, with a mode indicator. Off by default; Escape and standard editing are unchanged when off."
       },
       "computerUsePanel": {
         "accessibility": "Универсальный доступ",

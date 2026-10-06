@@ -2074,7 +2074,10 @@
       "terminal_review": "Review and run in terminal",
       "terminal_run_review": "Review terminal command",
       "terminal_force_stop": "Stop agent",
-      "terminal_pending": "Wait for session details to load, or select another session."
+      "terminal_pending": "Wait for session details to load, or select another session.",
+      "vim_mode_indicator": "Vim mode: {{mode}}",
+      "vim_mode_normal": "Normal",
+      "vim_mode_insert": "Insert"
     },
     "chatPane": {
       "crewmate_quiet": "{{name}} hasn't said anything to you yet.",
@@ -6954,7 +6957,9 @@
         "failed_to_load_feature_video_status": "Failed to load feature-video cache status",
         "failed_to_start_feature_video_download": "Failed to start the download",
         "message_font_size": "Message Font Size",
-        "message_font_size_desc": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected."
+        "message_font_size_desc": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
+        "vim_mode": "Vim keybindings",
+        "vim_mode_desc": "Edit messages with Vim motions and commands in the composer. Normal and Insert modes, with a mode indicator. Off by default; Escape and standard editing are unchanged when off."
       },
       "displayPanel": {
         "color": "Color {{n}}",

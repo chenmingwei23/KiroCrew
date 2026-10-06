@@ -6372,7 +6372,10 @@
       "terminal_review": "Vérifier et exécuter dans le terminal",
       "terminal_force_stop": "Arrêter l’agent",
       "terminal_pending": "Attends le chargement des détails de la session ou sélectionne une autre session.",
-      "terminal_run_review": "Vérifier la commande du terminal"
+      "terminal_run_review": "Vérifier la commande du terminal",
+      "vim_mode_indicator": "Vim mode: {{mode}}",
+      "vim_mode_normal": "Normal",
+      "vim_mode_insert": "Insert"
     },
     "chatPane": {
       "agent_list": "Liste des agents",
@@ -15475,7 +15478,9 @@
         "message_font_size_desc": "Taille de police de la conversation, dans toutes les sessions : texte des messages, code, tableaux, réponses suggérées et zone de saisie du message. La largeur de contenu compacte s'élargit en proportion. La barre latérale, la liste des sessions et le reste de l'interface ne sont pas affectés.",
         "remove_the_agents_pin": "Retirer son épingle",
         "failed_to_clear_agent_model_pin": "Impossible de retirer le modèle épinglé de l’agent ({{error}}). Réessaie.",
-        "failed_to_clear_agent_model_pin_no_reason": "Impossible de retirer le modèle épinglé de l’agent. Réessaie."
+        "failed_to_clear_agent_model_pin_no_reason": "Impossible de retirer le modèle épinglé de l’agent. Réessaie.",
+        "vim_mode": "Vim keybindings",
+        "vim_mode_desc": "Edit messages with Vim motions and commands in the composer. Normal and Insert modes, with a mode indicator. Off by default; Escape and standard editing are unchanged when off."
       },
       "computerUsePanel": {
         "accessibility": "Accessibilité",
