@@ -665,6 +665,55 @@ class TestContextTrace:
         assert out["slot"] == SLOT
         assert any("usage fold unreadable" in r.message for r in caplog.records)
 
+    def test_blocks_are_correlated_to_the_turns_stop_reason(self):
+        """The correlation buckets a turn's blocks under how that turn ended.
+
+        One turn ends ``tool_stall``, another ``end_turn``: a reader can then see which
+        blocks travelled with the stall and compare it against the clean turn. The
+        per-row ``stop_reason`` carries the same fact for a reader grouping the rows
+        itself.
+        """
+        _open(window=200_000)
+        _compose({"memory": 40_000, "loaded_skill": 90_000}, turn=1, phase=PHASE_PER_TURN)
+        crew_log_emit.on_turn_completed(
+            UNIT, 1, model="opus-5", context_used=180_000, context_window=200_000,
+            stop_reason="tool_stall",
+        )
+        _compose({"memory": 40_000, USER_LABEL: 120}, turn=2, phase=PHASE_PER_TURN)
+        crew_log_emit.on_turn_completed(
+            UNIT, 2, model="opus-5", context_used=50_000, context_window=200_000,
+            stop_reason="end_turn",
+        )
+        _flush()
+        out = usage_mod.context_trace(SLOT, 14)
+
+        # Each row carries its own terminal stop reason.
+        assert [t["stop_reason"] for t in out["turns"]] == ["tool_stall", "end_turn"]
+        # The correlation separates the two: loaded_skill rode only the stalled turn.
+        by_stop = out["by_stop_reason"]
+        assert set(by_stop) == {"tool_stall", "end_turn"}
+        assert by_stop["tool_stall"] == {
+            "memory": {"blocks": 1, "chars": 40_000},
+            "loaded_skill": {"blocks": 1, "chars": 90_000},
+        }
+        assert by_stop["end_turn"] == {
+            "memory": {"blocks": 1, "chars": 40_000},
+            "your_message": {"blocks": 1, "chars": 120},
+        }
+
+    def test_an_unclosed_turn_is_absent_from_the_correlation(self):
+        """A composition whose turn never closed carries no stop reason, so it is not
+
+        bucketed: an unsealed row is a turn still in flight, not a measurement of 0.
+        """
+        _open(window=200_000)
+        _compose({"memory": 100}, turn=1, phase=PHASE_PER_TURN)
+        # No turn/completed for turn 1.
+        _flush()
+        out = usage_mod.context_trace(SLOT, 14)
+        assert out["by_stop_reason"] == {}
+        assert out["turns"][0]["stop_reason"] == ""
+
 
 def _projection_with(rows: list[dict[str, Any]], **context: Any):
     """A stand-in ``usage`` projection carrying exactly *rows*.
@@ -1198,6 +1247,7 @@ class TestContextTraceParityWithTheShardScan:
                     "context_used": 9_000,
                     "context_window": 200_000,
                     "model": "opus-5",
+                    "stop_reason": "",
                     "ordinal": 1,
                 },
                 {
@@ -1207,6 +1257,7 @@ class TestContextTraceParityWithTheShardScan:
                     "context_used": 12_500,
                     "context_window": 200_000,
                     "model": "opus-5",
+                    "stop_reason": "",
                     "ordinal": 2,
                 },
             ],
@@ -1215,6 +1266,19 @@ class TestContextTraceParityWithTheShardScan:
             "user_chars": 460,
             "peak_context_used": 12_500,
             "context_window": 200_000,
+            # These closers stated no stop reason, so both turns bucket under "" -- a
+            # clean finish with no watchdog verdict. A reader compares a stall bucket
+            # (``tool_stall`` / ``stale_recover``) against this baseline: the per-block
+            # utility signal. Char/block totals are per block label, summed over the
+            # folded turns.
+            "by_stop_reason": {
+                "": {
+                    "lessons": {"blocks": 1, "chars": 5_000},
+                    "memory": {"blocks": 1, "chars": 30_000},
+                    "surface": {"blocks": 1, "chars": 200},
+                    "your_message": {"blocks": 2, "chars": 460},
+                }
+            },
             "window_days": 14,
         }
         # A stamp is an ISO-8601 UTC string, which is what the declared shape says and

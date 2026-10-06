@@ -851,6 +851,12 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
                 "context_used": used,
                 "context_window": row_window,
                 "model": str(row.get("model") or ""),
+                # How this turn ended, carried through so a reader can group the
+                # per-turn breakdown by stop reason. "" is a clean finish with
+                # no watchdog verdict; a watchdog outcome reads e.g. "tool_stall" /
+                # "stale_recover". Absent on an unsealed (never-closed) row, which
+                # str-coerces to "".
+                "stop_reason": str(row.get("stop_reason") or ""),
                 # The row's EXACT position in the whole session history, assigned by the
                 # fold before any truncation. A reader shows this as the turn's number
                 # directly, so it stays true no matter how many older rows the fold
@@ -897,8 +903,40 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
         # the session is configured with, which is what a reader with no reading can
         # still be told.
         "context_window": peak_window if peak_seen else _coerce_int(context.get("window")),
+        # Per-stop-reason per-block correlation. The fold aggregates this over
+        # every turn it folded, not only the per-turn ``turns`` window above, so it is
+        # read straight through rather than recomputed from the (truncated) rows. Values
+        # are coerced here the same way the per-row blocks are, because the fold's own
+        # output is the one source the handler does not re-validate elsewhere.
+        "by_stop_reason": _coerce_by_stop(context.get("by_stop_reason")),
         "window_days": days,
     }
+
+
+def _coerce_by_stop(raw: Any) -> dict[str, dict[str, dict[str, int]]]:
+    """The fold's ``by_stop_reason`` map, with every count coerced to a non-negative int.
+
+    Shaped ``{stop_reason: {label: {"blocks": int, "chars": int}}}``. A damaged or
+    legacy fold (one recorded before this field existed) yields ``None`` or a wrong
+    type, which reads as "no correlation recorded" -- an empty map -- rather than a
+    500, the same tolerance the per-turn reader keeps for absent occupancy keys.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for reason, blocks in raw.items():
+        if not isinstance(reason, str) or not isinstance(blocks, dict):
+            continue
+        reason_out: dict[str, dict[str, int]] = {}
+        for label, cell in blocks.items():
+            if not isinstance(label, str) or not isinstance(cell, dict):
+                continue
+            reason_out[label] = {
+                "blocks": _coerce_int(cell.get("blocks")),
+                "chars": _coerce_int(cell.get("chars")),
+            }
+        out[reason] = reason_out
+    return out
 
 
 def _row_iso(raw: Any) -> tuple[float, str] | None:

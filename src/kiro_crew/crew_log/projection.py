@@ -1495,6 +1495,13 @@ def _usage_start() -> dict[str, Any]:
         "context_blocks": 0,
         "context_estimated": 0,
         "context_by_source": {},
+        # Per-STOP-REASON per-source char/block totals: the per-block utility
+        # correlation. Keyed first by the turn's terminal stop reason (``""`` for a
+        # clean finish the closer gave no verdict for), then by block label, so a
+        # reader can compare which blocks a stalled turn carried against a clean one's
+        # without scanning the per-turn rows (which the day/window bound and
+        # ``CONTEXT_TURNS_LIMIT`` truncate). Folded once per row at its seal in ``_usage_step``.
+        "context_by_stop": {},
         # Sources a retained row could not detail (see ``CONTEXT_SOURCES_PER_TURN_LIMIT``).
         "context_sources_omitted": 0,
         # The per-turn window the Context panel reads, newest LAST, bounded by
@@ -1816,6 +1823,14 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
         if isinstance(occupancy, dict):
             used = _as_int(occupancy.get("used"))
             window = _as_int(occupancy.get("window"))
+        # The turn's terminal stop reason, read off the SAME closer that carries the
+        # occupancy and sealed onto the turn's rows below. It is the join key the
+        # per-block utility correlation needs: a row's ``sources`` says which blocks
+        # the turn carried, and this says how that turn ended (``end_turn`` vs a
+        # watchdog outcome like ``tool_stall`` / ``stale_recover``). ``None`` when the
+        # closer named none, which is a clean ``end_turn``-style finish with no
+        # watchdog verdict rather than a measurement that is missing.
+        stop_reason = _as_text_or_none(data.get("stop_reason"))
         turn_no = _as_int(data.get("turn"))
         unit_no = state["context_unit"]
         rows = state["context_turns"]
@@ -1845,7 +1860,27 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
                 # borrowing another turn's size would pair the number with something it
                 # was never measured against.
                 sealed["used_window"] = window
+            # The stop reason the closer stated, stamped onto the row the same way the
+            # occupancy reading is: the closer is the one entry that knows how the turn
+            # ended, and the composition that built the row ran before it. ``None`` is a
+            # clean finish with no watchdog verdict; it is written as the key below so a
+            # reader can tell "ended cleanly" from "never closed" (an unsealed row has
+            # no ``stop_reason`` key at all).
+            sealed["stop_reason"] = stop_reason
             rows[index] = sealed
+            # Fold this row's per-block breakdown into the session-wide correlation,
+            # ONCE -- the loop seals each row exactly once (it stops at the first
+            # already-``_closed`` row), so a retried or re-attached turn cannot
+            # double-count. ``stop_reason`` None buckets under "" so an unverdicted
+            # clean finish is a bucket of its own rather than silently dropped. This is
+            # the per-block utility signal: which context blocks are present in turns
+            # that end in ``end_turn`` vs ``tool_stall`` vs ``stale_recover``, as a
+            # read-only breakdown over data the fold already carries -- no auto-tuning.
+            bucket = state["context_by_stop"].setdefault(stop_reason or "", {})
+            for label, chars in sealed.get("sources", {}).items():
+                per_label = bucket.setdefault(label, {"blocks": 0, "chars": 0})
+                per_label["blocks"] += 1
+                per_label["chars"] += _as_int(chars)
         duration = data.get("duration_ms")
         if isinstance(duration, int) and not isinstance(duration, bool):
             state["duration_ms"] += duration
@@ -2059,6 +2094,17 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
             "estimated_turns": state["context_estimated"],
             "by_source": {
                 name: dict(row) for name, row in sorted(state["context_by_source"].items())
+            },
+            # The per-block utility correlation: for each terminal stop reason
+            # (``""`` is a clean finish the closer gave no verdict for), the blocks the
+            # turns that ended that way carried, as block/char totals. A reader compares
+            # ``tool_stall`` / ``stale_recover`` against ``end_turn`` to see which blocks
+            # travel with stalls -- read-only signal to inform budget allocation, with no
+            # auto-tuning. Derived from the sealed rows, so it covers every turn folded,
+            # not only the ``CONTEXT_TURNS_LIMIT`` window the ``turns`` list retains.
+            "by_stop_reason": {
+                reason: {label: dict(cell) for label, cell in sorted(blocks.items())}
+                for reason, blocks in sorted(state["context_by_stop"].items())
             },
             # How many sources the retained ``turns`` rows leave out, across the session.
             # 0 means every row's ``sources`` is its whole breakdown.
@@ -5983,6 +6029,13 @@ def _usage_copy(state: dict[str, Any]) -> dict[str, Any]:
     grown["by_model"] = {model: dict(row) for model, row in state["by_model"].items()}
     grown["context_by_source"] = {
         source: dict(row) for source, row in state["context_by_source"].items()
+    }
+    # Nested two levels (stop reason -> label -> {blocks, chars}) and incremented in
+    # place at each row's seal, so both levels are rebuilt: a shared inner cell would
+    # have a snapshot's totals grow under the reader holding it.
+    grown["context_by_stop"] = {
+        reason: {label: dict(cell) for label, cell in blocks.items()}
+        for reason, blocks in state["context_by_stop"].items()
     }
     # Appended to, trimmed from the front, and a row is REPLACED when its turn's
     # occupancy arrives -- so only the LIST is rebuilt. The row dicts are shared with

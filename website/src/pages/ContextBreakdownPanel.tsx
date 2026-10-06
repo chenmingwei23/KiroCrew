@@ -25,11 +25,22 @@ export interface ContextTurn {
   context_used: number
   context_window: number
   model: string
+  /** How the turn ended, as the backend fold sealed it from the turn closer: ''
+   *  is a clean finish the closer gave no watchdog verdict for, a watchdog outcome
+   *  reads e.g. 'tool_stall' / 'stale_recover'. The join key behind
+   *  `ContextTrace.by_stop_reason`. */
+  stop_reason: string
   /** The turn's EXACT 1-based position in the whole session history, assigned by the
    *  backend fold before any truncation. Shown as the turn number directly: it stays
    *  true no matter how many older turns the fold dropped or this day view excluded,
    *  where a count applied to the array index would not. */
   ordinal: number
+}
+
+/** Per-block char/block totals for the turns that ended with one stop reason. */
+export interface StopReasonBlock {
+  blocks: number
+  chars: number
 }
 
 export interface ContextTrace {
@@ -41,6 +52,13 @@ export interface ContextTrace {
   /** Occupancy pair in TOKENS, read by the Session Breakdown tree. */
   peak_context_used: number
   context_window: number
+  /** Per-STOP-REASON per-block correlation: for each terminal stop reason ('' is a
+   *  clean finish), the blocks the turns that ended that way carried, in chars and
+   *  block count. Aggregated by the backend over every turn it folded -- not only the
+   *  truncated `turns` window -- so a reader can compare which blocks travel with a
+   *  stall (`tool_stall` / `stale_recover`) against a clean `end_turn`. Read-only
+   *  signal to inform budget allocation; no auto-tuning. */
+  by_stop_reason: Record<string, Record<string, StopReasonBlock>>
   window_days: number
 }
 

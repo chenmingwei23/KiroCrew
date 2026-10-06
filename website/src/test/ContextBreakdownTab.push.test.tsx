@@ -42,6 +42,7 @@ function trace(turns: number): ContextTrace {
       context_used: 0,
       context_window: 0,
       model: 'm',
+      stop_reason: '',
       ordinal: i + 1,
     })),
     totals: { your_message: 10 * turns },
@@ -49,6 +50,7 @@ function trace(turns: number): ContextTrace {
     user_chars: 10 * turns,
     peak_context_used: 0,
     context_window: 0,
+    by_stop_reason: {},
     window_days: 14,
   }
 }

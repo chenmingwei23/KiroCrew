@@ -55,6 +55,7 @@ const turn = (over: Partial<ContextTurn> = {}): ContextTurn => ({
   context_used: 2000,
   context_window: 200000,
   model: 'claude',
+  stop_reason: '',
   ordinal: 0,
   ...over,
 })
@@ -67,6 +68,7 @@ const trace = (over: Partial<ContextTrace> = {}): ContextTrace => ({
   user_chars: 0,
   peak_context_used: 0,
   context_window: 0,
+  by_stop_reason: {},
   window_days: 14,
   ...over,
 })
