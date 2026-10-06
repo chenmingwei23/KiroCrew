@@ -268,6 +268,10 @@ export default [
       // iframe element) that hosts an untrusted widget in a browser popout —
       // never user-facing copy. Same rationale as the srcdoc builders above.
       'src/apps/mochi/src/shared/widgetPopout.ts',
+      // Machine HTML/markup only (DOCTYPE, a fixed stylesheet, a sandboxed
+      // iframe element) that hosts an untrusted local HTML file in a browser
+      // popout — never user-facing copy. Same rationale as widgetPopout.ts.
+      'src/utils/htmlPopout.ts',
       // Key glyphs / key-cap names only (⌘ ⇧ ⌥ / Ctrl Win Alt) — a machine
       // grammar the OS parses, not translatable copy. Same rationale as above.
       'src/apps/mochi/src/shared/shortcut.ts',

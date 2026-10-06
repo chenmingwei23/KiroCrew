@@ -8,6 +8,7 @@ import { ExcalidrawBlock } from './ExcalidrawBlock'
 import ErrorNotice from './ErrorNotice'
 import { useCanOpenFile, useCopyAck } from './FilePathMenu'
 import { fileDownloadUrl, fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
+import { openHtmlInNewTab } from '../utils/htmlPopout'
 import { sendErrorToChat } from '../utils/errorReport'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /* ── extension helpers ── */
@@ -273,20 +274,39 @@ export const JsonlViewer = memo(function JsonlViewer({ content }: { content: str
   )
 })
 
-/* ── HTML preview (sandboxed iframe) ── */
+/* ── HTML preview (sandboxed iframe) ──
+ *
+ * The inline preview below keeps `sandbox=""` (NO allowances): the srcDoc
+ * document stays fully inert, so a local HTML file that pulls a CDN `<script>`
+ * (Mermaid, Chart.js, …) shows its raw source here rather than running. That is
+ * a deliberate trust boundary — the preview must never execute agent-written or
+ * downloaded markup on the dashboard origin — and this component does not relax
+ * it.
+ *
+ * To actually SEE such a document rendered, the "Open in new tab" button pops it
+ * out into a real browser tab where scripts (CDN-loaded included) run natively.
+ * `openHtmlInNewTab` keeps that popout origin-isolated (a null-origin
+ * `sandbox="allow-scripts"` host frame), so the document can touch neither the
+ * dashboard origin nor the filesystem. See `utils/htmlPopout.ts`. */
 export const HtmlViewer = memo(function HtmlViewer({ content }: { content: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
-    <div className="h-full border border-border rounded-md overflow-hidden bg-white">
+    <div className="h-full border border-border rounded-md overflow-hidden bg-white flex flex-col">
       <iframe
         srcDoc={content}
         sandbox=""
-        className="w-full h-full border-none"
+        className="flex-1 w-full border-none"
         // Own compositing layer: a sandboxed srcDoc frame with no transform can
         // skip its first paint and render blank. Same remedy as McpAppFrame.
         style={{ transform: 'translateZ(0)' }}
         title={i18nT('components.fileRenderers.html_preview')}
       />
+      <div className="flex justify-end p-1 bg-chrome border-t border-border">
+        <button
+          className="px-2 py-1 rounded text-[11px] text-muted hover:text-text cursor-pointer bg-transparent border-none"
+          onClick={() => openHtmlInNewTab(content, i18nT('components.fileRenderers.html_preview'))}
+        >{i18nT('components.fileRenderers.open_in_new_tab')}</button>
+      </div>
     </div>
   )
 })

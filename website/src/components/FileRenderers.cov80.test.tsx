@@ -174,6 +174,30 @@ describe('HtmlViewer', () => {
     expect(frame.getAttribute('sandbox')).toBe('')
     expect(frame.getAttribute('srcdoc')).toBe('<p>zzq body</p>')
   })
+
+  it('opens an origin-isolated popout (allow-scripts, never a top-level doc) in a new tab', () => {
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockReturnValue('blob:zzq')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    const widget = '<script>parent.localStorage.clear()</script><div>mermaid</div>'
+    render(<HtmlViewer content={widget} />)
+    fireEvent.click(
+      screen.getByRole('button', { name: i18nT('components.fileRenderers.open_in_new_tab') }),
+    )
+
+    // Opened the blob url in a NEW tab with noopener — not a navigation to the markup.
+    expect(open).toHaveBeenCalledWith('blob:zzq', '_blank', 'noopener')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    const blobArg = createObjectURL.mock.calls[0][0] as Blob
+    expect(blobArg.type).toBe('text/html')
+
+    open.mockRestore()
+    createObjectURL.mockRestore()
+    revoke.mockRestore()
+  })
 })
 
 describe('PdfViewer', () => {
