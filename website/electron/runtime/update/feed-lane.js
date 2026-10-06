@@ -43,7 +43,6 @@ function createFeedLane({
   checkIntervalMs,
 }) {
   let updateReady = false;
-  let downloading = false;
   let stagedVersion = null; // version electron-updater has downloaded + staged
   let stagedNotes = "";
   // Was the staged build fetched by the auto-download policy rather than asked
@@ -56,8 +55,44 @@ function createFeedLane({
   // the update-downloaded handler -- the event carries no provenance of its own.
   let downloadWasAutomatic = false;
   let foundVersion = null; // last version surfaced to the user, awaiting consent
-  let installing = false;
-  let quitHandled = false;
+
+  // The ONE mutually-exclusive lifecycle position of the download/install side
+  // of the lane. It replaces the old `downloading` / `installing` / `quitHandled`
+  // boolean trio, which encoded exactly these four states across three flags
+  // with no declaration of which combinations were legal:
+  //
+  //   IDLE                 nothing moving  (all three were false)
+  //   DOWNLOADING          bytes in flight (downloading)
+  //   INSTALLING_MANUAL    the Install & Restart dispatch (installing)
+  //   INSTALLING_DEFERRED  the install-on-quit dispatch   (quitHandled)
+  //
+  // They were mutually exclusive in practice — an install requires a completed
+  // download (which clears `downloading`), and the manual and deferred install
+  // paths each tear the other's hook down — but nothing in the code SAID so, so
+  // every guard re-derived the legal set by hand. Making it one variable makes
+  // the illegal combinations unrepresentable rather than merely unreached, which
+  // is the whole point of #10282.
+  //
+  // `checking` stays a SEPARATE flag below, deliberately: a feed check already
+  // in flight when the user clicks Install straddles the install dispatch (that
+  // overlap is what applyUpdateAndRestart's post-stopGateway `checking` abort and
+  // the error handler's install-outranks-check precedence exist to handle), so
+  // discovery is a genuinely independent axis, not another value of this enum.
+  const Phase = Object.freeze({
+    IDLE: "idle",
+    DOWNLOADING: "downloading",
+    INSTALLING_MANUAL: "installing-manual",
+    INSTALLING_DEFERRED: "installing-deferred",
+  });
+  let phase = Phase.IDLE;
+  // True iff an install dispatch (manual or deferred) is underway: the window in
+  // which the gateway is being stopped on purpose and the process is handing off
+  // to the platform installer. Replaces the old `installing || quitHandled`
+  // test every install-aware guard spelled out.
+  const installingNow = () =>
+    phase === Phase.INSTALLING_MANUAL || phase === Phase.INSTALLING_DEFERRED;
+
+  // Is a feed check in flight? Independent of `phase` — see the note above.
   let checking = false;
   // The channel the LAST configureFeed() pointed the updater at. Captured at
   // check time because the update-available handler's direction gate must
@@ -131,18 +166,18 @@ function createFeedLane({
    */
   async function safeCheck() {
     if (checking) return;
-    if (installing || quitHandled) {
+    if (installingNow()) {
       // Install activity: the gateway is stopped on purpose and the process
       // is handing off to the platform installer. The poll timer already
       // skips this window (see pollTimer below); the renderer-driven path
       // must refuse for the same reasons — a check outcome here either races
-      // the handoff or, because `installing` outranks `checking` in the error
-      // handler's phase derivation, a feed failure would fire the host's
+      // the handoff or, because an install phase outranks `checking` in the
+      // error handler's phase derivation, a feed failure would fire the host's
       // gateway recovery in the middle of the bundle swap.
       log.info("[update] check requested during install activity — skipping");
       return;
     }
-    if (downloading) {
+    if (phase === Phase.DOWNLOADING) {
       // A download is in flight. Re-entering the check would restart the
       // updater's flow underneath the running download; report progress
       // instead. update-downloaded/error clears the flag.
@@ -187,7 +222,7 @@ function createFeedLane({
    * with nothing discovered discovers instead of blind-downloading.
    */
   async function startDownload({ automatic = false } = {}) {
-    if (downloading) { emit("downloading", { version: pendingVersion() }); return; }
+    if (phase === Phase.DOWNLOADING) { emit("downloading", { version: pendingVersion() }); return; }
     if (updateReady && stagedVersion) {
       emit("downloaded", { version: stagedVersion, notes: stagedNotes });
       return;
@@ -200,13 +235,13 @@ function createFeedLane({
       return;
     }
     log.info(`[update] downloading ${foundVersion}`);
-    downloading = true;
+    phase = Phase.DOWNLOADING;
     downloadWasAutomatic = automatic;
     emit("downloading", { version: pendingVersion() });
     try {
       await autoUpdater.downloadUpdate();
     } catch (err) {
-      downloading = false;
+      phase = Phase.IDLE;
       emitError("download", err);
     }
   }
@@ -290,7 +325,7 @@ function createFeedLane({
   }
 
   async function applyUpdateAndRestart() {
-    if (installing) return;
+    if (installingNow()) return;
     // REQUIRE a staged update. Without this guard an install() dispatched
     // before the download finished reaches MacUpdater.quitAndInstall()'s
     // squirrelDownloadedUpdate === false branch, which does NOT install --
@@ -304,7 +339,7 @@ function createFeedLane({
       emit(foundVersion ? "found" : "not-available", foundVersion ? { version: foundVersion } : {});
       return;
     }
-    installing = true;
+    phase = Phase.INSTALLING_MANUAL;
     // Tell the renderer the install is UNDERWAY before anything goes silent:
     // the gateway is about to be stopped on purpose, and without this state
     // the dashboard renders the stoppage as an outage (offline pill, failed
@@ -324,11 +359,11 @@ function createFeedLane({
       log.error("[update] gateway stop errored (continuing to install)", err);
     }
     // An install-phase failure can land while the gateway stops: the error
-    // handler classifies it (installing outranks checking there), resets
-    // `installing`, and runs the host recovery. This dispatch is already
+    // handler classifies it (an install phase outranks checking there), resets
+    // the phase to IDLE, and runs the host recovery. This dispatch is already
     // dead — proceeding would install on a failure the user was just told
     // about, and aborting would run the recovery a second time.
-    if (!installing) {
+    if (phase !== Phase.INSTALLING_MANUAL) {
       log.info("[update] install failed while the gateway stopped — dispatch abandoned");
       return;
     }
@@ -350,7 +385,7 @@ function createFeedLane({
           ? "[update] stage invalidated while the gateway stopped — aborting install and restoring"
           : "[update] check still in flight after the gateway stopped — aborting install and restoring",
       );
-      installing = false;
+      phase = Phase.IDLE;
       try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
       // Use the install-error renderer contract, NOT a bare found/not-available:
       // the user just clicked Install Update & Restart App and is watching an install
@@ -379,7 +414,7 @@ function createFeedLane({
   // gateway must be stopped first; before-quit can't await async work, so
   // preventDefault, stop the gateway, then quitAndInstall.
   function deferredInstallOnQuit(event) {
-    if (quitHandled || !updateReady) return;
+    if (phase === Phase.INSTALLING_DEFERRED || !updateReady) return;
     // The opt-out has to govern the update the user opted out BECAUSE OF.
     // Without this, the nudge says "downloading, will install on your next
     // quit", the user follows it to the toggle and switches it off, and the
@@ -407,7 +442,7 @@ function createFeedLane({
         return;
       }
     }
-    quitHandled = true;
+    phase = Phase.INSTALLING_DEFERRED;
     event.preventDefault();
     (async () => {
       // Same signal as the manual path: the window can stay visible for
@@ -421,8 +456,8 @@ function createFeedLane({
       // Same stage re-check as the manual path: a feed response in flight at
       // quit time can invalidate the stage while the gateway stops. The user
       // asked to QUIT, so skip the install and let the quit proceed. What
-      // makes the re-entry safe is the LISTENER state, not `quitHandled`: a
-      // retraction handler resets `quitHandled = false` and removes this
+      // makes the re-entry safe is the LISTENER state, not the phase: a
+      // retraction handler resets the phase to IDLE and removes this
       // listener, and it was registered with app.once so it has already been
       // consumed -- either way no live before-quit hook re-prevents the quit,
       // so app.quit() exits normally without installing the withdrawn build.
@@ -481,10 +516,10 @@ function createFeedLane({
   }
 
   autoUpdater.on("error", (err) => {
-    // The library funnels every failure through one event, so derive the phase
-    // from the operation actually in flight. Read the flags BEFORE clearing
-    // `downloading`, or a mid-download failure would be reported as a check
-    // failure. `installing` must outrank `checking`: once an install is
+    // The library funnels every failure through one event, so derive the error
+    // phase from the operation actually in flight. Read the state BEFORE
+    // resetting it, or a mid-download failure would be reported as a check
+    // failure. An install phase must outrank `checking`: once an install is
     // dispatched the gateway is stopped ON PURPOSE, and a genuine installer
     // failure (observed live in the OTA lane: a Squirrel signature rejection)
     // that arrives while a check happens to be in flight would otherwise be
@@ -495,23 +530,41 @@ function createFeedLane({
     // the post-stopGateway abort would run anyway — and that abort refuses to
     // reach quitAndInstall while `checking` is true, so no check outcome can
     // fire recovery in the middle of an actual bundle swap. The
-    // `downloading`-before-`installing` precedence is long-standing behavior,
-    // preserved as-is.
-    const phase = downloading ? "download" : installing ? "install" : "check";
-    downloading = false;
-    if (phase === "install") {
+    // download-before-install precedence is long-standing behavior, preserved
+    // as-is; `checking` is the fallback because it is the one axis that can
+    // overlap an install (which is why it is a separate flag, not a phase).
+    //
+    // Only the MANUAL install dispatch maps to the "install" error phase, which
+    // preserves the pre-enum behavior exactly: the old derivation tested
+    // `installing` (set only by applyUpdateAndRestart), never `quitHandled`, so
+    // an error during a deferred install-on-quit classified as "check" and did
+    // NOT fire onInstallFailed — the quit path has no gateway to restore into a
+    // living app, it is on its way out.
+    const errPhase = phase === Phase.DOWNLOADING
+      ? "download"
+      : phase === Phase.INSTALLING_MANUAL
+        ? "install"
+        : "check";
+    if (phase === Phase.DOWNLOADING) phase = Phase.IDLE;
+    if (errPhase === "install") {
       // The dispatch is over: allow a retry (updateReady is still true -- the
       // zip is still staged) and tell the host to bring the gateway back.
       // Observed live in the OTA lane: a Squirrel signature rejection lands
       // here; without recovery the app survives with a dead dashboard.
-      installing = false;
+      phase = Phase.IDLE;
       try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
     }
-    emitError(phase, err);
+    emitError(errPhase, err);
   });
   autoUpdater.on("checking-for-update", () => { log.info("[update] checking…"); emit("checking"); });
   autoUpdater.on("update-not-available", () => {
-    downloading = false;
+    // Cancel an in-flight download, and disarm a deferred install-on-quit whose
+    // stage this response is invalidating -- but NEVER clear a MANUAL install
+    // dispatch: it is mid-flight through applyUpdateAndRestart, whose own
+    // post-stopGateway `!updateReady` re-check (below sets updateReady=false) is
+    // what aborts it. Mirrors the pre-enum pair `downloading = false;
+    // quitHandled = false;`, which likewise left `installing` untouched.
+    if (phase === Phase.DOWNLOADING || phase === Phase.INSTALLING_DEFERRED) phase = Phase.IDLE;
     foundVersion = null;
     // The feed's gate is DIFFERENCE-based (allowDowngrade=true), so "not
     // available" means the followed lane publishes exactly the running version:
@@ -531,7 +584,6 @@ function createFeedLane({
     updateReady = false;
     stagedVersion = null;
     stagedNotes = "";
-    quitHandled = false;
     app.removeListener("before-quit", deferredInstallOnQuit);
     log.info("[update] up to date");
     emit("not-available");
@@ -583,11 +635,12 @@ function createFeedLane({
       );
       if (updateReady || stagedVersion) {
         // A downgrade staged before this guard existed (or by a race) must not
-        // survive to install on the next quit.
+        // survive to install on the next quit. Disarm a deferred install-on-quit
+        // (never a manual dispatch -- see the update-not-available handler).
         updateReady = false;
         stagedVersion = null;
         stagedNotes = "";
-        quitHandled = false;
+        if (phase === Phase.INSTALLING_DEFERRED) phase = Phase.IDLE;
         app.removeListener("before-quit", deferredInstallOnQuit);
       }
       foundVersion = null;
@@ -651,7 +704,10 @@ function createFeedLane({
   });
   autoUpdater.on("update-downloaded", (info) => {
     updateReady = true;
-    downloading = false;
+    // Download done: the active phase ends. A stage now exists (updateReady /
+    // stagedVersion), but that is staged-data state, not a lifecycle position --
+    // the lane is idle until an install is dispatched.
+    if (phase === Phase.DOWNLOADING) phase = Phase.IDLE;
     stagedVersion = (info && info.version) || null;
     stagedNotes = notesFrom(info);
     stagedWasAutomatic = downloadWasAutomatic;
@@ -676,17 +732,16 @@ function createFeedLane({
   // staged case: re-surface when the stage is still latest, discard and
   // re-find when it is superseded.
   //
-  // INSTALL ACTIVITY is the one state the poll must still skip, and there are
-  // exactly two install entry points to cover: `installing` (the manual
-  // Restart & Update dispatch) and `quitHandled` (the deferred install on a
-  // natural quit, which never sets `installing`). In either window the
-  // gateway is being stopped on purpose and the process is about to hand off
-  // to the platform installer -- a check there is useless at best, and at
-  // worst its outcome (an error event, or a retraction clearing the stage
-  // under a dispatch that already passed its guard) races the handoff.
-  // Staged-but-idle and installing are different states; only the latter is
-  // unsafe to probe.
-  const pollTimer = setInterval(() => { if (!installing && !quitHandled) safeCheck(); }, checkIntervalMs);
+  // INSTALL ACTIVITY is the one state the poll must still skip, and the phase
+  // enum names both entry points it has to cover: INSTALLING_MANUAL (the
+  // Restart & Update dispatch) and INSTALLING_DEFERRED (the deferred install on
+  // a natural quit). In either window the gateway is being stopped on purpose
+  // and the process is about to hand off to the platform installer -- a check
+  // there is useless at best, and at worst its outcome (an error event, or a
+  // retraction clearing the stage under a dispatch that already passed its
+  // guard) races the handoff. Staged-but-idle and installing are different
+  // states; only the latter is unsafe to probe.
+  const pollTimer = setInterval(() => { if (!installingNow()) safeCheck(); }, checkIntervalMs);
   // Timers must never hold the process open (Electron quit, tests).
   if (typeof launchTimer.unref === "function") launchTimer.unref();
   if (typeof pollTimer.unref === "function") pollTimer.unref();
