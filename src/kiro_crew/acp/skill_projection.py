@@ -2956,7 +2956,17 @@ def prepare_native_skill_projection(
             # withholding the view for it would refuse a supported customization
             # and abort the spawn over a restriction that reaches the session.
             if per_session_element:
-                withheld = session_mcp.native_mount_withholding("kirocrew-core", original_core, [])
+                # kirocrew-core is a control-plane server: its ``disabledTools``
+                # ride the per-call gate the mount feeds, so they no longer
+                # withhold the element and must not refuse the view either --
+                # ``carry_disabled_tools`` makes this reader agree with the mount
+                # (#14125). ``skill_search`` itself being disabled was already
+                # refused above; what remains for carry are the OTHER tools the
+                # toggle named, which leave skill search standing. A mute, a
+                # non-stdio transport and an uncarriable key still withhold.
+                withheld = session_mcp.native_mount_withholding(
+                    "kirocrew-core", original_core, [], carry_disabled_tools=True
+                )
                 if withheld is not None:
                     errors[agent.name] = withheld.explain("skill search")
                     continue
