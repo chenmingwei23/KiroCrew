@@ -1473,15 +1473,45 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the module-global highlight names away from the visible panel.
   useEffect(() => { if (!active) closeFind() }, [active, closeFind])
 
-  // Capture-phase Cmd+F: fires before ChatPage's bubble-phase chat-find. We
-  // only steal the key in markdown preview when this panel is the active
-  // region; otherwise we let it bubble (chat-find) or let the editor handle it.
+  // Capture-phase Cmd+F: fires before ChatPage's bubble-phase chat-find.
+  //
+  // Four side-panel surfaces compete for the chord, and this handler is the one
+  // component that already knows which surface is on screen (`editing`,
+  // `diffMode`, `isMarkdown`) AND whether the user is looking at it
+  // (`findActiveRef`). So it is where the routing decision belongs:
+  //
+  //   • markdown preview — open our own in-document find (TreeWalker + CSS
+  //     Highlight API over `previewRef`), stealing the key from chat-find.
+  //   • edit mode — Pierre's editor binds the chord on its own content element
+  //     and preventDefault()s it, and #6397's `defaultPrevented` guard in
+  //     useMessageSearch already stops chat-find from stacking a second pane.
+  //     Nothing to do here; bail so the editor keeps ownership.
+  //   • code preview and read-only diff — there is no in-document find for
+  //     these yet (code preview is windowed behind Pierre's <Virtualizer> so a
+  //     DOM TreeWalker would silently under-report off-screen matches, and the
+  //     diff renders outside `previewRef`; a real find for either is an open
+  //     design question — see #6383). But chat-find answering the chord with
+  //     the conversation is strictly worse than not answering, so we YIELD the
+  //     key away from chat-find without opening anything. We only stop the
+  //     event reaching chat-find's bubble-phase listener; we deliberately do
+  //     NOT preventDefault(), so a native browser find bar (where one exists)
+  //     still opens over the file, which is honest about what is on screen.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!hasCommandModifier(e) || e.key.toLowerCase() !== 'f') return
       if (!active) return                                   // hidden tab: never claim the key
-      if (editing || diffMode || !isMarkdown) return       // editor owns it; non-markdown skip
+      if (editing) return                                   // editor owns it (#6397)
       if (!findActiveRef.current) return                    // cursor is in chat → let chat-find handle
+      if (diffMode || !isMarkdown) {
+        // Code preview / read-only diff: no in-document find to open, but keep
+        // chat-find from answering with the wrong content. Stopping the event
+        // in the capture phase prevents chat-find's bubble-phase listener from
+        // running at all; leaving the default action lets a native find bar
+        // (browser) open over the file.
+        e.stopImmediatePropagation()
+        return
+      }
+      // Markdown preview: open our own in-document find.
       e.preventDefault()
       e.stopImmediatePropagation()                          // beat ChatPage's bubble-phase chat-find
       setFindOpen(true)
