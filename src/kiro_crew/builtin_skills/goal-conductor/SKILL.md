@@ -25,12 +25,11 @@ all** — not `fs_write`, and not `code` either, which governance classes as a
 filesystem write because it writes files and can shell out. `grep`, `glob` and
 `web_search` are unmounted as well; `fs_read` and `web_fetch` are what you read
 the world with. That is deliberate. If a task needs a file written, it is a work
-item, not something you do. `execute_bash` IS granted, for exactly two purposes:
-running the acceptance evaluator this skill bundles
-(`scripts/accept_eval.py`) and its patrol budget script
+item, not something you do. The acceptance evaluator is the **`accept_eval` MCP
+tool** (not a shell command) — see "Verify every `done`" below. `execute_bash`
+IS still granted, now for ONE purpose: running the patrol budget script
 (`scripts/patrol_budget.py`). It is deliberately kept out of `allowedTools`, so
-every call prompts for approval — see "Known limits" for what that costs per
-patrol cycle.
+every call prompts for approval — see "Known limits" for what that costs.
 
 ## What is a work item
 
@@ -163,8 +162,8 @@ beats more parallelism: every open item is a session the user may have to read.
 For each item in the round, in **exactly this order**:
 
 1. `work_ledger_record` `action=create`, with the item's `title` and its
-   `acceptance` condition — the same condition object `accept_eval.py` parses,
-   stored verbatim. It returns the `item_id`.
+   `acceptance` condition — the same condition object the `accept_eval` tool
+   reads, stored verbatim. It returns the `item_id`.
 2. `session_create` with a title that says what the item is FOR, `folder` set to
    `<goal folder>/<agent>` — the goal's folder from Round 0 with the agent name
    as the subfolder, e.g. `Flaky test backlog/kirocrew-worker` (missing path
@@ -320,13 +319,16 @@ Each cycle:
    transcript and judging, and never by believing the claim.** Take the
    `accept_batch` from a full `work_ledger_read` (no `compact`), **keep only the entries
    whose item is currently `status: done`** — each entry carries that status, so
-   the filter is a read of the document you already have — and pipe that filtered
-   document through a **quoted heredoc**:
+   the filter is a read of the document you already have — and pass that filtered
+   list to the **`accept_eval` tool**:
 
-   ```bash
-   python3 <this skill's dir>/scripts/accept_eval.py <<'ACCEPT_BATCH'
-   <the accept_batch document, with every non-done and every placeholder entry removed>
-   ACCEPT_BATCH
+   ```
+   accept_eval(items=[
+     {"id": "item-1", "accept": {"kind": "pr_checks", "pr": 123, "repo": "owner/name"}},
+     {"id": "item-2", "accept": {"kind": "file", "path": "/abs/path", "exists": true}},
+   ])
+   -> {"results": [{"id": "...", "verdict": "pass|fail|pending|refused|error",
+                    "evidence": "..."}]}
    ```
 
    **The filter is yours to apply, and it is not optional.** `accept_batch` is
@@ -339,27 +341,22 @@ Each cycle:
    commit. Evaluating that item returns a genuine `pass` on unfinished work, and
    recording it with `action=verdict` then `action=close` closes the item under
    the worker. A `done` is the worker saying the world-state now means what the
-   condition says; only then is the evaluator's answer an acceptance. Never pipe
+   condition says; only then is the evaluator's answer an acceptance. Never send
    the unfiltered document.
 
-   **The heredoc is load-bearing, not style.** `acceptance` holds text you built
-   from ingested content — an issue title, a file path a worker named — and a
-   `file` path carrying a single quote would end a `'...'` string early and hand
-   the rest of the value to the shell as a command, which `execute_bash` then runs
-   after one approval. A heredoc whose delimiter is quoted (`<<'ACCEPT_BATCH'`) is
-   the one form the shell copies to stdin without interpreting anything inside it.
-   Never paste the document into a `printf '%s' '...'` or `echo '...'` argument,
-   and never let the document contain a line that is exactly `ACCEPT_BATCH`.
+   **`accept_eval` is an MCP tool, not a shell command, and that is deliberate.**
+   The acceptance condition holds text you built from ingested content — an issue
+   title, a file path a worker named. As a tool, the whole `items` document is a
+   structured argument, so a `file` path carrying a single quote is just a string
+   value — there is no shell to interpret it, no heredoc to get right, and no
+   `<this skill's dir>` path to resolve. Its calls pass the `hooks.on_tool_call`
+   gate like any other tool, so the sensitive-path floor governs a `file` path
+   and the denied-command floor governs anything it would run — neither of which
+   a bundled script invoked through `execute_bash` could reach.
 
-   **Resolve `<this skill's dir>` from where this SKILL.md was actually loaded
-   from** — the skill index names its absolute path. Do NOT hardcode a path under
-   the default skills root: a `KIROCREW_HOME` override moves it, so on such an
-   install that path does not exist and every evaluator call would fail before
-   patrol ever ran.
-
-   Evaluate **every `done` item in ONE call** — each invocation costs one
-   approval prompt — then record each answer with `work_ledger_record`
-   `action=verdict` (with `fails` when you are counting retries).
+   Evaluate **every `done` item in ONE call** — one batched call per cycle — then
+   record each answer with `work_ledger_record` `action=verdict` (with `fails`
+   when you are counting retries).
 
    Verdicts: `pass` / `fail` are final for this cycle. `pending` means keep
    waiting. `refused` means the spec asked for something the evaluator will not
@@ -400,11 +397,11 @@ Each cycle:
 6. **Say nothing unless there is a real signal.** An item passing acceptance,
    failing it, asking a question, or stalling. Never post "nothing changed".
 
-**Shell exists for the two bundled scripts, not for work.** `execute_bash` is
-granted so patrol can run `accept_eval.py` and `patrol_budget.py`. Running a work item's build, test, or fix
-yourself through it is the boundary violation this skill exists to prevent — if
-you need a command run to MAKE something true, that is a work item; the evaluator
-only CHECKS what is already true.
+**Shell exists for the patrol budget script, not for work.** `execute_bash` is
+granted so patrol can run `patrol_budget.py`. Running a work item's build, test,
+or fix yourself through it is the boundary violation this skill exists to
+prevent — if you need a command run to MAKE something true, that is a work item;
+the evaluator (the `accept_eval` tool) only CHECKS what is already true.
 
 ### Close the round
 
@@ -626,7 +623,8 @@ what the composer renders:
   granted by name too, and only these: `monitor_start`, `monitor_update`,
   `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
   `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
-  `select_crew`, `send_message`, `send_notification`, `ask_question`. That covers
+  `select_crew`, `send_message`, `send_notification`, `ask_question`,
+  `accept_eval`. That covers
   every core call this procedure asks you to make; **any other core tool is
   mounted but prompts**, including `task_run`, `workflow_run` and the `spawn_*`
   family, which this charter forbids you to route a work item to in the first
@@ -638,11 +636,12 @@ what the composer renders:
   question you answer, and one if you ever stop an item. `session_close` sits on
   the same footing — it writes to a session that is not yours, even though it
   archives rather than deletes — so budget one approval per child you close out.
-  `execute_bash` also still prompts, so **each patrol cycle that verifies
-  anything blocks on one approval for the `accept_eval.py` invocation**. Size
-  the nudge interval for that, and batch. `patrol_budget.py` prompts the same
-  way, which is why it runs once at arm time and then only on
-  `10% or less left` cycles. On a host with a governance ceiling
+  **`accept_eval` is auto-approved**, so a patrol cycle that verifies a `done`
+  item never blocks on an approval — that is the user-visible win of moving the
+  evaluator out of `execute_bash` into a tool. `execute_bash` itself still
+  prompts (it is never auto-approved), so the one call that costs an approval
+  per budget check is `patrol_budget.py`, which is why it runs once at arm time
+  and then only on `10% or less left` cycles. On a host with a governance ceiling
   even the granted verbs prompt; if you see approvals where this says you
   should not, that is why.
 - **`session_send` reports delivery, not completion.** `started: true` means the
@@ -661,16 +660,19 @@ what the composer renders:
   app-scoped sessions, channel-linked or mirrored sessions,
   and sessions in another workspace are all refused by the shared guard. Plan
   work items onto plain persistent dashboard sessions only.
-- **Shell is for the two bundled scripts only, and the evaluator runs no
-  command you name.** `execute_bash` exists so patrol can run `accept_eval.py`
-  and `patrol_budget.py`; every call is
-  audit-logged and every call prompts. The evaluator accepts **no command, argv
-  array, or shell string from a spec** — it builds every argv it runs from a
-  fixed template, so `pr_checks` becomes `gh pr checks <n>` and nothing else
-  executes. That is deliberate and load-bearing: this script is invoked as an
-  approved wrapper, so a spec that could name a command would turn it into a
-  general way to run one, and Kiro Crew's denied-command floor cannot see inside
-  it (the floor reads the `execute_bash` string, which says
-  `python3 accept_eval.py`). Widening happens by adding a purpose-built kind that
-  constructs its own argv — never by accepting one. A `refused` verdict is a spec
-  to re-express, never a list to route around.
+- **Shell is for the patrol budget script only, and the evaluator runs no
+  command you name.** `execute_bash` exists so patrol can run `patrol_budget.py`;
+  every call is audit-logged and every call prompts. The evaluator is the
+  `accept_eval` tool, and it accepts **no command, argv array, or shell string
+  from a spec** — it builds every argv it runs from a fixed template, so
+  `pr_checks` becomes `gh pr checks <n>` and nothing else executes. That is
+  deliberate and load-bearing: a spec that could name a command would turn the
+  evaluator into a general way to run one. Because it is now an MCP tool rather
+  than a script behind `execute_bash`, its calls pass the `hooks.on_tool_call`
+  gate, so Kiro Crew's denied-command floor governs anything it would run and
+  the sensitive-path floor governs a `file` path — the floors a bundled script
+  invoked through `execute_bash` could not reach (the gate saw only the
+  `python3 <script>` command string, with the real argv on stdin). Widening
+  happens by adding a purpose-built kind that constructs its own argv — never by
+  accepting one. A `refused` verdict is a spec to re-express, never a list to
+  route around.

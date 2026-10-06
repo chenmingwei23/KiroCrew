@@ -271,6 +271,11 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            # The acceptance evaluator, migrated from the bundled script to a
+            # core MCP tool (#5926). Auto-approved so patrol verification never
+            # blocks on an approval; it reads world state and builds its own
+            # argv, so it is granted on the same rule as the reads above.
+            "@kirocrew-core/accept_eval",
         }
         # The bare server is what this test exists to keep out: it would re-grant
         # all 74 registered core tools, including every verb named below.
@@ -471,7 +476,7 @@ class TestConductorInstaller:
         assert "whose status is `done`" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "keep only the entries whose item is currently `status: done`" in body
-        assert "Never pipe the unfiltered document" in body
+        assert "Never send the unfiltered document" in body
 
     def test_prompt_and_skill_make_a_nested_conductor_report_upward(self, tmp_path, monkeypatch):
         """A second-level conductor is bound as its parent's worker, and the parent
@@ -596,17 +601,23 @@ class TestConductorInstaller:
             " unmerged PR" in body
         )
 
-    def test_skill_feeds_the_evaluator_through_a_quoted_heredoc(self):
+    def test_skill_invokes_the_evaluator_as_the_accept_eval_tool_not_the_shell(self):
         """The acceptance document is built from ingested text, and the skill's
-        example is what the agent copies. A ``printf '%s' '<json>'`` form ends its
-        string at the first single quote inside a path and hands the remainder to
-        the shell, which ``execute_bash`` then runs after one approval. A quoted
-        heredoc is the one form the shell copies to stdin without interpreting.
+        example is what the agent copies. Since #5926 the evaluator is the
+        ``accept_eval`` MCP tool: the whole ``items`` batch is a structured
+        argument, so a ``file`` path carrying a single quote is just a string
+        value — there is no shell to interpret it and no heredoc to get right.
+        The skill must therefore name the tool, and must NOT carry the retired
+        shell forms (the quoted heredoc, a ``printf``/``python3 accept_eval.py``
+        invocation) that the migration removed, or the agent would copy a shape
+        the conductor no longer has a grant for.
         """
         body = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        assert "<<'ACCEPT_BATCH'" in body
-        assert "printf '%s' '<" not in body
-        assert "printf '%s' '{" not in body
+        assert "accept_eval(items=" in body
+        # The retired shell forms are gone: no heredoc, no printf, no script run.
+        assert "<<'ACCEPT_BATCH'" not in body
+        assert "printf '%s'" not in body
+        assert "accept_eval.py" not in body
 
     def test_dashboard_entry_omits_managed_metadata_on_a_default_install(
         self, tmp_path, monkeypatch
@@ -677,6 +688,7 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/accept_eval",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",
@@ -702,6 +714,7 @@ class TestConductorInstaller:
         literal would have lost.
         """
         core_resources = [
+            "kirocrew-core/accept_eval",
             "kirocrew-core/ask_question",
             "kirocrew-core/autonudge_stop",
             "kirocrew-core/list_sessions",
@@ -871,6 +884,7 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/accept_eval",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",
@@ -902,15 +916,19 @@ class TestConductorInstaller:
     def test_skill_states_the_real_approval_cost(self):
         """The cost note must match the spec, or patrol plans for wrong prompts.
 
-        The granted verbs run silently while `session_send` / `session_stop` and
-        the bundled scripts prompt, so a skill that claimed either "everything
-        prompts" or "nothing prompts" would have the conductor sizing its nudge
-        interval around approvals it does not pay — or walking into ones it does.
+        The granted verbs run silently while `session_send` / `session_stop`
+        prompt, so a skill that claimed either "everything prompts" or "nothing
+        prompts" would have the conductor sizing its nudge interval around
+        approvals it does not pay — or walking into ones it does. Since #5926 the
+        evaluator is the auto-approved `accept_eval` tool (so verification no
+        longer prompts), and `patrol_budget.py` is the one `execute_bash`
+        invocation that still does.
         """
         text = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Reads and creates do not prompt" in text
         assert "`session_send` and `session_stop` are deliberately NOT auto-approved" in text
-        assert "accept_eval.py` invocation" in text
+        assert "`accept_eval` is auto-approved" in text
+        assert "patrol_budget.py" in text
 
     def test_skill_keeps_item_state_in_the_store_and_not_in_artifacts(self):
         """One record per item, in the one place the evaluator batch reads.

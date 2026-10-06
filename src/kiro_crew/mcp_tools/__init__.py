@@ -35,6 +35,7 @@ DOMAIN_MODULES: tuple[str, ...] = (
     "workflows",
     "apps",
     "browser",
+    "accept_eval",
 )
 
 

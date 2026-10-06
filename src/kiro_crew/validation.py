@@ -2758,6 +2758,22 @@ POD_STATUS_SCHEMA = ToolSchema(
 # what makes an unexpected argument an "Error:" string instead of unvalidated input.
 POD_LS_SCHEMA = ToolSchema(tool_name="pod_ls", fields=[])
 
+# The acceptance evaluator takes one field: ``items``, a bounded list of work
+# items. Each item is a nested object (``id`` + a kind-discriminated ``accept``
+# spec) whose per-kind fields the HANDLER validates — the list branch here only
+# bounds the count and the top-level type, and (being registered at all) makes
+# an unexpected top-level field an "Error:" rather than unvalidated input. The
+# nested validation deliberately stays in the handler: it is kind-dependent and
+# answers with a per-item ``error`` verdict rather than a whole-call rejection,
+# so one malformed spec never hides its siblings' verdicts.
+ACCEPT_EVAL_MAX_ITEMS = 200
+ACCEPT_EVAL_SCHEMA = ToolSchema(
+    tool_name="accept_eval",
+    fields=[
+        FieldSpec("items", list, required=True, item_type=dict, max_items=ACCEPT_EVAL_MAX_ITEMS),
+    ],
+)
+
 ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
     tool_name="issue_radar_record_investigation",
     fields=[
@@ -3849,6 +3865,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     # crash that takes the whole kirocrew-core server down for the session.
     "issue_radar_crew_read": ISSUE_RADAR_CREW_READ_SCHEMA,
     "issue_radar_crew_record": ISSUE_RADAR_CREW_RECORD_SCHEMA,
+    "accept_eval": ACCEPT_EVAL_SCHEMA,
 }
 
 MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {

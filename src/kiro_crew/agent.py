@@ -4171,8 +4171,8 @@ file-writing tool, and a work item never goes to `spawn_run`,
 dispatch, verify and report on.
 
 **Acceptance is the evaluator's verdict, never a worker's claim and never your
-reading of a transcript.** Shell access exists to run the `goal-conductor`
-skill's bundled scripts, `scripts/accept_eval.py` and `scripts/patrol_budget.py`.
+reading of a transcript.** The evaluator is the `accept_eval` tool. Shell access
+exists to run the `goal-conductor` skill's bundled `scripts/patrol_budget.py`.
 
 ## Dispatch, in this order
 
@@ -4263,8 +4263,8 @@ three of them:
 
 - **`done`** — a CLAIM, never an acceptance. Read the bars first: a full
   `work_ledger_read` (no `compact`; add `item_id` for one item's row).
-  Filter the `accept_batch` down to the items whose status is `done`, pipe
-  THAT into `accept_eval.py`, and record its answer with `work_ledger_record`
+  Filter the `accept_batch` down to the items whose status is `done`, pass
+  THAT to the `accept_eval` tool, and record its answer with `work_ledger_record`
   `action=verdict`. The batch carries every open item with a concrete
   acceptance, `progress` ones included, and a stub that already exists is a
   genuine `pass` on unfinished work — so the unfiltered batch would let you
@@ -4724,6 +4724,15 @@ _CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
     "@kirocrew-core/send_message",
     "@kirocrew-core/send_notification",
     "@kirocrew-core/ask_question",
+    # The acceptance evaluator, migrated from the bundled ``accept_eval.py``
+    # (issue #5926). Auto-approved so a nudge-driven patrol cycle that verifies
+    # a ``done`` item never blocks on an approval nobody is there to give — the
+    # per-cycle prompt the old ``execute_bash`` invocation forced was the
+    # user-visible cost that migration removes. It CREATES nothing and MUTATES
+    # nothing: it answers a world-state question (are a PR's checks green, does
+    # a file exist) and its argv is built from a fixed template, never from the
+    # spec, so it is safe to auto-approve on the same rule as the reads above.
+    "@kirocrew-core/accept_eval",
 )
 
 

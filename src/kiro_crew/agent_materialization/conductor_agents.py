@@ -152,6 +152,13 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
         frozenset({"session", "report", "tool_search", "@kirocrew-core"})
         | _HISTORY_CORE_VERBS
         | {"@kirocrew-core/select_crew"}
+        # The acceptance evaluator, migrated from the bundled script to a core
+        # MCP tool in #5926. Added to the goal conductor and its ledger alias
+        # (the two specs that ship it via ``_CONDUCTOR_CORE_GRANTS``) rather
+        # than to the shared ``_HISTORY_CORE_VERBS``: the pipeline and security
+        # conductors do NOT ship it, and a shared entry would read as a
+        # retirement on those specs and trip the residue pin.
+        | {"@kirocrew-core/accept_eval"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS
@@ -161,6 +168,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
         frozenset({"session", "report", "tool_search"})
         | _HISTORY_CORE_VERBS
         | {"@kirocrew-core/select_crew"}
+        | {"@kirocrew-core/accept_eval"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS
@@ -601,8 +609,9 @@ def _conductor_spec(
     The charter, and why each property is a property of the SPEC rather than of
     the prompt. Derived from the kirocrew agent (resolved MCP invocations,
     security hooks) and narrowed to what conducting needs: session control,
-    core tools, the work ledger, and shell for the bundled acceptance
-    evaluator — and **no tool that can write a file**, not ``fs_write`` and not
+    core tools (the acceptance evaluator among them, as the ``accept_eval``
+    MCP tool), the work ledger, and shell for the bundled patrol budget
+    script — and **no tool that can write a file**, not ``fs_write`` and not
     ``code`` either, which governance classes under ``filesystem.write``
     because it writes files and can shell out. That is what makes "never does a
     work item's work itself" true against the tool list and not just against
