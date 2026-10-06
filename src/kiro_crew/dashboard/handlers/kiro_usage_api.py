@@ -802,26 +802,31 @@ def _map_response(data: dict) -> dict | None:
     if not credit:
         return None
 
-    # Ambiguity probe (observation only — selection above is unchanged). The
-    # plan-pool picker takes the FIRST entry that is exactly resourceType
-    # "CREDIT", so a second CREDIT-typed pool (e.g. a promotional/welcome grant
-    # typed literally "CREDIT" rather than a bonus marker) can win the plan slot
-    # by list order and displace the real plan pool — a latent, unobserved case
-    # with no captured payload. When more than one entry satisfies the plan-pool
-    # test we record the SHAPE so a maintainer can choose a remedy (fail-closed
-    # vs deterministic pick) against real evidence. Log resource types and
-    # counts only, never balances or identifiers (billing-adjacent). Additive:
-    # nothing about which pool wins changes.
+    # Ambiguity guard — FAIL CLOSED. The plan-pool picker above takes the FIRST
+    # entry that is exactly resourceType "CREDIT", so a second CREDIT-typed pool
+    # (e.g. a promotional/welcome grant typed literally "CREDIT" rather than a
+    # bonus marker) can win the plan slot by list order and displace the real
+    # plan pool — a latent, unobserved case with no captured payload. Rather than
+    # pick one deterministically from a wire shape nobody has observed (which
+    # risks showing a confidently wrong billing number), we refuse: when more
+    # than one entry satisfies the plan-pool test the pool is ambiguous, so we
+    # return None and let the caller degrade to "no credit plan" (which now falls
+    # back to the /usage text scrape — a different code path that reads the two
+    # pools from separate lines and cannot swap them). This matches the function's
+    # existing posture of returning None on ambiguous/untrustworthy input rather
+    # than guessing. The SHAPE is still logged first (resource types and counts
+    # only, never balances or identifiers) so a maintainer can revisit a
+    # deterministic pick against real evidence if a two-CREDIT payload ever lands.
     _credit_typed = [b for b in breakdowns if b.get("resourceType") == "CREDIT"]
     if len(_credit_typed) > 1:
         logger.warning(
             "Kiro usage API: %d CREDIT-typed pools in usageBreakdownList "
-            "(resource types %s); plan pool selected by list order at index %d "
-            "— a second CREDIT-typed pool may be displacing the real plan pool",
+            "(resource types %s); plan pool is ambiguous — returning no credit "
+            "plan (fail closed) rather than selecting one by list order",
             len(_credit_typed),
             [str(b.get("resourceType")) for b in breakdowns],
-            breakdowns.index(credit),
         )
+        return None
 
     # Prefer the *-WithPrecision fields only when they are valid numbers; a
     # present-but-null/malformed precision value must fall back to the legacy

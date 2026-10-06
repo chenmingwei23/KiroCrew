@@ -145,24 +145,25 @@ class TestMapResponse:
         ]}
         assert "bonus_limit" not in api._map_response(data)
 
-    def test_warns_on_two_credit_typed_pools(self, caplog):
+    def test_fails_closed_on_two_credit_typed_pools(self, caplog):
         # The exact payload nobody has captured: TWO entries typed literally
-        # "CREDIT". The picker takes the first by list order; detection must fire
-        # AND selection must stay byte-for-byte identical (first entry wins).
+        # "CREDIT". The plan pool is then ambiguous — picking one by list order
+        # could surface a promotional pool's limit as the plan and drop the real
+        # plan pool. Fail closed: return None (the caller degrades to the /usage
+        # text scrape) AND log the shape so a maintainer can revisit.
         data = {"usageBreakdownList": [
             {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
             {"resourceType": "CREDIT", "currentUsage": 999, "usageLimit": 2000},
         ]}
         with caplog.at_level("WARNING", logger=api.logger.name):
             out = api._map_response(data)
-        # Selection unchanged: the first CREDIT entry still wins.
-        assert out["credits_used"] == 5.0
-        assert out["credits_plan"] == 100.0
+        # Fail closed: no credit plan is returned when the pool is ambiguous.
+        assert out is None
         warnings = [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
         assert len(warnings) == 1
         msg = warnings[0].getMessage()
         assert "2 CREDIT-typed pools" in msg
-        assert "index 0" in msg
+        assert "fail closed" in msg
         # Shape only — no balances/identifiers leak into the log line.
         assert "999" not in msg and "2000" not in msg
 
