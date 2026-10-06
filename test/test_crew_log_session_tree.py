@@ -23,6 +23,7 @@ from kiro_crew.crew_log.session_tree import (
     CHAIN_END_CYCLE,
     CHAIN_END_FIRST,
     CHAIN_END_FOREIGN,
+    CHAIN_END_GAP,
     CHAIN_END_MISSING,
     CHAIN_END_UNKNOWN,
     SLOT_CHAIN_CAP,
@@ -45,9 +46,27 @@ def _isolated_home(tmp_path, monkeypatch):
     yield
 
 
-def _rec(sid: str, slot: str, created: int = 1, parent: str | None = None, previous=None):
+def _rec(
+    sid: str,
+    slot: str,
+    created: int = 1,
+    parent: str | None = None,
+    previous=None,
+    edge: str | None = None,
+):
+    # Mirror the emitter: a log that names a predecessor carries EDGE_NAMED, and one
+    # that names none STATES it starts the chain (EDGE_NONE, what previous_none=True
+    # records). ``edge`` overrides this to build a GAP log -- a cold-started
+    # successor that cites nothing without stating it is first.
+    if edge is None:
+        edge = session_tree.EDGE_NAMED if previous else session_tree.EDGE_NONE
     return OpenedRecord(
-        sid=sid, slot=slot, created_at=created, parent_slot=parent, previous_sid=previous
+        sid=sid,
+        slot=slot,
+        created_at=created,
+        parent_slot=parent,
+        previous_sid=previous,
+        previous_edge=edge,
     )
 
 
@@ -62,6 +81,8 @@ def _opened(
     parent: dict[str, str] | None = None,
     resumed: bool = False,
     previous: object = None,
+    previous_none: bool = False,
+    previous_undecided: bool = False,
 ) -> None:
     data = {
         "agent": "kirocrew",
@@ -77,6 +98,13 @@ def _opened(
     # log and the reader's "first log" answer depends on that absence.
     if previous is not None:
         data["previous"] = previous
+    # The emitter STATES a first log with ``previous_none`` and a gap it could not
+    # name with ``previous_undecided``; a log that writes neither (predating the keys)
+    # reads as EDGE_LEGACY, which is also a gap.
+    if previous_none:
+        data["previous_none"] = True
+    if previous_undecided:
+        data["previous_undecided"] = True
     handle.append("session/opened", data, src=GATEWAY)
 
 
@@ -791,11 +819,44 @@ def test_a_slot_s_logs_come_back_newest_first_through_the_previous_edge() -> Non
 
 
 def test_a_slot_s_first_log_answers_only_itself_and_reports_first() -> None:
-    chain = fold_slot_chain([_rec("a", "chat-1")], "a")
+    # The log STATES it starts the chain (previous_none=True -> EDGE_NONE), so the
+    # walk reaching it is the slot's whole life.
+    chain = fold_slot_chain([_rec("a", "chat-1", edge=session_tree.EDGE_NONE)], "a")
     assert chain.sids == ("a",)
     # Not "missing": the emitter omits the key for a first log, so a reader can tell
     # "there is nothing before this" from "a predecessor I could not reach".
     assert chain.ended == CHAIN_END_FIRST
+    assert chain.cited is None
+
+
+@pytest.mark.parametrize(
+    "edge",
+    [session_tree.EDGE_UNDECIDED, session_tree.EDGE_UNREAD, session_tree.EDGE_LEGACY],
+)
+def test_an_oldest_log_that_cites_nothing_without_stating_first_ends_in_a_gap(edge) -> None:
+    # The walk ran off the end, but the oldest log did not STATE it starts the chain:
+    # its writer could not name a predecessor, there was no announce to read, or it
+    # predates the edge keys. The unit before it may exist, so this is not the slot's
+    # whole life and must not read as CHAIN_END_FIRST.
+    chain = fold_slot_chain([_rec("a", "chat-1", edge=edge)], "a")
+    assert chain.sids == ("a",)
+    assert chain.ended == CHAIN_END_GAP
+    # No cited id: nothing was named to follow, the record simply ran out.
+    assert chain.cited is None
+
+
+def test_a_chain_whose_oldest_log_left_a_gap_is_not_whole() -> None:
+    # The walk follows the previous edges to the oldest log, which cites nothing but
+    # left a gap. The ids come back in order; only the end reason says it is a gap.
+    chain = fold_slot_chain(
+        [
+            _rec("a", "chat-1", created=1, edge=session_tree.EDGE_UNDECIDED),
+            _rec("b", "chat-1", created=2, previous="a"),
+        ],
+        "b",
+    )
+    assert chain.sids == ("b", "a")
+    assert chain.ended == CHAIN_END_GAP
     assert chain.cited is None
 
 
@@ -1062,14 +1123,33 @@ def test_the_scanner_walks_two_real_logs_of_one_slot_on_disk() -> None:
     """End to end through the store, so the walk is reachable from the scanner and
     not only from a hand-built record list."""
     first = _log("acp-1", "chat-7")
-    _opened(first, "chat-7")
+    _opened(first, "chat-7", previous_none=True)
     second = _log("acp-2", "chat-7")
     _opened(second, "chat-7", previous={"sid": "acp-1"})
 
     reading = SessionTree().chain("acp-2")
     assert reading.chain.slot == "chat-7"
     assert reading.chain.sids == ("acp-2", "acp-1")
+    # The oldest log STATES it starts the chain, so the walk reached the slot's
+    # whole life.
     assert reading.chain.ended == CHAIN_END_FIRST
+    assert reading.incomplete is False
+
+
+def test_the_scanner_reports_a_gap_when_the_oldest_real_log_does_not_state_first() -> None:
+    """The same walk, but the oldest log cites nothing without stating it starts the
+    chain (a log from before the edge keys). The ids come back the same; only the
+    end reason says the unit before it may exist, so this is not the slot's whole
+    life."""
+    first = _log("acp-g1", "chat-g")
+    _opened(first, "chat-g")  # neither previous_none nor previous_undecided: a gap
+    second = _log("acp-g2", "chat-g")
+    _opened(second, "chat-g", previous={"sid": "acp-g1"})
+
+    reading = SessionTree().chain("acp-g2")
+    assert reading.chain.slot == "chat-g"
+    assert reading.chain.sids == ("acp-g2", "acp-g1")
+    assert reading.chain.ended == CHAIN_END_GAP
     assert reading.incomplete is False
 
 

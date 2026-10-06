@@ -2427,9 +2427,13 @@ whose header names the slot, because a unit off the chain is another conversatio
 and its calls are not this one's. Names go newest first, capped at a quarter of
 the evidence budget, with `tools_omitted` counting every name left out
 (`tools_called` is `null` when the fold cannot be read). `tools_whole` is true
-only when nothing was cut and that same chain ended at a unit with no predecessor
-in a scan that saw the whole store (or the slot has no unit at all); any other
-chain end leaves it false. The prompt forbids saying
+only when nothing was cut and that same chain ended at a unit that STATES it
+starts the slot's chain -- its announce records that the slot had no earlier store
+(`EDGE_NONE`) -- in a scan that saw the whole store (or the slot has no unit at
+all); any other chain end leaves it false. A unit that cites no predecessor only
+because its writer could not name one, because its announce could not be read, or
+because it predates the edge keys does NOT state it starts the chain: it is a GAP,
+the unit before it may exist, and `tools_whole` stays false. The prompt forbids saying
 a tool was or was not called unless that list says so, and forbids any "never
 called" claim unless `tools_whole` is true, because a note once said no stop call
 was made while the log held one, and a resumed slot's stop call can sit in the unit

@@ -527,22 +527,25 @@ def _read_card_tools(slot_key: str, reads: _CardReads) -> Any:
     in a conversation that never made one. One unit list then answers both the names
     and whether they are whole.
 
-    ``units_whole`` is added to the render: true only when the chain reached a unit with
-    no predecessor (:data:`~kiro_crew.crew_log.session_tree.CHAIN_END_FIRST`) whose own
-    announce STATES it starts the slot's chain
-    (:data:`~kiro_crew.crew_log.session_tree.EDGE_NONE`), in a scan that saw the whole
-    store, or when the slot has no unit at all. A unit that cites nothing because its
-    writer could not name the predecessor, or that predates the edge keys, is a gap. Any other end -- a
-    unit retention took, another slot's unit, a loop, the cap -- leaves it false, and a
-    list that is not whole must never license a "never called" claim. A fold that
-    cannot be read, or units the store cannot rank, are ``FOLD_UNREADABLE``.
+    ``units_whole`` is added to the render: true only when the chain reached a unit
+    that STATES it starts the slot's chain
+    (:data:`~kiro_crew.crew_log.session_tree.CHAIN_END_FIRST`, which the walk now
+    reports only for an :data:`~kiro_crew.crew_log.session_tree.EDGE_NONE` oldest
+    log), in a scan that saw the whole store, or when the slot has no unit at all. A
+    unit that cites nothing because its writer could not name the predecessor, or
+    that predates the edge keys, ends the walk at
+    :data:`~kiro_crew.crew_log.session_tree.CHAIN_END_GAP` and is not whole. Any
+    other end -- a unit retention took, another slot's unit, a loop, the cap --
+    leaves it false too, and a list that is not whole must never license a "never
+    called" claim. A fold that cannot be read, or units the store cannot rank, are
+    ``FOLD_UNREADABLE``.
 
     Called on the prompt path only: the refresh path binds numbers and has no use for
     tool names.
     """
     from kiro_crew.crew_log import projection as projections
     from kiro_crew.crew_log.read import slot_chain
-    from kiro_crew.crew_log.session_tree import CHAIN_END_FIRST, EDGE_NONE
+    from kiro_crew.crew_log.session_tree import CHAIN_END_FIRST
 
     unit = reads.get("unit", "")
     if not unit:
@@ -557,11 +560,7 @@ def _read_card_tools(slot_key: str, reads: _CardReads) -> Any:
         return FOLD_UNREADABLE
     if not isinstance(render, dict):
         return FOLD_UNREADABLE
-    whole = (
-        reading.chain.ended == CHAIN_END_FIRST
-        and reading.chain.root_edge == EDGE_NONE
-        and not reading.incomplete
-    )
+    whole = reading.chain.ended == CHAIN_END_FIRST and not reading.incomplete
     return {**render, "units_whole": whole}
 
 

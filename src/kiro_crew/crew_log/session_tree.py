@@ -148,10 +148,27 @@ SLOT_CHAIN_CAP: Final[int] = 512
 #: combinations representable and force every reader to check all of them.
 #:
 #: Only :data:`CHAIN_END_FIRST` means the walk reached the slot's whole life. The
-#: other four each mean there is more the walk could not reach, and they are kept
-#: apart because the remedies differ: retention took a log, a step was refused as
-#: another slot's, the edges form a loop, the bound was hit.
+#: other five each mean there is more the walk could not reach, and they are kept
+#: apart because the remedies differ: the oldest log cites no predecessor but does
+#: not STATE it is first, retention took a log, a step was refused as another
+#: slot's, the edges form a loop, the bound was hit.
+#:
+#: :data:`CHAIN_END_FIRST` requires the oldest log's own ``previous_edge`` to be
+#: :data:`EDGE_NONE` -- the announce STATING the slot had no earlier store. A log
+#: that merely cites nothing (:data:`EDGE_UNDECIDED`, :data:`EDGE_LEGACY`,
+#: :data:`EDGE_UNREAD`) is a GAP, not a start: it is a cold-started successor whose
+#: writer could not name its predecessor, or one that predates the edge keys, so
+#: the unit before it may exist and the walk did NOT reach the slot's whole life.
 CHAIN_END_FIRST: Final[str] = "first"
+#: The walk reached a log that cites no predecessor, but that log does not STATE it
+#: starts the slot's chain -- its ``previous_edge`` is a gap
+#: (:data:`EDGE_UNDECIDED`, :data:`EDGE_LEGACY`, :data:`EDGE_UNREAD`) rather than
+#: :data:`EDGE_NONE`. The walk ran off the end of the records, so there is no cited
+#: id to report, but unlike :data:`CHAIN_END_FIRST` this is NOT the slot's whole
+#: life: the unit before this one may well exist, and the log simply failed to name
+#: it. A reader claiming a slot's whole life must treat this exactly like the four
+#: unreachable ends below, never like :data:`CHAIN_END_FIRST`.
+CHAIN_END_GAP: Final[str] = "gap"
 #: The cited log answered no record -- retention removed it, or its header was
 #: refused. An absence, and the ordinary end of an old chain.
 CHAIN_END_MISSING: Final[str] = "missing"
@@ -631,13 +648,16 @@ class SlotChain:
     """One slot's logs in succession order, newest first, and why the walk stopped.
 
     ``sids`` always begins with the log the walk was asked to start from, so a slot
-    with one log answers a single id and :data:`CHAIN_END_FIRST`. It is empty only
-    for :data:`CHAIN_END_UNKNOWN`, where that starting log answered no record.
+    with one log that STATES it starts the chain answers a single id and
+    :data:`CHAIN_END_FIRST`; one whose single log cites nothing without stating so
+    answers that id and :data:`CHAIN_END_GAP`. It is empty only for
+    :data:`CHAIN_END_UNKNOWN`, where that starting log answered no record.
 
     ``ended`` is the load-bearing field and a reader that joins folds MUST read it.
     ``sids`` alone cannot say whether it is the slot's whole life: a chain cut short
     by retention, a refused step, a loop or the bound looks exactly like a complete
-    one from the ids. Only :data:`CHAIN_END_FIRST` means whole.
+    one from the ids, and so does one that ran off the end at a log that never
+    stated it was first. Only :data:`CHAIN_END_FIRST` means whole.
 
     ``cited`` is the id the walk could not follow -- present for
     :data:`CHAIN_END_MISSING`, :data:`CHAIN_END_FOREIGN` and
@@ -645,19 +665,19 @@ class SlotChain:
     evidence: a reader reporting an incomplete chain can name the log it stopped
     at, and for :data:`CHAIN_END_FOREIGN` that id is the only record of a citation
     that should never have been written.
+
+    Whether the oldest log STATES it starts the slot's chain is folded into
+    ``ended`` itself: :data:`CHAIN_END_FIRST` is the oldest log citing no
+    predecessor AND stating so (:data:`EDGE_NONE`), while a log that cites nothing
+    only because its writer could not name the predecessor, or because it predates
+    the edge keys, ends the walk at :data:`CHAIN_END_GAP`. A reader claiming the
+    slot's whole life reads ``ended == CHAIN_END_FIRST`` and nothing else.
     """
 
     slot: str
     sids: tuple[str, ...]
     ended: str
     cited: str | None = None
-    #: The oldest log's own ``previous_edge``, set for :data:`CHAIN_END_FIRST` and
-    #: ``None`` otherwise. :data:`CHAIN_END_FIRST` means only that the oldest log
-    #: cites no predecessor; whether it STATES it starts the slot's chain
-    #: (:data:`EDGE_NONE`) or left a gap (:data:`EDGE_UNDECIDED`, :data:`EDGE_LEGACY`,
-    #: :data:`EDGE_UNREAD`) is this field, and a reader claiming the slot's whole life
-    #: must require :data:`EDGE_NONE`.
-    root_edge: str | None = None
 
 
 def fold_slot_chain(records: Iterable[OpenedRecord], head_sid: str) -> SlotChain:
@@ -679,6 +699,17 @@ def fold_slot_chain(records: Iterable[OpenedRecord], head_sid: str) -> SlotChain
     A cited id that no record answers is NOT the same refusal and gets its own
     reason: retention removing an old log is the ordinary way a long-lived slot's
     chain ends, and reporting that as damage would cry wolf on every healthy store.
+
+    Running off the end -- the oldest log cites no predecessor -- is :data:`CHAIN_END_FIRST`
+    ONLY when that log STATES it starts the slot's chain (``previous_edge`` is
+    :data:`EDGE_NONE`). A log that cites nothing merely because its writer could not
+    name the predecessor (:data:`EDGE_UNDECIDED`), because there was no announce to
+    read (:data:`EDGE_UNREAD`), or because it predates the edge keys
+    (:data:`EDGE_LEGACY`) is a GAP: the unit before it may exist, so the walk did not
+    reach the slot's whole life and ends at :data:`CHAIN_END_GAP`. The two were one
+    answer once, with the oldest log's edge carried alongside for the one consumer to
+    re-check; folding it into ``ended`` here means every reader gets the distinction
+    without having to know to look for it.
 
     Order is the edges', never a timestamp. ``created_at`` is wall clock, so a
     backward clock step across a restart gives the newer log the earlier stamp and
@@ -707,9 +738,11 @@ def fold_slot_chain(records: Iterable[OpenedRecord], head_sid: str) -> SlotChain
     while True:
         cited = cursor.previous_sid
         if cited is None:
-            return SlotChain(
-                slot=slot, sids=tuple(sids), ended=CHAIN_END_FIRST, root_edge=cursor.previous_edge
-            )
+            # Ran off the end. Whole life ONLY when the oldest log STATES it starts
+            # the chain; a log that cites nothing without stating so left a gap, so
+            # the unit before it may exist and this is not the slot's whole life.
+            ended = CHAIN_END_FIRST if cursor.previous_edge == EDGE_NONE else CHAIN_END_GAP
+            return SlotChain(slot=slot, sids=tuple(sids), ended=ended)
         if cited in seen:
             return SlotChain(slot, tuple(sids), CHAIN_END_CYCLE, cited)
         if len(sids) >= SLOT_CHAIN_CAP:
