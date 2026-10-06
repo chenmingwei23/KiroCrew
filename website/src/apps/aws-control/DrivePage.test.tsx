@@ -2427,6 +2427,55 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     expect(screen.queryByTestId('backup-remote-toggle')).not.toBeNull()
   })
 
+  /* ── Retention floor: the permanent unretirable count on the panel ───────── */
+
+  it('surfaces the measured retention floor per kind, with its unrecorded sibling', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      nightly: false,
+      runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: emptyRemote,
+      // The number this issue is about: archives this install wrote that no sweep
+      // can ever retire, surfaced where retention is read rather than only in the
+      // audit event. The sibling counts objects the listing held with no record here.
+      retentionUnclaimed: { snapshot: { archives: 3, bytes: 4096, at: '2026-08-24T00:00:00Z' } },
+      retentionUnrecorded: { snapshot: { objects: 2, bytes: 2048, at: '2026-08-24T00:00:00Z' } },
+    } as BackupStatus)
+
+    await renderDrive('backup')
+
+    const unclaimed = await screen.findByTestId('backup-unclaimed-snapshot')
+    // The count rides into the sentence; a dropped `{{count}}` would show no number.
+    expect(unclaimed.textContent).toContain('3')
+    const unrecorded = screen.getByTestId('backup-unrecorded-snapshot')
+    expect(unrecorded.textContent).toContain('2')
+    // The sessions kind measured nothing, so neither line is minted for it.
+    expect(screen.queryByTestId('backup-unclaimed-sessions')).toBeNull()
+    expect(screen.queryByTestId('backup-unrecorded-sessions')).toBeNull()
+  })
+
+  it('renders no floor line for a measured-zero or unmeasured kind', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      nightly: false,
+      runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: emptyRemote,
+      // A measured zero is the healthy case and must not draw a line; `sessions`
+      // is unmeasured (absent) and must not read as a zero floor either.
+      retentionUnclaimed: { snapshot: { archives: 0, bytes: 0, at: '2026-08-24T00:00:00Z' } },
+      retentionUnrecorded: {},
+    } as BackupStatus)
+
+    await renderDrive('backup')
+
+    await screen.findByTestId('backup-row-snapshot')
+    expect(screen.queryByTestId('backup-unclaimed-snapshot')).toBeNull()
+    expect(screen.queryByTestId('backup-unrecorded-snapshot')).toBeNull()
+    expect(screen.queryByTestId('backup-unclaimed-sessions')).toBeNull()
+  })
+
   /* ── Access: forget a share ──────────────────────────────────────────────── */
 
   it('forgets a share through the api', async () => {

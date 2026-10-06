@@ -5275,6 +5275,8 @@
         "backup_last_run": "Ultimo backup {{when}} · {{size}}",
         "backup_never": "Ancora nessun backup",
         "backup_remembered": "Archivi registrati da questa installazione: {{count}} · mostra l'elenco",
+        "backup_unclaimed": "La conservazione non può recuperare {{count}} archivio/i ({{size}}) scritti da questa installazione · misurato {{when}}",
+        "backup_unrecorded": "{{count}} oggetto/i ({{size}}) in questa cartella non hanno un record qui, quindi la conservazione li lascia · misurato {{when}}",
         "backup_sessions_scope": "Include i log di riproduzione della CLI di ogni sessione in questa home di Kiro, non solo delle chat avviate in {{productName}}.",
         "backup_run_now": "Esegui backup",
         "backup_running": "Backup in corso…",

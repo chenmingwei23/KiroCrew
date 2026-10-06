@@ -68,7 +68,7 @@ import { awsControlApi, AwsControlError } from './api'
 import type {
   DriveSection, DriveStatus, ArtifactKind, LibraryArtifact,
   BackupKind, BackupRun, BackupJobState, Share, DriveUsage,
-  BackupArchive, RemoteBackup,
+  BackupArchive, RemoteBackup, RetentionFloor,
 } from './types'
 import { CopyBtn, PaneHeader, AwsErrorNotice, StorageBar, QuickTile } from './shared'
 
@@ -3830,6 +3830,8 @@ function BackupRow({
   kind,
   run,
   remembered,
+  unclaimed,
+  unrecorded,
   job,
   unsupported,
   onStarted,
@@ -3843,6 +3845,17 @@ function BackupRow({
      drive's contents in either direction, so the row sends the reader to the
      list for what is actually there. */
   remembered: number | undefined
+  /* The last sweep's floor of this install's own archives that no sweep can ever
+     retire, or undefined for a kind no sweep has measured yet. This is the number
+     the issue is about: the permanent floor the keep count will never collect, so
+     a bill can fail to fall after retention is turned on. Rendered as a stamped
+     line, not a live one -- it is only as fresh as the sweep that measured it. */
+  unclaimed: RetentionFloor | undefined
+  /* Beside `unclaimed`: objects the listing held under this kind's folder that the
+     install has no record of. Counted, never retired, and not claimed as this
+     install's -- so the line says "objects", not "archives". Undefined until a
+     sweep measures it. */
+  unrecorded: RetentionFloor | undefined
   job: BackupJobState | undefined
   /* This host cannot produce this kind's payload at all. The manual run answers
      the same capability question and refuses with 501, so a pressable button here
@@ -3920,6 +3933,38 @@ function BackupRow({
           >
             {i18nT('apps.awsControl.console.backup_remembered', { count: remembered })}
           </button>
+        )}
+        {/* The permanent floor this issue is about: archives this install wrote that
+            retention can never retire, so the keep count above overstates what a sweep
+            will collect and a bill can fail to fall after it is enabled. Rendered only
+            when a sweep has measured a NON-ZERO floor: a measured zero is the healthy
+            case and needs no line, and an unmeasured kind (undefined) must not read as
+            zero. Stamped with when the sweep measured it, because it is never live --
+            refreshing it would need the bucket listing this panel keeps opt-in -- so a
+            stale number does not masquerade as a current one. Not a button: unlike the
+            remembered count there is no list to open, the sweep already named the floor. */}
+        {unclaimed && (unclaimed.archives ?? 0) > 0 && (
+          <div className="text-[12px] text-muted" data-testid={`backup-unclaimed-${kind}`}>
+            {i18nT('apps.awsControl.console.backup_unclaimed', {
+              count: unclaimed.archives ?? 0,
+              size: fmtBytes(unclaimed.bytes),
+              when: fmtRelative(unclaimed.at),
+            })}
+          </div>
+        )}
+        {/* Beside the floor above, never folded into it: objects the listing held under
+            this kind's folder that the install has no record of. Counted and never
+            retired, and NOT asserted to be this install's -- the install id in a key is
+            a string any co-writer can type -- so the copy says "objects", not
+            "archives". Same measured-non-zero and stamped rules as the line above. */}
+        {unrecorded && (unrecorded.objects ?? 0) > 0 && (
+          <div className="text-[12px] text-muted" data-testid={`backup-unrecorded-${kind}`}>
+            {i18nT('apps.awsControl.console.backup_unrecorded', {
+              count: unrecorded.objects ?? 0,
+              size: fmtBytes(unrecorded.bytes),
+              when: fmtRelative(unrecorded.at),
+            })}
+          </div>
         )}
         {/* Two different failures share one line: a START the route refused
             (its thrown error rides along) and a RUN the server reports as its
@@ -4159,6 +4204,13 @@ export function BackupSection({ account }: { account: string }) {
               // A floor on this kind's recorded archives, so the row can say the
               // single run line above it is not the whole list.
               remembered={data.rememberedArchives?.[kind]}
+              // The permanent retention floor this account's last sweep measured for
+              // this kind: archives it can never retire, and objects it has no record
+              // of, surfaced where the keep count is read instead of only in the audit
+              // event. Undefined for a kind no sweep has measured, which the row reads
+              // as "unmeasured", never as a zero floor.
+              unclaimed={data.retentionUnclaimed?.[kind]}
+              unrecorded={data.retentionUnrecorded?.[kind]}
               // Account-scoped: this payload answers "is a backup running for THIS
               // account", which the app-scoped `_jobs/active` surface cannot.
               job={data.jobs?.[kind]}

@@ -5115,6 +5115,8 @@
         "backup_last_run": "最終バックアップ {{when}} · {{size}}",
         "backup_never": "まだバックアップされていません",
         "backup_remembered": "このインストールが記録したアーカイブ：{{count}} · 一覧を表示",
+        "backup_unclaimed": "保持機能はこのインストールが書き込んだ {{count}} 個のアーカイブ（{{size}}）を回収できません · 測定 {{when}}",
+        "backup_unrecorded": "このフォルダー内の {{count}} 個のオブジェクト（{{size}}）はここに記録がないため、保持機能はそのまま残します · 測定 {{when}}",
         "backup_sessions_scope": "この Kiro ホーム配下のすべてのセッションの CLI 再生ログが含まれます。{{productName}} で開始したチャットだけではありません。",
         "backup_run_now": "今すぐバックアップ",
         "backup_running": "バックアップ中…",

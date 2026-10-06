@@ -5275,6 +5275,8 @@
         "backup_last_run": "Última copia {{when}} · {{size}}",
         "backup_never": "Aún sin copia de seguridad",
         "backup_remembered": "Copias registradas por esta instalación: {{count}} · ver la lista",
+        "backup_unclaimed": "La retención no puede recuperar {{count}} archivo(s) ({{size}}) que escribió esta instalación · medido {{when}}",
+        "backup_unrecorded": "{{count}} objeto(s) ({{size}}) en esta carpeta no tienen registro aquí, así que la retención los deja · medido {{when}}",
         "backup_sessions_scope": "Incluye los registros de reproducción de la CLI de todas las sesiones de este directorio de Kiro, no solo de los chats iniciados en {{productName}}.",
         "backup_run_now": "Copiar ahora",
         "backup_running": "Copiando…",

@@ -3778,6 +3778,8 @@
         "backup_last_run": "Last backed up {{when}} · {{size}}",
         "backup_never": "Not backed up yet",
         "backup_remembered": "Archives this install has recorded: {{count}} · show the list",
+        "backup_unclaimed": "Retention cannot reclaim {{count}} archive(s) ({{size}}) this install wrote · measured {{when}}",
+        "backup_unrecorded": "{{count}} object(s) ({{size}}) under this folder have no record here, so retention leaves them · measured {{when}}",
         "backup_sessions_scope": "Includes the CLI replay logs for every session under this Kiro home, not only chats started in {{productName}}.",
         "backup_run_now": "Back up now",
         "backup_running": "Backing up…",

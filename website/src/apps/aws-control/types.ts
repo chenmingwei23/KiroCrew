@@ -501,10 +501,45 @@ export interface BackupStatus {
   nightlySessionsBlocked?: string | null
   runs: Partial<Record<BackupKind, BackupRun>>
   rememberedArchives?: Partial<Record<BackupKind, number>>
+  /**
+   * Per kind, the last sweep's floor of archives this install wrote that no sweep
+   * can ever retire -- `archives` of them, `bytes` large, as of `at`. The permanent
+   * floor the keep count cannot collect, which is why a bill can fail to fall after
+   * an operator enables retention. Stamped, not live: it is only ever as fresh as
+   * the last sweep that measured it, and a kind no sweep has measured is absent
+   * (NOT zero). Absent whole from an older backend that does not report it. See the
+   * backend `retention_unclaimed`.
+   */
+  retentionUnclaimed?: Partial<Record<BackupKind, RetentionFloor>>
+  /**
+   * Beside `retentionUnclaimed`, never instead of it: that one is a floor on the
+   * archives this install still remembers, while this counts `objects` the listing
+   * showed under this kind's folder for which the install holds neither an uploads
+   * entry nor a version record. `objects`, not `archives`, because the install id in
+   * a key is a string any co-writer can type, so this makes no ownership claim.
+   * Same stamping and same absent-means-never-measured rule as the field above. See
+   * the backend `retention_unrecorded`.
+   */
+  retentionUnrecorded?: Partial<Record<BackupKind, RetentionFloor>>
   jobs?: Partial<Record<BackupKind, BackupJobState>>
   install: InstallIdentity
   remote: RemoteBackup | null
   remoteError?: string
+}
+
+/**
+ * One kind's measured retention floor, as `GET /backup/{account}` serves it. `count`
+ * is `archives` on `retentionUnclaimed` and `objects` on `retentionUnrecorded` -- the
+ * backend names them apart on purpose (one is attributed to this install, the other
+ * is not), but a reader rendering a count and bytes needs the same two numbers either
+ * way, so this interface carries both backend spellings as optional and reads
+ * whichever is present. `at` is the ISO-8601 stamp of the sweep that measured it.
+ */
+export interface RetentionFloor {
+  archives?: number
+  objects?: number
+  bytes: number
+  at: string
 }
 
 /** Result of `POST /install/label`. */

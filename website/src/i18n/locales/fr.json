@@ -5275,6 +5275,8 @@
         "backup_last_run": "Dernière sauvegarde {{when}} · {{size}}",
         "backup_never": "Pas encore sauvegardé",
         "backup_remembered": "Archives enregistrées par cette installation : {{count}} · afficher la liste",
+        "backup_unclaimed": "La rétention ne peut pas récupérer {{count}} archive(s) ({{size}}) écrite(s) par cette installation · mesuré {{when}}",
+        "backup_unrecorded": "{{count}} objet(s) ({{size}}) dans ce dossier n’ont aucun enregistrement ici, donc la rétention les laisse · mesuré {{when}}",
         "backup_sessions_scope": "Inclut les journaux de relecture CLI de chaque session de ce dossier Kiro, pas seulement des conversations démarrées dans {{productName}}.",
         "backup_run_now": "Sauvegarder maintenant",
         "backup_running": "Sauvegarde…",
