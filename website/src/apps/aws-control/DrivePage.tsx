@@ -3896,10 +3896,20 @@ function BackupRow({
       </span>
       <div className="min-w-0 flex-1">
         <div className="text-[13px] font-medium text-text">{i18nT(BACKUP_KIND_LABEL_KEY[kind])}</div>
-        <div className="text-[12px] text-muted">
+        <div className="text-[12px] text-muted" data-testid={`backup-last-${kind}`}>
           {run
             ? i18nT('apps.awsControl.console.backup_last_run', { when: fmtRelative(run.at), size: fmtBytes(run.bytes) })
-            : i18nT('apps.awsControl.console.backup_never')}
+            : // "Not backed up yet" alone contradicts a nonzero recorded count on
+              // the same row: the ledger keeps one run record per kind and holds
+              // only this install's, so a record aged out of it -- or made by a
+              // reinstall under the same name -- leaves archives on the drive with
+              // no run line. When the count line below will say archives exist,
+              // this one says which kind of "none" it means: no run recorded here,
+              // not no archive kept. With nothing recorded either, the plain line
+              // still reads correctly.
+              remembered != null && remembered > 0
+              ? i18nT('apps.awsControl.console.backup_never_recorded')
+              : i18nT('apps.awsControl.console.backup_never')}
         </div>
         {/* The line above reports ONE run, because the ledger keeps one record per
             kind: a second nightly overwrites the first while both archives stay in
@@ -4015,6 +4025,21 @@ export function BackupSection({ account }: { account: string }) {
   const qc = useQueryClient()
   const appKey = useAppQueryKey()
   const [showRemote, setShowRemote] = useState(false)
+  // The stored-archive disclosure the count line opens. Clicking that line far
+  // up the pane used only to flip `showRemote`, which left the list it reveals
+  // off-screen on a long pane -- the reader asked to see the archives and the
+  // view did not move. This ref is the scroll target so the open and the scroll
+  // happen together.
+  const remoteRef = useRef<HTMLDivElement>(null)
+  // Open the disclosure AND bring it into view. The scroll is deferred to the
+  // next frame because `setShowRemote(true)` has to render the panel before
+  // there is anything to scroll to; a `scrollIntoView` in the same tick would
+  // run against the collapsed height. Already-open is handled too: a second
+  // click on the count line re-scrolls to the list rather than doing nothing.
+  const revealRemote = useCallback(() => {
+    setShowRemote(true)
+    requestAnimationFrame(() => remoteRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' }))
+  }, [])
   // Opt-in: each other install listed costs extra paid AWS calls, so the drive
   // is asked about co-tenants only when the reader turns this on. Part of the
   // query key the same way `showRemote` is, so flipping it is a deliberate
@@ -4170,8 +4195,10 @@ export function BackupSection({ account }: { account: string }) {
               // poll gap and looking like the click did nothing.
               onStarted={invalidate}
               // The same act as clicking the disclosure below: the reader asks for
-              // the listing, which is why the paid remote half stays opt-in.
-              onShowArchives={() => setShowRemote(true)}
+              // the listing, which is why the paid remote half stays opt-in. It
+              // also scrolls the list into view, since the count line can sit a
+              // long way above the disclosure it opens.
+              onShowArchives={revealRemote}
             />
           ))}
           <div className="flex items-center justify-between gap-3 px-3 py-2.5" data-testid="backup-nightly">
@@ -4361,7 +4388,7 @@ export function BackupSection({ account }: { account: string }) {
         * remote fetching wait for the fetch it enables, and the archive and
         * Restore became unreachable. The rows below are already null-safe. */}
       {data && (
-        <div className="mt-2">
+        <div className="mt-2" ref={remoteRef}>
           <button
             onClick={() => setShowRemote((v) => !v)}
             className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-text cursor-pointer bg-transparent border-none p-0"

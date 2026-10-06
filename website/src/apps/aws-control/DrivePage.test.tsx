@@ -2407,6 +2407,57 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     expect(await screen.findByTestId('backup-restored')).toHaveTextContent('/home/u/.kiro/restore/2026-08-24')
   })
 
+  it('distinguishes "no run recorded here" from "no archive kept" when archives are remembered', async () => {
+    // #13566 item 2: a row with no run record but a nonzero recorded count showed
+    // "Not backed up yet" beside "Archives this install has recorded: N", which
+    // reads as a contradiction -- the ledger keeps one run record per kind and
+    // holds only this install's, so a record can age out while archives stay on
+    // the drive. The meta line must then say which kind of "none" it means.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      runs: {},
+      rememberedArchives: { snapshot: 3 },
+    })
+
+    await renderDrive('backup')
+
+    const meta = await screen.findByTestId('backup-last-snapshot')
+    expect(meta.textContent ?? '').toContain('No run recorded here')
+    expect(meta.textContent ?? '').not.toContain('Not backed up yet')
+    // The count line still invites the reader to the list that says what is there.
+    expect(await screen.findByTestId('backup-remembered-snapshot')).toBeTruthy()
+    // A kind with nothing recorded keeps the plain line -- the clause is only for
+    // the contradiction.
+    expect((screen.getByTestId('backup-last-sessions').textContent ?? '')).toContain('Not backed up yet')
+  })
+
+  it('scrolls the stored-archive disclosure into view when the recorded-count line is clicked', async () => {
+    // #13566 item 3: clicking the count line opened the disclosure but left it
+    // off-screen on a long pane, so the reader asked to see the archives and the
+    // view did not move. jsdom has no scrollIntoView; install one for the
+    // assertion and restore it so nothing leaks into the next test.
+    const scrolled = vi.fn()
+    const original = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = scrolled
+    onTestFinished(() => { Element.prototype.scrollIntoView = original })
+    // requestAnimationFrame drives the deferred scroll; run it synchronously.
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => { cb(0); return 0 })
+    onTestFinished(() => raf.mockRestore())
+
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      runs: {},
+      rememberedArchives: { snapshot: 2 },
+    })
+
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-remembered-snapshot'))
+    // The disclosure opened AND it was scrolled to.
+    expect(await screen.findByTestId('backup-archive')).toBeTruthy()
+    expect(scrolled).toHaveBeenCalled()
+  })
+
   it('shows the backup remote-error note when the archive could not be read', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.backup).mockResolvedValue({
