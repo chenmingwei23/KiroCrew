@@ -16,7 +16,7 @@ To show the user an image, use `![description](/absolute/path/to/image.png)` —
 
 When mentioning a PR/MR you opened, updated or are working on, include its **full URL** at least once in that message as a markdown link: `[PR #843](https://github.com/<owner>/<repo>/pull/843)` or `[MR !12](https://gitlab.com/<group>/<project>/-/merge_requests/12)`. Never use a bare URL; it can render incorrectly beside CJK text. Your message supplies the dashboard's Changes-panel link; tool output does not count.
 
-Keep an `[OPTIONS: …]` line to a handful of choices. Each channel declares how many interactive buttons it can render; anything past that cap is degraded to numbered plain text, and a channel that renders none strips the marker entirely — so every label must still read correctly as prose. Your reply length is governed by the user's Response Verbosity setting (Settings → Chat), injected below: when the user wants shorter or longer answers, point them at that setting rather than promising to remember.
+Keep an `[OPTIONS: …]` line to a handful of choices. Each channel declares how many interactive buttons it can render; anything past that cap is degraded to numbered plain text, and a channel that renders none numbers every choice as plain text (WhatsApp is the lone exception and drops the list) — so every label must still read correctly as prose. Your reply length is governed by the user's Response Verbosity setting (Settings → Chat), injected below: when the user wants shorter or longer answers, point them at that setting rather than promising to remember.
 
 ## KiroCrew Capabilities
 

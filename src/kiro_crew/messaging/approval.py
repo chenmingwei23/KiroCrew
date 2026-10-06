@@ -1,11 +1,14 @@
 """Tool approval by TYPED REPLY, for channels that have no interactive widget.
 
 This is the fallback ``transport.py`` and ``renderer.py`` both already promise:
-a channel declaring ``max_buttons=0`` renders no widget and strips the
-``[OPTIONS:]`` trailer, and both docstrings say the numbered-text form "lands
-with the approval-ladder work". This module is that work, and it is
-channel-neutral for the same reason the button cap is: a channel cannot forget
-what it does not implement itself.
+a channel declaring ``max_buttons=0`` renders no widget and degrades an
+``[OPTIONS:]`` trailer to a numbered-text list (``render_options_as_text``), which
+the operator answers by typing. This module is the APPROVAL half of that typed
+answer, and it is channel-neutral for the same reason the button cap is: a channel
+cannot forget what it does not implement itself. (WhatsApp is the one zero-widget
+channel that drops the trailer instead of numbering it, precisely because its
+approval decider -- below -- already claims the ``1``/``2``/``3`` and ``yes``/``no``
+answer grammar; see ``whatsapp/turn_renderer._strip_options``.)
 
 Without it, a zero-widget channel is not merely less pretty -- it cannot run a
 tool at all. ``TurnDriver`` in ``interactive`` mode is deny-by-default with no

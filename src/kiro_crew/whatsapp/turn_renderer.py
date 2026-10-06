@@ -100,7 +100,19 @@ _ERROR_TEXT = "Something went wrong on my side. Please try again."
 
 
 def _strip_options(text: str) -> str:
-    """Drop the dashboard-only [OPTIONS: ...] trailer (no buttons here)."""
+    """Drop a COMPLETE [OPTIONS: ...] trailer; WhatsApp renders no buttons.
+
+    Unlike the other four ``max_buttons=0`` channels, WhatsApp does NOT fall back
+    to a numbered list -- those route through ``render_options_as_text`` while this
+    drops the trailer. The gap is recorded, not accidental: this channel installs a
+    typed-reply approval decider (``messaging.approval.APPROVAL_ORDINALS``) that
+    consumes a bare ``1``/``2``/``3`` or ``yes``/``no`` from the operator whenever a
+    tool approval is open, so a numbered answer list would collide with the approval
+    verdict grammar. Only a COMPLETE trailer is removed -- a still-arriving
+    fragment renders raw and then vanishes -- which is what keeps the streaming
+    frames MONOTONIC (see ``_rendered_chunks``). See ``docs/channel-capabilities.md``
+    and the ratchet in ``test/test_options_cap_contract.py`` (STRIPS_NOT_NUMBERS).
+    """
     return OPTIONS_RE_TRAILER.sub("", relocate_glued_tail_marker(text)).strip()
 
 
