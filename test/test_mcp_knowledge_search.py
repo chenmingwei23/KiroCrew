@@ -280,8 +280,10 @@ class TestKnowledgeSearchSourceFilter:
     def test_source_id_rejects_non_string(self):
         from kiro_crew.mcp_core import _call_tool_inner
 
+        # A genuinely wrong type (list) on a string field is still rejected.
+        # A number is defensively converted to its string form.
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": 7})
+            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": [7]})
 
     def test_source_id_rejects_overlong_value(self):
         from kiro_crew.mcp_core import _call_tool_inner
@@ -311,8 +313,10 @@ class TestKnowledgeSearchSourceFilter:
     def test_namespace_rejects_non_string(self):
         from kiro_crew.mcp_core import _call_tool_inner
 
+        # A genuinely wrong type (list) on a string field is still rejected.
+        # A number is defensively converted to its string form.
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": 7})
+            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": [7]})
 
     def test_namespace_rejects_overlong_value(self):
         from kiro_crew.mcp_core import _call_tool_inner

@@ -2368,7 +2368,7 @@ async def api_file_write(request: web.Request) -> web.Response:
     assert body is not None  # read_bounded_json returns (dict, None) on success
 
     try:
-        validate_tool_args(
+        cleaned = validate_tool_args(
             {"path": body.get("path", ""), "content": body.get("content", "")}, FILE_WRITE_SCHEMA
         )
     except ValidationError:
@@ -2379,6 +2379,12 @@ async def api_file_write(request: web.Request) -> web.Response:
             resources=body.get("path", ""),
         )
         return web.json_response({"error": "invalid input"}, status=400)
+    # Use the NORMALIZED content, not the raw request value: validate_tool_args
+    # sanitizes the string and may repair an integer that arrived as a number
+    # into its string form, and the writer below encodes text — handing it the
+    # raw value would pass an int straight to atomic_write and raise TypeError
+    # (an HTTP 500) for input the validator already accepted.
+    write_content = cleaned["content"]
 
     # Off-loop: validation and the stat are filesystem syscalls that must not
     # run on the event loop (see _probe_request_path).
@@ -2403,7 +2409,7 @@ async def api_file_write(request: web.Request) -> web.Response:
     try:
         # Off the event loop: see _file_write_blocking's own note on why the
         # whole transaction is offloaded rather than each call individually.
-        outcome = await asyncio.to_thread(_file_write_blocking, path, body.get("content", ""))
+        outcome = await asyncio.to_thread(_file_write_blocking, path, write_content)
         if outcome == "notfound":
             _sel().log_tool_invocation(
                 session_key="dashboard",

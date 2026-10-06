@@ -668,10 +668,12 @@ class TestBadInputsCaught:
         assert "unknown field" in result
 
     def test_wrong_type_rejected(self):
+        # A genuinely wrong type (list) on a string field is still rejected.
+        # A number on a string field is defensively converted to its string form.
         result = self._core_call(
             "spawn_run",
             {
-                "task": 12345,  # should be string
+                "task": ["not", "a", "string"],  # list, not coercible
             },
         )
         assert "Error" in result

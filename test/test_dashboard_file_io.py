@@ -594,6 +594,20 @@ class TestFileWrite:
             )
 
     @pytest.mark.asyncio
+    async def test_write_numeric_content_is_normalized_not_a_crash(
+        self, tmp_file, mock_sel, home_patch
+    ):
+        """An integer content is repaired to its string form by validation and
+        the handler forwards the NORMALIZED value, so it is written as "42"
+        rather than raising TypeError in the encoder (an HTTP 500)."""
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": 42}
+            )
+            assert resp.status == 200
+            assert tmp_file.read_text(encoding="utf-8") == "42"
+
+    @pytest.mark.asyncio
     async def test_write_outside_home(self, mock_sel, home_patch):
         """Non-sensitive paths outside home are allowed; /etc/evil returns 404 (not found)."""
         async with TestClient(TestServer(_make_app())) as client:

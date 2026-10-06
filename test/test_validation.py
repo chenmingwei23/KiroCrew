@@ -222,8 +222,14 @@ class TestValidateField:
         assert validate_field(None, FieldSpec("x", str, default="hi")) == "hi"
 
     def test_wrong_type(self):
+        # A number on a string field is defensively converted to its string
+        # form (see test_validation_numeric_string_coercion.py), so it is not a
+        # type error. A genuinely wrong, non-numeric type is still rejected.
+        assert validate_field(123, FieldSpec("x", str)) == "123"
         with pytest.raises(ValidationError, match="expected str"):
-            validate_field(123, FieldSpec("x", str))
+            validate_field(["a"], FieldSpec("x", str))
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_field({"a": 1}, FieldSpec("x", str))
 
     def test_string_max_len(self):
         with pytest.raises(ValidationError, match="max length"):
@@ -699,8 +705,14 @@ class TestSetProjectSchema:
             validate_tool_args({"path": "relative/path"}, SET_PROJECT_SCHEMA)
 
     def test_non_string_rejected(self):
-        with pytest.raises(ValidationError, match="expected str"):
+        # A number is now defensively converted to its string form, so 42 ->
+        # "42", which is still rejected -- it is not an absolute path (invalid
+        # format), so a non-string path never reaches the project scope either
+        # way. A non-numeric wrong type is still a plain type error.
+        with pytest.raises(ValidationError, match="invalid format"):
             validate_tool_args({"path": 42}, SET_PROJECT_SCHEMA)
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_tool_args({"path": ["/abs/path"]}, SET_PROJECT_SCHEMA)
 
     def test_oversized_rejected(self):
         too_long = "/" + "a" * 4096

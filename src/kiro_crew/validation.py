@@ -570,12 +570,62 @@ def clamp_to_max_len(value: str, max_len: int) -> str:
     return head + _CLAMP_NOTE.format(n=len(value) - len(head))
 
 
+def _coerce_number_to_string_for_string_field(value: Any, spec: FieldSpec) -> Any:
+    """Defensive repair for an integer that reached a string field as a number.
+
+    Some agent runtimes defer a tool's schema and load it on demand; a few of
+    those, when they later marshal the model's ``arguments``, re-type a
+    top-level argument whose VALUE looks like a number (``"42"``) into a JSON
+    number — even though the loaded tool schema declared that field a string.
+    By the time the call reaches this validator the type has already been lost
+    upstream, so a ``FieldSpec`` that says ``str`` sees an ``int`` and the call
+    is rejected (or, for a server that is stricter, fails downstream) when the
+    author clearly meant a string.
+
+    This is a NARROW, EXACT repair, not a general coercion:
+
+    * It fires ONLY for a field whose declared type is EXACTLY ``str`` (not a
+      tuple like ``(int, float)`` that legitimately accepts a number) — a field
+      that wanted a number keeps getting one.
+    * It converts an ``int`` to its string form and NOTHING else: a ``str``
+      stays a ``str``, a ``bool`` (an ``int`` subclass) is left for the normal
+      type check to reject, and a ``float`` / list / dict / ``None`` is
+      untouched.
+
+    A ``float`` is DELIBERATELY not converted. ``str(float)`` is the shortest
+    round-tripping form, which is NOT the author's original text whenever that
+    text carried a digit the float cannot distinguish: ``"1790284307.156620"``
+    becomes the float ``1790284307.15662`` and then ``"1790284307.15662"`` — a
+    DIFFERENT, still-schema-valid value (it still matches a ``^\\d+\\.\\d+$``
+    timestamp pattern), so a Slack reply would silently go to the wrong thread
+    instead of failing loudly. For a value the author meant as a string, a loud
+    ``expected str`` is strictly safer than a silently-wrong one, so a float on
+    a string field is left to the ordinary type error. Only ``int`` round-trips
+    exactly (``str(42) == "42"``, including large ids), so only ``int`` is
+    repaired here.
+    """
+    if spec.type is not str:
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    return value
+
+
 def validate_field(value: Any, spec: FieldSpec) -> Any:
     """Validate and normalize a single field value. Returns cleaned value."""
     if value is None:
         if spec.required:
             raise ValidationError(spec.name, "required")
         return spec.default
+
+    # Defensive repair BEFORE the type check: an upstream runtime that defers a
+    # tool's schema can re-type a numeric-looking string argument into a JSON
+    # number against a field the schema declared a string. Convert it back to
+    # its string form (number -> string only; see the helper) so a value the
+    # author meant as a string is validated as one instead of rejected.
+    value = _coerce_number_to_string_for_string_field(value, spec)
 
     # Type check
     if not isinstance(value, spec.type):
