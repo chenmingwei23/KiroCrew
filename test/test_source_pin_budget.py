@@ -98,7 +98,7 @@ BUDGET: dict[str, int] = {
     "test/test_session_control.py": 1,
     # the admission record's set and compare-and-clear in _run_chat, and the
     # fence clear in _end_turn_tail
-    "test/test_session_control_owner_dm.py": 3,
+    "test/test_session_control_owner_dm.py": 1,
     "test/test_session_control_set_model.py": 3,
     "test/test_start_priority.py": 1,
     "test/test_stderr_redact_then_tail.py": 1,
