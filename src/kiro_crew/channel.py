@@ -110,15 +110,21 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS: tuple[str, ...] = (
 # tool's own schema admits nothing but an exact member of its allowlist in
 # either, so an operation named here cannot be reached under a second spelling.
 #
+# One tool, one operation: a single ``(tool, method, path)`` constant rather than
+# a registry.  A second blocked operation turns this back into a mapping; until
+# one exists the container shape would anticipate a generality that is not here.
+#
 # Enforced at MCP dispatch alone, unlike the name list, which is also matched at
 # the permission-request event: that matcher reads the rendered title, where an
 # operation does not appear.  Containment still holds, because the dispatch guard
 # is what refuses the call -- approving the prompt only means the refusal arrives
 # one step later, and the interactive guard's job is to beat an AUTO-approval,
 # which the dispatch guard beats as well.
-CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]] = {
-    "ops_mission_control_api": (("POST", "/rotation/arm"),),
-}
+CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION: tuple[str, str, str] = (
+    "ops_mission_control_api",
+    "POST",
+    "/rotation/arm",
+)
 
 # Direct-to-user messaging tools a channel agent may never invoke — channel
 # agents communicate exclusively through channel posts.  send_notification

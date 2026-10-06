@@ -937,10 +937,10 @@ def _deny_channel_agent_dispatch(tool_name: str, args: dict[str, Any] | None = N
     permission guard and this one cannot drift apart.
 
     A name alone does not identify one of these calls when the tool is a
-    passthrough carrying a whole API surface, so a second set keyed on the
-    operation, ``CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS``, holds those: the
-    tool stays callable and only the operations that start work are refused.
-    That is why this takes the call's arguments as well as its name.
+    passthrough carrying a whole API surface, so a single ``(tool, method,
+    path)`` constant, ``CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION``, holds that
+    one: the tool stays callable and only the operation that starts work is
+    refused. That is why this takes the call's arguments as well as its name.
 
     Why the refusal lands HERE, on the channel agent's own hop, rather than on
     the descendant: a descendant's session key is ``subagent:<id>``, carrying no
@@ -967,7 +967,7 @@ def _deny_channel_agent_dispatch(tool_name: str, args: dict[str, Any] | None = N
     # through the cheapest possible path, having touched nothing. The import is a
     # ``sys.modules`` hit once the first call has paid it.
     from kiro_crew.channel import (
-        CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS,
+        CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION,
         CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS,
     )
 
@@ -977,17 +977,18 @@ def _deny_channel_agent_dispatch(tool_name: str, args: dict[str, Any] | None = N
     # its reads are gone when they are not.
     subject = tool_name
     if not denied:
-        operations = CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS.get(tool_name)
-        if not operations:
+        blocked_tool, blocked_method, blocked_path = CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION
+        if tool_name != blocked_tool:
             return None
         call = args or {}
         # Upper-cased so the deny is never spelled more narrowly than the
         # operation it holds; the path is compared as given, because the tool's
         # schema admits only an exact member of its own allowlist there.
-        operation = (str(call.get("method", "")).upper(), str(call.get("path", "")))
-        if operation not in operations:
+        method = str(call.get("method", "")).upper()
+        path = str(call.get("path", ""))
+        if (method, path) != (blocked_method, blocked_path):
             return None
-        subject = f"{operation[0]} {operation[1]} on {tool_name}"
+        subject = f"{blocked_method} {blocked_path} on {tool_name}"
     caller_session = require_strict_session_key("channel-agent containment")[0]
     if not caller_session.startswith("channel:"):
         return None

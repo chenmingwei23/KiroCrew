@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew.channel import (
-    CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS,
+    CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION,
     CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS,
     CHANNEL_AGENT_BLOCKED_TOOLS,
     _stream_task,
@@ -176,20 +176,26 @@ def test_dispatch_tuple_names_the_verbs_that_start_work():
     }
 
 
-def test_operation_map_names_the_operations_that_start_work():
-    """A passthrough tool is held by operation, so the operations are pinned too.
+def test_operation_constant_names_the_operation_that_starts_work():
+    """A passthrough tool is held by operation, so the operation is pinned too.
 
     ``ops_mission_control_api`` carries a whole API surface behind one name, and
     only ``POST /rotation/arm`` starts work that outlives the turn: it arms the
     app's crons, which fire unattended afterwards. Every other operation reads, or
     writes a record inside the turn, so the tool itself is not on the name list.
+
+    One tool, one operation: a single ``(tool, method, path)`` constant rather
+    than a registry. A second blocked operation would turn this back into a
+    mapping.
     """
-    assert CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS == {
-        "ops_mission_control_api": (("POST", "/rotation/arm"),),
-    }
+    assert CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION == (
+        "ops_mission_control_api",
+        "POST",
+        "/rotation/arm",
+    )
 
 
-def test_blocked_operations_are_real_operations_of_their_tool():
+def test_blocked_operation_is_a_real_operation_of_its_tool():
     """A typo here would deny nothing and read as protection.
 
     The operation is matched against the arguments a caller sends, so a method or
@@ -199,10 +205,9 @@ def test_blocked_operations_are_real_operations_of_their_tool():
     """
     from kiro_crew.validation import OPS_MISSION_CONTROL_ALLOWED_CALLS
 
-    for tool, operations in CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS.items():
-        assert tool == "ops_mission_control_api", f"no known surface for {tool}"
-        for operation in operations:
-            assert operation in OPS_MISSION_CONTROL_ALLOWED_CALLS, operation
+    tool, method, path = CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION
+    assert tool == "ops_mission_control_api", f"no known surface for {tool}"
+    assert (method, path) in OPS_MISSION_CONTROL_ALLOWED_CALLS, (method, path)
 
 
 @pytest.mark.parametrize(
