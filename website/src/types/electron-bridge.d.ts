@@ -49,6 +49,9 @@ declare global {
     setThemeAccent: (hex: string) => void
     setThemeMode: (pref: string) => void
     setTitleBarOverlayTheme: (mode: string) => void
+    /** One-shot ping that the top-level dashboard SPA mounted; disarms the
+     *  main-process blank-shell watchdog. Absent in a browser. */
+    dashboardBooted?: () => void
     setFocusModeChrome: (visible: boolean) => void
     /** Watch how far the cursor travels OUTSIDE this window while a focus-mode
      *  reveal is open. Fires the callback once — `true` past the dismissal

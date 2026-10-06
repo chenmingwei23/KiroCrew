@@ -68,6 +68,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // the Windows titleBarOverlay colors. Separate from setThemeMode because that
   // carries the preference (system/dark/light) while this carries the outcome.
   setTitleBarOverlayTheme: (mode) => ipcRenderer.send("titlebar-overlay-theme", String(mode || "")),
+  // One-shot "the dashboard SPA actually mounted" ping. The main process arms a
+  // blank-shell watchdog on the dashboard's `did-finish-load` (stale-shell-watchdog.js);
+  // this ping cancels it. A window that loaded its HTML but whose entry bundle
+  // never evaluated (a stale HTTP-cache capsule) never sends this, so the
+  // watchdog forces a cache-ignoring reload — the recovery cannot live in the
+  // bundle, because on that failure the bundle never runs.
+  dashboardBooted: () => ipcRenderer.send("dashboard:booted"),
   // Focus mode: report whether the dashboard header is on screen so the native
   // macOS traffic lights can follow it. They are AppKit views painted at a window
   // coordinate, so the renderer cannot hide or move them itself — with the header

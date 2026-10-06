@@ -283,6 +283,16 @@ function boot(startSync: boolean): void {
     announceBoot('render')
     createRoot(document.getElementById('root')!).render(appTree)
     if (startSync) startUiPrefsSync()
+    // Tell the desktop main process the top-level dashboard actually mounted, so
+    // its blank-shell watchdog (electron/stale-shell-watchdog.js) disarms. A
+    // window whose entry bundle never evaluated (a stale HTTP-cache capsule)
+    // never reaches this line, so the watchdog forces a cache-ignoring reload —
+    // which is why the recovery lives in the main process, not here. Top-level
+    // only (an embedded pane has no window of its own to heal), and a no-op
+    // outside the desktop app (the bridge is absent in a browser).
+    if (!isEmbeddedPane()) {
+      try { window.electronAPI?.dashboardBooted?.() } catch { /* no bridge — browser */ }
+    }
   })
 }
 

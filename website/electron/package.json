@@ -189,6 +189,7 @@
       "gateway-recovery.js",
       "renderer-recovery.js",
       "hang-recovery.js",
+      "stale-shell-watchdog.js",
       "native-logging.js",
       "crash-collector.js",
       "runtime/crash/ownership.js",
