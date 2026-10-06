@@ -598,6 +598,7 @@ class TestPointName:
             "model.route",
             "compaction.keep",
             "memory.recall",
+            "context.inject",
             "nudge.wake",
         )
 

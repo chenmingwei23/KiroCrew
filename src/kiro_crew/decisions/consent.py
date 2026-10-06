@@ -105,6 +105,19 @@ STATE_KEY_MEMORY_TEXT = "memory_text"
 #: three is inert here.
 STATE_KEY_NUDGE_EVIDENCE = "nudge_evidence"
 
+#: Whether the owner consented to sending SNIPPETS FROM THEIR OTHER CONVERSATIONS
+#: at startup -- the ``## Recent Session Context`` lines ``context.inject`` offers,
+#: drawn from sessions other than the one being built. A FIFTH leaf for exactly the
+#: reason there is a fourth, and the category is genuinely new again: the docs
+#: today promise startup/compaction scoring sends no other session, so a snippet
+#: from a DIFFERENT conversation is content no existing scope was reviewed to cover.
+#: It is kept distinct from ``nudge_evidence`` -- the nearest neighbour -- on
+#: purpose: that scope is a WATCHED session's tail and a forge's comment
+#: fingerprint, text the owner opted into watching, while this is the owner's own
+#: other chats surfaced into a prompt they did not ask to assemble. Absent reads as
+#: NOT consented, so an install that granted any of the other four is inert here.
+STATE_KEY_OTHER_SESSIONS = "other_sessions"
+
 #: "Keep whatever ceiling is recorded" for :func:`save_enabled`. A distinct object,
 #: because ``0`` is a ceiling an owner may choose and no number can mean "not asked".
 #: Resolved inside the read-modify-write, so the value written comes from the same
@@ -135,6 +148,13 @@ KEEP_MEMORY_TEXT: object = object()
 #: lock so an enabling PUT cannot restore a scope a concurrent revoking PUT just
 #: cleared.
 KEEP_NUDGE_EVIDENCE: object = object()
+
+#: "Keep whatever other-sessions scope is recorded", on the same terms and for the
+#: same reason as :data:`KEEP_NUDGE_EVIDENCE`: ``False`` is a scope an owner may
+#: choose, so no boolean can also mean "not asked", and it is resolved inside the
+#: lock so an enabling PUT cannot restore a scope a concurrent revoking PUT just
+#: cleared.
+KEEP_OTHER_SESSIONS: object = object()
 
 #: "Keep whatever the keystone records" -- the switch AND the endpoint it is bound to.
 #: A distinct object for the reason the four above are: ``False`` is a state an owner
@@ -311,6 +331,25 @@ def consented_nudge_evidence(state: "dict | None" = None) -> bool:
     return data.get(STATE_KEY_NUDGE_EVIDENCE) is True
 
 
+def consented_other_sessions(state: "dict | None" = None) -> bool:
+    """Whether the owner consented to sending other-conversation snippets. Absent reads False.
+
+    Only a literal ``True`` consents, on the same terms as
+    :func:`consented_tool_args` and for the same reason: this value decides whether
+    a new category of content leaves the machine, so a value nobody can read back
+    as a deliberate yes is a no.
+
+    NOT implied by :func:`consented_nudge_evidence`, which is the nearest neighbour
+    and still a different decision. That scope was reviewed as a WATCHED session's
+    tail and a forge comment's fingerprint -- evidence the owner opted into
+    watching. This one carries ``## Recent Session Context`` snippets drawn from
+    the owner's OTHER chats into a prompt they did not ask to assemble, so consent
+    to the first cannot stand for the second.
+    """
+    data = load_state() if state is None else state
+    return data.get(STATE_KEY_OTHER_SESSIONS) is True
+
+
 def permits(endpoint: object, state: "dict | None" = None) -> bool:
     """Whether the keystone consents to sending to *endpoint*, exactly.
 
@@ -358,6 +397,7 @@ def save_enabled(
     compaction: object = False,
     memory_text: object = False,
     nudge_evidence: object = False,
+    other_sessions: object = False,
 ) -> dict:
     """Record *enabled* for *endpoint* atomically, owner-only; return the state written.
 
@@ -419,6 +459,13 @@ def save_enabled(
     their own transcript scored for compaction without the tail of every session they
     are watching leaving the machine.
 
+    *other_sessions* is the OTHER-CONVERSATION SNIPPET scope ``context.inject`` needs
+    for its ``## Recent Session Context`` candidates, on the same terms again, down
+    to :data:`KEEP_OTHER_SESSIONS` and the lock. A fifth independent field because it
+    is a fifth independent decision: an owner may want risky tool calls flagged, or
+    their memory store scored at startup, without snippets of their OTHER chats being
+    surfaced into a prompt build.
+
     This is what makes the route safe rather than careful. A caller that must supply
     ``enabled`` can only supply what it last read, so a view read before a revoke
     re-grants egress; with the switch resolved here, no scope write can move it.
@@ -452,6 +499,9 @@ def save_enabled(
     keep_nudge = nudge_evidence is KEEP_NUDGE_EVIDENCE
     if not keep_nudge and not isinstance(nudge_evidence, bool):
         raise ValueError("nudge_evidence must be a bool")
+    keep_other = other_sessions is KEEP_OTHER_SESSIONS
+    if not keep_other and not isinstance(other_sessions, bool):
+        raise ValueError("other_sessions must be a bool")
     target = normalize_endpoint(endpoint)
     if enabled is True and not target:
         raise ValueError("consent needs the endpoint it is given for")
@@ -486,6 +536,8 @@ def save_enabled(
             memory_text = consented_memory_text(state)
         if keep_nudge:
             nudge_evidence = consented_nudge_evidence(state)
+        if keep_other:
+            other_sessions = consented_other_sessions(state)
         state[STATE_KEY_ENABLED] = enabled
         state[STATE_KEY_ENDPOINT] = target if enabled else ""
         state[STATE_KEY_HISTORY_BUDGET] = history_budget_chars if enabled else 0
@@ -493,6 +545,7 @@ def save_enabled(
         state[STATE_KEY_COMPACTION] = compaction is True if enabled else False
         state[STATE_KEY_MEMORY_TEXT] = memory_text is True if enabled else False
         state[STATE_KEY_NUDGE_EVIDENCE] = nudge_evidence is True if enabled else False
+        state[STATE_KEY_OTHER_SESSIONS] = other_sessions is True if enabled else False
         atomic_write(consent_path(), json.dumps(state, indent=2) + "\n", mode=_STATE_FILE_MODE)
     return state
 

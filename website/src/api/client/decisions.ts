@@ -48,6 +48,15 @@ export interface DecisionsConsentData {
    */
   nudge_evidence?: boolean
   /**
+   * Whether the owner consented to sending OTHER-CONVERSATION SNIPPETS — the
+   * `## Recent Session Context` lines `context.inject` offers from the owner's OTHER
+   * chats at startup. Absent reads as not consented, on the same terms as the four
+   * above: the docs promise startup/compaction scoring sends no other session, so a
+   * snippet from a different conversation is a category none of the narrower yeses was
+   * reviewed to cover.
+   */
+  other_sessions?: boolean
+  /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
    * written here, so a build that ships another point lights up a row with no

@@ -80,6 +80,7 @@ DECISION_POINT_NAMES = (
     "model.route",
     "compaction.keep",
     "memory.recall",
+    "context.inject",
     "nudge.wake",
 )
 
@@ -136,7 +137,18 @@ POINTS_NEEDING_COMPACTION = frozenset({"compaction.keep"})
 #: text the AGENT wrote down turns or days ago about work the owner was not
 #: reviewing when they consented. An install that granted either other scope is
 #: inert here.
-POINTS_NEEDING_MEMORY_TEXT = frozenset({"memory.recall"})
+#:
+#: ``context.inject`` is here too, and it is the one point in this set that needs a
+#: SECOND scope on top: its memory candidates (lessons, past findings, facts,
+#: activity entries) are exactly this category, so the gate enforces ``memory_text``
+#: for it here, while its ``## Recent Session Context`` candidates are a different
+#: category gated on ``other_sessions``. The point consults that second scope
+#: ITSELF (``context_inject.other_sessions_consented``) and simply OMITS the
+#: other-session candidates when it is not granted, rather than being refused
+#: outright -- the per-point table maps one point to one scope, and refusing on the
+#: second would make an install that granted only ``memory_text`` inert for the
+#: memory sources it DID consent to.
+POINTS_NEEDING_MEMORY_TEXT = frozenset({"memory.recall", "context.inject"})
 
 #: Points whose request carries EVIDENCE GATHERED FROM OTHER SESSIONS AND THIRD
 #: PARTIES -- a watched worker's transcript tail, a bot's review comment body, a
