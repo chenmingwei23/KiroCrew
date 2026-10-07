@@ -57,6 +57,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from kiro_crew.apps.builtins.mochi import queue_file as qf
 from kiro_crew.apps.builtins.mochi.queue_file import _epoch_ms, _iso
 from kiro_crew.apps.builtins.mochi.soul_loader import load_skill_line
+from kiro_crew.apps.spawn_sdk import SpawnError
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,14 @@ _PLAN_BACKOFF_CAP_MS = 16 * 60_000
 # Storm breaker: hard rate-limit on watch spawns regardless of lock state.
 WATCH_STORM_WINDOW_MS = 10 * 60_000
 MAX_WATCH_SPAWNS_PER_WINDOW = 5
+
+# Freestyle decline backoff: after the HOST declines a freestyle spawn (the
+# admission gate deferring for low memory, raised as a SpawnError), defer the
+# whole route=="execute" block for this long before trying again. A declined
+# task is never marked done, so without this it re-attempts on every 1s poll
+# (#13129: ~400 attempts/min on a low-memory host). A SUCCESSFUL spawn clears
+# the backoff at once, so a healthy host is never throttled by this path.
+FREESTYLE_DECLINE_BACKOFF_MS = 10 * 60_000
 
 # Planned (non-urgent) move/mood tasks older than this are skipped as stale.
 # (The original comment said 2 minutes; the code says 30 — quirk 1.)
@@ -232,6 +241,10 @@ class QueuePoller:
         self._plan_next_retry_at = 0
         self._watch_spawn_count = 0
         self._watch_window_start = 0
+        # Freestyle decline backoff: a deadline until which the route=="execute"
+        # block is skipped after the host declined a spawn (SpawnError). 0 means
+        # "not backing off". Cleared the moment a freestyle spawn succeeds.
+        self._freestyle_backoff_until = 0
         self._first_launch_grace = False
         self._grace_deadline: int | None = None
         # Serial spawn wait: pending future + its timeout deadline + spawn id.
@@ -557,13 +570,37 @@ class QueuePoller:
             return
 
         # 7. route == 'execute': freestyle agent tasks, serially.
+        #
+        # Decline backoff: a freestyle spawn the HOST declines (SpawnError —
+        # the admission gate deferring for low memory) leaves the due task
+        # undone, so without a brake it re-attempts on every 1s poll (#13129:
+        # ~400 attempts/min on a starved host). Back off ONLY on a decline —
+        # a successful spawn clears the deadline below, so a healthy host whose
+        # spawns all land is never throttled by this path, and the hourly
+        # activity_budget meter (recorded only after a success, see hooks.py) is
+        # deliberately left untouched.
+        now = self._clock()
+        backing_off = bool(self._freestyle_backoff_until) and now < self._freestyle_backoff_until
         for task in due_tasks:
+            if backing_off:
+                # Still cooling down after a decline: skip the execute block
+                # this poll (every due task would be declined too). No per-poll
+                # logging — the one warning was emitted when the backoff armed.
+                break
             if task.get("type") not in AGENT_TYPES:
                 continue
             try:
-                await self._spawn_agent_task_serial(task)
+                declined = await self._spawn_agent_task_serial(task)
             except Exception:  # noqa: BLE001
                 logger.exception("[QueuePoller] failed to spawn agent task %s", task.get("id"))
+                continue
+            if declined:
+                # Host under pressure: arm the backoff and stop attempting the
+                # remaining due tasks this poll (they would all be declined too).
+                self._freestyle_backoff_until = self._clock() + FREESTYLE_DECLINE_BACKOFF_MS
+                break
+            # Accepted: the host has capacity, so clear any prior backoff.
+            self._freestyle_backoff_until = 0
 
         # 8. Cleanup + write-back, merged onto a FRESH read so tasks written
         #    by agents during steps 4-7 are not clobbered.
@@ -643,9 +680,16 @@ class QueuePoller:
             self._spawn_future = None
             self._spawn_deadline = None
 
-    async def _spawn_agent_task_serial(self, task: dict[str, Any]) -> None:
+    async def _spawn_agent_task_serial(self, task: dict[str, Any]) -> bool:
         """Spawn a freestyle task's agent and wait; on timeout, mark failure
-        and queue the sticky fail-notify after MAX_FAIL_COUNT."""
+        and queue the sticky fail-notify after MAX_FAIL_COUNT.
+
+        Returns True when the HOST DECLINED the spawn (a raised ``SpawnError`` —
+        e.g. the admission gate deferring for low memory). The caller uses that
+        to back off the freestyle block instead of re-attempting every poll; a
+        return of False means the spawn was accepted (or failed for an
+        unrelated reason that is not a host-pressure signal).
+        """
         task_id = task.get("id")
         prompt = build_agent_prompt(task)
 
@@ -655,12 +699,21 @@ class QueuePoller:
 
         try:
             spawn_id = await self._callbacks.spawn_agent(prompt)
+        except SpawnError:
+            # The host declined (low memory / admission deferral). Signal the
+            # caller to back off; the task stays undone and is retried after the
+            # cooldown rather than on the very next poll.
+            logger.warning("[QueuePoller] freestyle spawn declined by host for %s", task_id)
+            on_end = getattr(self._callbacks, "on_agent_spawn_end", None)
+            if on_end is not None:
+                on_end()
+            return True
         except Exception:  # noqa: BLE001
             logger.exception("[QueuePoller] spawnAgent failed for %s", task_id)
             on_end = getattr(self._callbacks, "on_agent_spawn_end", None)
             if on_end is not None:
                 on_end()
-            return
+            return False
 
         self._current_spawn_id = spawn_id or None
         timed_out = await self._await_spawn()
@@ -675,6 +728,7 @@ class QueuePoller:
                 await asyncio.to_thread(self._locked_mark_timeout, task_id)
             except OSError:
                 logger.exception("[QueuePoller] spawn timeout handler error for %s", task_id)
+        return False
 
     async def _spawn_watch_check(self, prompt: str) -> None:
         """Spawn a watch/recovery agent and wait — same serial mechanism,
