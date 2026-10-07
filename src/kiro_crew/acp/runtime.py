@@ -6708,7 +6708,7 @@ class AcpRuntime:
 
     async def _unpooled_control_planes(
         self, entries: list[dict[str, Any]], agent: str | None, work_dir: str | Path
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], frozenset[tuple[str, str]]]:
         # A shared Kiro process has no session-valued environment. Its native
         # managed servers need per-element identity even with the broker off.
         if self.acp_backend == ACP_BACKEND_KIRO:
@@ -6751,6 +6751,14 @@ class AcpRuntime:
                 # this agent's skill resources on the element's promise, and
                 # without the element kirocrew-core mounts natively, carries no
                 # identity and answers identity_unattested to every skill_search.
+                #
+                # A ``disabledTools`` toggle on kirocrew-core no longer reaches
+                # here as a withheld element: the mount carries it on the gate
+                # and emits the element, so the element IS in ``mount.elements``
+                # and this branch is not taken for it. What is still kept native
+                # -- a mute, a non-stdio transport, a key the element cannot
+                # express -- has no per-call form, so refusing stays the only
+                # honest answer for those (#14125).
                 withheld = mount.withheld.get("kirocrew-core")
                 if withheld is not None:
                     raise AcpRuntimeError(f"Agent {name!r}: {withheld.explain('skill search')}")
@@ -6759,8 +6767,8 @@ class AcpRuntime:
                         "Cannot bind skill_search to this session without losing native MCP "
                         "restrictions. Check the agent's kirocrew-core server configuration."
                     )
-            return [*entries, *mount.elements]
-        return entries
+            return [*entries, *mount.elements], mount.carried
+        return entries, frozenset()
 
     @staticmethod
     async def _source_agent(agent: str | None) -> str | None:
@@ -6894,9 +6902,18 @@ class AcpRuntime:
                     self.acp_backend,
                     session_work_dir,
                 )
-                mcp_servers = await self._unpooled_control_planes(
+                mcp_servers, carried_denied = await self._unpooled_control_planes(
                     pooled, agent or self._agent, session_work_dir
                 )
+                # On the kiro backend a ``disabledTools`` toggle on the control
+                # plane is carried on the per-call gate rather than withholding
+                # the element and refusing the session (#14125). The pairs land
+                # on this session's ``spec_denied_tools`` the same way a mirrored
+                # host's do -- the handle refuses a switched-off tool at the
+                # permission request -- so the session runs minus the toggled
+                # tool and keeps skill_search. Empty on every other backend and
+                # whenever nothing is toggled.
+                denied_tools = carried_denied
                 mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         else:
             # An explicit array is the caller's own composition (a mirror's
@@ -7779,9 +7796,13 @@ class AcpRuntime:
                 self.acp_backend,
                 session_work_dir,
             )
-            mcp_servers = await self._unpooled_control_planes(
+            mcp_servers, carried_denied = await self._unpooled_control_planes(
                 pooled, active_agent, session_work_dir
             )
+            # Carry a control-plane ``disabledTools`` toggle on the gate here too,
+            # so a RESUMED session keeps the same deny set a fresh one gets and
+            # the toggled tool stays refused across session/load (#14125).
+            denied_tools = carried_denied
             mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         member_withheld = False
         # False for every non-member session, set without an awaited call so the

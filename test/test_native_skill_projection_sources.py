@@ -100,6 +100,16 @@ async def _session_refusal(prepared, tree, entries=()) -> str:
     return str(refused.value)
 
 
+async def _session_carries(prepared, tree, entries=()):
+    """The entries and carried deny pairs a ``kirocrew`` session gets on a warm
+    runtime, for a restriction the mount carries rather than refusing."""
+    from test_acp_runtime import _make_runtime
+
+    runtime, _, _ = _make_runtime()
+    runtime._native_skill_projection = prepared
+    return await runtime._unpooled_control_planes(list(entries), "kirocrew", tree.project)
+
+
 def _mount(prepared, tree, entries=()) -> session_mcp.NativeControlPlaneMount:
     """What the mount yields for a ``kirocrew`` session over the view, as the runtime asks it."""
     return session_mcp.kiro_control_plane_servers(
@@ -117,39 +127,49 @@ def _withheld(prepared, tree) -> str | None:
 
 
 @pytest.mark.asyncio
-async def test_a_tool_disabled_in_the_global_settings_refuses_the_search_agents_sessions_by_name(
+async def test_a_tool_disabled_in_the_global_settings_carries_on_the_gate_not_refusing(
     tree,
 ):
-    """The toggle is written into a file every agent of the process shares, so it
-    refuses the search agent's SESSIONS, naming the file -- never the spawn, which
-    every other agent's sessions ride on, and never the other agents."""
+    """A control-plane tool toggled off in the file every agent of the process
+    shares no longer refuses the search agent's SESSIONS (#14125): the element
+    mounts and the ``(server, tool)`` pair rides this session's per-call gate, so
+    the session runs minus the toggled tool and keeps skill_search. kirocrew-core
+    carries no annotations, so every call reaches Crew as a permission request the
+    client can reject -- the one channel that honours the restriction without a
+    file the element cannot write."""
     _write(tree.settings, TOGGLED)
     prepared = projection.prepare_native_skill_projection(tree.project)
     assert prepared is not None
     # The view stands: the spec is clean, so the spawn goes ahead under the alias.
     assert prepared.search_agents == {"kirocrew"} and prepared.errors == {}
     assert (tree.agents / f"{prepared.agent('kirocrew')}.json").exists()
-    reason = _withheld(prepared, tree)
-    assert reason is not None
-    assert reason.startswith("kirocrew-core is withheld by the global MCP settings")
-    assert str(tree.settings) in reason
-    assert "disabledTools lists learn_add" in reason
-    assert "dashboard's MCP tab" in reason and reason.endswith("to restore skill search")
-    assert await _session_refusal(prepared, tree) == f"Agent 'kirocrew': {reason}"
+    # The element is NOT withheld -- the mount carries the restriction instead.
+    assert _withheld(prepared, tree) is None
+    mount = _mount(prepared, tree)
+    assert "kirocrew-core" not in mount.withheld
+    assert any(e["name"] == "kirocrew-core" for e in mount.elements)
+    assert mount.carried == frozenset({("kirocrew-core", "learn_add")})
+    # The runtime does not refuse the session; the pairs flow back for the gate.
+    entries, carried = await _session_carries(prepared, tree)
+    assert carried == frozenset({("kirocrew-core", "learn_add")})
+    assert any(e["name"] == "kirocrew-core" for e in entries)
     # The agent that never asked for the element is untouched by the restriction.
     assert (tree.agents / f"{prepared.agent('plain')}.json").exists()
     assert "plain" not in prepared.search_agents
 
 
 @pytest.mark.asyncio
-async def test_a_tool_disabled_in_the_project_settings_refuses_the_search_agents_sessions(tree):
+async def test_a_tool_disabled_in_the_project_settings_carries_on_the_gate_not_refusing(tree):
     _write(_project_settings(tree), TOGGLED)
     prepared = projection.prepare_native_skill_projection(tree.project)
     assert prepared.search_agents == {"kirocrew"}
-    reason = _withheld(prepared, tree)
-    assert reason.startswith("kirocrew-core is withheld by the project's MCP settings")
-    assert str(_project_settings(tree)) in reason and "learn_add" in reason
-    assert await _session_refusal(prepared, tree) == f"Agent 'kirocrew': {reason}"
+    assert _withheld(prepared, tree) is None
+    mount = _mount(prepared, tree)
+    assert any(e["name"] == "kirocrew-core" for e in mount.elements)
+    assert mount.carried == frozenset({("kirocrew-core", "learn_add")})
+    entries, carried = await _session_carries(prepared, tree)
+    assert carried == frozenset({("kirocrew-core", "learn_add")})
+    assert any(e["name"] == "kirocrew-core" for e in entries)
 
 
 @pytest.mark.parametrize(
@@ -209,10 +229,6 @@ def test_every_restriction_the_mount_knows_refuses_the_session_with_its_name(tre
 @pytest.mark.parametrize(
     "core, reason",
     [
-        (
-            {**MANAGED, "disabledTools": ["learn_add"]},
-            "kirocrew-core is withheld by the agent spec",
-        ),
         # A mute is caught by the spec-shape check ahead of the predicate.
         ({**MANAGED, "disabled": True}, "skill_search is disabled"),
         ({**MANAGED, "type": "http"}, "kirocrew-core is withheld by the agent spec"),
@@ -222,7 +238,9 @@ def test_a_restriction_authored_in_the_spec_entry_refuses_the_view_at_preparatio
     tree, core, reason
 ):
     """The spec is this preparation's input and a restriction there is static for
-    the view's life, so the view is refused now, naming the spec."""
+    the view's life, so the view is refused now, naming the spec. A
+    ``disabledTools`` toggle is NOT among these -- it is carried on the gate and
+    covered by its own test below (#14125)."""
     spec = {**tree.specs["kirocrew"], "mcpServers": {"kirocrew-core": core}}
     (tree.agents / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
     prepared = projection.prepare_native_skill_projection(tree.project)
@@ -230,6 +248,36 @@ def test_a_restriction_authored_in_the_spec_entry_refuses_the_view_at_preparatio
     assert prepared.errors["kirocrew"].startswith(reason)
     with pytest.raises(ValueError, match=reason.split(" is ")[0]):
         prepared.agent("kirocrew")
+
+
+def test_disabled_tools_authored_in_the_spec_entry_carries_the_view_not_refusing(tree):
+    """A ``disabledTools`` on kirocrew-core authored in the spec (naming a tool
+    other than skill_search) leaves the view standing: it is a restriction a
+    control-plane server's per-call gate carries, so the mount emits the element
+    and reports the pair rather than withholding it (#14125). skill_search itself
+    being disabled is still refused, by the explicit check ahead of the
+    predicate."""
+    core = {**MANAGED, "disabledTools": ["learn_add"]}
+    spec = {**tree.specs["kirocrew"], "mcpServers": {"kirocrew-core": core}}
+    (tree.agents / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
+    tree.specs["kirocrew"] = spec
+    prepared = projection.prepare_native_skill_projection(tree.project)
+    assert prepared.search_agents == {"kirocrew"} and prepared.errors == {}
+    assert prepared.agent("kirocrew")  # the spawn has an alias to run
+    mount = session_mcp.kiro_control_plane_servers(
+        "kirocrew", work_dir=tree.project, spec_override=prepared.specs.get("kirocrew")
+    )
+    assert "kirocrew-core" not in mount.withheld
+    assert any(e["name"] == "kirocrew-core" for e in mount.elements)
+    assert mount.carried == frozenset({("kirocrew-core", "learn_add")})
+
+    # skill_search itself disabled still refuses, by the pre-predicate check.
+    core_search = {**MANAGED, "disabledTools": ["skill_search"]}
+    spec_search = {**tree.specs["kirocrew"], "mcpServers": {"kirocrew-core": core_search}}
+    (tree.agents / "kirocrew.json").write_text(json.dumps(spec_search), encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(tree.project)
+    assert "kirocrew" not in prepared.search_agents
+    assert prepared.errors["kirocrew"].startswith("skill_search is disabled")
 
 
 @pytest.mark.parametrize("where", ["spec", "global", "project"])
@@ -425,18 +473,22 @@ async def test_an_empty_settings_file_starts_the_search_agents_sessions(tree, sc
     assert _withheld(prepared, tree) is None
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
-    servers = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+    servers, _carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
     assert [server["name"] for server in servers] == ["kirocrew-core"]
 
 
 @pytest.mark.asyncio
 async def test_a_session_of_an_agent_the_spec_refused_reaches_no_guard(tree):
-    """The ``session/new`` guard is unreachable once the projection has refused."""
+    """The ``session/new`` guard is unreachable once the projection has refused.
+
+    Uses a non-stdio transport in the spec -- a restriction with no per-call form,
+    so it still refuses the view (a ``disabledTools`` toggle would now be carried,
+    #14125). The session reaches no guard and no element is mounted."""
     from test_acp_runtime import _make_runtime
 
     spec = {
         **tree.specs["kirocrew"],
-        "mcpServers": {"kirocrew-core": {**MANAGED, "disabledTools": ["learn_add"]}},
+        "mcpServers": {"kirocrew-core": {**MANAGED, "type": "http"}},
     }
     (tree.agents / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
     tree.specs["kirocrew"] = spec
@@ -445,7 +497,7 @@ async def test_a_session_of_an_agent_the_spec_refused_reaches_no_guard(tree):
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
     try:
-        servers = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+        servers, _carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
     except AcpRuntimeError as exc:  # pragma: no cover - the defect this module pins
         pytest.fail(f"session start raised for a restriction the projection can read: {exc}")
     assert servers == []
@@ -455,38 +507,37 @@ STUB = {"name": "kirocrew-core", "command": "stub", "args": [], "env": [], "type
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "restriction, named",
-    [
-        pytest.param(
-            lambda tree: _write(tree.settings, TOGGLED),
-            "the global MCP settings",
-            id="global-toggle",
-        ),
-        pytest.param(
-            lambda tree: _write(_project_settings(tree), {**MANAGED, "disabled": True}),
-            "the project's MCP settings",
-            id="project-mute",
-        ),
-    ],
-)
-async def test_a_broker_stub_in_the_array_does_not_carry_a_restricted_agents_session(
-    tree, restriction, named
-):
+async def test_a_broker_stub_does_not_carry_an_uncarriable_restriction(tree):
     """The sources decide; a stub ``session/new`` would mount is not one of them.
 
     A stub element can carry a kiro-cli-only restriction no better than the native
     element can, and the overlay it comes from is written once, from the spec and
     the global file as they were then, so a stub's presence in the array is no
-    evidence that the restriction reaches the session. The runtime asks the files
-    before it accepts the stub, and refuses the session with the file's name.
+    evidence that an uncarriable restriction (a mute) reaches the session. The
+    runtime asks the files before it accepts the stub, and refuses the session
+    with the file's name.
     """
-    restriction(tree)
+    _write(_project_settings(tree), {**MANAGED, "disabled": True})
     prepared = projection.prepare_native_skill_projection(tree.project)
     assert prepared.search_agents == {"kirocrew"}
     message = await _session_refusal(prepared, tree, entries=[dict(STUB)])
-    assert message.startswith(f"Agent 'kirocrew': kirocrew-core is withheld by {named}")
+    assert message.startswith("Agent 'kirocrew': kirocrew-core is withheld by the project's")
     assert "Cannot bind skill_search" not in message
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_tool_behind_a_broker_stub_is_carried_on_the_gate(tree):
+    """A ``disabledTools`` toggle in the global file is CARRIED, not withholding --
+    and a stub carries the restriction no better than the element does, so the
+    pairs are owed on the stub path too (#14125). The session is not refused; the
+    stub stays in the array and the deny pair comes back for the gate."""
+    _write(tree.settings, TOGGLED)
+    prepared = projection.prepare_native_skill_projection(tree.project)
+    assert prepared.search_agents == {"kirocrew"}
+    entries, carried = await _session_carries(prepared, tree, entries=[dict(STUB)])
+    assert carried == frozenset({("kirocrew-core", "learn_add")})
+    # The stub pre-empts the element, so the array still carries exactly it.
+    assert [e["name"] for e in entries] == ["kirocrew-core"]
 
 
 @pytest.mark.asyncio
@@ -496,7 +547,9 @@ async def test_a_broker_stub_carries_the_session_while_the_files_allow_the_eleme
     prepared = projection.prepare_native_skill_projection(tree.project)
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
-    servers = await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
+    servers, _carried = await runtime._unpooled_control_planes(
+        [dict(STUB)], "kirocrew", tree.project
+    )
     assert servers == [STUB]
 
 
@@ -509,11 +562,6 @@ def _corrupt(path: Path) -> None:
 @pytest.mark.parametrize(
     "edit, named",
     [
-        pytest.param(
-            lambda tree: _write(tree.settings, TOGGLED),
-            ("the global MCP settings", "disabledTools lists learn_add", "dashboard's MCP tab"),
-            id="global-toggle",
-        ),
         pytest.param(
             lambda tree: _write(_project_settings(tree), {**MANAGED, "disabled": True}),
             ("the project's MCP settings", "it is disabled"),
@@ -545,7 +593,7 @@ async def test_a_restriction_written_after_the_spawn_refuses_the_next_session_by
     assert _withheld(prepared, tree) is None
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
-    first = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+    first, _carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
     assert [entry["name"] for entry in first] == ["kirocrew-core"]
     edit(tree)
     with pytest.raises(AcpRuntimeError) as refused:
@@ -566,28 +614,53 @@ async def test_a_restriction_written_after_the_spawn_refuses_the_next_session_by
 
 
 @pytest.mark.asyncio
+async def test_a_disabled_tool_written_after_the_spawn_carries_the_next_session_on_the_gate(tree):
+    """A ``disabledTools`` toggle written while the runtime is warm is CARRIED at
+    the next session start, not refusing it (#14125): the element stays mounted
+    and the pair comes back for the gate. Undoing the toggle drops the pair with
+    no respawn, the symmetry the carried path keeps with the withholding one."""
+    from test_acp_runtime import _make_runtime
+
+    prepared = projection.prepare_native_skill_projection(tree.project)
+    assert prepared.search_agents == {"kirocrew"}
+    runtime, _, _ = _make_runtime()
+    runtime._native_skill_projection = prepared
+    first, carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+    assert [e["name"] for e in first] == ["kirocrew-core"] and carried == frozenset()
+    _write(tree.settings, TOGGLED)
+    entries, carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+    assert [e["name"] for e in entries] == ["kirocrew-core"]
+    assert carried == frozenset({("kirocrew-core", "learn_add")})
+    _write(tree.settings, MANAGED)
+    _entries, carried = await runtime._unpooled_control_planes([], "kirocrew", tree.project)
+    assert carried == frozenset()
+
+
+@pytest.mark.asyncio
 async def test_a_stub_ahead_of_the_element_does_not_carry_a_session_started_after_the_edit(tree):
     """The stub array comes from an overlay written before the edit, so the stub
     is exactly what a restriction written since cannot have reached; the files are
-    asked before it is accepted, and the session is refused with the file's name."""
+    asked before it is accepted, and the session is refused with the file's name.
+    Uses a mute -- an uncarriable restriction -- since a ``disabledTools`` toggle
+    is now carried on the gate rather than refusing (#14125)."""
     from test_acp_runtime import _make_runtime
 
     prepared = projection.prepare_native_skill_projection(tree.project)
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
-    first = await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
+    first, _carried = await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
     assert first == [STUB]
-    _write(tree.settings, TOGGLED)
+    _write(tree.settings, {**MANAGED, "disabled": True})
     with pytest.raises(AcpRuntimeError) as refused:
         await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
     message = str(refused.value)
     assert message.startswith(
         "Agent 'kirocrew': kirocrew-core is withheld by the global MCP settings"
     )
-    assert "disabledTools lists learn_add" in message
-    # Undoing the toggle restores the next session without a respawn.
+    assert "it is disabled" in message
+    # Undoing the restriction restores the next session without a respawn.
     _write(tree.settings, MANAGED)
-    again = await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
+    again, _carried = await runtime._unpooled_control_planes([dict(STUB)], "kirocrew", tree.project)
     assert again == [STUB]
 
 
@@ -615,7 +688,7 @@ def test_the_mount_and_the_projection_ask_one_predicate_with_one_source_set(tree
     that one verdict on."""
     seen: list[tuple[str, object, list[str]]] = []
 
-    def recorder(name, spec_entry, settings):
+    def recorder(name, spec_entry, settings, *, carry_disabled_tools=False):
         labels = [source.label for source in settings]
         seen.append((name, spec_entry, labels))
         if not labels:
@@ -957,8 +1030,8 @@ def test_a_settings_path_in_a_retained_message_is_cut_from_the_front_keeping_the
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "core",
-    [{**MANAGED, "disabledTools": ["learn_add"]}, {**MANAGED, "type": "http"}],
-    ids=["disabledTools", "type"],
+    [{**MANAGED, "timeout": 60000}, {**MANAGED, "type": "http"}],
+    ids=["timeout", "type"],
 )
 async def test_a_view_the_spec_refused_fails_the_spawn_as_the_error_the_startup_paths_translate(
     tree, monkeypatch, core
@@ -1062,10 +1135,16 @@ async def test_a_direct_client_session_keeps_an_unrelated_disabled_tool_and_spaw
     # The restriction reaches the session as written, on the managed launch.
     assert core["disabledTools"] == ["learn_add"] and core["command"] == MANAGED["command"]
     assert projection._SEARCH_TOOL in view["tools"] and "skill_search" not in core["disabledTools"]
-    # The same spec on the shared runtime still refuses the view: there the element
-    # would replace the declaration and cannot carry the list.
+    # The same spec on the shared runtime now ALSO lets the view stand: the
+    # element mounts and the control-plane gate carries the restriction, so a
+    # ``disabledTools`` toggle no longer refuses the view there either (#14125).
     shared = projection.prepare_native_skill_projection(tree.project)
-    assert shared.errors["kirocrew"].startswith("kirocrew-core is withheld by the agent spec")
+    assert shared.errors == {} and "kirocrew" in shared.search_agents
+    mount = session_mcp.kiro_control_plane_servers(
+        "kirocrew", work_dir=tree.project, spec_override=shared.specs.get("kirocrew")
+    )
+    assert any(e["name"] == "kirocrew-core" for e in mount.elements)
+    assert mount.carried == frozenset({("kirocrew-core", "learn_add")})
 
 
 @pytest.mark.parametrize("where", ["spec-disabledTools", "spec-timeout", "spec-skill_search"])
@@ -1107,7 +1186,7 @@ def test_the_mount_hands_on_the_verdict_it_withheld_on_from_its_one_read(tree, s
     stub carries a kiro-cli-only restriction no better than the element does, and
     the guard that refuses the session has to learn it from this read."""
     if shape == "withheld":
-        _write(tree.settings, TOGGLED)
+        _write(tree.settings, {**MANAGED, "disabled": True})
     elif shape == "unreadable":
         _corrupt(tree.settings)
     prepared = projection.prepare_native_skill_projection(tree.project)
@@ -1122,7 +1201,7 @@ def test_the_mount_hands_on_the_verdict_it_withheld_on_from_its_one_read(tree, s
     if shape == "withheld":
         assert isinstance(verdict, session_mcp.NativeMountWithholding)
         assert verdict.source.startswith(session_mcp.NATIVE_SOURCE_GLOBAL)
-        assert "learn_add" in verdict.restriction
+        assert "it is disabled" in verdict.restriction
     else:
         assert isinstance(verdict, session_mcp.NativeSettingsUnreadable)
         # Nothing can be read, so nothing identity-bound is mounted: every name says so.
@@ -1135,8 +1214,8 @@ def test_the_mount_hands_on_the_verdict_it_withheld_on_from_its_one_read(tree, s
     "restriction, entries",
     [
         pytest.param(None, [], id="allowed"),
-        pytest.param(TOGGLED, [], id="withheld"),
-        pytest.param(TOGGLED, [dict(STUB)], id="withheld-behind-a-stub"),
+        pytest.param({**MANAGED, "disabled": True}, [], id="withheld"),
+        pytest.param({**MANAGED, "disabled": True}, [dict(STUB)], id="withheld-behind-a-stub"),
         pytest.param(None, [dict(STUB)], id="allowed-behind-a-stub"),
     ],
 )
@@ -1171,26 +1250,28 @@ async def test_a_session_start_reads_the_settings_files_exactly_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entries", [[], [dict(STUB)]], ids=["no-stub", "stub"])
-async def test_a_toggle_undone_between_two_reads_cannot_send_the_session_to_the_wrong_guard(
+async def test_a_restriction_undone_between_two_reads_cannot_send_the_session_to_the_wrong_guard(
     tree, monkeypatch, entries
 ):
-    """The window a second read opened: the mount read the toggle and withheld the
-    element; the user undid the toggle; a re-read for the guard answered "allowed",
-    and the session fell to the generic guard naming the agent's configuration
-    (or, behind a stub, was carried while its array was built under the
-    restriction). With one read there is no second answer: the session is
-    refused for the verdict the array was built on, naming the file."""
+    """The window a second read opened: the mount read the restriction and withheld
+    the element; the user undid it; a re-read for the guard answered "allowed", and
+    the session fell to the generic guard naming the agent's configuration (or,
+    behind a stub, was carried while its array was built under the restriction).
+    With one read there is no second answer: the session is refused for the verdict
+    the array was built on, naming the file. Uses a mute -- an uncarriable
+    restriction that still withholds -- since a ``disabledTools`` toggle is now
+    carried on the gate rather than refusing (#14125)."""
     from test_acp_runtime import _make_runtime
 
     read = session_mcp.native_settings_sources
     answers: list[list[session_mcp.NativeSettingsSource]] = []
 
-    def toggled_then_undone(work_dir):
-        _write(tree.settings, TOGGLED if not answers else MANAGED)
+    def restricted_then_undone(work_dir):
+        _write(tree.settings, {**MANAGED, "disabled": True} if not answers else MANAGED)
         answers.append(read(work_dir))
         return answers[-1]
 
-    monkeypatch.setattr(session_mcp, "native_settings_sources", toggled_then_undone)
+    monkeypatch.setattr(session_mcp, "native_settings_sources", restricted_then_undone)
     prepared = projection.prepare_native_skill_projection(tree.project)
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = prepared
@@ -1200,6 +1281,110 @@ async def test_a_toggle_undone_between_two_reads_cannot_send_the_session_to_the_
     assert message.startswith(
         "Agent 'kirocrew': kirocrew-core is withheld by the global MCP settings"
     )
-    assert "disabledTools lists learn_add" in message
+    assert "it is disabled" in message
     assert "Cannot bind skill_search" not in message and "server configuration" not in message
     assert len(answers) == 1
+
+
+# ---------------------------------------------------------------------------
+# #14125 fail-safe: a carried disabledTools deny is only honest where the
+# backend actually PROMPTS for the tool. kiro-cli auto-approves a tool its
+# --agent spec lists in ``allowedTools`` (a whole-server ``@kirocrew-core``
+# covers every tool) and sends no permission request, so a carried deny on such
+# a tool never fires and the switched-off tool runs -- bolichen97's P0 on #17547.
+# The mount must keep WITHHOLDING for that server rather than carry (fail-open).
+# ---------------------------------------------------------------------------
+
+
+def test_allowedtools_auto_approved_pairs_reads_kiro_cli_allowlist_semantics():
+    """The matcher mirrors kiro-cli's ``allowedTools`` reading: a whole-server
+    ``@server`` entry covers every tool, ``@server/tool`` an exact one, and a
+    ``@server/<glob>`` the ``*``/``?`` forms. A non-matching entry, a builtin
+    grant and a different server name select nothing."""
+    pairs = {("kirocrew-core", "learn_add"), ("kirocrew-core", "memory_recall")}
+    whole = session_mcp.allowedtools_auto_approved_pairs(["@kirocrew-core"], pairs)
+    assert whole == frozenset(pairs)
+    exact = session_mcp.allowedtools_auto_approved_pairs(
+        ["@kirocrew-core/learn_add"], pairs
+    )
+    assert exact == frozenset({("kirocrew-core", "learn_add")})
+    glob = session_mcp.allowedtools_auto_approved_pairs(["@kirocrew-core/memory_*"], pairs)
+    assert glob == frozenset({("kirocrew-core", "memory_recall")})
+    # A grant for another server, a builtin, and no list at all approve nothing.
+    assert session_mcp.allowedtools_auto_approved_pairs(["@kirocrew-cron"], pairs) == frozenset()
+    assert session_mcp.allowedtools_auto_approved_pairs(["fs_read"], pairs) == frozenset()
+    assert session_mcp.allowedtools_auto_approved_pairs(None, pairs) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_a_toggled_tool_that_allowedtools_auto_approves_is_withheld_not_carried(tree):
+    """The P0 regression (#17547): when the agent spec whole-server auto-approves
+    ``@kirocrew-core`` in ``allowedTools``, kiro-cli approves the toggled tool
+    locally and never prompts, so carrying the deny would be a silent fail-open.
+    The mount keeps WITHHOLDING the element instead, and nothing is handed to the
+    gate as a would-run tool -- the restriction is honoured by refusal, never
+    dropped. This is the test that fails on the carry-everything head."""
+    _write(tree.settings, TOGGLED)
+    spec = {
+        "name": "kirocrew",
+        "tools": ["@kirocrew-core"],
+        "allowedTools": ["@kirocrew-core"],
+        "mcpServers": {"kirocrew-core": MANAGED},
+    }
+    mount = session_mcp.kiro_control_plane_servers(
+        "kirocrew", work_dir=tree.project, spec_override=spec
+    )
+    # Fail-safe: the element is withheld (session will be refused) rather than
+    # mounted with an unenforceable deny, and the toggled pair is NOT carried.
+    assert "kirocrew-core" in mount.withheld
+    assert mount.carried == frozenset()
+    assert not any(e["name"] == "kirocrew-core" for e in mount.elements)
+    # The withholding names the toggle and the file, the same message #14125's
+    # own refusal arm already produced -- a disabled tool is never silently run.
+    reason = mount.withheld["kirocrew-core"].explain("skill search")
+    assert "learn_add" in reason and "the global MCP settings" in reason
+
+
+@pytest.mark.asyncio
+async def test_a_toggled_tool_the_spec_does_not_auto_approve_still_carries(tree):
+    """The #14125 win stands where it is safe: a spec that grants other core tools
+    by name but NOT the toggled one leaves that tool prompting, so kiro-cli sends a
+    permission request the gate rejects. The element mounts, the session runs minus
+    the toggled tool, and the pair rides the gate."""
+    _write(tree.settings, TOGGLED)
+    spec = {
+        "name": "kirocrew",
+        "tools": ["@kirocrew-core"],
+        # Auto-approves a different core tool, never ``learn_add`` (the toggled one).
+        "allowedTools": ["@kirocrew-core/skill_search"],
+        "mcpServers": {"kirocrew-core": MANAGED},
+    }
+    mount = session_mcp.kiro_control_plane_servers(
+        "kirocrew", work_dir=tree.project, spec_override=spec
+    )
+    assert "kirocrew-core" not in mount.withheld
+    assert mount.carried == frozenset({("kirocrew-core", "learn_add")})
+    assert any(e["name"] == "kirocrew-core" for e in mount.elements)
+
+
+@pytest.mark.asyncio
+async def test_the_projection_withholds_the_view_when_a_spec_toggle_is_auto_approved(tree):
+    """The projection reader reaches the same fail-safe verdict as the mount: a
+    ``disabledTools`` authored on the spec entry whose tool the spec also
+    auto-approves refuses the view, so it never promises an element the mount then
+    withholds (the one-read invariant the module's docstring pins)."""
+    core = {**MANAGED, "disabledTools": ["learn_add"]}
+    spec = {
+        "name": "kirocrew",
+        "tools": ["*"],
+        "allowedTools": ["@kirocrew-core"],
+        "mcpServers": {"kirocrew-core": core},
+    }
+    (tree.agents / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(tree.project)
+    assert prepared is not None
+    # The view is withheld for kirocrew: the toggled tool would be auto-approved,
+    # so the mount would withhold the element and the projection must agree.
+    assert "kirocrew" in prepared.errors
+    assert "kirocrew" not in prepared.search_agents
+    assert "learn_add" in prepared.errors["kirocrew"]

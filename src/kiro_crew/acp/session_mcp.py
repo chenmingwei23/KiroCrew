@@ -795,6 +795,94 @@ def session_mcp_disabled_tools(
     return frozenset(pairs)
 
 
+def native_carried_disabled_tools(
+    name: str, spec_entry: Any, settings: Collection[NativeSettingsSource]
+) -> frozenset[tuple[str, str]]:
+    """The ``(name, tool)`` pairs *name*'s declarations switch off, for the gate.
+
+    The companion of :func:`native_mount_withholding` for the one restriction it
+    now carries rather than withholds (#14125): when a control-plane server's
+    per-session element mounts with a ``disabledTools`` toggle standing, the
+    restriction has nowhere native to live, so :func:`kiro_control_plane_servers`
+    feeds these pairs to the session's per-call gate instead. Read from the SAME
+    declarations the withholding predicate reads -- the spec entry and each
+    settings file, through :func:`native_declarations` -- so the mount's two
+    decisions (mount the element, deny these calls) come from one source set and
+    cannot disagree. This is the ONE place the mount's reader spells the
+    ``disabledTools`` key; the mount itself keeps no copy of it. Free of I/O: the
+    sources are already read.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for _source, declared in native_declarations(name, spec_entry, settings):
+        if not isinstance(declared, dict):
+            continue
+        disabled = declared.get("disabledTools")
+        if not isinstance(disabled, list):
+            continue
+        for tool in disabled:
+            if isinstance(tool, str) and tool:
+                pairs.add((name, tool))
+    return frozenset(pairs)
+
+
+def allowedtools_auto_approved_pairs(
+    allowed_tools: Any, pairs: Collection[tuple[str, str]]
+) -> frozenset[tuple[str, str]]:
+    """Which of *pairs* the agent spec's ``allowedTools`` would auto-approve.
+
+    The fail-SAFE gate on carrying a ``disabledTools`` restriction (#14125): the
+    carry only honours the toggle on a backend that actually PROMPTS for the tool,
+    because the deny lives on ``session/request_permission`` and nothing checks it
+    unless a permission request is sent. kiro-cli auto-approves a tool its
+    ``--agent`` spec lists in ``allowedTools`` -- a whole-server ``@kirocrew-core``
+    entry covers every tool on the server -- and sends NO request for it, so a
+    carried deny on such a tool never fires and the switched-off tool runs
+    (bolichen97's P0 on #17547). A tool the spec does NOT auto-approve still
+    reaches Crew as a permission request the gate rejects, so carrying is faithful
+    only for those.
+
+    So this names the pairs for which the carry would be a silent no-op. The
+    caller (:func:`kiro_control_plane_servers`) keeps the old WITHHOLDING for a
+    server with any such pair -- refusing the session is the faithful answer when
+    the only alternative is running a tool the operator switched off -- and
+    carries only where the gate is a complete channel.
+
+    Matching follows kiro-cli's own ``allowedTools`` reading, the same semantics
+    :func:`kiro_crew.acp.kas_permissions._mcp_pattern` translates: ``@server``
+    auto-approves every tool on *server*; ``@server/tool`` an exact tool;
+    ``@server/<glob>`` a ``fnmatch`` glob over the tool part (``*``/``?``). A
+    non-string or non-``@`` entry (a builtin grant, a hand-edited value) names no
+    MCP server and is skipped. Free of I/O.
+    """
+    import fnmatch
+
+    if not isinstance(allowed_tools, list) or not pairs:
+        return frozenset()
+    whole_servers: set[str] = set()
+    tool_globs: dict[str, list[str]] = {}
+    for raw in allowed_tools:
+        # ``@`` is the one prefix an ``allowedTools`` entry puts before an MCP
+        # server name; a builtin grant (``fs_read``) names no server and is skipped.
+        if not isinstance(raw, str) or not raw.startswith("@"):
+            continue
+        ref = raw[1:]
+        server, slash, tool = ref.partition("/")
+        if not server:
+            continue
+        if slash and tool:
+            tool_globs.setdefault(server, []).append(tool)
+        else:
+            whole_servers.add(server)
+    approved: set[tuple[str, str]] = set()
+    for server, tool in pairs:
+        if server in whole_servers:
+            approved.add((server, tool))
+            continue
+        if any(fnmatch.fnmatchcase(tool, g) for g in tool_globs.get(server, ())):
+            approved.add((server, tool))
+    return frozenset(approved)
+
+
 def session_mcp_disabled_servers(spec: Any, settings: Any) -> frozenset[str]:
     """Every server switched off WHOLE by ``disabled: true``, from both sources.
 
@@ -1511,10 +1599,22 @@ class NativeControlPlaneMount(NamedTuple):
     files the mount performs, so a caller that refuses a session on ``withheld``
     refuses it for the reason the array was built on, never for what the files
     say a moment later.
+
+    ``carried`` names the ``(server, tool)`` pairs the mount DID produce an
+    element for while a ``disabledTools`` restriction stood on that server, so
+    the restriction rides the session's per-call permission gate instead of
+    withholding the element (#14125). Only a control-plane server appears here:
+    its tools carry no annotations, so every call reaches Crew as a permission
+    request the client can reject (see :func:`session_mcp_restricted_servers`).
+    The caller MUST feed these to ``AcpSessionHandle.spec_denied_tools`` -- the
+    element carries only command/args/env and expresses no restriction on its
+    own, so without the gate the toggled tool would run. From the same one read
+    as ``elements`` and ``withheld``.
     """
 
     elements: list[dict[str, Any]]
     withheld: dict[str, NativeMountWithholding | NativeSettingsUnreadable]
+    carried: frozenset[tuple[str, str]] = frozenset()
 
 
 def _named(value: Any) -> str:
@@ -1552,13 +1652,17 @@ def _named_tools(value: Any) -> str:
 
 
 def _native_restriction(
-    declared: Any, *, dashboard_writes: bool = False, crews_registry_marker: bool = False
+    declared: Any,
+    *,
+    dashboard_writes: bool = False,
+    crews_registry_marker: bool = False,
+    carry_disabled_tools: bool = False,
 ) -> tuple[str, str] | None:
     """``(restriction, remedy)`` when one declaration keeps its server native.
 
     The order is the order the questions are cheapest to answer and matters only
-    for which reason a declaration with several is named for. The two flags say
-    which declaration this is, because two answers depend on it. ``dashboard_writes``:
+    for which reason a declaration with several is named for. The three flags say
+    which declaration this is, because three answers depend on it. ``dashboard_writes``:
     the declaration lives in the file the dashboard's MCP tab writes -- the global
     settings -- so a mute or a ``disabledTools`` there is offered the tab as the
     way back; a spec or project entry is not, since following that remedy would
@@ -1568,6 +1672,20 @@ def _native_restriction(
     registry mode is on, the one state in which the spec rebuild stamps it there
     -- so it restricts nothing. In every other state the same value is one
     kiro-cli drops, and the caller says so by leaving the flag off.
+    ``carry_disabled_tools``: the server this declaration is for has a per-CALL
+    channel that CAN carry a ``disabledTools`` restriction (a control-plane
+    server, whose tools carry no annotations, so every call reaches Crew as a
+    ``session/request_permission`` the client answers with the reject option --
+    see :func:`session_mcp_restricted_servers`). For such a server the
+    ``disabledTools`` arm is NOT a reason to withhold the element: the element
+    mounts and the restriction rides the per-call gate instead, so the session
+    runs minus the toggled tool rather than being refused outright (#14125).
+    This narrows ONLY the ``disabledTools`` arm; a mute, a non-stdio transport
+    and a key the element cannot express still keep the declaration native --
+    none of those has a per-call form a gate could carry. The flag is off by
+    default, so a server without that channel (an opt-in server whose
+    read-only-annotated tools codex auto-approves without asking) keeps the old
+    withholding behaviour.
     """
     if not isinstance(declared, dict):
         return ("its entry is not a server object", "declare it as an object there")
@@ -1606,7 +1724,7 @@ def _native_restriction(
             _remedy("re-enable the server", "set disabled to false there", tab=dashboard_writes),
         )
     disabled_tools = declared.get("disabledTools", [])
-    if disabled_tools != []:
+    if disabled_tools != [] and not carry_disabled_tools:
         return (
             f"its disabledTools {_named_tools(disabled_tools)}",
             _remedy(
@@ -1632,7 +1750,11 @@ def _remedy(action: str, edit: str, *, tab: bool) -> str:
 
 
 def native_mount_withholding(
-    name: str, spec_entry: Any, settings: Collection[NativeSettingsSource]
+    name: str,
+    spec_entry: Any,
+    settings: Collection[NativeSettingsSource],
+    *,
+    carry_disabled_tools: bool = False,
 ) -> NativeMountWithholding | None:
     """Whether *name*'s per-session element must be withheld, and why.
 
@@ -1666,6 +1788,18 @@ def native_mount_withholding(
     ``session/new`` would fail with an error pointing at the wrong file; so both
     call this one function, and neither keeps a copy of the merge or of the
     predicate.
+
+    ``carry_disabled_tools`` says the caller has a per-CALL channel that can
+    honour a ``disabledTools`` restriction on *name* (a control-plane server:
+    its tools carry no annotations, so every call reaches Crew as a permission
+    request the client answers with the reject option). For such a server a
+    ``disabledTools`` declaration no longer withholds the element; the element
+    mounts and the restriction is carried on the gate instead, so the session
+    runs minus the toggled tool rather than being refused (#14125). Only the
+    ``disabledTools`` arm is narrowed -- a mute, a non-stdio transport and an
+    uncarriable key still withhold, because none has a per-call form -- and the
+    caller must then actually feed those ``(server, tool)`` pairs to the gate,
+    which :func:`kiro_control_plane_servers` does.
     """
     dashboard_writes = {s.named for s in settings if s.label == NATIVE_SOURCE_GLOBAL}
     registry_mode = _registry_mode()
@@ -1674,6 +1808,7 @@ def native_mount_withholding(
             declared,
             dashboard_writes=source in dashboard_writes,
             crews_registry_marker=source == NATIVE_SOURCE_SPEC and registry_mode,
+            carry_disabled_tools=carry_disabled_tools,
         )
         if verdict is not None:
             restriction, remedy = verdict
@@ -1740,6 +1875,7 @@ def kiro_control_plane_servers(
         return NativeControlPlaneMount([], {name: exc for name in IDENTITY_BOUND_SERVERS})
     out: list[dict[str, Any]] = []
     withheld_by_name: dict[str, NativeMountWithholding | NativeSettingsUnreadable] = {}
+    carried: set[tuple[str, str]] = set()
     for name in IDENTITY_BOUND_SERVERS:
         if not allow.grants(name):
             continue
@@ -1747,11 +1883,68 @@ def kiro_control_plane_servers(
         managed = managed_mcp_spec_entry(name, include_opt_in=True)
         if not isinstance(entry, dict) or not isinstance(managed, dict):
             continue
-        withheld = native_mount_withholding(name, entry, settings)
+        # The control plane has a per-call channel that CAN carry a
+        # ``disabledTools`` restriction: its tools carry no annotations, so every
+        # call reaches Crew as a ``session/request_permission`` the client
+        # answers with the reject option. So for it a ``disabledTools`` toggle no
+        # longer withholds the element and refuses the session -- the element
+        # mounts and the pairs ride the gate instead (#14125, carried below). An
+        # opt-in server has no such channel (a ``readOnlyHint`` tool is
+        # auto-approved inside codex without asking), so it keeps the old
+        # withholding behaviour and the flag stays off for it -- the same split
+        # :func:`session_mcp_restricted_servers` draws, for the same reason.
+        #
+        # But the gate is a complete channel ONLY where the backend actually
+        # sends a permission request. kiro-cli auto-approves a tool its
+        # ``--agent`` spec lists in ``allowedTools`` -- a whole-server
+        # ``@kirocrew-core`` entry covers every tool -- and sends NO request, so a
+        # carried deny on an auto-approved tool never fires and the switched-off
+        # tool runs (bolichen97's P0 on #17547). Carrying there would be a silent
+        # fail-OPEN, so when any of this server's disabled tools is auto-approved
+        # we keep the old withholding: refusing the session is the faithful
+        # answer when the only alternative is running a tool the operator turned
+        # off. The pairs still prompting are safe to carry, and in a spec that
+        # does not whole-server auto-approve the server (so every switched-off
+        # tool prompts) the #14125 win stands -- the session runs minus the
+        # toggled tool. ``allowedTools`` is read from the SAME spec this mount
+        # judges, with kiro-cli's own matching semantics.
+        can_carry = name in CONTROL_PLANE_SERVERS
+        if can_carry:
+            server_disabled = native_carried_disabled_tools(name, entry, settings)
+            fail_open = allowedtools_auto_approved_pairs(spec.get("allowedTools"), server_disabled)
+            if fail_open:
+                # At least one switched-off tool would be auto-approved and run.
+                # Fall back to withholding the whole element for this server so
+                # the restriction is honoured by refusal rather than dropped.
+                can_carry = False
+                logger.debug(
+                    "session MCP: not carrying %s disabledTools on the gate -- %s "
+                    "auto-approved by allowedTools would never prompt; withholding "
+                    "the element instead (fail-safe, #14125)",
+                    name,
+                    ", ".join(sorted(f"{s}/{t}" for s, t in fail_open)),
+                )
+        withheld = native_mount_withholding(
+            name, entry, settings, carry_disabled_tools=can_carry
+        )
         if withheld is not None:
             logger.debug("session MCP: %s", withheld.explain("its per-session element"))
             withheld_by_name[name] = withheld
             continue
+        # The element (or a pre-existing broker stub for the same name) will be
+        # on the session, and neither can express ``disabledTools`` -- so a
+        # restriction we chose to carry rather than withhold has to reach the
+        # gate. Collect its pairs from the SAME source set the withholding
+        # predicate read, before the ``existing_names`` continue: a stub carries
+        # the restriction no better than the element does, so the pairs are owed
+        # on that path too. The reader lives in
+        # :func:`native_carried_disabled_tools`, so this keeps no copy of the key
+        # -- only the control plane reaches it with a non-empty set, the opt-in
+        # servers withheld above. Only reached when every disabled tool here
+        # prompts (the auto-approved case took the withholding branch above), so
+        # every pair carried is one the gate can actually enforce.
+        if can_carry:
+            carried |= native_carried_disabled_tools(name, entry, settings)
         if name in existing_names:
             continue
         # The launch is the managed source's, never the spec's. A hand-authored
@@ -1793,4 +1986,4 @@ def kiro_control_plane_servers(
         element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)
-    return NativeControlPlaneMount(out, withheld_by_name)
+    return NativeControlPlaneMount(out, withheld_by_name, frozenset(carried))
