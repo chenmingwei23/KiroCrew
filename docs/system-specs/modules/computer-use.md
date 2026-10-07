@@ -128,7 +128,10 @@ session start and again on a resume -- and reused by the post-compaction re-rend
 so the restored block matches the tools that backend mounted. A session open across an
 enable resumes its own transcript after the reset (the session map keeps its id),
 and a resume re-sends no contract, so the pointer also tells the model to read the
-`computer-use` skill if the tools turn up. A user prompt override under the data
+`computer-use` skill if the tools turn up. The mirror case, a session open across a
+disable, resumes with the full section still in its transcript and no `computer_*`
+tool, so the section carries one sentence telling the model to point the user to
+Settings and call none; its next compaction restores the pointer. A user prompt override under the data
 home (`prompt.md` there) is the user's own text: one copied before the slot existed
 still carries the section inline and keeps it whatever the gate says. Pinned by
 `test_context_computer_use_block.py` and `test_prompt_compact_contract.py`.

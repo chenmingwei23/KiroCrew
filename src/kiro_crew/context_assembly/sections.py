@@ -532,9 +532,13 @@ def widget_block(density: str) -> str:
 
 # What an agent prompt's ``{{COMPUTER_USE_BLOCK}}`` resolves to while the session's
 # agent spec mounts ``kirocrew-computer``: the section ``config/prompt.md`` carried
-# inline before the slot existed, unchanged. It still counts against that file's
-# byte budget, ``PROMPT_BYTE_CEILINGS`` in ``test/test_prompt_compact_contract.py``,
-# which measures the prompt with this text in the slot.
+# inline before the slot existed, plus one sentence for a session that stays open
+# across a disable: disabling resets every session, a reset session resumes its own
+# transcript with this text still in it, and its new backend mounts no
+# ``computer_*`` tool (the mirror of the pointer's last sentence below). It still
+# counts against that file's byte budget, ``PROMPT_BYTE_CEILINGS`` in
+# ``test/test_prompt_compact_contract.py``, which measures the prompt with this
+# text in the slot.
 _COMPUTER_USE_SECTION = (
     "## Computer Use (native desktop apps)\n"
     "\n"
@@ -549,7 +553,9 @@ _COMPUTER_USE_SECTION = (
     'returns: a "disabled" or "not supported" refusal is final (relay it and stop),\n'
     "while a refusal that names an alternative (an `element_index` instead of\n"
     'coordinates, `click_method: "global"` to accept the cursor move) is telling you\n'
-    "the next call to make.\n"
+    "the next call to make. If no `computer_*` tool is in your tool list, Computer Use\n"
+    "was turned off after this session started: tell the user, point them to\n"
+    "Settings → Computer Use, and do not call one.\n"
     "\n"
     "**Tree first, always.** Call `computer_get_state(app=...)` before any action — it\n"
     "returns the window as a numbered element outline, and prefer addressing an element\n"

@@ -270,6 +270,7 @@ def test_computer_use_keeps_opt_in_and_cursor_password_refusals() -> None:
         r'click_method: "global".*ask for it BY NAME.*auto.*never picks it',
         r"Password fields.*<secure>.*never captured",
         r"own dashboard is refused, for reading as well as typing",
+        r"If no `computer_\*` tool is in your tool list.*turned off after this\s+session",
     )
 
 

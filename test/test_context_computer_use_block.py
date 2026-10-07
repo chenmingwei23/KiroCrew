@@ -110,6 +110,13 @@ class TestTheSlot:
         assert out == f"a\n{_SECTION}\nb"
         assert _SECTION.startswith(_HEADING + "\n\n")
         assert _SECTION.endswith("Read the `computer-use` skill before your first call.")
+        # A session open across a disable resumes with this text and no tools.
+        flat = " ".join(_SECTION.split())
+        assert (
+            "If no `computer_*` tool is in your tool list, Computer Use was turned off "
+            "after this session started" in flat
+        )
+        assert "point them to Settings → Computer Use, and do not call one" in flat
 
     @pytest.mark.parametrize("open_", [True, False])
     def test_without_a_session_reading_the_live_gate_decides(
@@ -368,3 +375,23 @@ class TestASessionOpenAcrossTheSwitch:
         )
         assert "[AGENT SYSTEM PROMPT]" not in message
         assert gate.calls == 1
+
+    def test_a_session_open_across_a_disable_keeps_a_section_that_covers_it(
+        self, gate: _Gate, builder: ContextBuilder
+    ) -> None:
+        """The mirror case: started with the tools, then Computer Use is switched
+        off. The resume re-sends no contract, so the transcript still holds the
+        full section while the new backend mounts no ``computer_*`` tool. The
+        section itself has to say what to do then; the next compaction restores
+        the pointer, from the resume's fresh reading."""
+        gate.open = True
+        fresh = _start(builder, "dashboard:cu-off")
+        assert _SECTION_FOLDED in fresh
+        assert "If no `computer_*` tool is in your tool list" in " ".join(fresh.split())
+        gate.open = False
+        message, _ = builder.build_message(
+            "back again", is_new_session=True, resumed=True, session_key="dashboard:cu-off"
+        )
+        assert "[AGENT SYSTEM PROMPT]" not in message
+        restored = _restore(builder, "dashboard:cu-off")
+        assert _POINTER_FOLDED in restored and _SECTION_FOLDED not in restored
