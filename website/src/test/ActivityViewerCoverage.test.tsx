@@ -1002,7 +1002,53 @@ describe('ActivityViewer — live model downgrade flag (#5326)', () => {
   })
 })
 
-/* ── Subagent card: markdown panes (#12734) ─────────────────────────────────*/
+/* ── Subagent card: wave membership chip (#759 item 4) ──────────────────────*/
+
+describe('ActivityViewer — wave membership chip (#759)', () => {
+  it('renders a batch chip carrying the wave id when the run is part of a wave', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running', batchId: 'wave-abc123' }) }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-batch')
+    expect(chip.getAttribute('data-batch')).toBe('wave-abc123')
+    // Short, stable tag — the last 6 chars, not the full id, so a card never
+    // implies the whole id is addressable.
+    expect(chip.textContent).toContain('abc123')
+  })
+
+  it('renders no batch chip for a solo spawn', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running' }) }}
+      />,
+    )
+    expect(screen.queryByTestId('subagent-batch')).toBeNull()
+  })
+
+  it('two siblings of one wave carry the same batch id, so the card can group them', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', { status: 'running', batchId: 'wave-xyz789' }),
+          s2: mkAgent('s2', { status: 'tool', batchId: 'wave-xyz789' }),
+        }}
+      />,
+    )
+    const chips = screen.getAllByTestId('subagent-batch')
+    expect(chips).toHaveLength(2)
+    expect(new Set(chips.map(c => c.getAttribute('data-batch')))).toEqual(new Set(['wave-xyz789']))
+  })
+})
+
+
 
 describe('ActivityViewer — subagent panes render markdown', () => {
   const md = '- one\n- two\n\n```py\nprint(1)\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n'

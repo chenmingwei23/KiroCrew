@@ -217,6 +217,9 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
   // the progress row had, so the same fallback answers it. This is not a redesign
   // of the header, only a refusal to leave the recovered state anonymous.
   const identity = a.agent || (a.id ? `agent #${a.id.slice(-6)}` : '')
+  // Short, stable wave tag. Follows the `agent #…` identity chip's raw-literal
+  // convention in this file rather than a new catalog string (#759 item 4).
+  const waveTag = a.batchId ? `wave #${a.batchId.slice(-6)}` : ''
   const terminalCredits = isDone && typeof a.credits === 'number' && Number.isFinite(a.credits) && a.credits > 0
     ? a.credits
     : null
@@ -257,6 +260,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
         <span className="shrink-0 flex items-center">{STATUS[a.status]}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0" title={i18nT('pages.chat.activityViewer.subagent', { label: statusLabel })}>{statusLabel}</span>
         {identity && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={identity}>{identity}</code>}
+        {waveTag && <code data-testid="subagent-batch" data-batch={a.batchId} className="text-[11px] text-muted/40 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={waveTag}>{waveTag}</code>}
         {(() => {
           const resolvedKnown = !!a.model
           const display = a.model || a.requestedModel || ''

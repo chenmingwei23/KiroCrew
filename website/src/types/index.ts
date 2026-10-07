@@ -1485,6 +1485,10 @@ export interface ChatMessage {
 
 export interface SubagentActivity {
   id: string; task: string; agent: string
+  /** The wave this agent belongs to, absent for a solo spawn. Folded from the
+   *  `batch_id` the gateway stamps on every spawn/done/snapshot frame; shown as
+   *  a short batch chip in the Subagents panel so wave siblings group (#759). */
+  batchId?: string
   /** Model the live session actually resolved to serve, '' when unknown. Folded
    *  from the `model` field on the `subagent_spawn`/`subagent_done`/snapshot WS
    *  frames; shown beside the agent pill in the Subagents panel so a model-pinned

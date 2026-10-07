@@ -531,6 +531,12 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "tool_count": a.tool_count,
         "stalled": a.stalled,
     }
+    # The wave this agent belongs to, when it is part of one. Mirrors the live
+    # ``_subagent_event`` stamp so a reconnect replay keeps the panel's batch
+    # chip; omitted for a solo spawn so the client reads "no wave", not "".
+    _bid = getattr(a, "batch_id", "")
+    if isinstance(_bid, str) and _bid:
+        data["batch_id"] = _bid
     if a.stalled:
         data["idle_secs"] = max(0, int(ts - a.last_activity))
     data["started"] = a.started
