@@ -1623,6 +1623,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     addSourceCommentToChat,
     colorThemeRef,
     handleFileOpen,
+    handleOpenWorkingTreeDiff,
     handleFolderOpen,
     handleArtifactOpen,
     handleOpenDiff,
@@ -6722,6 +6723,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onFileOpen={handleFileOpen}
               onArtifactOpen={handleArtifactOpen}
               onAddToContext={handleAddToContext}
+              onOpenWorkingTreeDiff={handleOpenWorkingTreeDiff}
               projectDir={currentSlot?.project || undefined} navLinks={chatNav.links} navResolving={chatNav.resolving}
               sources={panelSources} selectedSourceUrl={selectedSourceUrl} onSelectSource={selectSourceUrl} onReconcileSource={reconcileSourceUrl}
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
@@ -6763,6 +6765,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 onFileOpen={handleFileOpen}
                 onArtifactOpen={handleArtifactOpen}
                 onAddToContext={handleAddToContext}
+                onOpenWorkingTreeDiff={handleOpenWorkingTreeDiff}
                 projectDir={currentSlot?.project || undefined} navLinks={chatNav.links} navResolving={chatNav.resolving}
                 sources={panelSources} selectedSourceUrl={selectedSourceUrl} onSelectSource={selectSourceUrl} onReconcileSource={reconcileSourceUrl}
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
