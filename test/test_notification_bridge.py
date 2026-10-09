@@ -1186,6 +1186,31 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             await d.drain(timeout=3)
         self.assertEqual(len(sink.sent), 1)
 
+    async def test_drain_timeout_logs_stranded_fanout_and_does_not_hang(self) -> None:
+        # GPT 6.1 follow-up (bridge.drain), conductor fail-safe design call: a fanout
+        # leg still in flight when the drain budget is spent must not be dropped
+        # SILENTLY. drain returns (never hangs the shutdown) AND logs a visible warning
+        # naming the stranded count, so a terminal report cut short by shutdown leaves a
+        # trace (the note itself stays durable on the dashboard). No re-sequencing.
+        import logging
+
+        released = asyncio.Event()
+
+        async def _blocking_sink_dispatch(_note):
+            await released.wait()  # never set during the test: the leg stays in flight
+            return []
+
+        d = _dispatcher({"slack": _RecordingSink()}, {"system.cron": {"deliver_to": ["slack"]}})
+        with mock.patch.object(d, "_dispatch_guarded", _blocking_sink_dispatch):
+            d.schedule({"channel": "system.cron", "priority": "critical", "title": "t"})
+            with self.assertLogs("kiro_crew.notifications.bridge", level=logging.WARNING) as logs:
+                await asyncio.wait_for(d.drain(timeout=0.05), timeout=5)
+        released.set()  # let the stranded task unwind so the loop closes cleanly
+        self.assertTrue(
+            any("still" in m and "in flight" in m for m in logs.output),
+            logs.output,
+        )
+
 
 class OffLoopProducerTests(unittest.IsolatedAsyncioTestCase):
     """A producer on a worker thread must still reach the transport.
@@ -2098,3 +2123,33 @@ class AttributionTests(unittest.IsolatedAsyncioTestCase):
             producer_session="taskrunner:run-1:runtime",
         )
         self.assertEqual(sink.sent, [])
+
+    async def test_a_partially_attributed_required_note_is_refused(self) -> None:
+        # GPT 6.1 follow-up (bridge.py:_unattributed), conductor fail-safe design call:
+        # a restart whose parent execution record is unreadable leaves the parent's agent
+        # unresolved while the note still carries a CHILD's producer_agent. With
+        # producer_agent_required set, FEWER resolved agents than named producers is
+        # PARTIAL attribution and must DENY outright, rather than egress on the child's
+        # profile alone. (Deliberately coarser than per-producer tracking; a finer
+        # attribution is a follow-up.)
+        sink, outcomes, _sel = await self._send(
+            channel="system.subagent",
+            source="system",
+            producer_session="subagent:a1\nsubagent:a2",
+            producer_agent="writer",  # only one of two named producers resolved an agent
+            producer_agent_required="1",
+        )
+        self.assertEqual(sink.sent, [])
+        self.assertEqual([o.reason for o in outcomes], ["denied_unattributed"])
+
+    async def test_a_fully_attributed_required_note_is_sent(self) -> None:
+        # Paired with the refusal above so the guard cannot pass by withholding every
+        # required note: one resolved agent per named producer lets it through.
+        sink, _outcomes, _sel = await self._send(
+            channel="system.subagent",
+            source="system",
+            producer_session="subagent:a1\nsubagent:a2",
+            producer_agent="writer\nresearcher",
+            producer_agent_required="1",
+        )
+        self.assertEqual(len(sink.sent), 1)

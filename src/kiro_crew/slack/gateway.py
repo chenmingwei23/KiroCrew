@@ -9140,6 +9140,12 @@ class GatewayOrchestrator:
             sessions.append(conversation)
         if sessions:
             meta["producer_session"] = "\n".join(sessions)
+            # Agent attribution is REQUIRED for these producers: a completion note
+            # names the parent AND the child, and the bridge must consult each one's
+            # agent profile. On a restart whose parent execution record is unreadable
+            # the parent's agent cannot be resolved; this flag makes the bridge DENY
+            # the note then rather than egress it on the child's profile alone.
+            meta["producer_agent_required"] = "1"
         # The child's agent, and the template its execution binds when it named
         # none (a child spawned without an agent inherits its parent's template).
         from kiro_crew.execution_context import producer_agent_names

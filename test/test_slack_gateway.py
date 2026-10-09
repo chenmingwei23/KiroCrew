@@ -3088,6 +3088,7 @@ class TestNotifMeta:
             "slot": "my-slot",
             "producer_app": "my-app",
             "producer_session": "subagent:c1",
+            "producer_agent_required": "1",
         }
 
     def test_subagent_notif_meta_names_the_child_session_and_agent(self):
@@ -3102,6 +3103,7 @@ class TestNotifMeta:
             "slot": "my-slot",
             "producer_session": "subagent:c1\nsubagent:conv-9",
             "producer_agent": "researcher",
+            "producer_agent_required": "1",
         }
 
     def test_a_child_with_no_named_agent_names_its_inherited_template(self):
@@ -3132,6 +3134,7 @@ class TestNotifMeta:
         assert GatewayOrchestrator._subagent_notif_meta("", self._child(app="my-app")) == {
             "producer_app": "my-app",
             "producer_session": "subagent:c1",
+            "producer_agent_required": "1",
         }
 
     def test_every_subagent_completion_site_passes_the_child(self):

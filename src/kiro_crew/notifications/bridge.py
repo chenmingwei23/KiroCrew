@@ -600,6 +600,19 @@ class BridgeDispatcher:
                 return
             remaining = deadline - loop.time()
             if remaining <= 0:
+                # Fail-safe (conductor design call, follow-up GPT finding): the drain
+                # budget is spent and fanout is still in flight. These notes are already
+                # durable on the dashboard (``schedule`` is gated on the persist future),
+                # so they are not lost -- but returning silently here would leave a
+                # terminal report that never reached chat with no trace at all. Make the
+                # strand VISIBLE instead: one WARNING naming how many legs did not finish,
+                # so an operator can see a shutdown cut delivery short. No re-sequencing.
+                logger.warning(
+                    "Notification bridge drain timed out with %d fanout task(s) still "
+                    "in flight; those chat deliveries did not complete before shutdown "
+                    "(the notes remain on the dashboard).",
+                    len(pending),
+                )
                 return
             await asyncio.wait(pending, timeout=remaining)
 
@@ -841,6 +854,21 @@ class BridgeDispatcher:
         )
         if agent_claims:
             if self._note_values(note, "producer_agent"):
+                # Fail-safe (conductor design call, follow-up GPT finding): when the
+                # note DECLARES its agent attribution is required, every producer it
+                # names must have resolved an agent. A restart whose parent execution
+                # record is unreadable leaves the parent's agent unresolved while the
+                # note still carries a CHILD's ``producer_agent``, so a non-empty check
+                # alone would let the note through on the child's profile and skip the
+                # parent's. Partial attribution therefore DENIES outright: at least one
+                # resolved agent per named producer session, else refuse. This is
+                # deliberately coarser than per-producer tracking; finer attribution is
+                # a follow-up.
+                if note.get("producer_agent_required") == "1":
+                    producers = self._note_values(note, "producer_session")
+                    agents = self._note_values(note, "producer_agent")
+                    if len(agents) < len(producers):
+                        return "producer agent unresolved for a required producer"
                 return ""
             return "producer agent unresolved for an agent-produced note"
         return "note names no producer and is not tagged system-originated"
