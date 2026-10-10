@@ -109,6 +109,10 @@ function createWindowLifecycle(options) {
     syncTunnel = () => {},
     platform = process.platform,
     env = process.env,
+    // Shared single-use registry of downloads the renderer explicitly asked
+    // for; passed to the will-download handler so only announced downloads
+    // auto-save (see download-expectations.js).
+    downloadExpectations = null,
   } = options || {};
 
   if (!electron) throw new Error("createWindowLifecycle: electron is required");
@@ -554,7 +558,7 @@ function createWindowLifecycle(options) {
     // resolves a path and nothing lands on disk (issue #13047). Attached once
     // per session (every window shares the default session), so N windows do
     // not stack N handlers.
-    wireWillDownloadOnce(view.webContents.session, { app, log: glog });
+    wireWillDownloadOnce(view.webContents.session, { app, log: glog, dashboardUrl: windowBackendUrl, pending: downloadExpectations });
 
     return view;
   }
