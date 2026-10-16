@@ -2285,6 +2285,7 @@ def _apply_recent_session(
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
     effort_marker: bool = False,
+    pending_backfills: list[tuple[str, dict]] | None = None,
 ) -> None:
     """Build the slot for one prefetched recent session.
 
@@ -2294,6 +2295,15 @@ def _apply_recent_session(
     synchronous generator and :func:`restore_recent_sessions_async` share one
     definition of the build while differing only in where the reads that feed it
     happen.
+
+    *pending_backfills* collects the ``(key, fields)`` of any tab-id metadata
+    backfill this slot mints, instead of firing it off the loop here. The async
+    driver passes a list and DRAINS it (its ``os.replace`` committed) before it
+    returns, so a caller's immediate on-loop transcript read right after restore
+    cannot land inside that replace window and trip a Windows sharing violation.
+    When ``None`` (the synchronous :func:`restore_recent_sessions` driver) the
+    backfill fires off the loop as before. Mirrors the drain
+    :func:`_rehydrate_slot_from_history` performs for the open-slot driver.
     """
     _restore_cfg = restore_cfg
     # Member keys resolve their pin from dm.json BEFORE construction (the
@@ -2334,7 +2344,18 @@ def _apply_recent_session(
         # helper. Dispatched AFTER the transcript read (the caller prefetches
         # messages first) so its os.replace() cannot race the read of the same
         # file — see the equivalent note in _rehydrate_slot_from_history.
-        update_metadata_off_loop(conv_log, key, {"tab_id": applied.minted_tab_id})
+        #
+        # Reading first makes THIS slot's own read quiescent, but firing the
+        # backfill off the loop here still leaves its os.replace in flight when
+        # the restore driver returns. A caller that reads this transcript on the
+        # loop right after restore (a sidebar read, a resume) can then land inside
+        # the replace window — the same Windows sharing violation. When the driver
+        # supplies a drain list we hand the backfill to it so the replace is
+        # committed before the driver returns; otherwise it fires off the loop.
+        if pending_backfills is not None:
+            pending_backfills.append((key, {"tab_id": applied.minted_tab_id}))
+        else:
+            update_metadata_off_loop(conv_log, key, {"tab_id": applied.minted_tab_id})
     older_cut = max(0, len(messages) - 500)
     slot._disk_older_count = older_cut
     # Durable-only view of the same prefix, recomputed from disk on every load —
@@ -2477,6 +2498,11 @@ async def restore_recent_sessions_async(
         return 0
     restored = 0
     state.restoring_open_slots = True
+    # Tab-id backfills this restore mints. Drained (its os.replace committed)
+    # before we return, so a caller's immediate on-loop transcript read cannot
+    # race a backfill still in flight on Windows. See _apply_recent_session's
+    # pending_backfills note, and the open-slot driver's equivalent drain.
+    pending_backfills: list[tuple[str, dict]] = []
     try:
         conv_log = state.conversation_log
         cutoff = time.time() - (window_minutes * 60) if window_minutes > 0 else None
@@ -2560,6 +2586,7 @@ async def restore_recent_sessions_async(
                 member_identity=_member_id,
                 agent=agent,
                 effort_marker=effort_marker,
+                pending_backfills=pending_backfills,
             )
             restored += 1
             # Same recovery, with the spool read awaited: this driver is
@@ -2569,6 +2596,41 @@ async def restore_recent_sessions_async(
                 await _recover_mcp_app_claims_async(_recovered_slot)
             await asyncio.sleep(0)
         _sync_dashboard_slots(state)
+        # Commit the tab-id backfills this restore minted BEFORE returning. Each
+        # is an os.replace of a session file; left in flight (the fire-and-forget
+        # off-loop helper), it would still be mid-replace when a caller reads the
+        # same transcript on the loop right after restore, and on Windows that
+        # open() is a sharing violation the on-loop read cannot wait out, so the
+        # read re-raises PermissionError. Awaited one at a time off the loop so
+        # the flock/os.close/os.replace stay off the event-loop thread.
+        #
+        # Through ``update_metadata_if(require_existing=True)``, NOT the plain
+        # upserting ``update_metadata``: deferring every backfill to here widens
+        # the gap between a tab restoring and its write landing, and a
+        # ``DELETE /api/sessions/{key}`` can fall inside it. The checked variant
+        # re-reads existence UNDER the write lock, so a session unlinked during
+        # the restore window is left deleted instead of being recreated as a
+        # metadata-only transcript the next recent-session restore reopens as an
+        # empty tab. The guard always proceeds; existence is the only gate, and
+        # the minted tab_id has no on-disk siblings so a backfill that is
+        # correctly skipped loses nothing. Best-effort: a backfill is metadata
+        # already reflected in the restored slot, so a lock timeout / I/O error /
+        # a skipped (deleted) write is logged, not raised.
+        for _bk_key, _bk_fields in pending_backfills:
+            try:
+                await asyncio.to_thread(
+                    conv_log.update_metadata_if,
+                    _bk_key,
+                    _bk_fields,
+                    lambda _meta: True,
+                    require_existing=True,
+                )
+            except Exception:  # noqa: BLE001 - best-effort metadata backfill
+                logger.warning(
+                    "restore_recent_sessions: tab-id backfill failed for %s",
+                    _bk_key,
+                    exc_info=True,
+                )
     finally:
         state.restoring_open_slots = False
     return restored
