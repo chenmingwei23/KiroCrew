@@ -1542,14 +1542,17 @@ def test_custom_persona_is_not_classified_by_template_name(env, template, source
     cfg = KiroCrewConfig.load()
     cfg.agents["writer"].kiro_agent = template
     cfg.save()
-    persona = env.project / "prompt.md"
+    spec = env.project / ".kiro" / "agents" / f"{template}.json"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    # A relative file:// prompt resolves against the agent file's own directory,
+    # so the persona for that case lives beside the spec, not at the root.
+    persona = spec.parent / "prompt.md"
     persona.write_text("CUSTOM_OWNER_PERSONA", encoding="utf-8")
     prompts = {
         "inline": "CUSTOM_OWNER_PERSONA",
         "relative": "file://prompt.md",
         "absolute": f"file://{persona}",
     }
-    spec = env.project / ".kiro" / "agents" / f"{template}.json"
     spec.write_text(json.dumps({"name": template, "prompt": prompts[source]}), encoding="utf-8")
 
     message, _ = env.builder.build_message(

@@ -633,7 +633,19 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
 def resolve_relative_prompt_path(
     source: Path, spec_path: Path, project: str | None
 ) -> tuple[Path, Path] | None:
-    """Return a canonical relative prompt and the root that supplied its template."""
+    """Return a canonical relative prompt and the root that supplied its template.
+
+    A relative ``file://`` source is anchored to the agent config file's own
+    directory (``spec_path.parent``), the base the Kiro agent configuration
+    reference documents ("Resolved relative to the agent configuration file's
+    directory"). ``spec_path`` selects which admitted root applies: home for a
+    global agent, the project root for an agent under ``<project>/.kiro/agents``.
+
+    The admitted root (home, or that project root) is the containment boundary:
+    the resolved path must land inside it, so a ``..`` source that climbs above
+    the root is refused. That root is returned alongside the path so the readers
+    fence their read to it (``within_root``).
+    """
     try:
         root = _admitted_root(Path.home())
         if project:
@@ -644,7 +656,7 @@ def resolve_relative_prompt_path(
                 root = project_root
         if root is None:
             raise ValueError("template root is not admitted")
-        admitted = validate_file_path(str(root / source))
+        admitted = validate_file_path(str(spec_path.parent / source))
         if admitted is None or not Path(admitted).is_relative_to(root):
             raise ValueError("prompt is outside its template root")
         return Path(admitted), root
