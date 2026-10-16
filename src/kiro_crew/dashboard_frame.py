@@ -1074,14 +1074,61 @@ def compose(html: str, read: Mapping[str, Any], title: str = "") -> str:
     )
 
 
+#: A value as this reader ends it, the way an HTML tokenizer does: a quoted value is a
+#: unit that may hold anything but ``<`` (so a ``>`` inside the quotes is part of the
+#: value, not the end of the tag), and a bare value runs to white space, ``>`` or ``<``
+#: and may not start with a quote. Stopping a quoted value at ``<`` as well keeps the
+#: run from scanning past the next tag into the page, the same guard the two runs below
+#: carry; a start tag never legitimately holds a bare ``<`` inside a value.
+_CELL_VALUE = rf"\"[^\"<]*+\"|'[^'<]*+'|(?![\"'])[^{_WS}<>]*+"
+
+
+def _cell_attributes(value: str, guard: str = "") -> str:
+    """Attributes of a start tag as this reader skips them, each value matching *value*.
+
+    The same shape as :func:`_attributes`, possessive throughout so a run that does not
+    fit fails in time linear in its length, and reading every value as a whole unit so a
+    quoted ``>`` inside one is consumed rather than mistaken for the end of the tag.
+
+    *guard* is an optional negative lookahead placed before each attribute, so the run
+    that precedes the binding attribute does not itself consume it: being possessive, a
+    run that swallowed ``data-dashboard-field=...`` would never give it back for the
+    capture, so the whole cell would fail to match. Guarding only the attribute (not the
+    white-space separator) lets another attribute that merely starts with the same letters
+    (``data-dashboard-fieldset``) still be read before the binding one.
+    """
+    gap = rf"[{_WS}]*+"
+    separator = rf"[{_WS}/]++"
+    attribute = rf"{guard}[^{_WS}/<>=]++(?:{gap}={gap}(?:{value}))?+"
+    return rf"(?:{separator}|{attribute})*+"
+
+
+#: Refuses the binding attribute at the start of an attribute, so the run before it leaves
+#: the first one for the capture. ``\s*=`` is required so a boolean ``data-dashboard-field``
+#: with no value -- which the capture would not take anyway -- is still skipped as an
+#: ordinary attribute rather than ending the run.
+_NOT_BINDING = rf"(?!{BINDING_ATTRIBUTE}\s*=)"
+
+
 #: A text binding on an element with NO nested markup, which is every valid one: the
 #: bootstrap fills a binding by setting ``textContent``, so an element holding tags is
 #: not a text cell and is left alone rather than rewritten.
+#:
+#: The opening tag is read the way an HTML tokenizer reads it, not with a ``[^>]`` run:
+#: each attribute value is a whole unit (see :data:`_CELL_VALUE`), so a ``>`` inside a
+#: quoted value is part of the value and does not end the tag early -- which, before this,
+#: corrupted the page when the quoted ``>`` came after the binding attribute and silently
+#: left the cell unfilled when it came before. The tag name and both attribute runs are
+#: possessive, and the first binding attribute is committed in an atomic group, so a start
+#: tag that repeats the attribute or never closes is read once rather than researched; and
+#: every run stops at ``<`` as well as ``>``, so the search never scans past the next tag.
 _SIMPLE_BINDING_CELL = re.compile(
-    r"(<(?P<tag>[a-zA-Z][\w-]*)\b[^>]*?"
+    r"(<(?P<tag>[a-zA-Z][\w-]*+)(?>"
+    + _cell_attributes(_CELL_VALUE, _NOT_BINDING)
     + BINDING_ATTRIBUTE
-    + r"\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s\"'>=`]+))"
-    + r"[^>]*>)(?P<body>[^<]*)(?P<close></(?P=tag)\s*>)"
+    + r"\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s\"'>=`]+)))"
+    + _cell_attributes(_CELL_VALUE)
+    + r">)(?P<body>[^<]*)(?P<close></(?P=tag)\s*>)"
 )
 
 

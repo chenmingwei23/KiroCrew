@@ -304,3 +304,62 @@ class TestAScriptsOffPageStillShowsItsValues:
         src = inspect.getsource(fields.render_package_page)
         assert "if not scripts:" in src
         assert "fill_bindings_as_text" in src
+
+    def test_a_quoted_gt_after_the_binding_does_not_cut_the_tag(self) -> None:
+        """A ``>`` inside a double-quoted value AFTER the binding attribute is part of
+        the value, not the end of the tag. Read with ``[^>]`` the tag ended at the
+        quoted ``>``, so the fill overwrote the rest of the attribute and the original
+        text -- a corrupted page served as a current one."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = '<span data-dashboard-field="goal" title="a>b">old</span>'
+        out = frame.fill_bindings_as_text(page, self._read(goal="land it"))
+        assert out == '<span data-dashboard-field="goal" title="a>b">land it</span>'
+
+    def test_a_quoted_gt_before_the_binding_still_finds_the_cell(self) -> None:
+        """A ``>`` inside a double-quoted value BEFORE the binding attribute is part of
+        the value too. Read with ``[^>]`` the tag ended before the binding attribute was
+        reached, so the cell was silently left unfilled -- an empty cell on a page that
+        reads as current."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = '<span title="a>b" data-dashboard-field="goal">old</span>'
+        out = frame.fill_bindings_as_text(page, self._read(goal="land it"))
+        assert out == '<span title="a>b" data-dashboard-field="goal">land it</span>'
+
+    def test_a_single_quoted_gt_after_the_binding_does_not_cut_the_tag(self) -> None:
+        """The same for a single-quoted value: the two quoting styles are units alike."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = "<span data-dashboard-field='goal' title='a>b'>old</span>"
+        out = frame.fill_bindings_as_text(page, self._read(goal="land it"))
+        assert out == "<span data-dashboard-field='goal' title='a>b'>land it</span>"
+
+    def test_a_single_quoted_gt_before_the_binding_still_finds_the_cell(self) -> None:
+        """And a single-quoted ``>`` before the binding attribute is part of the value."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = "<span title='a>b' data-dashboard-field='goal'>old</span>"
+        out = frame.fill_bindings_as_text(page, self._read(goal="land it"))
+        assert out == "<span title='a>b' data-dashboard-field='goal'>land it</span>"
+
+    def test_a_value_that_reads_like_the_binding_attribute_is_not_the_binding(self) -> None:
+        """A quoted value may contain the literal text ``data-dashboard-field=`` without
+        being the binding attribute. The reader must see it as one value and find the
+        real binding attribute that follows, not stop inside the decoy."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = '<span title="data-dashboard-field=x" data-dashboard-field="goal">old</span>'
+        out = frame.fill_bindings_as_text(page, self._read(goal="land it"))
+        assert out == (
+            '<span title="data-dashboard-field=x" data-dashboard-field="goal">land it</span>'
+        )
+
+    def test_a_cell_with_a_quoted_gt_and_nested_markup_is_still_left_alone(self) -> None:
+        """The no-nested-markup rule holds through a quoted ``>``: an element whose start
+        tag carries a quoted ``>`` but whose body holds tags is not a text cell, so it is
+        left exactly as the author wrote it rather than rewritten."""
+        from kiro_crew import dashboard_frame as frame
+
+        page = '<b data-dashboard-field="goal" title="a>b"><i>nested</i></b>'
+        assert frame.fill_bindings_as_text(page, self._read(goal="land it")) == page
