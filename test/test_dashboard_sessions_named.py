@@ -12,6 +12,7 @@ Real auth middleware and real route table, as in ``test_dashboard_session_meta``
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -70,6 +71,25 @@ def _transcript(state, key: str, title: str, app_name: str = "") -> None:
     log.update_metadata(key, meta)
 
 
+async def _seed(state, *transcripts: tuple) -> None:
+    """Seed transcripts off the event loop.
+
+    ``_transcript`` ends in ``ConversationLog.update_metadata``, a synchronous
+    tmp-file-plus-rename whose Windows sharing-violation retry
+    (``atomic_write.replace_with_retry``) is a single attempt on the loop
+    thread. Seeding from an ``async def`` test on the loop therefore loses to
+    any handle a scanner holds on ``sessions/<key>.jsonl`` for a few
+    milliseconds (``[WinError 5]``). Running the writes on a worker thread,
+    which has no loop of its own, keeps the retry.
+    """
+
+    def _write() -> None:
+        for args in transcripts:
+            _transcript(state, *args)
+
+    await asyncio.to_thread(_write)
+
+
 async def _named(state, name: str, app_name: str = "") -> list[str]:
     app = web.Application(middlewares=[token_auth.token_auth_middleware()])
     app["state"] = state
@@ -85,11 +105,14 @@ async def _named(state, name: str, app_name: str = "") -> list[str]:
 
 @pytest.mark.asyncio
 async def test_name_keeps_its_own_sessions_oldest_first(state):
-    _transcript(state, "dashboard:chat-7-1790000000", "Newer")
-    _transcript(state, "dashboard:chat-7-1780000000", "Older")
-    _transcript(state, "dashboard:chat-70-1785000000", "Other number")
-    _transcript(state, "dashboard:chat-8-1785000000", "Other slot")
-    _transcript(state, "subagent:chat-7-1785000000", "Not a dashboard slot")
+    await _seed(
+        state,
+        ("dashboard:chat-7-1790000000", "Newer"),
+        ("dashboard:chat-7-1780000000", "Older"),
+        ("dashboard:chat-70-1785000000", "Other number"),
+        ("dashboard:chat-8-1785000000", "Other slot"),
+        ("subagent:chat-7-1785000000", "Not a dashboard slot"),
+    )
     assert await _named(state, "chat-7") == [
         "dashboard_chat-7-1780000000",
         "dashboard_chat-7-1790000000",
@@ -99,12 +122,15 @@ async def test_name_keeps_its_own_sessions_oldest_first(state):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["", "chat-7-1780000000", "chat-", "chat-7*", "dashboard_chat-7"])
 async def test_a_value_that_is_not_a_short_name_matches_nothing(state, name):
-    _transcript(state, "dashboard:chat-7-1780000000", "Older")
+    await _seed(state, ("dashboard:chat-7-1780000000", "Older"))
     assert await _named(state, name) == []
 
 
 @pytest.mark.asyncio
 async def test_app_sees_only_the_named_sessions_it_owns(state):
-    _transcript(state, "dashboard:chat-7-1780000000", "Not yours")
-    _transcript(state, "dashboard:chat-7-1790000000", "Mine", _APP)
+    await _seed(
+        state,
+        ("dashboard:chat-7-1780000000", "Not yours"),
+        ("dashboard:chat-7-1790000000", "Mine", _APP),
+    )
     assert await _named(state, "chat-7", _APP) == ["dashboard_chat-7-1790000000"]
