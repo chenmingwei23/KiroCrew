@@ -496,6 +496,22 @@ async def test_two_live_collectors_do_not_claim_each_others_frames():
     hold both frames -- and each adoption takes only the frames naming its own
     session."""
     rt, reader, _ = _make_runtime()
+    # The adoption this test proves is driven by frame ROUTING, not by the
+    # collect budget expiring: each collector adopts only the frames naming its
+    # own session, and that outcome is read from ``settled.wait`` /
+    # ``_dropped_frames`` below, never from the clock. ``_make_runtime``'s 0.4s
+    # collect budget is the one WALL-TIME input, and it is not a signal the
+    # production path resolves -- it is the collector's own abandon deadline. The
+    # staging + answering between the two live collectors is real work that runs
+    # ~0.37s unloaded (5x --durations, all 0.37s), ~93% of the 0.4s budget, so a
+    # loaded shard tips both collectors into ``abandoned`` and the routing
+    # assertion loses to the clock. The determinism contract wants such a budget
+    # sized as a lost-run ceiling that only ends a broken run, so use
+    # ``_SETTLE_BACKSTOP`` (30s) -- the named ceiling the ``settled.wait`` below
+    # also bounds against: >10x the ~0.37s + load worst case and well under half
+    # the suite's ``--timeout=120``, so a genuine hang still fails loudly here
+    # rather than racing the clock.
+    rt._start_collect_timeout = _SETTLE_BACKSTOP
     reader_task = await _start_reader(rt)
     adopted: dict = {}
 
