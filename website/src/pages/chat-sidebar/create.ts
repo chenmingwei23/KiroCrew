@@ -140,8 +140,14 @@ export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation,
       // A plain create activated the new slot, so leave Split View and show it,
       // the same answer a row click gets (#21935). The background-tab gesture
       // skips this: it keeps the user on their current session, so the split
-      // must stay.
-      if (!inNewTab && slot?.key) onSelectSlot?.(slot.key)
+      // must stay. Guard on the live activeSlot: `createSlot.fulfilled`
+      // declines to activate when the user moved to another session while the
+      // create was pending (switched-away guard, lifecycle.ts), leaving
+      // activeSlot on the OLD session. Firing the callback then would leave
+      // Split View and navigate the embedded Sessions frame onto a session the
+      // user never opened (#21959 review). Only fire it when the new slot is
+      // the one now active.
+      if (!inNewTab && slot?.key && store.getState().chat.activeSlot === slot.key) onSelectSlot?.(slot.key)
       if (slot?.key && columnId) {
         // Board view: also drop the new session into the column it was created
         // from, so a status-lane column shows it immediately instead of the
@@ -155,6 +161,15 @@ export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation,
         // Adds a tab beside the active one; `foreground` also switches to it,
         // same as the header New button's gestures (see createChatMutation).
         onOpenSlotInNewTab(slot.key, { background: inNewTab === 'background' })
+        // A foreground tab switches the view onto the new session, so leave
+        // Split View too — the same guarded callback the header New fires
+        // after its own foreground switch (createChatMutation). The plain
+        // branch above handles `false`; `background` keeps the user where they
+        // are, so it keeps the split. Guard on the live activeSlot for the
+        // switched-away case (see the plain branch): a slow foreground switch
+        // the user raced leaves activeSlot off the new slot, and firing then
+        // would strand them on a session they did not open.
+        if (inNewTab === 'foreground' && store.getState().chat.activeSlot === slot.key) onSelectSlot?.(slot.key)
         if (focus && inNewTab === 'foreground') focusComposer()
       }
     },
@@ -301,8 +316,12 @@ export function useSessionCreate({ setNewChatError, dispatch, mode, onOpenSlotIn
         if (inNewTab === 'background') return
       }
       // Plain create activated the new slot: leave Split View so it shows,
-      // the same answer a row click gets (#21935).
-      if (slot?.key) onSelectSlot?.(slot.key)
+      // the same answer a row click gets (#21935). Guard on the live
+      // activeSlot — see useFolderChatCreate's onSuccess: a user who switched
+      // away during a slow create leaves activeSlot on the old session, and
+      // firing the callback then would strand them on a session they did not
+      // open (#21959 review).
+      if (slot?.key && store.getState().chat.activeSlot === slot.key) onSelectSlot?.(slot.key)
       focusComposer()
     },
     onError: onNewChatError,
@@ -360,9 +379,12 @@ export function useSessionCreate({ setNewChatError, dispatch, mode, onOpenSlotIn
       return dispatch(createSlot({ mode: mode || '', memory_mode: memoryMode })).unwrap()
     },
     // Incognito/temporary always activate the new slot, so always leave Split
-    // View and show it, then focus the composer (#21935).
+    // View and show it, then focus the composer (#21935). Guard on the live
+    // activeSlot (see createChatMutation): a switched-away create leaves
+    // activeSlot on the old session, and firing the callback then would strand
+    // the user on a session they did not open (#21959 review).
     onSuccess: (slot) => {
-      if (slot?.key) onSelectSlot?.(slot.key)
+      if (slot?.key && store.getState().chat.activeSlot === slot.key) onSelectSlot?.(slot.key)
       focusComposer()
     },
     onError: onNewChatError,

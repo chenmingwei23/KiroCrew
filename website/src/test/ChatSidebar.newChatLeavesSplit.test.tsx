@@ -13,7 +13,10 @@
  *   (3) New incognito / New temporary fire it;
  *   (4) the open-as-a-background-tab gesture (Ctrl/Cmd/middle-click) does NOT
  *       fire it — that create keeps the user where they are, so the split must
- *       stay (and the store's active slot must not move).
+ *       stay (and the store's active slot must not move);
+ *   (5) a FOREGROUND-tab folder create (Cmd/Ctrl+Shift) switches onto the new
+ *       session, so it fires `onSelectSlot` and leaves the split, matching the
+ *       header New (#21959 review r112).
  *
  * The real `createSlot` thunk runs against a mocked `api.createChatSlot`, so the
  * active-slot assertions read the thunk's ACTUAL effect off the store.
@@ -25,6 +28,7 @@ import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+import { setActiveSlot } from '../store/chatSlice'
 import type { RootState } from '../store'
 import type { ChatSlot, ChatFolder } from '../types'
 
@@ -188,5 +192,84 @@ describe('ChatSidebar – a plain create leaves Split View (#21935)', () => {
     await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: true }))
     expect(onSelectSlot).not.toHaveBeenCalled()
     expect(store.getState().chat.activeSlot).toBe(ORIGIN)
+  })
+
+  // A FOREGROUND-tab folder create (Cmd/Ctrl+Shift+click) switches the view
+  // onto the new session through `onOpenSlotInNewTab`, so it must leave Split
+  // View too — the same guarded callback the header New fires after its own
+  // foreground switch (#21959 review r112, create.ts). The real controller's
+  // `openSlotInNewTab` moves the active slot synchronously via
+  // `switchSlot.pending`; the test's handler stands in for that switch so the
+  // active-slot guard sees the new slot the way it does in the app.
+  it('Cmd/Ctrl+Shift folder "New chat" (foreground tab) fires onSelectSlot and leaves the split', async () => {
+    const onSelectSlot = vi.fn()
+    let store: ReturnType<typeof renderSidebar> | undefined
+    // Foreground open: the controller switches the active slot to the new tab.
+    const onOpen = vi.fn((key: string, _o?: { background?: boolean }) => {
+      store?.dispatch(setActiveSlot(key))
+    })
+    store = renderSidebar({ onSelectSlot, onOpenSlotInNewTab: onOpen, folders: [FOLDER] })
+    fireEvent.click(await screen.findByTestId('folder-new-chat-f1'), { ctrlKey: true, shiftKey: true })
+    await created()
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: false }))
+    await waitFor(() => expect(onSelectSlot).toHaveBeenCalledWith(NEW_KEY))
+    expect(store.getState().chat.activeSlot).toBe(NEW_KEY)
+  })
+
+  it('Ctrl-click folder "New chat" (background tab) does NOT leave the split and keeps the user put', async () => {
+    const onSelectSlot = vi.fn()
+    const onOpen = vi.fn()
+    const store = renderSidebar({ onSelectSlot, onOpenSlotInNewTab: onOpen, folders: [FOLDER] })
+    fireEvent.click(await screen.findByTestId('folder-new-chat-f1'), { ctrlKey: true })
+    await created()
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(NEW_KEY, { background: true }))
+    expect(onSelectSlot).not.toHaveBeenCalled()
+    expect(store.getState().chat.activeSlot).toBe(ORIGIN)
+  })
+
+  // Switched-away guard (#21959 review): if the user moves to another session
+  // while a plain create is pending, `createSlot.fulfilled` declines to
+  // activate the new slot (lifecycle.ts). The sidebar must then NOT fire
+  // `onSelectSlot` either — doing so would leave Split View and navigate the
+  // host onto a session the user never opened. The create is held pending with
+  // a deferred `createChatSlot`, the active slot is moved mid-flight, then the
+  // create resolves.
+  describe('switched away while the create is pending', () => {
+    const OTHER = 's2'
+
+    function deferCreate() {
+      let resolve!: (v: { key: string }) => void
+      mocks.createChatSlot.mockReset().mockImplementation(() => new Promise<{ key: string }>(r => { resolve = r }))
+      return { resolve: () => resolve({ key: NEW_KEY }) }
+    }
+
+    it('plain header-New: the new slot is not activated and onSelectSlot is not fired', async () => {
+      const d = deferCreate()
+      const onSelectSlot = vi.fn()
+      const store = renderSidebar({ onSelectSlot })
+      fireEvent.click(newButton())
+      await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalledTimes(1))
+      // User moves to another session while "Creating…" is still in flight.
+      store.dispatch(setActiveSlot(OTHER))
+      d.resolve()
+      // The create settles, but the guard declines: active slot stays on OTHER
+      // and the callback never fires, so the host keeps the split.
+      await waitFor(() => expect(store.getState().chat.creatingSlot).toBe(false))
+      expect(store.getState().chat.activeSlot).toBe(OTHER)
+      expect(onSelectSlot).not.toHaveBeenCalled()
+    })
+
+    it('plain folder New: the new slot is not activated and onSelectSlot is not fired', async () => {
+      const d = deferCreate()
+      const onSelectSlot = vi.fn()
+      const store = renderSidebar({ onSelectSlot, folders: [FOLDER] })
+      fireEvent.click(await screen.findByTestId('folder-new-chat-f1'))
+      await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalledTimes(1))
+      store.dispatch(setActiveSlot(OTHER))
+      d.resolve()
+      await waitFor(() => expect(store.getState().chat.creatingSlot).toBe(false))
+      expect(store.getState().chat.activeSlot).toBe(OTHER)
+      expect(onSelectSlot).not.toHaveBeenCalled()
+    })
   })
 })
