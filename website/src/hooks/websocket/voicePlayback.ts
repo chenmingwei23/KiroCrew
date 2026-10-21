@@ -10,6 +10,7 @@ import { setVoicePlaying, setVoicePreparing, setVoiceAudio } from '../../store/c
 import { api } from '../../api/client'
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../../lib/voicePlayback'
 import { reportVoiceFailure } from '../../lib/voiceFailure'
+import { speakOnClient, stopClientSpeech } from '../../lib/clientSpeech'
 import type { ChatMessage } from '../../types'
 import type { FrameData } from './frames'
 
@@ -86,6 +87,9 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
     const stopVoice = () => {
       voiceMutedRef.current = true
       voiceEpochRef.current++
+      // Any client-side fallback speech shares the one output channel, so Stop,
+      // a new manual request, and a new turn must silence it too.
+      stopClientSpeech()
       for (const [requestId, slot] of voiceRequestsRef.current) {
         void api.voiceCancel?.(slot, requestId).catch(() => {})
       }
@@ -332,15 +336,35 @@ export function useVoicePlayback(dispatch: AppDispatch): VoicePlayback {
           autoSpeakRef.current = !!detail?.autoSpeak
           if (!autoSpeakRef.current) stopVoice()
         }
+        // The gateway host cannot synthesize (voice_unavailable); speak the
+        // reply on the client instead. Drives the same voicePlaying state as the
+        // gateway path, so the playback bar and its Stop button work unchanged.
+        const onClientSpeak = (event: Event) => {
+          const { slot, text, request_id } = (event as CustomEvent<{ slot: string; text: string; request_id?: string }>).detail
+          // The gateway request started (voice-synthesis-start) and never
+          // settled, so clear its preparing state before speaking locally.
+          if (request_id) {
+            voiceRequestsRef.current.delete(request_id)
+            audioSettled(request_id)
+          }
+          if (slot !== store.getState().chat.activeSlot) return
+          voiceMutedRef.current = false
+          speakOnClient(text, {
+            onPlaying: playing => dispatch(setVoicePlaying(playing)),
+            onError: code => reportVoiceFailure({ slot, code }),
+          })
+        }
         window.addEventListener('voice-stop', onVoiceStop)
         window.addEventListener('voice-synthesis-start', onVoiceStart)
         window.addEventListener('voice-synthesis-failed', onVoiceFailed)
         window.addEventListener('voice-config-changed', onVoiceConfigChanged)
+        window.addEventListener('voice-client-speak', onClientSpeak)
         return () => {
           window.removeEventListener('voice-stop', onVoiceStop)
           window.removeEventListener('voice-synthesis-start', onVoiceStart)
           window.removeEventListener('voice-synthesis-failed', onVoiceFailed)
           window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
+          window.removeEventListener('voice-client-speak', onClientSpeak)
         }
       },
       dispose() {

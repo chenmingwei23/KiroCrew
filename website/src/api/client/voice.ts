@@ -5,6 +5,7 @@
  */
 
 import { createVoiceRequestId } from '../../lib/voicePlayback'
+import { clientSpeechAvailable } from '../../lib/clientSpeech'
 import { parseErrorCode } from '../../utils/errorReport'
 import { ApiError } from '../apiError'
 import type { ClientTransport } from './transport'
@@ -84,11 +85,22 @@ export function createVoiceEndpoints({ post, put, j, jfetch: fetch }: ClientTran
   }
 
   const synthesis = {
-    voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string }) => {
-      const request_id = opts?.request_id || createVoiceRequestId()
+    voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string; clientFallback?: boolean }) => {
+      const { clientFallback = false, ...synthOpts } = opts ?? {}
+      const request_id = synthOpts.request_id || createVoiceRequestId()
       window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
-      return post('/api/voice/synthesize', { slot, text, ...opts, request_id }).then(j).catch(error => {
+      return post('/api/voice/synthesize', { slot, text, ...synthOpts, request_id }).then(j).catch(error => {
         const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
+        // The gateway host cannot synthesize at all (no system engine, Piper
+        // missing, no Polly) — the one case where speaking on the client is the
+        // right answer rather than another error notice. Route there instead of
+        // raising the failure so a desktop app on a headless remote gateway is
+        // not told to fix a host whose speakers the user never hears. Any other
+        // failure keeps its notice, so a working gateway is never affected.
+        if (clientFallback && code === 'voice_unavailable' && clientSpeechAvailable()) {
+          window.dispatchEvent(new CustomEvent('voice-client-speak', { detail: { slot, text, request_id } }))
+          return
+        }
         window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed' } }))
         throw error
       })
