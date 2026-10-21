@@ -299,3 +299,23 @@ async def test_side_turn_refuses_non_owner(monkeypatch) -> None:
             await client.post("/api/chat/slots/chat-1-1700000000/side/turn", json={"question": "x"})
         )
     dispatch.assert_not_called()
+
+
+async def test_side_read_refuses_non_owner(monkeypatch) -> None:
+    # The read route carries the SAME owner gate as turn/stop: a dashboard token
+    # whose subject is not the owner is refused with the shared ``owner_only``
+    # 403 before the sidecar is ever read. ``_side`` fails the test on ANY
+    # attribute access, so a gate placed after the lookup cannot pass.
+    from kiro_crew.dashboard.handlers import side
+
+    class _NoReadSidecar:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"read the sidecar's .{name} before refusing the non-owner")
+
+    slot = MagicMock(key="chat-1-1700000000", _app="")
+    slot._side = _NoReadSidecar()
+    app = web.Application(middlewares=[_non_owner])
+    app["state"] = SimpleNamespace(owner_id=OWNER, _slots={"chat-1-1700000000": slot})
+    app.router.add_get("/api/chat/slots/{slot}/side", side.api_side_read)
+    async with _client(app) as client:
+        await _assert_owner_only(await client.get("/api/chat/slots/chat-1-1700000000/side"))

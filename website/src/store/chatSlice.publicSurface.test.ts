@@ -44,7 +44,7 @@ const ACTION_CREATORS = [
   'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setCloseRefused', 'setFolderSuggestion',
   'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setQuestionNotice', 'setQuestionRequestInFlight', 'setSlotRunning',
   'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'setVoiceAudio',
-  'setVoicePlaying', 'setVoicePreparing', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
+  'setVoicePlaying', 'setVoicePreparing', 'settleStopNotRunning', 'sideClose', 'sideHydrate', 'sideOptimisticAppend',
   'sideOptimisticRollback', 'sideReleaseConsumed', 'sideSendStatus', 'sseActivityEvent', 'sseAutomation',
   'sseChatMessage', 'sseChatMessagePatchByTs', 'sseChatMessageUpdate', 'sseContextUsage',
   'sseMcpAppRender', 'sseSideQueue', 'sseSideResult', 'sseSubagentBatchChunks',

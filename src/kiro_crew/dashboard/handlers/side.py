@@ -101,7 +101,7 @@ def _dispatch_side_turn(
     is_first_turn = not any(m.get("role") == "assistant" for m in side.messages)
     side.last_run_id = run_id
     side.is_complete = False
-    side.append_user(question)
+    side.append_user(question, run_id=run_id)
 
     broadcast_side_result(
         state,
@@ -399,7 +399,9 @@ async def _run_side_turn(
         # still unproven, and committing then duplicated any question the model
         # never consumed (the finally requeues it and the queue runs it for real).
         for entry in side_at_start.steer_settle(snapshot):
-            side_at_start.append_user(entry["text"], steer=True)
+            side_at_start.append_user(
+                entry["text"], steer=True, run_id=side_at_start.last_run_id or ""
+            )
             broadcast_side_result(
                 state,
                 slot_key=slot.key,
@@ -710,7 +712,7 @@ async def _run_side_turn(
             )
             response_text = redact("".join(chunks))
             if slot._side is not None and slot._side.open and slot._side.last_run_id == run_id:
-                slot._side.append_assistant(response_text)
+                slot._side.append_assistant(response_text, run_id=run_id)
             broadcast_side_result(
                 state,
                 slot_key=slot.key,
@@ -745,7 +747,7 @@ async def _run_side_turn(
             )
 
         if slot._side is not None and slot._side.open and slot._side.last_run_id == run_id:
-            slot._side.append_assistant(response_text)
+            slot._side.append_assistant(response_text, run_id=run_id)
 
         broadcast_side_result(
             state,
@@ -938,6 +940,107 @@ async def api_side_open(request: web.Request) -> web.Response:
             "messages": len(slot._side.messages),
             "last_run_id": slot._side.last_run_id,
             "created_at": slot._side.created_at,
+        }
+    )
+
+
+async def api_side_read(request: web.Request) -> web.Response:
+    """GET /api/chat/slots/{slot}/side — the sidecar's held conversation.
+
+    A browser reload empties the panel's page-only store while the gateway still
+    holds the side conversation on ``slot._side``; this is the read the reloaded
+    panel uses to rehydrate it (#22869). Returns the held rows, the pending
+    queue, and whether a turn is running — never a 500 when no sidecar exists:
+    an absent/closed sidecar answers ``open: false`` with empty collections, the
+    same shape a reload onto a never-opened slot expects.
+
+    Owner-only and redacted the SAME way the ``chat.side_result`` frames are: the
+    side conversation is the owner's own, so an app token asking about a slot it
+    does not own gets the uniform 404, and every row's content goes out through
+    ``redact()`` (both the exfiltration-URL and credential passes, exactly as
+    ``broadcast_side_result``/the final frame apply) so a credential a row still
+    holds raw is never leaked. Each row carries its ``run_id`` — the id the
+    announcing frame also carries — so the panel draws a row once whether the
+    stored copy or a concurrent in-flight frame arrives first. Nothing is read
+    from or written to disk.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return slot_not_found()
+
+    # Owner-dashboard gate, mirroring ``api_side_turn``/``api_side_stop``: the
+    # side conversation's content is the owner's, so a dashboard-user request is
+    # ruled on by ``is_owner_dashboard_request`` and an app token keeps the slot
+    # scoping below.
+    if request.get("app") == "":
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "chat.side_read")
+        if owner_denied is not None:
+            return owner_denied
+
+    own = _check_slot_ownership(request, slot, "chat.side_read")
+    if own is not None:
+        return own
+
+    side = slot._side
+    if side is None or not side.open:
+        # Not an error: a reload onto a slot whose sidecar was never opened (or
+        # has been closed) is the ordinary empty case. The panel reads this as
+        # "nothing to rehydrate" and stays empty, exactly as it is today.
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="chat.side_read",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slot={slot.key},open=false",
+        )
+        return web.json_response(
+            {"ok": True, "open": False, "messages": [], "queue": [], "running": False}
+        )
+
+    # Redact every row's content the way the frames do. Stored assistant text was
+    # already redacted when it was stored, but user questions are held raw (the
+    # frame redacts them on the wire); applying redact() here keeps this read
+    # byte-identical to what the panel would have seen over the socket, and fails
+    # safe if a future store path ever holds a credential raw.
+    messages = [
+        {
+            "role": m["role"],
+            "content": redact(m["content"]),
+            "ts": m["ts"],
+            **({"run_id": m["run_id"]} if m.get("run_id") else {}),
+            **({"steer": True} if m.get("steer") else {}),
+            **({"is_error": True} if m.get("is_error") else {}),
+        }
+        for m in side.messages
+    ]
+    queue = [{"id": e["id"], "content": redact(e["content"]), "ts": e["ts"]} for e in side.queue]
+    # In flight when a run is current and either still streaming or being stopped
+    # — the same predicate ``api_side_turn``'s busy gate uses.
+    running = bool(side.last_run_id) and (not side.is_complete or side.is_stopping)
+
+    sel().log_api_access(
+        caller=request.get("app", "") or "dashboard",
+        operation="chat.side_read",
+        outcome="allowed",
+        source="dashboard",
+        resources=(
+            f"slot={slot.key},open=true,messages={len(messages)},"
+            f"queue={len(queue)},running={running}"
+        ),
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "open": True,
+            "messages": messages,
+            "queue": queue,
+            "running": running,
+            "last_run_id": side.last_run_id,
+            "created_at": side.created_at,
         }
     )
 
@@ -1494,7 +1597,7 @@ async def _cancel_and_settle_side_turn(
     # the stopped question as an open, unanswered ``User:`` line. Without this
     # ``side.messages`` ends ``[user: Q1]`` and ``_format_side_history`` hands
     # the model Q1 as still-pending.
-    side.append_assistant("(side response stopped)")
+    side.append_assistant("(side response stopped)", run_id=run_id, is_error=True)
 
     # The terminal frame the client needs to clear streaming/pending. A fresh
     # run_id would read as a new turn's answer; this one matches the row the

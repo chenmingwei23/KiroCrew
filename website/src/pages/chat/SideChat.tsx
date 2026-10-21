@@ -6,7 +6,7 @@ import { sendTurn, type SendReceipt } from '../../chat-core/transport/sendTurn'
 import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import { sideTurnWire } from './sideTurnWire'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, type SideStandingNotice } from '../../store/chatSlice'
+import { sideClose, sideHydrate, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -121,6 +121,35 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   const postureError = sideToolsQ.data?.config_unavailable === true
   const readOnlyToolsAvailable = sideToolsQ.data?.read_only_tools === true
   const reduxSide = useAppSelector(s => s.chat.slotSide[slot])
+  // Rehydrate after a page reload (#22869): the panel's transcript and queue
+  // live only in this page's store, so a reload empties them while the gateway
+  // still holds the side conversation on the slot. Read the held rows ONCE when
+  // the panel mounts for this slot and merge them into the store; the merge is
+  // idempotent with the SSE frames of an in-flight turn (see `sideHydrate`).
+  // `staleTime: Infinity` so it fires once per mount, not on every focus — the
+  // live socket is the source of truth after the first read. `enabled: connected`
+  // waits for the wire so a cold mount does not read before auth is ready.
+  const sideReadQ = useQuery({
+    queryKey: ['sideRead', slot],
+    queryFn: () => api.sideRead(slot),
+    enabled: connected,
+    staleTime: Infinity,
+    gcTime: 0,
+    retry: false,
+  })
+  useEffect(() => {
+    const d = sideReadQ.data
+    if (!d || !d.ok) return
+    dispatch(sideHydrate({
+      slot,
+      open: d.open,
+      messages: d.messages,
+      queue: d.queue,
+      running: d.running,
+      last_run_id: d.last_run_id,
+      created_at: d.created_at,
+    }))
+  }, [sideReadQ.data, slot, dispatch])
   const parentTurnCount = useAppSelector(s =>
     s.chat.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
   )

@@ -33,6 +33,68 @@ export function queueEditBroadcastAt(slot: string, queueId: string): number {
 }
 
 export const sideReducers = {
+  /** Rehydrate the panel from the gateway's held side conversation after a page
+   *  reload (#22869). The transcript and queue live only in this store, so a
+   *  reload empties them while the gateway still holds the conversation on
+   *  `slot._side`; `SideChat` reads `GET .../side` once on mount and dispatches
+   *  this.
+   *
+   *  Idempotent with the SSE frames of an in-flight turn, which can arrive
+   *  before OR after this: a row is MERGED only when no row already carries its
+   *  `run_id`+`role`+`content`, so whichever of the stored copy and the live
+   *  frame lands first wins and the other is a no-op. It never clobbers — an
+   *  optimistic bubble or a streamed partial already in the store is left alone.
+   *  A slot the user closed this session (`slotSideClosed`) is NOT resurrected,
+   *  and an `open: false` read (no sidecar) merges nothing. */
+  sideHydrate(state: ChatState, action: PayloadAction<{ slot: string; open: boolean; messages: { role: 'user' | 'assistant'; content: string; ts: string; run_id?: string; steer?: boolean; is_error?: boolean }[]; queue: { id: string; content: string; ts: string }[]; running: boolean; last_run_id?: string; created_at?: string }>) {
+    const { slot, open, messages, queue, running, last_run_id, created_at } = action.payload
+    if (isUnsafeKey(slot)) return
+    // Nothing to restore, or the user closed it this session — do not resurrect.
+    if (!open || state.slotSideClosed[slot]) return
+    if (!state.slotSide[slot]) {
+      const parentTurnCount = slot === state.activeSlot
+        ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+        : 0
+      state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: created_at ?? new Date().toISOString() }
+    }
+    const side: SideState = state.slotSide[slot]
+    // Merge rows the store does not already hold. Identity is run_id+role+content:
+    // an assistant answer is one row per run, a steer and the question share a run
+    // but differ in content, and a concurrent frame that already landed carries
+    // the same triple — so this draws each row exactly once whichever arrived first.
+    const seen = new Set(side.messages.map(m => [m.run_id ?? '', m.role, m.content].join('\u0000')))
+    for (const m of messages) {
+      const key = [m.run_id ?? '', m.role, m.content].join('\u0000')
+      if (seen.has(key)) continue
+      seen.add(key)
+      side.messages.push({
+        role: m.role,
+        content: m.content,
+        ts: m.ts,
+        ...(m.run_id ? { run_id: m.run_id } : {}),
+        ...(m.steer ? { steer: true } : {}),
+        ...(m.is_error ? { is_error: true } : {}),
+      })
+    }
+    // Merge queue entries by id, skipping any already present or already retired
+    // (a drain/cancel frame that beat this read).
+    if (!side.queue) side.queue = []
+    for (const e of queue) {
+      if (side.queue.some(q => q.id === e.id)) continue
+      if (side.removedQueueIds?.includes(e.id)) continue
+      // Content is redacted on the wire; mark it NOT raw so a tab that typed the
+      // real text can still ratchet it in, and so a cancel prefers a raw copy.
+      side.queue.push({ id: e.id, content: e.content, ts: e.ts })
+    }
+    if (last_run_id) side.lastRunId = last_run_id
+    // Reflect a turn still in flight so the thinking indicator and busy gate are
+    // correct immediately after the reload; its terminal frame clears them as usual.
+    // Never turn OFF a flag a live frame already set — only raise it.
+    if (running) {
+      side.pending = true
+      side.streaming = true
+    }
+  },
   sseSideResult(state: ChatState, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean; steer?: boolean }>) {
     const { slot, run_id, role, content, ts, is_error, final, steer } = action.payload
     if (isUnsafeKey(slot)) return

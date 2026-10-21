@@ -99,9 +99,16 @@ class SideState:
     #: handler clears it after recording and broadcasting the terminal row.
     is_stopping: bool = False
 
-    def append_user(self, content: str, ts: str = "", *, steer: bool = False) -> None:
+    def append_user(
+        self, content: str, ts: str = "", *, steer: bool = False, run_id: str = ""
+    ) -> None:
         """Append a user turn. ``steer`` marks it as injected mid-turn, which the
-        panel renders as a distinct bubble rather than a normal question."""
+        panel renders as a distinct bubble rather than a normal question.
+
+        ``run_id`` is the turn this row belongs to — the SAME id the
+        ``chat.side_result`` frame that announced it carries. It is stored so the
+        read route can hand a reloaded page rows it can match against any frame of
+        an in-flight turn, drawing each once (see ``api_side_read``)."""
         entry: dict[str, Any] = {
             "role": "user",
             "content": content,
@@ -109,16 +116,26 @@ class SideState:
         }
         if steer:
             entry["steer"] = True
+        if run_id:
+            entry["run_id"] = run_id
         self.messages.append(entry)
 
-    def append_assistant(self, content: str, ts: str = "") -> None:
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "ts": ts or _now_iso(),
-            }
-        )
+    def append_assistant(
+        self, content: str, ts: str = "", *, run_id: str = "", is_error: bool = False
+    ) -> None:
+        """Append an assistant turn. ``run_id`` is the turn it answers, matching
+        the announcing frame's id (see ``append_user``); ``is_error`` marks the
+        error/stopped rows the panel renders distinctly."""
+        entry: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+            "ts": ts or _now_iso(),
+        }
+        if run_id:
+            entry["run_id"] = run_id
+        if is_error:
+            entry["is_error"] = True
+        self.messages.append(entry)
 
     def clear(self) -> None:
         self.messages.clear()

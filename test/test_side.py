@@ -15,7 +15,10 @@
 The file also pins that a stale readiness value never refuses a side turn and that a
 signed-out CLI reaches the panel as its own message, plus the slot project as the session
 cwd, the fallback when binding resolution fails, the app-agent refusal and self-heal, and
-``/side/stop`` (cancel, settle exactly once, and the races around a stop). The read-only
+``/side/stop`` (cancel, settle exactly once, and the races around a stop). The read route
+``GET /api/chat/slots/{slot}/side`` the reloaded panel rehydrates from — the empty/absent
+shape, the held rows keyed by run_id, redaction, the queue + running flag, and the
+owner/app gate — is pinned at the end of this file. The read-only
 confinement of a side turn, from its approval policy and session binding to each backend's
 tools, is pinned in ``test_side_turn_confinement.py``; the shared question and answer
 constants, the always-ready prerequisite service, the ``/side`` app factory, the broadcast
@@ -30,6 +33,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 from side_helpers import (  # noqa: F401 -- the autouse fixture registers by import
@@ -1313,3 +1317,206 @@ async def test_side_stop_on_missing_or_closed_side(tmp_path, monkeypatch):
         assert resp.status == 409
         body = await resp.json()
         assert body["code"] == "side_not_open"
+
+
+# ── Read route: GET /api/chat/slots/{slot}/side (#22869 rehydrate) ──
+#
+# The panel's transcript lives only in the page's Redux store, so a browser
+# reload empties it while the gateway still holds the side conversation on
+# ``slot._side``. These pin the read route the reloaded panel uses to rehydrate:
+# it returns the held rows (each with the run_id its announcing frame carries),
+# the queue and whether a turn is running, redacted like the frames, and it is
+# never a 500 when no sidecar exists.
+
+
+def _stub_run_side_turn_with_run_id(monkeypatch, *, answer: str = _SIDE_ANSWER):
+    """Like ``_stub_run_side_turn`` but records the run_id on the stored answer,
+    exactly as the real ``_run_side_turn`` does — so a read after it returns the
+    assistant row keyed by the same id its frame carried."""
+
+    async def _fake_run(state, slot, run_id, question, *, is_first_turn, start_priority=None):
+        if slot._side is not None and slot._side.open:
+            slot._side.append_assistant(answer, run_id=run_id)
+        # Mirror the real ``_run_side_turn`` finally: a completed turn flips
+        # ``is_complete`` True, so the read reports running=False for it.
+        if slot._side is not None and slot._side.last_run_id == run_id:
+            slot._side.is_complete = True
+
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.side._run_side_turn", _fake_run)
+
+
+@pytest.mark.asyncio
+async def test_side_read_absent_sidecar_is_empty_not_500(tmp_path, monkeypatch):
+    """A reload onto a slot with no open sidecar returns the empty shape, 200."""
+    _stub_run_side_turn(monkeypatch)
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    state.get_or_create_slot("parent")
+
+    app = _make_side_app(state)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/chat/slots/parent/side")
+        assert resp.status == 200
+        body = await resp.json()
+        assert body == {
+            "ok": True,
+            "open": False,
+            "messages": [],
+            "queue": [],
+            "running": False,
+        }
+
+
+@pytest.mark.asyncio
+async def test_side_read_unknown_slot_is_404(tmp_path, monkeypatch):
+    """A read of a slot that does not exist is the uniform 404."""
+    _stub_run_side_turn(monkeypatch)
+    state = _make_state(tmp_path)
+
+    app = _make_side_app(state)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/chat/slots/nope/side")
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_side_read_returns_held_rows_with_run_id(tmp_path, monkeypatch):
+    """After a round-trip the read returns the held rows the gateway still holds,
+    each assistant/user row keyed by the run_id its frame carried."""
+    _stub_run_side_turn_with_run_id(monkeypatch)
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    state.get_or_create_slot("parent")
+
+    app = _make_side_app(state)
+    async with TestClient(TestServer(app)) as client:
+        await client.post("/api/chat/slots/parent/side/open", json={})
+        turn = await client.post(
+            "/api/chat/slots/parent/side/turn",
+            json={"question": _SIDE_QUESTION},
+        )
+        run_id = (await turn.json())["run_id"]
+
+        # Simulate a reload: the page store is gone; the read recovers the rows.
+        resp = await client.get("/api/chat/slots/parent/side")
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["open"] is True
+        assert body["running"] is False
+        assert body["last_run_id"] == run_id
+        rows = [(m["role"], m["content"], m.get("run_id")) for m in body["messages"]]
+        assert ("user", _SIDE_QUESTION, run_id) in rows
+        assert ("assistant", _SIDE_ANSWER, run_id) in rows
+
+
+@pytest.mark.asyncio
+async def test_side_read_redacts_row_content(tmp_path, monkeypatch):
+    """A credential a stored row still holds raw is redacted on the way out,
+    the same scrub the frames apply — the read never leaks."""
+    # An AWS-access-key-shaped token the credential redactor recognises.
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    _stub_run_side_turn(monkeypatch, answer=f"the key is {secret}")
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    state.get_or_create_slot("parent")
+
+    app = _make_side_app(state)
+    async with TestClient(TestServer(app)) as client:
+        await client.post("/api/chat/slots/parent/side/open", json={})
+        await client.post(
+            "/api/chat/slots/parent/side/turn",
+            json={"question": f"remember {secret}"},
+        )
+        resp = await client.get("/api/chat/slots/parent/side")
+        body = await resp.json()
+        blob = "\n".join(m["content"] for m in body["messages"])
+        assert secret not in blob, "read route leaked a raw credential"
+
+
+@pytest.mark.asyncio
+async def test_side_read_reports_queue_and_running(tmp_path, monkeypatch):
+    """A turn in flight with a queued question reads back running=True and the
+    queued entry, so a reload shows what the next question joins and what waits."""
+    # A turn that never completes on its own, so the second submit queues behind
+    # it and the read observes a live turn.
+    gate = asyncio.Event()
+
+    async def _never_finishing(
+        state, slot, run_id, question, *, is_first_turn, start_priority=None
+    ):
+        if slot._side is not None and slot._side.open:
+            slot._side.append_user(question, run_id=run_id)
+        await gate.wait()
+
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.side._run_side_turn", _never_finishing)
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    state.get_or_create_slot("parent")
+
+    app = _make_side_app(state)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            await client.post("/api/chat/slots/parent/side/open", json={})
+            await client.post("/api/chat/slots/parent/side/turn", json={"question": "first"})
+            queued = await client.post(
+                "/api/chat/slots/parent/side/turn", json={"question": "second"}
+            )
+            qbody = await queued.json()
+            assert qbody.get("queued") is True
+
+            resp = await client.get("/api/chat/slots/parent/side")
+            body = await resp.json()
+            assert body["running"] is True
+            assert [e["content"] for e in body["queue"]] == ["second"]
+    finally:
+        gate.set()
+
+
+@pytest.mark.asyncio
+async def test_side_read_denied_to_foreign_app(tmp_path, monkeypatch):
+    """An app token asking about a slot it does not own gets the uniform 404 —
+    the side conversation is the owner's own, like the frames."""
+    _stub_run_side_turn(monkeypatch)
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    slot = state.get_or_create_slot("parent")
+    # Mark the slot as owned by a different app so deny_app_slot_access refuses.
+    slot._app = "owner-app"
+
+    @web.middleware
+    async def _as_other_app(request, handler):
+        request["app"] = "other-app"
+        return await handler(request)
+
+    app = _make_side_app(state)
+    app.middlewares.append(_as_other_app)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/chat/slots/parent/side")
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_side_read_is_isolated_to_its_own_slot(tmp_path, monkeypatch):
+    """A slot's read returns ONLY that slot's own sidecar rows — the lookup is
+    keyed strictly on the {slot} path param, never another slot's sidecar."""
+    _stub_run_side_turn_with_run_id(monkeypatch)
+    state = _make_state(tmp_path)
+    state.sessions.destroy = AsyncMock()
+    state.get_or_create_slot("alpha")
+    state.get_or_create_slot("beta")
+
+    app = _make_side_app(state)
+    async with TestClient(TestServer(app)) as client:
+        # Two independent side conversations on two slots.
+        await client.post("/api/chat/slots/alpha/side/open", json={})
+        await client.post("/api/chat/slots/alpha/side/turn", json={"question": "alpha-secret"})
+        await client.post("/api/chat/slots/beta/side/open", json={})
+        await client.post("/api/chat/slots/beta/side/turn", json={"question": "beta-secret"})
+
+        a = await (await client.get("/api/chat/slots/alpha/side")).json()
+        b = await (await client.get("/api/chat/slots/beta/side")).json()
+
+    a_blob = "\n".join(m["content"] for m in a["messages"])
+    b_blob = "\n".join(m["content"] for m in b["messages"])
+    assert "alpha-secret" in a_blob and "beta-secret" not in a_blob
+    assert "beta-secret" in b_blob and "alpha-secret" not in b_blob

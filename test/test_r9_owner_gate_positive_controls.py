@@ -289,3 +289,62 @@ async def test_side_turn_allows_owner(monkeypatch) -> None:
         response = await client.post(_SIDE_PATH, json={"question": "status?"})
         assert response.status == 200, await response.text()
     dispatch.assert_called_once()
+
+
+# ── side read: same owner gate + app scoping as the side turn ──
+
+
+def _side_read_app(monkeypatch, middleware, *, slot_app: str):
+    from kiro_crew.dashboard.handlers import side
+
+    monkeypatch.setattr(side, "sel", lambda: MagicMock())
+    sidecar = SimpleNamespace(
+        open=True,
+        last_run_id="r1",
+        is_complete=True,
+        is_stopping=False,
+        queue=[],
+        messages=[
+            {"role": "user", "content": "held", "ts": "2026-10-21T20:00:00Z", "run_id": "r1"}
+        ],
+        created_at="2026-10-21T20:00:00Z",
+    )
+    slot = MagicMock(key="chat-1-1700000000", _app=slot_app)
+    slot._side = sidecar
+
+    app = web.Application(middlewares=[middleware])
+    app["state"] = MagicMock(owner_id=OWNER, _slots={"chat-1-1700000000": slot})
+    app.router.add_get("/api/chat/slots/{slot}/side", side.api_side_read)
+    return app
+
+
+_SIDE_READ_PATH = "/api/chat/slots/chat-1-1700000000/side"
+
+
+async def test_side_read_allows_owner(monkeypatch) -> None:
+    """The owner reads the held rows — the same gate the side turn allows them."""
+    app = _side_read_app(monkeypatch, _owner(), slot_app="")
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(_SIDE_READ_PATH)
+        assert response.status == 200, await response.text()
+        body = await response.json()
+        assert body["open"] is True
+        assert any(m["content"] == "held" for m in body["messages"])
+
+
+async def test_side_read_app_token_owned_slot_still_reads(monkeypatch) -> None:
+    """An app token on its own app's slot is not owner-gated: the read succeeds."""
+    app = _side_read_app(
+        monkeypatch, _identity(user="dashboard", app="spec-builder"), slot_app="spec-builder"
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(_SIDE_READ_PATH)
+        assert response.status == 200, await response.text()
+
+
+async def test_side_read_app_token_foreign_slot_still_404(monkeypatch) -> None:
+    """The app-isolation answer is unchanged: a foreign slot reads as missing."""
+    app = _side_read_app(monkeypatch, _identity(user="dashboard", app="spec-builder"), slot_app="")
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(_SIDE_READ_PATH)
+        assert response.status == 404, await response.text()
