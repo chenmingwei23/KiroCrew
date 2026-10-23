@@ -49,6 +49,31 @@ function insertAfterRun(messages: SideMessage[], row: SideMessage): void {
   messages.push(row)
 }
 
+/** Re-stamp an empty side state when its FIRST real message lands.
+ *
+ *  A `chat.side_queue` frame (or a status notice) for a slot with no side state
+ *  creates an empty shell stamped with THAT frame's time and the parent turn
+ *  count at that moment. If the restore read then answers that no conversation
+ *  is open, `sideRestore` early-returns and leaves the shell in place. The next
+ *  real message would otherwise inherit those stale stamps, so the banner dates
+ *  a just-started conversation from the old frame and can mark it stale.
+ *
+ *  "Empty" is no messages AND no queue entries: a shell that only ever held a
+ *  cancelled/drained queue card is still pre-conversation. Called at the point a
+ *  message is about to become the first row, so `createdAt`/`openedAtTurnCount`
+ *  start from the first question rather than the frame that created the shell. */
+function reStampIfEmpty(state: ChatState, slot: string, side: SideState, ts: string): void {
+  if (side.messages.length > 0 || (side.queue?.length ?? 0) > 0) return
+  side.createdAt = ts
+  side.openedAtTurnCount = slot === state.activeSlot
+    ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+    : side.openedAtTurnCount
+  // The conversation opens live in this tab now, so the banner compares against
+  // openedAtTurnCount rather than counting parent turns newer than a stale
+  // createdAt — the stamp a restore-only shell was carrying.
+  delete side.countsTurnsSinceCreated
+}
+
 /** The side state a panel restored from `GET .../side` shows, merged with what
  *  frames already drew in this tab (`local`).
  *
@@ -217,6 +242,11 @@ export const sideReducers = {
         // already ended. A steer never STARTS a turn, so it owns neither.
         return
       }
+      // A user frame can be the FIRST real message of a slot whose only prior
+      // state is an empty restore-only shell (no optimistic bubble preceded it,
+      // e.g. a frame that beat the local optimistic append). Re-stamp before the
+      // row lands so the banner dates from this question, not the shell's frame.
+      reStampIfEmpty(state, slot, side, tsIso)
       // Reconcile with the optimistic bubble appended in sideOptimisticAppend,
       // found by its MARKER rather than by position. This frame can arrive after
       // the in-flight turn has already streamed assistant text, so the bubble is
@@ -463,6 +493,7 @@ export const sideReducers = {
       state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: message.ts }
     }
     const side = state.slotSide[slot]
+    reStampIfEmpty(state, slot, side, message.ts)
     side.messages.push({ ...message, optimistic: true })
     side.pending = true
   },

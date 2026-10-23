@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, fireEvent, screen, waitFor } from '@testing-library/react'
-import chatReducer, { replaceMessages, restoreSideConversation, sideClose, sideOptimisticAppend, sideOptimisticRollback, sideRestore, sseSideQueue, sseSideResult } from '../store/chatSlice'
+import chatReducer, { replaceMessages, restoreSideConversation, setActiveSlot, sideClose, sideOptimisticAppend, sideOptimisticRollback, sideRestore, sseSideQueue, sseSideResult } from '../store/chatSlice'
 import type { SideSnapshot } from '../types'
 import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
@@ -376,6 +376,93 @@ describe('sideRestore', () => {
     const s = chatReducer(fresh(), sideRestore({ slot: SLOT, snapshot: snapshot() }))
     expect(s.slotSide[SLOT].countsTurnsSinceCreated).toBe(true)
     expect(s.slotSide[SLOT].createdAt).toBe(CREATED)
+  })
+})
+
+describe('first message re-stamps an empty restore-only side shell (#23312)', () => {
+  const SHELL_WALL = new Date('2026-10-21T10:00:00.000Z') // wall clock when the queue frame is processed
+  const SHELL_ISO = SHELL_WALL.toISOString()
+  const FIRST_TS = '2026-10-21T12:00:00.000Z' // the first real question, two hours later
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(SHELL_WALL)
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** A slot active in this tab with seven parent turns, so the empty shell the
+   *  queue frame mints is stamped openedAtTurnCount:7, createdAt:SHELL_ISO (the
+   *  wall clock at processing time). Drained, so the shell holds no messages and
+   *  no queue — the pre-conversation shape. The side read then answers nothing is
+   *  open, so sideRestore early-returns and leaves the stale-stamped shell. */
+  function emptyShellFromQueueFrame(): ChatState {
+    let s = fresh()
+    s = chatReducer(s, setActiveSlot(SLOT))
+    s = chatReducer(s, replaceMessages(
+      Array.from({ length: 7 }, (_v, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `m${i}`, cls: '', ts: SHELL_ISO })),
+    ))
+    s = chatReducer(s, sseSideQueue({ slot: SLOT, action: 'push', queue_id: 'q0', content: 'phantom' }))
+    s = chatReducer(s, sseSideQueue({ slot: SLOT, action: 'drain', queue_id: 'q0' }))
+    s = chatReducer(s, sideRestore({ slot: SLOT, snapshot: { open: false } }))
+    const shell = s.slotSide[SLOT]
+    expect(shell.messages).toEqual([])
+    expect(shell.queue ?? []).toEqual([])
+    expect(shell.createdAt).toBe(SHELL_ISO)
+    expect(shell.openedAtTurnCount).toBe(7)
+    return s
+  }
+
+  it('re-stamps createdAt and openedAtTurnCount when the first message is an optimistic append', () => {
+    let s = emptyShellFromQueueFrame()
+    // Two more parent turns have landed since the frame: the conversation really
+    // opens now, at turn 9, not at the frame's turn 7.
+    s = chatReducer(s, replaceMessages(
+      Array.from({ length: 9 }, (_v, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `m${i}`, cls: '', ts: SHELL_ISO })),
+    ))
+    s = chatReducer(s, sideOptimisticAppend({ slot: SLOT, message: { role: 'user', content: 'first real question', ts: FIRST_TS } }))
+
+    const side = s.slotSide[SLOT]
+    expect(side.createdAt).toBe(FIRST_TS)
+    expect(side.createdAt).not.toBe(SHELL_ISO)
+    expect(side.openedAtTurnCount).toBe(9)
+    // Opened live in this tab now: the banner compares with openedAtTurnCount
+    // instead of counting turns newer than the stale createdAt.
+    expect(side.countsTurnsSinceCreated).toBeUndefined()
+  })
+
+  it('re-stamps when the first message arrives as a user frame with no optimistic bubble', () => {
+    let s = emptyShellFromQueueFrame()
+    const frameTs = Math.floor(new Date(FIRST_TS).getTime() / 1000)
+    s = chatReducer(s, sseSideResult({ slot: SLOT, run_id: 'r1', role: 'user', content: 'framed first question', ts: frameTs, message_id: 'u1' }))
+
+    const side = s.slotSide[SLOT]
+    expect(side.createdAt).toBe(FIRST_TS)
+    expect(side.createdAt).not.toBe(SHELL_ISO)
+    expect(side.openedAtTurnCount).toBe(7)
+  })
+
+  it('leaves the stamps alone once the conversation already has messages', () => {
+    let s = emptyShellFromQueueFrame()
+    s = chatReducer(s, sideOptimisticAppend({ slot: SLOT, message: { role: 'user', content: 'Q1', ts: FIRST_TS } }))
+    // A second question must NOT move the stamps: the conversation is no longer empty.
+    s = chatReducer(s, sideOptimisticAppend({ slot: SLOT, message: { role: 'user', content: 'Q2', ts: '2026-10-21T13:00:00.000Z' } }))
+    expect(s.slotSide[SLOT].createdAt).toBe(FIRST_TS)
+  })
+
+  it('does not re-stamp while the shell still holds a live queue entry', () => {
+    let s = fresh()
+    s = chatReducer(s, setActiveSlot(SLOT))
+    // A queue frame creates the shell and the entry is NOT drained: still queued.
+    s = chatReducer(s, sseSideQueue({ slot: SLOT, action: 'push', queue_id: 'q0', content: 'queued' }))
+    const stamp = s.slotSide[SLOT].createdAt
+    expect(s.slotSide[SLOT].queue?.length).toBe(1)
+    // A user frame for that queued question lands: the shell was not empty (it had
+    // a queue entry), so this is not the "first message into an empty shell" case.
+    const frameTs = Math.floor(new Date(FIRST_TS).getTime() / 1000)
+    s = chatReducer(s, sseSideResult({ slot: SLOT, run_id: 'r1', role: 'user', content: 'queued', ts: frameTs, message_id: 'u1' }))
+    expect(s.slotSide[SLOT].createdAt).toBe(stamp)
   })
 })
 
