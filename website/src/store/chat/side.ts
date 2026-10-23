@@ -65,13 +65,20 @@ function insertAfterRun(messages: SideMessage[], row: SideMessage): void {
 function reStampIfEmpty(state: ChatState, slot: string, side: SideState, ts: string): void {
   if (side.messages.length > 0 || (side.queue?.length ?? 0) > 0) return
   side.createdAt = ts
-  side.openedAtTurnCount = slot === state.activeSlot
-    ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-    : side.openedAtTurnCount
-  // The conversation opens live in this tab now, so the banner compares against
-  // openedAtTurnCount rather than counting parent turns newer than a stale
-  // createdAt — the stamp a restore-only shell was carrying.
-  delete side.countsTurnsSinceCreated
+  // A restored empty shell counts parent turns newer than createdAt
+  // (timestamp-based). Keep that against the freshly re-stamped createdAt rather
+  // than switching to an openedAtTurnCount baseline: paging older parent history
+  // (loadOlderMessages) prepends rows without adjusting openedAtTurnCount, so a
+  // count-based banner would read those historical rows as new parent turns and
+  // falsely mark the just-started conversation stale. Timestamp-based counting
+  // ignores rows older than createdAt, so it stays correct for both the active
+  // and the inactive slot after history loads.
+  if (side.countsTurnsSinceCreated) return
+  // A count-based shell (e.g. a queue frame) has no timestamp flag to preserve;
+  // only the active slot has a live parent turn count to capture as its baseline.
+  if (slot === state.activeSlot) {
+    side.openedAtTurnCount = state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+  }
 }
 
 /** The side state a panel restored from `GET .../side` shows, merged with what

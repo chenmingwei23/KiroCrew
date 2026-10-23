@@ -443,6 +443,67 @@ describe('first message re-stamps an empty restore-only side shell (#23312)', ()
     expect(side.openedAtTurnCount).toBe(7)
   })
 
+  it('keeps timestamp-based counting when the first message lands on an INACTIVE slot', () => {
+    // The finding: /side opened with no question leaves an open, empty shell
+    // stamped openedAtTurnCount:0 with timestamp-based counting. The user then
+    // switches to another conversation (this slot goes inactive) and asks the
+    // first question from the other window — it arrives as a user frame.
+    let s = fresh()
+    s = chatReducer(s, setActiveSlot(SLOT))
+    s = chatReducer(s, replaceMessages(
+      Array.from({ length: 20 }, (_v, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `m${i}`, cls: '', ts: SHELL_ISO })),
+    ))
+    // Open, empty restore: openedAtTurnCount:0, countsTurnsSinceCreated:true.
+    s = chatReducer(s, sideRestore({ slot: SLOT, snapshot: { open: true, created_at: SHELL_ISO, messages: [], queue: [] } }))
+    const restored = s.slotSide[SLOT]
+    expect(restored.messages).toEqual([])
+    expect(restored.openedAtTurnCount).toBe(0)
+    expect(restored.countsTurnsSinceCreated).toBe(true)
+
+    // Switch away: this slot is no longer active.
+    s = chatReducer(s, setActiveSlot('other-slot'))
+    const frameTs = Math.floor(new Date(FIRST_TS).getTime() / 1000)
+    s = chatReducer(s, sseSideResult({ slot: SLOT, run_id: 'r1', role: 'user', content: 'first question from the other window', ts: frameTs, message_id: 'u1' }))
+
+    const side = s.slotSide[SLOT]
+    // createdAt still re-stamps to the first question's time.
+    expect(side.createdAt).toBe(FIRST_TS)
+    // The inactive slot captured no live parent baseline, so it must KEEP
+    // counting turns since the fresh createdAt — not compare 20 parent turns
+    // against the stale openedAtTurnCount:0 and read "20 turns ago".
+    expect(side.countsTurnsSinceCreated).toBe(true)
+    expect(side.openedAtTurnCount).toBe(0)
+  })
+
+  it('keeps timestamp-based counting when the first message lands on the ACTIVE slot of a restored empty chat', () => {
+    // The finding: /side opened with no question restores an open, empty shell
+    // with countsTurnsSinceCreated:true. The first question arrives while this
+    // slot is still active. The old helper deleted the flag for the active slot
+    // and fell back to openedAtTurnCount — but paging older parent history
+    // (loadOlderMessages) prepends rows without adjusting openedAtTurnCount, so
+    // the count-based banner would read those historical rows as new parent
+    // turns and falsely mark the just-started conversation stale. The flag must
+    // be preserved so counting runs against the refreshed createdAt instead.
+    let s = fresh()
+    s = chatReducer(s, setActiveSlot(SLOT))
+    s = chatReducer(s, replaceMessages(
+      Array.from({ length: 3 }, (_v, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `m${i}`, cls: '', ts: SHELL_ISO })),
+    ))
+    // Open, empty restore: countsTurnsSinceCreated:true.
+    s = chatReducer(s, sideRestore({ slot: SLOT, snapshot: { open: true, created_at: SHELL_ISO, messages: [], queue: [] } }))
+    expect(s.slotSide[SLOT].countsTurnsSinceCreated).toBe(true)
+
+    // First question lands while SLOT is still active.
+    const frameTs = Math.floor(new Date(FIRST_TS).getTime() / 1000)
+    s = chatReducer(s, sseSideResult({ slot: SLOT, run_id: 'r1', role: 'user', content: 'first question', ts: frameTs, message_id: 'u1' }))
+
+    const side = s.slotSide[SLOT]
+    expect(side.createdAt).toBe(FIRST_TS)
+    // The flag is PRESERVED (not deleted) so the banner counts parent turns newer
+    // than the refreshed createdAt, immune to prepended older history.
+    expect(side.countsTurnsSinceCreated).toBe(true)
+  })
+
   it('leaves the stamps alone once the conversation already has messages', () => {
     let s = emptyShellFromQueueFrame()
     s = chatReducer(s, sideOptimisticAppend({ slot: SLOT, message: { role: 'user', content: 'Q1', ts: FIRST_TS } }))
