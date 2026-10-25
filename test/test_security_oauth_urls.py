@@ -1333,3 +1333,118 @@ class TestOperatorOAuthEndpointExtension:
         host, path = endpoint
         self._write_extension(ext_home, [{"host": host, "path": path}])
         assert oauth_url_contains_credential(url) is False
+
+
+class TestLoopbackIpOAuthQueryLengthCarveOut:
+    """Issue #24054: a loopback-IP MCP OAuth consent URL must not fail closed.
+
+    An MCP server's own authorization server commonly runs on a loopback
+    redirect/consent URL (the RFC 8252 native-app pattern), which can never meet
+    the approved-endpoint gate (https + no port + allowlisted host). A standard
+    long PKCE query there tripped ``exfil_query_length`` and sign-in failed
+    closed. The carve-out exempts ONLY that one heuristic, and ONLY for a LITERAL
+    loopback IP host (``127.0.0.0/8`` or ``[::1]``): every credential check and
+    ``exfil_query_pattern`` stay unconditional, and no hostname (``localhost`` or
+    any DNS name) is trusted.
+    """
+
+    # A standard front-channel query whose opaque 128-char state pushes the query
+    # well past the >=200-char length heuristic; every parameter is a known OAuth
+    # name, so only the LENGTH rule is in play.
+    QUERY = (
+        "?client_id=mcp_local_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=mcp%3Aconnect"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16)
+    )
+    AWS_KEY = "AKIA" "IOSFODNN7EXAMPLE"
+    GITHUB_TOKEN = "ghp_" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef12"
+    BARE_AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+    @pytest.mark.parametrize(
+        "authority",
+        ["127.0.0.1:33418", "127.0.0.2:33418", "[::1]:33418", "127.0.0.1"],
+        ids=["ipv4-port", "ipv4-other-in-8", "ipv6-port", "ipv4-no-port"],
+    )
+    def test_loopback_ip_long_query_is_allowed(self, authority: str) -> None:
+        # Each of these FAILS on main (the length heuristic rejects it) and
+        # passes only with the loopback carve-out.
+        url = f"http://{authority}/authorize" + self.QUERY
+        assert len(self.QUERY.split("?", 1)[1]) >= 200
+        assert security.diagnose_oauth_url_credential(url) is None
+        assert oauth_url_contains_credential(url) is False
+
+    @pytest.mark.parametrize(
+        "authority",
+        [
+            "localhost:33418",  # a name, not an IP literal — never trusted
+            "127.0.0.1.evil.com:33418",  # host-suffix trick: not an IP literal
+            "10.0.0.5:33418",  # non-loopback IP
+            "idp.example.com",  # ordinary public host
+        ],
+        ids=["localhost-name", "suffix-trick", "non-loopback-ip", "public-host"],
+    )
+    def test_non_loopback_ip_long_query_still_fails_closed(self, authority: str) -> None:
+        url = f"http://{authority}/authorize" + self.QUERY
+        diagnostic = security.diagnose_oauth_url_credential(url)
+        assert diagnostic is not None
+        assert diagnostic.rule == "exfil_query_length"
+        assert oauth_url_contains_credential(url) is True
+
+    def test_userinfo_loopback_spoof_still_fails_closed(self) -> None:
+        # ``127.0.0.1`` in the userinfo with a non-loopback real host must not
+        # earn the carve-out: the userinfo rule rejects before the length rule.
+        url = "http://127.0.0.1@evil.com:33418/authorize" + self.QUERY
+        assert oauth_url_contains_credential(url) is True
+
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("aws-key-in-state", lambda q, s: q + s.AWS_KEY),
+            ("bare-secret-std-alphabet", lambda q, s: q + s.BARE_AWS_SECRET),
+        ],
+        ids=["aws-key-in-state", "bare-secret-std-alphabet"],
+    )
+    def test_credential_in_query_at_loopback_still_fails_closed(
+        self, label: str, mutate: Callable[[str, object], str]
+    ) -> None:
+        # The carve-out skips ONLY the length heuristic; a real credential in the
+        # query is still caught by the unconditional credential scans.
+        url = f"http://127.0.0.1:33418/authorize{self.QUERY}" + mutate("", self)
+        assert oauth_url_contains_credential(url) is True
+
+    def test_credential_in_unknown_param_at_loopback_still_fails_closed(self) -> None:
+        url = f"http://127.0.0.1:33418/authorize{self.QUERY}&session_blob={self.GITHUB_TOKEN}"
+        assert oauth_url_contains_credential(url) is True
+
+    @pytest.mark.parametrize(
+        ("label", "suffix"),
+        [
+            ("heavy-percent", "&state=" + ("%41" * 25)),
+            ("fragment", "#fragmentsecret"),
+            ("path-params-marker", None),
+        ],
+        ids=["heavy-percent", "fragment", "path-params"],
+    )
+    def test_other_unconditional_rules_at_loopback_still_fail_closed(
+        self, label: str, suffix: str | None
+    ) -> None:
+        if label == "path-params-marker":
+            url = "http://127.0.0.1:33418/authorize;v=1" + self.QUERY
+        elif label == "heavy-percent":
+            url = "http://127.0.0.1:33418/authorize?state=" + ("%41" * 25)
+        else:
+            url = f"http://127.0.0.1:33418/authorize{self.QUERY}{suffix}"
+        assert oauth_url_contains_credential(url) is True
+
+    def test_general_redactors_do_not_inherit_the_loopback_carve_out(self) -> None:
+        # The carve-out is banner-only: arbitrary model/agent text keeps the full
+        # heuristics, so a loopback URL with a long query is still redacted there.
+        url = "http://127.0.0.1:33418/authorize" + self.QUERY
+        cleaned, warnings = redact_exfiltration_urls(url)
+        assert cleaned != url
+        assert warnings
+        assert scan_exfiltration_urls(url)

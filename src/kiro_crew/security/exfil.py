@@ -1065,6 +1065,24 @@ def _oauth_credential_scan_target(
     return url[: query_start + 1] + sanitized_query + suffix
 
 
+def _is_loopback_ip_host(hostname: str | None) -> bool:
+    """True only when *hostname* is a LITERAL loopback IP address.
+
+    ``hostname`` is ``urlparse``'s parsed host (lowercased, IPv6 brackets
+    stripped: ``[::1]`` -> ``::1``), read as an IP LITERAL via :mod:`ipaddress`
+    and accepted only when loopback (``127.0.0.0/8`` or ``::1``). A name that
+    merely RESOLVES to loopback is NOT trusted: ``localhost`` and any DNS name
+    raise ``ValueError`` here, so no resolution and no host-suffix trick
+    (``127.0.0.1.evil.com`` is not an IP literal) can earn the carve-out.
+    """
+    if not hostname:
+        return False
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def diagnose_oauth_url_credential(
     url: str, *, assume_approved_endpoint: bool = False
 ) -> OAuthUrlCredentialDiagnostic | None:
@@ -1219,6 +1237,19 @@ def diagnose_oauth_url_credential(
             heuristic_query = slack_alias
 
     if rule == "exfil_query_length":
+        # Loopback MCP OAuth carve-out (issue #24054). An MCP server's own
+        # authorization server commonly runs on a loopback consent URL
+        # (http://127.0.0.1:<port>/authorize, http://[::1]:<port>/...), the
+        # RFC 8252 native-app pattern, which can never meet the approved-endpoint
+        # gate (https + no port + allowlisted host); a standard long PKCE query
+        # then fails closed on this length rule. Exempt ONLY this heuristic, and
+        # ONLY for a LITERAL loopback IP: every unconditional check above (fixed
+        # credentials, userinfo, path params, fragment, heavy percent-encoding,
+        # the markerless bare-secret scan) has already run and still rejects, and
+        # exfil_query_pattern below is untouched. A loopback address never leaves
+        # the host, so a long query to it is not an exfiltration channel.
+        if _is_loopback_ip_host(parsed.hostname):
+            return None
         return _oauth_query_diagnostic(rule, heuristic_query)
     if rule == "exfil_query_pattern":
         query_decoder: Callable[[str], str] | None = (

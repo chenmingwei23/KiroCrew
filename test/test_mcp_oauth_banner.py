@@ -284,15 +284,23 @@ class TestEmitMcpOAuthRequest:
 
     @pytest.mark.parametrize(
         "host",
-        ["localhost:3100", "127.0.0.1:3100", "[::1]:3100"],
+        # A loopback host the guard still REFUSES: ``localhost`` is a DNS name,
+        # not an IP literal, so issue #24054's loopback-IP query-length carve-out
+        # (127.0.0.0/8, [::1]) deliberately does not cover it. This keeps a
+        # genuinely-refused loopback URL exercising the retry-advice branch.
+        ["localhost:3100"],
     )
     def test_loopback_rejection_points_at_a_retry_not_the_allowlist(self, host):
-        """A loopback authorize URL is still REJECTED, but the banner
-        must not send the user to ``oauth_endpoints.json`` -- that file refuses
-        loopback hosts and the gate never relaxes http/port, so the advice is
-        unactionable. It names the endpoint and suggests reconnecting."""
+        """A refused loopback authorize URL points at a retry, not the allowlist.
+
+        The banner must not send the user to ``oauth_endpoints.json`` -- that
+        file refuses loopback hosts and the gate never relaxes http/port, so the
+        advice is unactionable. It names the endpoint and suggests reconnecting.
+        Pinned on ``localhost`` because a literal loopback IP (127.0.0.1/[::1])
+        is now ALLOWED by the guard (#24054) and never reaches this branch.
+        """
         url = f"http://{host}/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
-        # Premise: the guard verdict itself is unchanged by this fix.
+        # Premise: the guard still refuses this (name-host) loopback URL.
         assert oauth_url_contains_credential(url)
         slot = _ChatSlot("s1")
         _emit_mcp_oauth_request(MagicMock(), slot, "tidal-knowledge", url)
@@ -322,6 +330,30 @@ class TestEmitMcpOAuthRequest:
         m = slot.messages[0]
         assert m["meta"]["remedy"] == "oauth_endpoints.json"
         assert "oauth_endpoints.json" in m["content"]
+
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1:49954", "[::1]:49954"],
+        ids=["ipv4", "ipv6"],
+    )
+    def test_literal_loopback_ip_authorize_url_renders_the_consent_banner(self, host):
+        """Issue #24054: a real MCP authorization server on a literal loopback
+        IP (the RFC 8252 native-app pattern) is now ALLOWED by the guard, so the
+        banner renders the live consent URL rather than the refused-loopback
+        retry advice. No banner product code changed: the guard verdict flipping
+        for a loopback IP is what moves this out of the rejection branch, while
+        ``localhost`` (a name) still refuses and still gets the retry advice."""
+        url = f"http://{host}/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        # The guard now accepts a literal loopback-IP authorize URL.
+        assert oauth_url_contains_credential(url) is False
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "local-idp", url)
+        m = slot.messages[0]
+        assert m["role"] == "mcp_oauth"
+        # Accepted -> the live auth-request banner, NOT a rejection.
+        assert m["meta"].get("rejected_url") is not True
+        assert m["meta"].get("failed") is not True
+        assert m["meta"]["oauth_url"] == url
 
     # A Cloudflare Access per-tenant consent URL with a real-world shape:
     # PKCE + state + redirect push the query past the 200-char length gate, and
