@@ -72,13 +72,14 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import functools
 import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 from kiro_crew.subprocess_pool import SubprocessPoolExecutor
 
@@ -111,6 +112,8 @@ __all__ = [
     "run_in_cron_gate_pool",
     "cron_gate_budget",
     "run_in_embed_pool",
+    "embed_pool_admission",
+    "EmbedAdmissionTimeout",
     "run_with_recall_deadline",
     "recall_executor",
     "shutdown_maintenance_executor",
@@ -1236,12 +1239,84 @@ async def run_with_recall_deadline(awaitable: Awaitable[_T]) -> _T:
         embedding_work.reset(token)
 
 
-async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+class EmbedAdmissionTimeout(asyncio.TimeoutError):
+    """The memory-admission semaphore did not free a slot within a caller's deadline.
+
+    Raised by :func:`embed_pool_admission` when a caller that must bound its wait
+    (the dashboard pre-prompt build) could not enter the embed pool in time, so the
+    caller can surface a visible error instead of waiting unbounded. Subclasses
+    :class:`asyncio.TimeoutError` so a caller that only handles timeouts still
+    catches it.
+    """
+
+    def __init__(self, waited: float) -> None:
+        shown = f"{waited:.2f}" if waited < 10 else f"{waited:.0f}"
+        super().__init__(f"memory pool admission not granted within {shown}s")
+        self.waited = waited
+
+
+def _embed_admission(loop: asyncio.AbstractEventLoop, *, recall: bool) -> asyncio.Semaphore:
+    """The per-loop embed/recall admission semaphore, created on first use.
+
+    One shared object per event loop keyed by whether the work is recall or a
+    memory build, so :func:`run_in_embed_pool` and :func:`embed_pool_admission`
+    gate on the SAME semaphore for a given loop. Without one accessor the two
+    could set up separate semaphores under the same attribute name and stop
+    bounding each other.
+    """
+    admission_key = "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission"
+    admission = getattr(loop, admission_key, None)
+    if admission is None:
+        admission = asyncio.Semaphore(_MAX_EMBED_WORKERS)
+        setattr(loop, admission_key, admission)
+    return admission
+
+
+@contextlib.asynccontextmanager
+async def embed_pool_admission(timeout: float, *, recall: bool = False) -> AsyncIterator[None]:
+    """Hold one embed-pool admission slot, acquired within *timeout* seconds.
+
+    Acquires the same per-loop semaphore :func:`run_in_embed_pool` waits on, but
+    BOUNDED: a caller that cannot afford the pool's unbounded wait acquires the
+    slot here first, runs its build inside the ``async with`` body calling
+    ``run_in_embed_pool(..., _admission_held=True)`` so the build does not try to
+    acquire a second slot, and the slot is released when the body exits. A build
+    that needs admission the saturated pool never frees raises
+    :class:`EmbedAdmissionTimeout` from the ``acquire`` rather than hanging — and
+    because the body has not run yet, a caller can take this BEFORE consuming any
+    one-shot turn input, so a timeout leaves nothing to restore.
+    """
+    loop = asyncio.get_running_loop()
+    admission = _embed_admission(loop, recall=recall)
+    started = loop.time()
+    try:
+        await asyncio.wait_for(admission.acquire(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise EmbedAdmissionTimeout(loop.time() - started) from exc
+    try:
+        yield
+    finally:
+        admission.release()
+
+
+async def run_in_embed_pool(
+    func: Callable[..., _T],
+    /,
+    *args: Any,
+    _admission_held: bool = False,
+    **kwargs: Any,
+) -> _T:
     """Offload bounded memory work, waiting without rejecting ordinary prompts.
 
     Submission is bounded to the worker count for this gateway event loop. A
     cancelled caller releases a slot only when its underlying thread actually
     finishes (or the queued future is successfully cancelled).
+
+    When *_admission_held* is True the caller already holds an admission slot
+    (through :func:`embed_pool_admission`), so this neither acquires nor releases
+    one — the enclosing context manager owns that slot's whole lifetime. Used by a
+    caller that must BOUND its admission wait and has taken the slot ahead of the
+    work for that reason.
     """
     from contextvars import copy_context
 
@@ -1249,20 +1324,20 @@ async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: An
 
     loop = asyncio.get_running_loop()
     recall = embedding_work.get() is not None
-    admission_key = "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission"
-    admission = getattr(loop, admission_key, None)
-    if admission is None:
-        admission = asyncio.Semaphore(_MAX_EMBED_WORKERS)
-        setattr(loop, admission_key, admission)
-    await admission.acquire()
+    admission = None if _admission_held else _embed_admission(loop, recall=recall)
+    if admission is not None:
+        await admission.acquire()
     try:
         executor = recall_executor() if recall else embed_executor()
         future = executor.submit(copy_context().run, functools.partial(func, *args, **kwargs))
     except BaseException:
-        admission.release()
+        if admission is not None:
+            admission.release()
         raise
 
     def finished(_future: object) -> None:
+        if admission is None:
+            return
         try:
             loop.call_soon_threadsafe(admission.release)
         except RuntimeError:
